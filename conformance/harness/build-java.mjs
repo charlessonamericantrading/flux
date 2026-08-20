@@ -102,11 +102,20 @@ if (artefactos.every((a) => existsSync(a.origen))) {
 
 // ─── Compilación ─────────────────────────────────────────────────────────────
 
-// Todo el SDK MENOS FluxBus: es lo único que importa io.nats, y el arnés no toca el
-// broker (conformance/harness/README.md: "Sin red y sin broker"). Dejarlo fuera hace que
-// el arnés se construya con Jackson y nada más.
+// Todo el SDK MENOS FluxBus y la validación L3.
+//
+// · FluxBus es lo único que importa io.nats, y el arnés no toca el broker
+//   (conformance/harness/README.md: "Sin red y sin broker").
+// · Validation/NetworkntValidator son lo único que importa
+//   `com.networknt:json-schema-validator`, que es una dependencia OPCIONAL del pom porque
+//   L3 es opt-in (00-protocol.md §5). Los vectores son de envelope y firma: ninguno valida
+//   contra un JSON Schema, así que incluirlas solo serviría para exigir aquí un jar que el
+//   arnés no ejecuta.
+//
+// Dejar ambas fuera hace que el arnés se construya con Jackson y nada más.
+const EXCLUIDAS = new Set(["FluxBus.java", "Validation.java", "NetworkntValidator.java"]);
 const fuentes = readdirSync(join(SDK, "src", "main", "java", "com", "flux"))
-  .filter((f) => f.endsWith(".java") && f !== "FluxBus.java")
+  .filter((f) => f.endsWith(".java") && !EXCLUIDAS.has(f))
   .map((f) => join("src", "main", "java", "com", "flux", f));
 
 console.log(`· javac ${fuentes.length} fuentes`);

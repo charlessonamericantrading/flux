@@ -1,7 +1,8 @@
 # flux SDK para Java
 
 Cliente del **flux Event Protocol v1** — CloudEvents 1.0 sobre NATS JetStream.
-Nivel de conformidad objetivo: **L2**.
+Nivel de conformidad: **L3**, con la validación de esquema **opt-in**; sin activarla, el SDK
+se comporta exactamente como en L2 y no arrastra ninguna dependencia de más.
 
 El contrato normativo vive en [`specification/`](../specification/); si algo de este
 README diverge de la spec, manda la spec.
@@ -18,6 +19,11 @@ Requiere **Java 17+**, `io.nats:jnats` 2.20+ (por la API de contextos:
 `StreamContext` / `ConsumerContext` / `MessageConsumer`) y `jackson-databind`. Nada más:
 el envelope es JSON plano y `time` se formatea a mano, así que no hacen falta
 `jackson-datatype-jsr310` ni módulos de parámetros.
+
+> **La validación L3 es opt-in y su dependencia también.**
+> `com.networknt:json-schema-validator` está declarada `<optional>true</optional>`, así que
+> **no llega** a quien use el SDK: solo la instala quien active
+> `Validation.Mode.WARN` o `STRICT`. Ver §"Validación L3".
 
 ---
 
@@ -128,6 +134,110 @@ Para que el clasificador reconozca un status HTTP, lanza
 
 ---
 
+## Validación L3 (opt-in)
+
+Nivel **L3** de [00-protocol.md §5](../specification/00-protocol.md): el SDK resuelve y
+valida el `dataschema` **antes de publicar**, y `publish()` **falla** si el payload no
+cumple su propio esquema.
+
+Sin esto, un productor puede publicar un payload que viola su contrato y nadie se entera
+hasta que un consumidor —posiblemente de otro equipo, otro lenguaje y otra semana— se
+atraganta: el error aparece lejísimos de su causa. Validar al publicar lo convierte en un
+fallo del servicio que lo provocó.
+
+```java
+SchemaBundle bundle = SchemaBundle.fromPath(Path.of("schemas/bundle.json"));
+// o, si viaja como recurso del jar:
+// SchemaBundle bundle = SchemaBundle.fromStream(App.class.getResourceAsStream("/bundle.json"));
+
+FluxBus bus = FluxBus.connect(new FluxBus.ConnectOptions()
+        // …
+        .validation(new Validation.Options()
+                .mode(Validation.Mode.STRICT)     // OFF (default) | WARN | STRICT
+                .bundle(bundle)
+                .onConsume(true)));               // opcional
+```
+
+Y en el `pom.xml` del servicio, porque la dependencia es `optional` y no se propaga:
+
+```xml
+<dependency>
+  <groupId>com.networknt</groupId>
+  <artifactId>json-schema-validator</artifactId>
+  <version>1.5.9</version>
+</dependency>
+```
+
+| Modo | Al publicar | Cuándo |
+|---|---|---|
+| `OFF` (default) | no valida | L2. Coste cero: no se compila un esquema ni se carga la librería. |
+| `WARN` | registra y publica | Introducir L3 en un ecosistema en marcha sin romper a nadie el primer día. |
+| `STRICT` | **lanza `SchemaValidationException`** | L3 de verdad. |
+
+- **Reporta TODOS los errores**, no solo el primero (`SchemaValidationException.errors()`).
+  De uno en uno, arreglar un payload con tres campos mal cuesta tres despliegues.
+- `onConsume(true)` valida también al consumir. Un fallo ahí es **PERMANENT**, no
+  RETRYABLE: el evento es sintácticamente correcto —ha llegado a parsearse, así que no es
+  POISON— pero incumple su contrato, y reintentarlo seis veces da el mismo resultado
+  bloqueando la cola 51 minutos para nada.
+- Pasar el bundle **también resuelve el `dataschema` exacto** de cada subject: el MINOR
+  real, no el `.0.0` que se asume con solo `schemaBaseUrl`.
+- Si el modo no es `OFF` y la librería no está en el classpath, el fallo es un
+  `IllegalStateException` **en `connect()`** con el snippet de Maven que falta — no un
+  `NoClassDefFoundError` a media publicación.
+
+### El bundle es un dato, no una descarga
+
+El `dataschema` es una URI, pero un SDK L3 **NO DEBE resolverla por red** al publicar
+(00-protocol.md §5). Validar está en la ruta caliente —una petición por evento es
+inaceptable— y una caché con TTL abre una ventana en la que dos servicios validan contra
+versiones distintas del mismo esquema: eso no produce un error, produce dos verdades.
+
+Los esquemas se empaquetan con `node scripts/bundle-schemas.mjs` y se despliegan **con el
+servicio**, así que la versión del esquema queda clavada a la versión del servicio — que es
+justo lo que `producerversion` promete poder acotar.
+
+El validador no descarga nada, y no por convención: se le **sustituye por completo** la
+lista de cargadores de esquema de la librería (que incluye uno que resuelve URIs por HTTP)
+por el mapa del bundle más un `DisallowSchemaLoader`. Un `$ref` a algo que no esté en el
+bundle es un error explícito en el arranque, no una petición HTTP silenciosa.
+
+### Qué librería, y qué cuesta
+
+⚠️ Los esquemas de flux declaran `$schema: draft/2020-12`, así que la librería **debe**
+soportarlo. Un validador de draft-07 no da un error de versión: da
+`no schema with key or ref ".../2020-12/schema"`, que no dice nada y manda al operador a
+buscar un fichero que no existe. Por eso `NetworkntValidator` fija
+`SpecVersion.VersionFlag.V202012` explícitamente en vez de dejarlo a una heurística.
+
+Se elige **`com.networknt:json-schema-validator` 1.5.9**, con versión concreta y no un
+rango: el conjunto de mensajes de error de un validador es lo que ve el operador, y que
+cambie solo en un `mvn install` es un cambio de comportamiento que nadie ha revisado.
+
+**Por qué la 1.5.x y no la 3.x, que es la última:** la serie 3.x migró a **Jackson 3**
+(`tools.jackson.core`), un *namespace de paquete distinto* del Jackson 2 que usa el envelope
+de este SDK. Adoptarla obligaría a tener las dos pilas de Jackson en el classpath y a
+convertir cada `JsonNode` de una a otra solo para poder validar un `data` que ya está
+parseado. La 1.5.x sigue en Jackson 2 y comparte tipos con el envelope: se valida el
+`JsonNode` tal cual llega, sin copias.
+
+**Coste real de la dependencia** (lo que entra al declararla):
+
+```
+json-schema-validator 1.5.9 → com.ethlo.time:itu 1.14.0     (formato date-time)
+                            → org.slf4j:slf4j-api 2.0.17
+                            → jackson-databind               (ya estaba)
+```
+
+Se **excluye** `jackson-dataformat-yaml`, que la librería declara para poder leer esquemas
+en YAML: aquí solo se validan CloudEvents, que son JSON por definición
+([01-envelope.md §1](../specification/01-envelope.md)). Verificado ejecutando
+`ValidationTest` con un classpath sin ese jar ni snakeyaml.
+
+> `json-schema-validator` 1.5.9 declara `jackson-databind` 2.18.3, pero este pom declara
+> 2.15.4 de forma **directa**, así que Maven resuelve 2.15.4 (*nearest-wins*) — y es esa
+> combinación, no otra, la que ejercitan los tests.
+
 ## Firma de eventos (opcional)
 
 Extensión **opcional** de v1 — [07-signing.md](../specification/07-signing.md). El default
@@ -211,11 +321,28 @@ métricas. Para enchufar Micrometer u OpenTelemetry, implementa `MetricsSink`.
 - **El último bucket del histograma es `30` porque *es* el `ack_wait`.** Un handler que cae
   ahí está a punto de que su mensaje se reentregue mientras aún se ejecuta. Hay un test que
   lo ata a `Protocol.DEFAULT_ACK_WAIT`: cambiar uno sin el otro rompe la suite.
-- **`flux_consumer_pending` se alimenta en cada entrega**, con el `pendingCount()` que ya
-  viene en los metadatos del mensaje de JetStream: no hace falta sondear al servidor. Es la
-  única señal que delata a un consumidor cuyo bucle murió, porque la conexión sigue
-  reportándose sana y el healthcheck dice que todo va bien
-  ([§4](../specification/08-observability.md)).
+- **`flux_consumer_pending` tiene DOS fuentes y el SDK usa las dos**
+  ([§2.3](../specification/08-observability.md)), porque cada una falla justo donde la otra
+  sirve:
+  1. **Los metadatos** del mensaje entregado (`pendingCount()`) — gratis y frescos en cada
+     evento, pero **fallan cuando no llegan mensajes**, que es el caso que importa: si el
+     bucle del consumidor muere, el gauge se queda plano en su último valor y el panel
+     muestra una línea horizontal, indistinguible de "no pasa nada".
+  2. **El sondeo periódico** de `num_pending` al servidor, cada
+     `ConnectOptions.pendingPollMillis(...)` (15 s por defecto, `0` lo desactiva). Sigue
+     corriendo aunque no se entregue nada, y es el que reporta el pending creciente. Ésa es
+     la señal.
+
+  Un fallo del sondeo **no afecta al consumo**: se traga y se registra en `DEBUG` —tragar
+  incluso un `Error` es deliberado, porque una excepción que escapara de
+  `scheduleAtFixedRate` **cancelaría la tarea en silencio** y la métrica dejaría de emitirse
+  para siempre tras un corte de red de dos segundos—. El sondeo corre en su propio hilo
+  daemon, aparte del de los WIP, para que una petición lenta al servidor no retrase la
+  renovación del plazo de ack de ninguna suscripción. Sin `metrics(...)` configurado no se
+  crea ni el hilo.
+- **Un payload que incumple su JSON Schema se contabiliza como `outcome="invalid_schema"`**,
+  al publicar y al consumir, mientras que el `dlqreason` sigue siendo `permanent`. Ver
+  §"Validación L3".
 - **Un fallo de firma se contabiliza como `outcome="invalid_signature"`**, aunque el
   `dlqreason` del evento siga siendo `poison`. Son dos incidentes distintos —basura frente
   a suplantación— con dos respuestas distintas. Es el mismo criterio que Go, Rust y PHP.
@@ -623,6 +750,11 @@ Jackson emite bien. Ahora `serialize` escribe vía `writeValueAsString(...).getB
 | `FluxBus.java` | `connect`, `publish`, `subscribe`, `close`, despacho, WIP, DLQ, firma, métricas, aislamiento de tenant |
 | `ConsumerConfigMismatchException.java` | Requisito L2: el servidor no honró la config |
 | `Signing.java` | Ed25519 sobre `java.security`: `SigningOptions`, `Signer`, `Verifier`, `generateKeyPair`, códigos POISON |
+| `Validation.java` | Contrato y política L3: `Mode`, `Options`, `Validator`, `create()`. **No toca la librería de validación** |
+| `NetworkntValidator.java` | El evaluador. **Única clase que importa `com.networknt`**, y la única que exige la dependencia opcional |
+| `SchemaBundle.java` | El `bundle.json` leído: subject → URI y URI → esquema. Solo Jackson |
+| `SchemaValidationException.java` | El payload no cumple su esquema. PERMANENT, con **todos** los errores |
+| `SchemaNotFoundException.java` | El bundle no trae el esquema que el evento declara. PERMANENT |
 | `MetricsSink.java` | El contrato de métricas: siete métodos con parámetros nombrados, buckets y `NONE` |
 | `InMemoryMetrics.java` | Recolector sin dependencias con salida en formato Prometheus |
 | `TenantIsolationException.java` | Suscripción sin filtro de tenant con el aislamiento en estricto |
@@ -662,7 +794,12 @@ Los tests no requieren un broker. Cubren:
   línea a línea, escapado de comillas, y que un fallo de firma dé
   `outcome="invalid_signature"` sin tocar el `dlqreason`;
 - **aislamiento de tenant** — `STRICT` sin tenant lanza, `"system"` no cuenta como filtro,
-  precedencia suscripción → conexión.
+  precedencia suscripción → conexión;
+- **validación L3** — los mismos casos que `sdk-node/test/validation.test.ts` (requerido
+  ausente, tipo incorrecto, campo desconocido, patrón incumplido, **todos** los errores a la
+  vez, esquema ausente del bundle, `warn` que avisa sin lanzar, `off` que no compila nada),
+  más la clasificación PERMANENT, la etiqueta `invalid_schema` y el sondeo de
+  `num_pending` —incluido que un fallo del sondeo no rompe nada ni envenena la tarea—.
 
 > Estos tres bloques se verificaron además **contra el SDK de Node**, que es la referencia:
 > un evento firmado en Java lo verifica el verificador de Node, la firma de los dos es el

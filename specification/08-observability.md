@@ -42,6 +42,32 @@ attempt  = 1..max_deliver
 
 `flux_connection_state`: `1` conectado, `0` desconectado, `2` reconectando.
 
+**`invalid_schema` e `invalid_signature` NO son opcionales.** Un SDK **DEBE** emitirlos
+siempre que un evento muera por esas causas, incluido cuando `publish()` **lanza**.
+
+Un `publish()` que falla sin dejar rastro en las métricas hace invisible el volumen de
+contratos rotos: la aplicación ve una excepción, pero el panel del ecosistema no ve
+nada, y nadie sabe cuántos productores están fallando ni desde cuándo. La excepción
+sirve al desarrollador que la provoca; la métrica, a quien opera el ecosistema.
+
+> Node era el único que no lo hacía al publicar: lanzaba sin anotar. Lo destaparon los
+> ports a Java y .NET, donde la etiqueta ya estaba declarada en el enum y sin usar.
+
+### 2.2 ⚠️ Cardinalidad
+
+- `subject` es **acotado** —hay tantos como eventos declarados— así que sirve como
+  etiqueta.
+- `code` **DEBE** ser un identificador estable y agrupable, nunca el mensaje de error.
+  Un mensaje contiene ids, timestamps y rutas: su cardinalidad es infinita y tumba el
+  almacenamiento de métricas. Es la misma razón por la que
+  [04-errors.md](04-errors.md) exige códigos estables para `dlqerror`.
+- **NUNCA** se etiqueta con `tenantid`, `id` ni `correlationid`. Un tenant nuevo no
+  debe crear series temporales nuevas; para eso están las trazas.
+
+> La cardinalidad no avisa: el sistema funciona en desarrollo con tres tenants y muere
+> en producción con diez mil. Y el fallo se manifiesta como "Prometheus se ha quedado
+> sin memoria", no como "alguien etiquetó por tenant".
+
 ### 2.3 `flux_consumer_pending`: metadatos **y** sondeo
 
 Es la única de las siete que no sale limpiamente del flujo de eventos, y tiene dos
@@ -85,9 +111,6 @@ querer.
 > mismo ecosistema, y en la dirección peligrosa justo en el lenguaje donde el cero es el
 > valor por defecto del tipo.
 
-Sin ese sondeo la métrica nunca se emite, y un panel que muestra "sin datos" es
-**indistinguible de un consumidor sano** — que es exactamente el fallo que esta
-métrica existe para detectar.
 
 **Qué mide, con precisión:** `num_pending` son los mensajes del stream **aún no
 entregados** a ese consumidor. No son los entregados y sin confirmar.
@@ -96,21 +119,6 @@ entregados** a ese consumidor. No son los entregados y sin confirmar.
   esperando ack. Se ve en `flux_event_handler_duration_seconds`.
 - Un consumidor **muerto** sí: deja de recoger mensajes y `num_pending` sube sin
   techo. Es la señal, y la conexión sigue reportándose sana mientras tanto.
-
-### 2.2 ⚠️ Cardinalidad
-
-- `subject` es **acotado** —hay tantos como eventos declarados— así que sirve como
-  etiqueta.
-- `code` **DEBE** ser un identificador estable y agrupable, nunca el mensaje de error.
-  Un mensaje contiene ids, timestamps y rutas: su cardinalidad es infinita y tumba el
-  almacenamiento de métricas. Es la misma razón por la que
-  [04-errors.md](04-errors.md) exige códigos estables para `dlqerror`.
-- **NUNCA** se etiqueta con `tenantid`, `id` ni `correlationid`. Un tenant nuevo no
-  debe crear series temporales nuevas; para eso están las trazas.
-
-> La cardinalidad no avisa: el sistema funciona en desarrollo con tres tenants y muere
-> en producción con diez mil. Y el fallo se manifiesta como "Prometheus se ha quedado
-> sin memoria", no como "alguien etiquetó por tenant".
 
 ## 3. Histograma de duración
 

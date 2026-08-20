@@ -454,10 +454,13 @@
       "node",
       "python",
       "go",
+      "java",
+      "dotnet",
       "rust",
       "php"
     ],
-    "$commentImplementsL3": "En Rust detras de la feature `validation` (crate jsonschema, sin resolucion HTTP); en PHP con opis/json-schema como dependencia opcional de Composer; en Python con el extra [validation] (jsonschema >= 4.18, import diferido). El coste de L3 se paga solo si se usa: sin activarlo, esos SDKs siguen siendo L2 y no arrastran el validador. Go es la excepcion: no existe el extra opcional, asi que santhosh-tekuri/jsonschema/v6 va en go.mod y lo pagan tambien los servicios en L2 (~1 MB de binario); en ejecucion sigue sin costar nada con Mode off."
+    "$commentImplementsL3": "En Rust detras de la feature `validation` (crate jsonschema, sin resolucion HTTP); en PHP con opis/json-schema como dependencia opcional de Composer; en Python con el extra [validation] (jsonschema >= 4.18, import diferido). El coste de L3 se paga solo si se usa: sin activarlo, esos SDKs siguen siendo L2 y no arrastran el validador. Go es la excepcion: no existe el extra opcional, asi que santhosh-tekuri/jsonschema/v6 va en go.mod y lo pagan tambien los servicios en L2 (~1 MB de binario); en ejecucion sigue sin costar nada con Mode off.",
+    "$commentL3Coverage": "Los SIETE SDKs implementan L3. La validacion es opt-in en todos: por extra (Python), feature (Rust), paquete aparte (.NET, con Flux.Validation), dependencia optional (Java) o suggest (PHP)."
   },
   "outOfScopeV1": [
     "request/reply",
@@ -623,7 +626,12 @@
     ],
     "$commentCardinality": "Un tenant nuevo no debe crear series temporales nuevas; para eso estan las trazas, donde la cardinalidad no es problema. El fallo no avisa: funciona en desarrollo con tres tenants y muere en produccion con diez mil, y se manifiesta como \"Prometheus se ha quedado sin memoria\", no como \"alguien etiqueto por tenant\". `code` DEBE ser un identificador estable, nunca el mensaje de error.",
     "labelValueEscaping": "prometheus-standard",
-    "$commentEscaping": "Los valores de etiqueta se ESCAPAN (barra invertida primero, luego comillas y saltos), no se sustituyen. Reemplazar por _ no romperia el scrape pero dejaria dos errores distintos bajo la misma etiqueta."
+    "$commentEscaping": "Los valores de etiqueta se ESCAPAN (barra invertida primero, luego comillas y saltos), no se sustituyen. Reemplazar por _ no romperia el scrape pero dejaria dos errores distintos bajo la misma etiqueta.",
+    "mandatoryOutcomes": [
+      "invalid_schema",
+      "invalid_signature"
+    ],
+    "$commentMandatoryOutcomes": "NO son opcionales, y se emiten tambien cuando publish() LANZA. Un publish que falla sin dejar rastro en las metricas hace invisible el volumen de contratos rotos: la aplicacion ve una excepcion, pero el panel del ecosistema no ve nada. La excepcion sirve al desarrollador que la provoca; la metrica, a quien opera el ecosistema."
   },
   "multitenancy": {
     "spec": "specification/09-multitenancy.md",

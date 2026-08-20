@@ -6,6 +6,8 @@ Project("{9A19103F-16F7-4668-BE54-9A1E7A4F7556}") = "Flux", "src\Flux\Flux.cspro
 EndProject
 Project("{9A19103F-16F7-4668-BE54-9A1E7A4F7556}") = "Flux.Signing", "src\Flux.Signing\Flux.Signing.csproj", "{5C8E1D74-2A9B-4F36-B5D1-6E7F80912A34}"
 EndProject
+Project("{9A19103F-16F7-4668-BE54-9A1E7A4F7556}") = "Flux.Validation", "src\Flux.Validation\Flux.Validation.csproj", "{2E9B7C51-8A4D-4F62-B7E3-5D6071829344}"
+EndProject
 Project("{9A19103F-16F7-4668-BE54-9A1E7A4F7556}") = "Flux.Tests", "tests\Flux.Tests\Flux.Tests.csproj", "{7A2D5B3F-4E6C-4D82-8F19-2B3C4D5E6F71}"
 EndProject
 Project("{9A19103F-16F7-4668-BE54-9A1E7A4F7556}") = "Flux.ConformanceHarness", "tools\Flux.ConformanceHarness\Flux.ConformanceHarness.csproj", "{1D4F8A62-9C3E-4B57-8A0D-4E5F60718293}"
@@ -24,6 +26,10 @@ Global
 		{5C8E1D74-2A9B-4F36-B5D1-6E7F80912A34}.Debug|Any CPU.Build.0 = Debug|Any CPU
 		{5C8E1D74-2A9B-4F36-B5D1-6E7F80912A34}.Release|Any CPU.ActiveCfg = Release|Any CPU
 		{5C8E1D74-2A9B-4F36-B5D1-6E7F80912A34}.Release|Any CPU.Build.0 = Release|Any CPU
+		{2E9B7C51-8A4D-4F62-B7E3-5D6071829344}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{2E9B7C51-8A4D-4F62-B7E3-5D6071829344}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{2E9B7C51-8A4D-4F62-B7E3-5D6071829344}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{2E9B7C51-8A4D-4F62-B7E3-5D6071829344}.Release|Any CPU.Build.0 = Release|Any CPU
 		{7A2D5B3F-4E6C-4D82-8F19-2B3C4D5E6F71}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
 		{7A2D5B3F-4E6C-4D82-8F19-2B3C4D5E6F71}.Debug|Any CPU.Build.0 = Debug|Any CPU
 		{7A2D5B3F-4E6C-4D82-8F19-2B3C4D5E6F71}.Release|Any CPU.ActiveCfg = Release|Any CPU

@@ -224,6 +224,52 @@ public class EnvelopeTests
         Assert.Contains("claim-check", e.Message, StringComparison.Ordinal);
     }
 
+    // ─── UTF-8 literal — 01-envelope.md §1.1 ─────────────────────────────────
+
+    [Fact]
+    public void SerializeEmiteUtf8LiteralTambienFueraDelBmp()
+    {
+        // Los escapes van en el CÓDIGO, no en el fichero: así el test no depende de con qué
+        // codificación se lea este .cs. "✅ \U0001F680" es "✅ 🚀".
+        const string emoji = "✅ \U0001F680";
+        var evento = Envelope.BuildEvent(FixtureInput() with { Data = new { emoji, acento = "café" } });
+
+        var json = Json(evento);
+
+        // UnsafeRelaxedJsonEscaping emite el BMP literal pero escapa lo de FUERA del BMP
+        // como pareja de suplentes: el cohete saldría como doce caracteres ASCII (una barra
+        // invertida, una u y cuatro dígitos, dos veces). El JSON sería equivalente al
+        // parsearlo, pero NO son los mismos bytes — y de los bytes dependen el replay
+        // verbatim, la dedupe por hash y la firma Ed25519. Lo detectó el vector
+        // `utf8-literal` del arnés cross-SDK.
+        Assert.Contains(emoji, json, StringComparison.Ordinal);
+        Assert.Contains("café", json, StringComparison.Ordinal);
+        Assert.DoesNotContain("\\u", json, StringComparison.Ordinal);
+
+        // Y sigue siendo JSON válido con el mismo payload.
+        var vuelta = Envelope.ParseEvent(Encoding.UTF8.GetBytes(json));
+        Assert.Equal(emoji, vuelta.Data.GetProperty("emoji").GetString());
+    }
+
+    [Fact]
+    public void UnaBarraInvertidaLiteralEnElPayloadNoSeConvierteEnEmoji()
+    {
+        // El texto de doce caracteres que un productor escriba a mano —barra invertida, u,
+        // D83D…— NO es un cohete. Se serializa con la barra escapada y debe seguir ahí:
+        // deshacer ese escape inventaría un carácter que nadie publicó.
+        const string literal = "\\uD83D\\uDE80";   // 12 caracteres ASCII, no un emoji
+        var evento = Envelope.BuildEvent(FixtureInput() with { Data = new { texto = literal } });
+
+        var json = Json(evento);
+
+        // En el JSON, cada barra invertida del texto va escapada: "\\\\uD83D\\\\uDE80".
+        Assert.Contains("\\\\uD83D\\\\uDE80", json, StringComparison.Ordinal);
+        Assert.DoesNotContain("\U0001F680", json, StringComparison.Ordinal);
+
+        var vuelta = Envelope.ParseEvent(Encoding.UTF8.GetBytes(json));
+        Assert.Equal(literal, vuelta.Data.GetProperty("texto").GetString());
+    }
+
     // ─── parseo ──────────────────────────────────────────────────────────────
 
     [Fact]
@@ -369,7 +415,169 @@ public class EnvelopeTests
 
         // "Confidential" con mayúscula no es un valor del protocolo: la comparación es
         // case-sensitive — 01-envelope.md §2.3.
-        Assert.Throws<PoisonException>(() => Envelope.ParseEvent(Encoding.UTF8.GetBytes(cuerpo)));
+        var e = Assert.Throws<PoisonException>(() => Envelope.ParseEvent(Encoding.UTF8.GetBytes(cuerpo)));
+
+        Assert.Equal("INVALID_DATACLASSIFICATION", e.FluxCode);
+    }
+
+    // ─── extensiones obligatorias — 01-envelope.md §3.1 ──────────────────────
+
+    [Theory]
+    [InlineData("correlationid")]
+    [InlineData("tenantid")]
+    [InlineData("producerversion")]
+    [InlineData("dataclassification")]
+    public void ParseEventExigeLasCuatroExtensionesObligatorias(string extension)
+    {
+        // No es "prosa recomendada": si no se exigieran no serían obligatorias, y cada
+        // consumidor tendría que tratar el caso ausente — que es exactamente lo que
+        // declararlas obligatorias pretendía evitar. Además, un `tenantid` ausente aceptado
+        // en silencio se cuela por CUALQUIER filtro de tenant (09-multitenancy.md §3).
+        var cuerpo = QuitarAtributo(Valido(), extension);
+
+        var e = Assert.Throws<PoisonException>(() => Envelope.ParseEvent(Encoding.UTF8.GetBytes(cuerpo)));
+
+        Assert.Equal("MISSING_REQUIRED_EXTENSION", e.FluxCode);
+        Assert.Contains(extension, e.Message, StringComparison.Ordinal);
+    }
+
+    [Theory]
+    [InlineData("correlationid")]
+    [InlineData("tenantid")]
+    [InlineData("producerversion")]
+    [InlineData("dataclassification")]
+    public void UnaExtensionVaciaCuentaComoAusente(string extension)
+    {
+        // 01-envelope.md §3.3 prohíbe darle significado propio a un valor vacío: un
+        // `tenantid: ""` no es un tenant.
+        //
+        // Y el ORDEN importa: para `dataclassification`, el vacío se evalúa ANTES que el
+        // enum, así que el código es MISSING_REQUIRED_EXTENSION y no
+        // INVALID_DATACLASSIFICATION. Si un SDK lo invierte, la agrupación de la DLQ por
+        // causa deja de coincidir entre lenguajes.
+        var cuerpo = ReemplazarPorCadena(Valido(), extension, "");
+
+        var e = Assert.Throws<PoisonException>(() => Envelope.ParseEvent(Encoding.UTF8.GetBytes(cuerpo)));
+
+        Assert.Equal("MISSING_REQUIRED_EXTENSION", e.FluxCode);
+    }
+
+    [Fact]
+    public void UnAtributoDelNucleoANullCuentaComoAusente()
+    {
+        // 01-envelope.md §4 prohíbe usar `null` para "no aplica", así que un obligatorio a
+        // null está igual de mal que no estar. TryGetProperty lo daría por presente.
+        var cuerpo = Valido().Replace("\"source\":\"/e/s\"", "\"source\":null", StringComparison.Ordinal);
+
+        var e = Assert.Throws<PoisonException>(() => Envelope.ParseEvent(Encoding.UTF8.GetBytes(cuerpo)));
+
+        Assert.Equal("MISSING_REQUIRED_ATTRIBUTE", e.FluxCode);
+        Assert.Contains("source", e.Message, StringComparison.Ordinal);
+    }
+
+    [Theory]
+    [InlineData("id")]
+    [InlineData("source")]
+    [InlineData("type")]
+    [InlineData("time")]
+    [InlineData("correlationid")]
+    [InlineData("tenantid")]
+    [InlineData("producerversion")]
+    public void UnAtributoDeIdentidadQueNoEsCadenaEsWrongAttributeType(string atributo)
+    {
+        // {"tenantid": 42} es POISON, no el tenant "42" — 01-envelope.md §2.4. El código
+        // DEBE ser éste y no el genérico de parseo: Jackson lo convertiría en "42" en
+        // silencio, y un envelope que significa cosas distintas en dos SDKs deja de ser un
+        // contrato.
+        var cuerpo = ReemplazarPorNumero(Valido(), atributo);
+
+        var e = Assert.Throws<PoisonException>(() => Envelope.ParseEvent(Encoding.UTF8.GetBytes(cuerpo)));
+
+        Assert.Equal("WRONG_ATTRIBUTE_TYPE", e.FluxCode);
+        Assert.Contains(atributo, e.Message, StringComparison.Ordinal);
+    }
+
+    /// <summary>Quita un atributo raíz del JSON, tal cual, sin reserializar el resto.</summary>
+    private static string QuitarAtributo(string json, string nombre)
+    {
+        using var documento = JsonDocument.Parse(json);
+        var buffer = new System.IO.MemoryStream();
+        using (var writer = new Utf8JsonWriter(buffer, new JsonWriterOptions
+               {
+                   Encoder = System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping,
+               }))
+        {
+            writer.WriteStartObject();
+            foreach (var propiedad in documento.RootElement.EnumerateObject())
+            {
+                if (!string.Equals(propiedad.Name, nombre, StringComparison.Ordinal))
+                {
+                    propiedad.WriteTo(writer);
+                }
+            }
+
+            writer.WriteEndObject();
+        }
+
+        return Encoding.UTF8.GetString(buffer.ToArray());
+    }
+
+    /// <summary>Sustituye el valor de un atributo raíz por otra cadena.</summary>
+    private static string ReemplazarPorCadena(string json, string nombre, string valor)
+    {
+        using var documento = JsonDocument.Parse(json);
+        var buffer = new System.IO.MemoryStream();
+        using (var writer = new Utf8JsonWriter(buffer, new JsonWriterOptions
+               {
+                   Encoder = System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping,
+               }))
+        {
+            writer.WriteStartObject();
+            foreach (var propiedad in documento.RootElement.EnumerateObject())
+            {
+                if (string.Equals(propiedad.Name, nombre, StringComparison.Ordinal))
+                {
+                    writer.WriteString(nombre, valor);
+                }
+                else
+                {
+                    propiedad.WriteTo(writer);
+                }
+            }
+
+            writer.WriteEndObject();
+        }
+
+        return Encoding.UTF8.GetString(buffer.ToArray());
+    }
+
+    /// <summary>Sustituye el valor de un atributo raíz por un número.</summary>
+    private static string ReemplazarPorNumero(string json, string nombre)
+    {
+        using var documento = JsonDocument.Parse(json);
+        var buffer = new System.IO.MemoryStream();
+        using (var writer = new Utf8JsonWriter(buffer, new JsonWriterOptions
+               {
+                   Encoder = System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping,
+               }))
+        {
+            writer.WriteStartObject();
+            foreach (var propiedad in documento.RootElement.EnumerateObject())
+            {
+                if (string.Equals(propiedad.Name, nombre, StringComparison.Ordinal))
+                {
+                    writer.WriteNumber(nombre, 42);
+                }
+                else
+                {
+                    propiedad.WriteTo(writer);
+                }
+            }
+
+            writer.WriteEndObject();
+        }
+
+        return Encoding.UTF8.GetString(buffer.ToArray());
     }
 
     // ─── DLQ ─────────────────────────────────────────────────────────────────

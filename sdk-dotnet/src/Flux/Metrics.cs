@@ -112,6 +112,15 @@ public static class MetricLabels
             return ConsumeOutcome.InvalidSignature;
         }
 
+        // Mismo argumento que con la firma: el `reason` de la DLQ sigue siendo `permanent`
+        // —es el enum cerrado de 04-errors.md §1— pero "un productor incumple su esquema" y
+        // "mi lógica rechaza este evento" son dos preguntas distintas, y la etiqueta
+        // `invalid_schema` existe para separarlas — 08-observability.md §2.1.
+        if (IsSchemaCode(code))
+        {
+            return ConsumeOutcome.InvalidSchema;
+        }
+
         return reason switch
         {
             DlqReason.Retryable => ConsumeOutcome.Retryable,
@@ -119,6 +128,13 @@ public static class MetricLabels
             _ => ConsumeOutcome.Poison,
         };
     }
+
+    /// <summary>Los dos códigos de la validación L3 — 00-protocol.md §5.</summary>
+    /// <param name="code">Código estable de la clasificación.</param>
+    /// <returns><see langword="true"/> si el fallo es de esquema.</returns>
+    public static bool IsSchemaCode(string? code) =>
+        string.Equals(code, SchemaValidationException.CodeValue, StringComparison.Ordinal) ||
+        string.Equals(code, SchemaNotFoundException.CodeValue, StringComparison.Ordinal);
 
     /// <summary>Los tres códigos POISON de la extensión de firma — 07-signing.md §7.</summary>
     /// <param name="code">Código estable de la clasificación.</param>

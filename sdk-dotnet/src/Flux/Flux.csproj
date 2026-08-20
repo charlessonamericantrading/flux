@@ -38,6 +38,15 @@
 
   <ItemGroup>
     <!--
+      Los tests ven los `internal` de este ensamblado. Es lo que permite probar sin broker
+      decisiones que no son API pública —si toca sondear `num_pending`, por ejemplo— sin
+      tener que ampliar la superficie pública del SDK solo para poder testearla.
+    -->
+    <InternalsVisibleTo Include="Flux.Tests" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!--
       NATS.Net es el cliente oficial de segunda generación (namespaces NATS.Client.Core /
       NATS.Client.JetStream). El paquete antiguo `NATS.Client` está en mantenimiento y un
       SDK nuevo no debería nacer sobre él, igual que el SDK de Node usa @nats-io/* y no el

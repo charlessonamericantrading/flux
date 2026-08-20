@@ -108,13 +108,20 @@ anteriores.
 > `no schema with key or ref ".../draft/2020-12/schema"`, que no dice nada útil.
 > En `ajv` hay que usar `ajv/dist/2020`, no el export por defecto; en Rust, el crate
 > `jsonschema`; en PHP, `opis/json-schema` 2.4+; en Python, `jsonschema` 4.18+ eligiendo
-> el validador por el `$schema` de cada esquema; en Go, `santhosh-tekuri/jsonschema/v6`.
+> el validador por el `$schema` de cada esquema; en Go, `santhosh-tekuri/jsonschema/v6`;
+> en Java, `com.networknt:json-schema-validator` fijando `VersionFlag.V202012`; en .NET,
+> `JsonSchema.Net` — **`System.Text.Json` no valida JSON Schema**, y `NJsonSchema`, que es
+> lo que suele aparecer al buscar, está anclado en draft-07 y produce exactamente ese
+> mensaje inútil.
 
-Los SDKs de fase 1 apuntan a **L2**; los de **Node, Python, Go, Rust y PHP** implementan ya
-**L3** de forma opt-in. El coste de L3 se paga solo si se usa: en Rust va detrás de la
-feature `validation`, en PHP de una dependencia opcional de Composer y en Python del extra
-`[validation]` con importación diferida, así que un servicio que se conforma con L2 no
-arrastra el validador.
+Los SDKs de **Node, Python, Go, Rust, PHP, Java y .NET** implementan **L3** de forma
+opt-in. El coste de L3 se paga solo si se usa: en Rust va detrás de la feature
+`validation`, en PHP de una dependencia opcional de Composer, en Python del extra
+`[validation]` con importación diferida, en Java de una dependencia Maven
+`<optional>true</optional>` que solo se carga si el modo no es `OFF`, y en .NET de un
+paquete aparte (`Flux.Validation`), porque toda `PackageReference` de NuGet es transitiva y
+ahí "opcional" no puede expresarse de otra forma. Un servicio que se conforma con L2 no
+arrastra el validador en ninguno de los siete.
 
 > **Go es la excepción, y conviene decirlo.** No existe allí la figura de la dependencia
 > opcional, así que el validador va en `go.mod` y lo paga también quien se quede en L2

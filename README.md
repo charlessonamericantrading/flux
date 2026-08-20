@@ -132,7 +132,7 @@ protocolo a v2.
 | [Python](sdk-python/) | **L3** | 205 | ✅ |
 | [Go](sdk-go/) | **L3** | 162 | ✅ (también con `-race`) |
 | [Java](sdk-java/) | **L3** | 144 | ✅ (Maven en el runner) |
-| [.NET](sdk-dotnet/) | **L3** | 157 | ✅ |
+| [.NET](sdk-dotnet/) | **L3** | 189 | ✅ |
 | [Rust](sdk-rust/) | L2 | 175 | ✅ (incl. 14 contra NATS real) |
 | [PHP](sdk-php/) | L2 | 272 | ⚠️ el adaptador NATS no se ha probado contra un broker real |
 | [PHP](sdk-php/) | L2 | 201 | ✅ (transporte no — ver abajo) |

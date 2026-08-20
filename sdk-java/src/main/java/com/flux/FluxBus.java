@@ -1,5 +1,5 @@
 /*
- * Cliente de flux. Nivel de conformidad: L2.
+ * Cliente de flux. Nivel de conformidad: L3 (la validacion de esquema es opt-in).
  * Contrato normativo: specification/00-protocol.md §5
  *
  * Regla de diseno: este fichero NO expone ningun tipo de NATS en su API publica. Si lo
@@ -164,6 +164,8 @@ public final class FluxBus implements AutoCloseable {
         private String version;
         private String tenantId;
         private TenantIsolation tenantIsolation = TenantIsolation.OFF;
+        private Validation.Options validation;
+        private long pendingPollMillis = DEFAULT_PENDING_POLL_MILLIS;
         private Signing.SigningOptions signing;
         private MetricsSink metrics = MetricsSink.NONE;
         private FluxEvent.DataClassification classification;
@@ -214,6 +216,42 @@ public final class FluxBus implements AutoCloseable {
         public ConnectOptions tenantIsolation(TenantIsolation v) {
             this.tenantIsolation = v != null ? v : TenantIsolation.OFF;
             return this;
+        }
+
+        /**
+         * Validacion L3 contra el JSON Schema del evento — 00-protocol.md §5.
+         *
+         * <p>Con {@link Validation.Mode#STRICT}, publicar un payload que viola su contrato
+         * falla en el productor en vez de aparecer como un misterio en un consumidor de otro
+         * equipo la semana que viene. Default: sin validacion, es decir L2.
+         *
+         * <p>El bundle se pasa como DATO: el SDK NO resuelve el {@code dataschema} por HTTP.
+         * Ver {@link SchemaBundle}.
+         */
+        public ConnectOptions validation(Validation.Options v) {
+            this.validation = v;
+            return this;
+        }
+
+        /**
+         * Cada cuanto sondear el {@code num_pending} de cada consumidor, en milisegundos.
+         * {@code 0} lo desactiva. Default {@value #DEFAULT_PENDING_POLL_MILLIS}.
+         *
+         * <p>No es un capricho de configuracion: {@code flux_consumer_pending} tiene DOS
+         * fuentes y hacen falta las dos (08-observability.md §2.3). Los metadatos del
+         * mensaje entregado son gratis y frescos, pero <b>si el bucle del consumidor muere
+         * dejan de llegar mensajes</b> y el gauge se queda PLANO en su ultimo valor en vez
+         * de crecer — una linea horizontal indistinguible de "no pasa nada". El sondeo sigue
+         * corriendo y reporta el pending creciente. Es la senal.
+         */
+        public ConnectOptions pendingPollMillis(long v) {
+            this.pendingPollMillis = Math.max(v, 0);
+            return this;
+        }
+
+        /** El periodo configurado. Package-private: es para los tests, no API publica. */
+        long pendingPollMillis() {
+            return pendingPollMillis;
         }
 
         /**
@@ -432,12 +470,16 @@ public final class FluxBus implements AutoCloseable {
         private final String subject;
         private final String durable;
         private final MessageConsumer consumer;
+        /** {@code null} si el sondeo esta desactivado. Ver {@link #startPendingPoll}. */
+        private final ScheduledFuture<?> pendingPoll;
         private volatile boolean stopped;
 
-        private Subscription(String subject, String durable, MessageConsumer consumer) {
+        private Subscription(String subject, String durable, MessageConsumer consumer,
+                             ScheduledFuture<?> pendingPoll) {
             this.subject = subject;
             this.durable = durable;
             this.consumer = consumer;
+            this.pendingPoll = pendingPoll;
         }
 
         public String subject() {
@@ -457,6 +499,9 @@ public final class FluxBus implements AutoCloseable {
                 return;
             }
             stopped = true;
+            if (pendingPoll != null) {
+                pendingPoll.cancel(false);
+            }
             consumer.stop();
             subscriptions.remove(this);
         }
@@ -469,6 +514,9 @@ public final class FluxBus implements AutoCloseable {
 
     // ─── Estado ──────────────────────────────────────────────────────────────
 
+    /** Periodo por defecto del sondeo de {@code num_pending} — 08-observability.md §2.3. */
+    public static final long DEFAULT_PENDING_POLL_MILLIS = 15_000L;
+
     private final Connection connection;
     private final JetStream jetStream;
     private final JetStreamManagement jsm;
@@ -477,6 +525,9 @@ public final class FluxBus implements AutoCloseable {
     private final MetricsSink metrics;
     private final Signing.Signer signer;
     private final Signing.Verifier verifier;
+    /** {@code null} salvo en L3. Ver {@link Validation#create}. */
+    private final Validation.Validator validator;
+    private final boolean validateOnConsume;
     private final String source;
     private final Set<Subscription> subscriptions =
             Collections.newSetFromMap(new ConcurrentHashMap<>());
@@ -497,6 +548,18 @@ public final class FluxBus implements AutoCloseable {
         return t;
     });
 
+    /**
+     * Hilo del sondeo de {@code num_pending}, o {@code null} si esta desactivado.
+     *
+     * <p>Es un hilo APARTE del de los WIP y no una tarea mas en {@link #wipScheduler} por la
+     * misma razon por la que aquel tiene dos: una peticion al servidor puede tardar, y un
+     * sondeo lento no debe retrasar la renovacion del plazo de ack de ninguna suscripcion
+     * — eso seria provocar la reentrega concurrente que el WIP existe para evitar.
+     *
+     * <p>Si el sondeo esta desactivado no se crea el hilo: quien no lo usa no lo paga.
+     */
+    private final ScheduledExecutorService pendingScheduler;
+
     private FluxBus(Connection connection, JetStream jetStream, JetStreamManagement jsm,
                     ConnectOptions options) {
         this.connection = connection;
@@ -509,7 +572,26 @@ public final class FluxBus implements AutoCloseable {
         // el arranque del servicio y no la primera publicacion a las 3 de la manana.
         this.signer = Signing.createSigner(options.signing);
         this.verifier = Signing.createVerifier(options.signing);
+        // Los esquemas se compilan UNA vez, por el mismo motivo y ademas por throughput:
+        // compilar un JSON Schema por evento esta en la ruta caliente. En modo OFF esto
+        // devuelve null y no se carga ni la libreria de validacion — 00-protocol.md §5.
+        Validation.Options validationOptions = options.validation;
+        this.validator = Validation.create(validationOptions != null
+                ? validationOptions.logger(validationOptions.logger() != null
+                        ? validationOptions.logger() : options.logger)
+                : null);
+        this.validateOnConsume = validationOptions != null && validationOptions.onConsume();
         this.source = Protocol.sourceUri(options.environment, options.service);
+        // Sin sink de metricas el sondeo no tendria donde escribir, asi que ni se crea el
+        // hilo: es la misma condicion que aplica el SDK de Node.
+        this.pendingScheduler =
+                pendingPollEnabled(options.pendingPollMillis, this.metrics)
+                        ? Executors.newSingleThreadScheduledExecutor(r -> {
+                            Thread t = new Thread(r, "flux-pending-poll");
+                            t.setDaemon(true);
+                            return t;
+                        })
+                        : null;
         this.metrics.connectionState(MetricsSink.ConnectionState.CONNECTED);
     }
 
@@ -582,6 +664,9 @@ public final class FluxBus implements AutoCloseable {
         }
         subscriptions.clear();
         wipScheduler.shutdownNow();
+        if (pendingScheduler != null) {
+            pendingScheduler.shutdownNow();
+        }
         metrics.connectionState(MetricsSink.ConnectionState.DISCONNECTED);
         try {
             // drain y no close: los acks pendientes no se pierden en silencio.
@@ -673,9 +758,26 @@ public final class FluxBus implements AutoCloseable {
             input.traceparent(emptyToNull(options.traceparentSupplier.get()));
         }
 
+        FluxEvent event = Envelope.buildEvent(input);
+
+        // L3: validar ANTES de publicar. Un payload que viola su contrato debe fallar aqui,
+        // en el servicio que lo genero, y no aparecer como un misterio en un consumidor de
+        // otro equipo la semana que viene — 00-protocol.md §5.
+        if (validator != null) {
+            try {
+                validator.check(event, subject);
+            } catch (RuntimeException e) {
+                // `invalid_schema` y no `error`: "el broker rechazo la publicacion" y "el
+                // productor publico basura" son dos incidentes distintos con dos respuestas
+                // distintas, y la etiqueta existe justo para separarlos
+                // — 08-observability.md §2.1.
+                metrics.eventPublished(subject, MetricsSink.PublishOutcome.INVALID_SCHEMA);
+                throw e;
+            }
+        }
+
         // Firmar es lo ULTIMO antes de serializar: la firma cubre el envelope COMPLETO, asi
         // que cualquier atributo anadido despues la invalidaria — 07-signing.md §5.
-        FluxEvent event = Envelope.buildEvent(input);
         if (signer != null) {
             event = signer.sign(event);
         }
@@ -705,15 +807,25 @@ public final class FluxBus implements AutoCloseable {
         if (explicit != null && !explicit.isEmpty()) {
             return explicit;
         }
+        // El bundle L3 conoce el MINOR real de cada subject: dentro de un mayor todo es
+        // BACKWARD-compatible, asi que el mas alto acepta lo que aceptan los anteriores.
+        // Sin el, mas abajo solo se puede asumir el .0.0 — 00-protocol.md §5.
+        if (options.validation != null && options.validation.bundle() != null) {
+            String fromBundle = options.validation.bundle().schemaUriFor(subject);
+            if (fromBundle != null && !fromBundle.isEmpty()) {
+                return fromBundle;
+            }
+        }
         if (options.schemaBaseUrl == null || options.schemaBaseUrl.isEmpty()) {
             throw new FluxBusException("flux: no hay dataschema para \"" + subject
-                    + "\". Declara schema(\"" + subject + "\", …) o schemaBaseUrl en ConnectOptions");
+                    + "\". Declara schema(\"" + subject + "\", …), schemaBaseUrl, o pasa un bundle "
+                    + "en validation(...) (ConnectOptions)");
         }
         String base = options.schemaBaseUrl.endsWith("/")
                 ? options.schemaBaseUrl.substring(0, options.schemaBaseUrl.length() - 1)
                 : options.schemaBaseUrl;
-        // Sin registro exacto solo se puede asumir el .0.0 del mayor. Un SDK L3 resolvera el
-        // minor real contra el Schema Registry — 00-protocol.md §5.
+        // Sin bundle ni mapa explicito solo se puede asumir el .0.0 del mayor. Es suficiente
+        // para L2 —el atributo es informativo— pero no para L3 — 00-protocol.md §5.
         return base + "/" + parsed.domain() + "/" + parsed.aggregate() + "/" + parsed.event()
                 + "/" + parsed.major() + ".0.0.json";
     }
@@ -787,7 +899,8 @@ public final class FluxBus implements AutoCloseable {
                 }
             });
 
-            Subscription subscription = new Subscription(subject, durable, consumer);
+            Subscription subscription =
+                    new Subscription(subject, durable, consumer, startPendingPoll(stream, subject, durable));
             subscriptions.add(subscription);
             return subscription;
         } catch (IOException | JetStreamApiException e) {
@@ -850,6 +963,79 @@ public final class FluxBus implements AutoCloseable {
         return a == null ? b == null : a.equals(b);
     }
 
+    /**
+     * Arranca el sondeo periodico de {@code num_pending} para una suscripcion.
+     *
+     * <p>{@code flux_consumer_pending} tiene DOS fuentes y un SDK DEBE usar las dos, porque
+     * cada una falla justo donde la otra sirve (08-observability.md §2.3):
+     *
+     * <ul>
+     *   <li>Los <b>metadatos</b> del mensaje entregado son gratis y frescos en cada evento,
+     *       pero fallan cuando <b>no llegan mensajes</b> — que es exactamente el caso que
+     *       importa. Si el bucle del consumidor muere, el gauge se queda plano en su ultimo
+     *       valor: un panel mostraria una linea horizontal, indistinguible de "no pasa
+     *       nada".</li>
+     *   <li>El <b>sondeo</b> cuesta una peticion cada ~15 s y sigue corriendo aunque no se
+     *       entregue nada. Es el que reporta el pending creciente. Es la senal.</li>
+     * </ul>
+     *
+     * @return la tarea, o {@code null} si el sondeo esta desactivado.
+     */
+    private ScheduledFuture<?> startPendingPoll(String stream, String subject, String durable) {
+        if (pendingScheduler == null) {
+            return null;
+        }
+        long period = options.pendingPollMillis;
+        Runnable task = pendingPollTask(subject, durable, metrics,
+                () -> jsm.getConsumerInfo(stream, durable).getCalculatedPending(),
+                message -> log(System.Logger.Level.DEBUG, message));
+        return pendingScheduler.scheduleAtFixedRate(task, period, period, TimeUnit.MILLISECONDS);
+    }
+
+    /**
+     * Si hay que crear el hilo del sondeo.
+     *
+     * <p>{@code 0} lo desactiva —lo permite explicitamente 08-observability.md §2.3— y sin
+     * sink de metricas no habria donde escribir el gauge, asi que el hilo tampoco se crea:
+     * quien no usa la metrica no paga un hilo por ella. Es la misma condicion que aplica el
+     * SDK de Node.
+     *
+     * <p>Package-private para poder testear la decision sin broker.
+     */
+    static boolean pendingPollEnabled(long pollMillis, MetricsSink metrics) {
+        return pollMillis > 0 && metrics != MetricsSink.NONE;
+    }
+
+    /** De donde sale el {@code num_pending}. Existe para poder testear el sondeo sin broker. */
+    @FunctionalInterface
+    interface PendingSource {
+        long pending() throws Exception;
+    }
+
+    /**
+     * El cuerpo de UNA iteracion del sondeo.
+     *
+     * <p>Package-private para poder testear sin broker lo unico que puede salir mal aqui:
+     * que un fallo del sondeo se lleve por delante algo mas que la propia telemetria.
+     */
+    static Runnable pendingPollTask(String subject, String durable, MetricsSink metrics,
+                                    PendingSource source, java.util.function.Consumer<String> log) {
+        return () -> {
+            try {
+                metrics.consumerPending(subject, durable, source.pending());
+            } catch (Exception | Error e) {
+                // Un fallo del sondeo NO DEBE afectar al consumo: esto es telemetria
+                // (08-observability.md §2.3). Se traga TODO —incluido un Error— porque una
+                // excepcion que escape de una tarea de scheduleAtFixedRate CANCELA la tarea
+                // en silencio: un corte de red de dos segundos apagaria el sondeo para
+                // siempre y la metrica dejaria de emitirse sin que nada lo dijera. Ese
+                // fallo se manifiesta como "el panel lleva horas sin datos", que es
+                // exactamente lo que esta metrica existe para que no ocurra.
+                log.accept("no se pudo sondear num_pending de " + durable + ": " + e);
+            }
+        };
+    }
+
     // ─── despacho ────────────────────────────────────────────────────────────
 
     /**
@@ -896,11 +1082,14 @@ public final class FluxBus implements AutoCloseable {
             if (delivered > 0) {
                 attempt = (int) delivered;
             }
-            // `pending` viene en los metadatos del propio mensaje: no hace falta sondear al
-            // servidor. Es la UNICA senal que delata a un consumidor cuyo bucle murio — la
-            // conexion sigue reportandose sana y el healthcheck dice que todo va bien, asi
-            // que solo el crecimiento de pending lo evidencia (08-observability.md §4). Es
-            // el bug que aparecio de verdad en el SDK de Node.
+            // `pending` viene en los metadatos del propio mensaje: gratis y mas fresco que
+            // el sondeo, porque se actualiza en CADA entrega. Es una de las dos fuentes
+            // obligatorias de la metrica.
+            //
+            // Pero NO sustituye al sondeo de startPendingPoll(): si el bucle del consumidor
+            // muere dejan de llegar mensajes, y una metrica alimentada solo desde aqui se
+            // queda PLANA en su ultimo valor en vez de crecer — que es exactamente lo
+            // contrario de la senal que hace falta (08-observability.md §2.3).
             metrics.consumerPending(subject, durable, meta.pendingCount());
         } catch (RuntimeException e) {
             // Un mensaje sin metadatos de JetStream no deberia llegar aqui; si llega, se
@@ -949,6 +1138,16 @@ public final class FluxBus implements AutoCloseable {
             // abajo, que la clasifica como POISON y la enruta a la DLQ con alerta
             // — 07-signing.md §7.
             Throwable handlerError = verifierError(event);
+            // L3 al consumir (opt-in): el evento es sintacticamente valido —ha llegado a
+            // parsearse, asi que no es POISON— pero incumple su contrato. Reintentarlo dara
+            // exactamente el mismo resultado, asi que la clasificacion correcta es PERMANENT
+            // y la da la propia SchemaValidationException — 04-errors.md §1.2.
+            //
+            // Va DESPUES de la firma: si el evento fue manipulado, su payload puede validar
+            // perfectamente y aun asi no ser del productor que dice ser.
+            if (handlerError == null && validateOnConsume) {
+                handlerError = validationError(event, subject);
+            }
             if (handlerError == null) {
                 handlerError = invoke(handler, event, delivery);
             }
@@ -1087,6 +1286,26 @@ public final class FluxBus implements AutoCloseable {
         }
     }
 
+    /**
+     * Valida el payload contra su esquema, o {@code null} si no hay validador o pasa.
+     *
+     * <p>Devuelve el error en vez de lanzarlo por la misma razon que
+     * {@link #verifierError}: asi recorre exactamente la misma ruta que un fallo del
+     * handler —clasificacion, DLQ, metricas y {@code term}— en vez de abrir un segundo
+     * sitio donde arreglar el enrutado a la DLQ.
+     */
+    private Throwable validationError(FluxEvent event, String subject) {
+        if (validator == null) {
+            return null;
+        }
+        try {
+            validator.check(event, subject);
+            return null;
+        } catch (RuntimeException e) {
+            return e;
+        }
+    }
+
     private static double elapsedSeconds(long startNanos) {
         return (System.nanoTime() - startNanos) / 1_000_000_000.0;
     }
@@ -1106,11 +1325,24 @@ public final class FluxBus implements AutoCloseable {
         if (isSignatureCode(code)) {
             return MetricsSink.ConsumeOutcome.INVALID_SIGNATURE;
         }
+        // Mismo argumento que con la firma: el `reason` de la DLQ sigue siendo `permanent`
+        // —es el enum cerrado de 04-errors.md §1— pero "un productor incumple su esquema" y
+        // "mi logica rechaza este evento" son dos preguntas distintas, y la etiqueta
+        // `invalid_schema` existe para separarlas — 08-observability.md §2.1.
+        if (isSchemaCode(code)) {
+            return MetricsSink.ConsumeOutcome.INVALID_SCHEMA;
+        }
         return switch (reason) {
             case RETRYABLE -> MetricsSink.ConsumeOutcome.RETRYABLE;
             case PERMANENT -> MetricsSink.ConsumeOutcome.PERMANENT;
             case POISON -> MetricsSink.ConsumeOutcome.POISON;
         };
+    }
+
+    /** Los dos codigos de la validacion L3 — 00-protocol.md §5. */
+    private static boolean isSchemaCode(String code) {
+        return SchemaValidationException.CODE.equals(code)
+                || SchemaNotFoundException.CODE.equals(code);
     }
 
     /** Los tres codigos POISON de la extension de firma — 07-signing.md §7. */

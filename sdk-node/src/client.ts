@@ -304,7 +304,16 @@ export class FluxBus {
     // L3: validar ANTES de publicar. Un payload que viola su contrato debe fallar
     // aquí, en el servicio que lo generó, y no aparecer como un misterio en un
     // consumidor de otro equipo la semana que viene — 00-protocol.md §5.
-    this.#validate?.(event, subject);
+    try {
+      this.#validate?.(event, subject);
+    } catch (e) {
+      // Se anota ANTES de propagar. Un `publish()` que lanza sin dejar rastro en las
+      // métricas hace invisible el volumen de contratos rotos: la aplicación ve una
+      // excepción, pero el panel del ecosistema no ve nada y nadie sabe cuántos
+      // productores están fallando ni desde cuándo — 08-observability.md §2.1.
+      this.#metrics.eventPublished(subject, "invalid_schema");
+      throw e;
+    }
 
     // Firmar es lo ULTIMO antes de serializar: la firma cubre el envelope completo,
     // así que cualquier atributo añadido después la invalidaría — 07-signing.md §5.

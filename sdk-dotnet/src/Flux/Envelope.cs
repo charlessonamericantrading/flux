@@ -7,6 +7,7 @@
 // mode repartiendo los atributos entre cabeceras `ce-*` y cuerpo.
 
 using System.Globalization;
+using System.Text;
 using System.Text.Encodings.Web;
 using System.Text.Json;
 using System.Text.Json.Serialization;
@@ -131,18 +132,71 @@ public static class Envelope
     };
 
     /// <summary>
-    /// Atributos cuya ausencia hace POISON al mensaje — 04-errors.md §1.3.
+    /// Atributos del NÚCLEO de CloudEvents cuya ausencia hace POISON al mensaje
+    /// — 04-errors.md §1.3.
     /// </summary>
     /// <remarks>
-    /// Son los ocho del núcleo, exactamente los mismos que comprueban Node, Python y Go.
-    /// Las cuatro extensiones que 01-envelope.md §3.1 llama obligatorias NO están aquí, y
-    /// esa omisión es del SDK de referencia, no de este port: replicarla es lo que impide
-    /// que .NET mande a la DLQ mensajes que los demás SDKs entregan. Ver README
-    /// §"Fricciones".
+    /// Son los ocho del núcleo, exactamente los mismos que comprueban Node, Python, Go,
+    /// Java, Rust y PHP. Un valor <c>null</c> cuenta como AUSENTE: 01-envelope.md §4
+    /// prohíbe usar <c>null</c> para "no aplica", así que aceptarlo daría dos formas
+    /// distintas de decir "no está" de las que solo una sería POISON.
     /// </remarks>
     public static readonly IReadOnlyList<string> RequiredAttributes = new[]
     {
         "specversion", "id", "source", "type", "time", "datacontenttype", "dataschema", "data",
+    };
+
+    /// <summary>
+    /// Extensiones del perfil flux cuya ausencia hace POISON al mensaje
+    /// — 01-envelope.md §3.1.
+    /// </summary>
+    /// <remarks>
+    /// Se exigen de verdad, no solo en la prosa: si no se exigieran no serían obligatorias,
+    /// serían recomendadas, y cada consumidor tendría que tratar el caso ausente — que es
+    /// exactamente lo que declararlas obligatorias pretendía evitar.
+    /// <para>
+    /// Y asumir un valor por defecto es peligroso en las cuatro: un
+    /// <c>dataclassification</c> ausente tomado como <c>internal</c> hace circular PII con
+    /// 30 días de retención en vez de 7, y un <c>tenantid</c> ausente tomado como
+    /// <c>"system"</c> se cuela por CUALQUIER filtro de tenant — 06-security.md §4 y
+    /// 09-multitenancy.md §3.
+    /// </para>
+    /// <para>
+    /// <c>""</c> cuenta como ausente igual que <c>null</c>: 01-envelope.md §3.3 prohíbe
+    /// darle significado propio a un valor vacío, así que un <c>tenantid: ""</c> no es un
+    /// tenant.
+    /// </para>
+    /// </remarks>
+    public static readonly IReadOnlyList<string> RequiredExtensions = new[]
+    {
+        "correlationid", "tenantid", "producerversion", "dataclassification",
+    };
+
+    /// <summary>Los cuatro valores del enum de <c>dataclassification</c> — 01-envelope.md §3.1.</summary>
+    /// <remarks>
+    /// Un valor fuera del enum no se puede degradar a algo seguro: la retención y las ACLs
+    /// de 06-security.md §5 se derivan de él, así que inventarle un sentido es peor que
+    /// rechazar el mensaje.
+    /// </remarks>
+    public static readonly IReadOnlySet<string> ValidClassifications = new HashSet<string>(
+        StringComparer.Ordinal)
+    {
+        "public", "internal", "confidential", "restricted",
+    };
+
+    /// <summary>
+    /// Atributos que DEBEN llegar como cadena JSON — 01-envelope.md §2.4.
+    /// </summary>
+    /// <remarks>
+    /// <c>{"tenantid": 42}</c> es POISON, no el tenant <c>"42"</c>. Se comprueba sobre el
+    /// <see cref="JsonElement"/> y no se deja al deserializador porque el fallo del
+    /// deserializador llega envuelto en un error genérico, indistinguible de un
+    /// <c>"dlqattempts": "seis"</c>: el código sería <c>INVALID_ATTRIBUTE_TYPE</c> en vez
+    /// del <c>WRONG_ATTRIBUTE_TYPE</c> que dan los otros seis SDKs ante el mismo cuerpo.
+    /// </remarks>
+    public static readonly IReadOnlyList<string> StringAttributes = new[]
+    {
+        "id", "source", "type", "time", "correlationid", "tenantid", "producerversion",
     };
 
     // ─── Construcción ────────────────────────────────────────────────────────
@@ -315,7 +369,7 @@ public static class Envelope
     /// <exception cref="EnvelopeException">El evento no cabe en 1 MiB.</exception>
     public static byte[] Serialize(FluxEvent evento)
     {
-        var bytes = JsonSerializer.SerializeToUtf8Bytes(evento, JsonOptions);
+        var bytes = UnescapeAstralPlane(JsonSerializer.SerializeToUtf8Bytes(evento, JsonOptions));
         if (bytes.Length > Protocol.MaxMessageBytes)
         {
             throw new EnvelopeException(
@@ -329,6 +383,111 @@ public static class Envelope
         }
 
         return bytes;
+    }
+
+    /// <summary>
+    /// Devuelve los caracteres FUERA DEL BMP a su forma literal UTF-8.
+    /// </summary>
+    /// <remarks>
+    /// ⚠️ <see cref="JavaScriptEncoder.UnsafeRelaxedJsonEscaping"/> emite literalmente todo
+    /// el BMP —<c>é</c>, <c>✅</c>— pero **escapa los escalares fuera del BMP** como la
+    /// pareja de escapes de sus dos suplentes: el cohete U+1F680 sale como doce caracteres
+    /// ASCII —barra invertida, <c>u</c> y cuatro dígitos, dos veces— en vez de como sus
+    /// cuatro octetos <c>F0 9F 9A 80</c>. No es
+    /// configurable: los rangos de <see cref="System.Text.Unicode.UnicodeRange"/> llegan
+    /// hasta U+FFFF, así que ni <c>JavaScriptEncoder.Create(UnicodeRanges.All)</c> lo evita,
+    /// y la alternativa —un <c>JavaScriptEncoder</c> propio— exige <c>unsafe</c> en el
+    /// paquete base por los punteros de sus miembros abstractos.
+    /// <para>
+    /// El JSON resultante es equivalente al parsearlo, pero <b>no son los mismos bytes</b>, y
+    /// de los bytes dependen el replay verbatim desde la DLQ, la deduplicación por hash y la
+    /// firma Ed25519: un evento con un emoji firmado aquí NO verificaría en Node, Go, Java o
+    /// Python, que emiten el literal. Además 01-envelope.md §1.1 prohíbe explícitamente los
+    /// escapes <c>\uXXXX</c>.
+    /// </para>
+    /// <para>
+    /// Es exactamente el mismo fallo que tuvo el SDK de Java (Jackson lo hacía en su
+    /// generador de bytes) y lo detecta el mismo vector: <c>utf8-literal</c> del arnés de
+    /// conformidad cruzada. Los tests de un solo SDK no podían verlo porque solo cubrían el
+    /// BMP.
+    /// </para>
+    /// <para>
+    /// El recorrido solo toca parejas de suplentes VÁLIDAS. Un <c>\uXXXX</c> del BMP se deja
+    /// como está —los caracteres de control DEBEN ir escapados en JSON— y una barra
+    /// invertida escapada (<c>\\</c>) se salta entera, así que un payload que contenga el
+    /// texto literal <c>\uD83D</c> sobrevive intacto.
+    /// </para>
+    /// </remarks>
+    private static byte[] UnescapeAstralPlane(byte[] utf8)
+    {
+        // Ruta rápida: sin ninguna barra invertida no hay nada que deshacer, y es el caso
+        // de la inmensa mayoría de los eventos. Cero copias.
+        if (Array.IndexOf(utf8, (byte)'\\') < 0)
+        {
+            return utf8;
+        }
+
+        var salida = new byte[utf8.Length];
+        var escritos = 0;
+
+        for (var i = 0; i < utf8.Length;)
+        {
+            if (utf8[i] != (byte)'\\')
+            {
+                salida[escritos++] = utf8[i++];
+                continue;
+            }
+
+            // `\\` es una barra invertida escapada: se copian las dos y se sigue. Sin esto,
+            // el texto literal `🚀` dentro de un payload se "descodificaría" a un
+            // emoji que el productor nunca escribió.
+            if (i + 1 < utf8.Length && utf8[i + 1] == (byte)'\\')
+            {
+                salida[escritos++] = utf8[i++];
+                salida[escritos++] = utf8[i++];
+                continue;
+            }
+
+            if (i + 11 < utf8.Length &&
+                utf8[i + 1] == (byte)'u' && utf8[i + 6] == (byte)'\\' && utf8[i + 7] == (byte)'u' &&
+                TryHex(utf8, i + 2, out var alto) && TryHex(utf8, i + 8, out var bajo) &&
+                alto is >= 0xD800 and <= 0xDBFF && bajo is >= 0xDC00 and <= 0xDFFF)
+            {
+                var escalar = 0x10000 + ((alto - 0xD800) << 10) + (bajo - 0xDC00);
+                escritos += Encoding.UTF8.GetBytes(char.ConvertFromUtf32(escalar), 0, 2, salida, escritos);
+                i += 12;
+                continue;
+            }
+
+            salida[escritos++] = utf8[i++];
+        }
+
+        return escritos == salida.Length ? salida : salida[..escritos];
+    }
+
+    /// <summary>Lee cuatro dígitos hexadecimales ASCII. Devuelve <see langword="false"/> si no lo son.</summary>
+    private static bool TryHex(byte[] utf8, int offset, out int value)
+    {
+        value = 0;
+        for (var i = offset; i < offset + 4; i++)
+        {
+            var b = utf8[i];
+            var digito = b switch
+            {
+                >= (byte)'0' and <= (byte)'9' => b - '0',
+                >= (byte)'a' and <= (byte)'f' => b - 'a' + 10,
+                >= (byte)'A' and <= (byte)'F' => b - 'A' + 10,
+                _ => -1,
+            };
+            if (digito < 0)
+            {
+                return false;
+            }
+
+            value = (value << 4) | digito;
+        }
+
+        return true;
     }
 
     // ─── Parseo ──────────────────────────────────────────────────────────────
@@ -384,12 +543,56 @@ public static class Envelope
                     code: "UNSUPPORTED_SPECVERSION");
             }
 
-            var missing = RequiredAttributes.Where(a => !root.TryGetProperty(a, out _)).ToList();
+            // `null` cuenta como ausente. Con TryGetProperty a secas, un `"time": null`
+            // se daría por presente y el mensaje seguiría adelante hasta morir más tarde
+            // con un código que no dice qué faltaba — 01-envelope.md §4.
+            var missing = RequiredAttributes.Where(a => !Present(root, a)).ToList();
             if (missing.Count > 0)
             {
                 throw new PoisonException(
                     "faltan atributos obligatorios de CloudEvents: " + string.Join(", ", missing),
                     code: "MISSING_REQUIRED_ATTRIBUTE");
+            }
+
+            // Las cuatro extensiones del perfil flux se exigen igual que el núcleo, y ANTES
+            // que el enum de dataclassification: un `dataclassification: ""` es una
+            // extensión ausente (MISSING_REQUIRED_EXTENSION), no un valor inválido. El
+            // orden es el mismo en los siete SDKs porque el código forma parte del contrato
+            // — 01-envelope.md §3.1.
+            var missingExtensions = RequiredExtensions.Where(a => !PresentAndNotEmpty(root, a)).ToList();
+            if (missingExtensions.Count > 0)
+            {
+                throw new PoisonException(
+                    "faltan extensiones obligatorias del perfil flux: " +
+                    string.Join(", ", missingExtensions) +
+                    ". Su ausencia no es recuperable asumiendo un valor: un dataclassification " +
+                    "ausente tomado como \"internal\" haría circular PII con la retención larga " +
+                    "(01-envelope.md §3.1)",
+                    code: "MISSING_REQUIRED_EXTENSION");
+            }
+
+            var classification = RawString(root, "dataclassification");
+            if (classification is null || !ValidClassifications.Contains(classification))
+            {
+                throw new PoisonException(
+                    $"dataclassification inválido: {RawOrAbsent(root, "dataclassification")}. " +
+                    "Valores permitidos: public, internal, confidential, restricted",
+                    code: "INVALID_DATACLASSIFICATION");
+            }
+
+            // Los tipos son EXACTOS: {"tenantid": 42} es POISON, no el tenant "42". Los
+            // deserializadores discrepan por defecto —Jackson coacciona, Go rechaza— y el
+            // que "funciona" es el peor: un envelope que significa cosas distintas en dos
+            // SDKs deja de ser un contrato — 01-envelope.md §2.4.
+            foreach (var attribute in StringAttributes)
+            {
+                if (!root.TryGetProperty(attribute, out var value) ||
+                    value.ValueKind != JsonValueKind.String)
+                {
+                    throw new PoisonException(
+                        $"{attribute} debe ser una cadena, llegó {RawOrAbsent(root, attribute)}",
+                        code: "WRONG_ATTRIBUTE_TYPE");
+                }
             }
 
             if (!string.Equals(RawString(root, "datacontenttype"), Protocol.DataContentType, StringComparison.Ordinal))
@@ -444,6 +647,31 @@ public static class Envelope
     {
         ArgumentNullException.ThrowIfNull(body);
         return ParseEvent(new ReadOnlyMemory<byte>(body));
+    }
+
+    /// <summary>
+    /// Si el atributo está y NO es <c>null</c>.
+    /// </summary>
+    /// <remarks>
+    /// <see cref="JsonElement.TryGetProperty(string, out JsonElement)"/> devuelve
+    /// <see langword="true"/> para un valor <c>null</c>, y 01-envelope.md §4 prohíbe usar
+    /// <c>null</c> para "no aplica": un obligatorio a <c>null</c> está igual de mal que no
+    /// estar.
+    /// </remarks>
+    private static bool Present(JsonElement root, string name) =>
+        root.TryGetProperty(name, out var value) && value.ValueKind != JsonValueKind.Null;
+
+    /// <summary>Como <see cref="Present"/>, pero la cadena vacía también cuenta como ausente.</summary>
+    private static bool PresentAndNotEmpty(JsonElement root, string name)
+    {
+        if (!root.TryGetProperty(name, out var value) || value.ValueKind == JsonValueKind.Null)
+        {
+            return false;
+        }
+
+        // Solo se mira el vacío de una CADENA: un `tenantid: 42` no está ausente, está mal
+        // tipado, y ése es el WRONG_ATTRIBUTE_TYPE de más abajo.
+        return value.ValueKind != JsonValueKind.String || value.GetString()?.Length > 0;
     }
 
     /// <summary>Extrae un atributo raíz como string, o <see langword="null"/> si falta o no es string.</summary>

@@ -1,4 +1,4 @@
-// Cliente de flux. Nivel de conformidad: L2.
+// Cliente de flux. Nivel de conformidad: L3 (la validación de esquema es opt-in).
 // Contrato normativo: specification/00-protocol.md §5
 //
 // Regla de diseño: este fichero es el ÚNICO del SDK que conoce NATS, y NO expone ningún
@@ -124,6 +124,34 @@ public sealed record ConnectOptions
     /// verifica, que es el modo <see cref="VerificationMode.Off"/> de 07-signing.md §7.
     /// </summary>
     public IEventVerifier? Verifier { get; init; }
+
+    /// <summary>
+    /// Validación L3 contra el JSON Schema del evento — 00-protocol.md §5.
+    /// </summary>
+    /// <remarks>
+    /// Con <see cref="ValidationMode.Strict"/>, publicar un payload que viola su contrato
+    /// falla en el productor en vez de aparecer como un misterio en un consumidor de otro
+    /// equipo la semana que viene. <see langword="null"/> (default) es L2.
+    /// <para>
+    /// El evaluador de esquemas vive en el paquete <c>Flux.Validation</c>, que no es una
+    /// dependencia de éste. Ver <see cref="ValidationOptions"/>.
+    /// </para>
+    /// </remarks>
+    public ValidationOptions? Validation { get; init; }
+
+    /// <summary>
+    /// Cada cuánto sondear el <c>num_pending</c> de cada consumidor.
+    /// <see cref="TimeSpan.Zero"/> lo desactiva. Default 15 s.
+    /// </summary>
+    /// <remarks>
+    /// No es un capricho de configuración: <c>flux_consumer_pending</c> tiene DOS fuentes y
+    /// hacen falta las dos (08-observability.md §2.3). Los metadatos del mensaje entregado
+    /// son gratis y frescos, pero <b>si el bucle del consumidor muere dejan de llegar
+    /// mensajes</b> y el gauge se queda PLANO en su último valor en vez de crecer — una
+    /// línea horizontal indistinguible de "no pasa nada". El sondeo sigue corriendo y
+    /// reporta el pending creciente. Ésa es la señal.
+    /// </remarks>
+    public TimeSpan PendingPollInterval { get; init; } = FluxBus.DefaultPendingPollInterval;
 
     /// <summary>
     /// Destino de las métricas. <see langword="null"/> usa <see cref="NoMetrics.Instance"/>.
@@ -303,6 +331,11 @@ public sealed class FluxBus : IAsyncDisposable
     /// <summary>Tope del base64 del cuerpo crudo en la DLQ, para que el envelope quepa en 1 MiB.</summary>
     private const int MaxRawBase64Chars = 700_000;
 
+    /// <summary>
+    /// Periodo por defecto del sondeo de <c>num_pending</c> — 08-observability.md §2.3.
+    /// </summary>
+    public static readonly TimeSpan DefaultPendingPollInterval = TimeSpan.FromSeconds(15);
+
     private readonly NatsConnection _connection;
     private readonly NatsJSContext _jetStream;
     private readonly ConnectOptions _options;
@@ -351,6 +384,20 @@ public sealed class FluxBus : IAsyncDisposable
         // solo se descubriría al parsear nombres de consumidor en una herramienta
         // — protocol.json naming.service.
         Protocol.ValidateService(options.Service);
+
+        // Un modo de validación encendido SIN evaluador no es "validación degradada": es
+        // creer que se valida cuando no se valida, que es peor que no validar. Falla aquí,
+        // al arrancar, y diciendo exactamente qué paquete falta — 00-protocol.md §5.
+        if (options.Validation is { Mode: not ValidationMode.Off, Validator: null })
+        {
+            throw new ArgumentException(
+                $"Validation.Mode = {options.Validation.Mode} pero Validation.Validator es null. " +
+                "El evaluador de JSON Schema vive en el paquete Flux.Validation, que no es una " +
+                "dependencia de Flux porque L3 es opt-in y System.Text.Json no valida esquemas:\n" +
+                "  dotnet add package Flux.Validation\n" +
+                "  Validation = new ValidationOptions { Mode = …, Bundle = … }.WithSchemaValidator()",
+                nameof(options));
+        }
 
         var natsOptions = NatsOpts.Default with
         {
@@ -468,6 +515,29 @@ public sealed class FluxBus : IAsyncDisposable
             TraceState = inherited?.TraceState ?? FluxContext.ActiveTracestate(),
         });
 
+        // L3: validar ANTES de publicar. Un payload que viola su contrato debe fallar aquí,
+        // en el servicio que lo generó, y no aparecer como un misterio en un consumidor de
+        // otro equipo la semana que viene — 00-protocol.md §5.
+        if (_options.Validation?.Validator is { } validator)
+        {
+            try
+            {
+                validator.Check(evento, subject);
+            }
+            catch (ClassifiedException e) when (MetricLabels.IsSchemaCode(e.FluxCode))
+            {
+                // `invalid_schema` y no `error`: "el broker rechazó la publicación" y "el
+                // productor publicó basura" son dos incidentes distintos con dos respuestas
+                // distintas, y la etiqueta existe justo para separarlos
+                // — 08-observability.md §2.1.
+                //
+                // `throw;` a secas conserva la pila: lo único que añade este catch es la
+                // anotación de la métrica.
+                _metrics.EventPublished(subject, PublishOutcome.InvalidSchema);
+                throw;
+            }
+        }
+
         // Firmar es lo ÚLTIMO antes de serializar: la firma cubre el envelope COMPLETO, así
         // que cualquier atributo añadido después la invalidaría — 07-signing.md §5.
         if (_options.Signer is not null)
@@ -517,15 +587,24 @@ public sealed class FluxBus : IAsyncDisposable
             return explicitSchema;
         }
 
+        // El bundle L3 conoce el MINOR real de cada subject: dentro de un mayor todo es
+        // BACKWARD-compatible, así que el más alto acepta lo que aceptan los anteriores
+        // — 00-protocol.md §5.
+        if (_options.Validation?.Bundle?.SchemaUriFor(subject) is { Length: > 0 } fromBundle)
+        {
+            return fromBundle;
+        }
+
         if (string.IsNullOrEmpty(_options.SchemaBaseUrl))
         {
             throw new EnvelopeException(
-                $"no hay dataschema para \"{subject}\". Declara Schemas[\"{subject}\"] o " +
-                "SchemaBaseUrl en ConnectOptions (01-envelope.md §2)");
+                $"no hay dataschema para \"{subject}\". Declara Schemas[\"{subject}\"], " +
+                "SchemaBaseUrl, o pasa un bundle en Validation.Bundle (ConnectOptions) " +
+                "(01-envelope.md §2)");
         }
 
-        // Sin registro exacto solo se puede asumir el .0.0 del mayor. Un SDK L3 resolverá
-        // el minor real contra el Schema Registry — 00-protocol.md §5.
+        // Sin bundle ni mapa explícito solo se puede asumir el .0.0 del mayor. Es suficiente
+        // para L2 —el atributo es informativo— pero no para L3 — 00-protocol.md §5.
         var baseUrl = _options.SchemaBaseUrl.TrimEnd('/');
         return string.Create(
             CultureInfo.InvariantCulture,
@@ -595,7 +674,7 @@ public sealed class FluxBus : IAsyncDisposable
             ConsumerConfigSnapshot.Canonical(maxAckPending),
             Snapshot(consumer.Info.Config));
 
-        var subscription = new Subscription(this, subject, durable);
+        var subscription = new Subscription(this, subject, durable, stream);
         _subscriptions[subscription] = 0;
         subscription.Start(consumer, handler, tenantFilter);
         return subscription;
@@ -653,11 +732,14 @@ public sealed class FluxBus : IAsyncDisposable
         var attempt = delivered < 1 ? 1 : (int)delivered;
         var raw = message.Data ?? Array.Empty<byte>();
 
-        // `NumPending` viene en los metadatos del propio mensaje: no hace falta sondear al
-        // servidor. Es la ÚNICA señal que delata a un consumidor cuyo bucle murió —la
-        // conexión sigue reportándose sana y el healthcheck dice que todo va bien, así que
-        // solo el crecimiento de pending lo evidencia (08-observability.md §4). Es el bug
-        // que apareció de verdad en el SDK de Node.
+        // `NumPending` viene en los metadatos del propio mensaje: gratis y más fresco que el
+        // sondeo, porque se actualiza en CADA entrega. Es una de las dos fuentes
+        // obligatorias de la métrica.
+        //
+        // Pero NO sustituye al sondeo de PollPendingAsync: si el bucle del consumidor muere
+        // dejan de llegar mensajes, y una métrica alimentada solo desde aquí se queda PLANA
+        // en su último valor en vez de crecer — que es exactamente lo contrario de la señal
+        // que hace falta (08-observability.md §2.3).
         if (message.Metadata is { } metadata)
         {
             _metrics.ConsumerPending(subject, durable, (long)metadata.NumPending);
@@ -708,6 +790,18 @@ public sealed class FluxBus : IAsyncDisposable
             // — 07-signing.md §7.
             _options.Verifier?.Check(evento);
 
+            // L3 al consumir (opt-in): el evento es sintácticamente válido —ha llegado a
+            // parsearse, así que no es POISON— pero incumple su contrato. Reintentarlo dará
+            // exactamente el mismo resultado, así que la clasificación correcta es PERMANENT
+            // y la declara la propia SchemaValidationException — 04-errors.md §1.2.
+            //
+            // Va DESPUÉS de la firma: si el evento fue manipulado, su payload puede validar
+            // perfectamente y aun así no ser del productor que dice ser.
+            if (_options.Validation is { OnConsume: true, Validator: { } consumeValidator })
+            {
+                consumeValidator.Check(evento, subject);
+            }
+
             // El contexto del evento entrante se instala aquí. En Go esto obliga a pasar el
             // ctx a mano hasta el Publish; AsyncLocal lo propaga solo, igual que el
             // AsyncLocalStorage de Node. Ver EventContext.cs.
@@ -742,6 +836,24 @@ public sealed class FluxBus : IAsyncDisposable
             message, subject, durable, evento, attempt, handlerError, comienzo, cancellationToken)
             .ConfigureAwait(false);
     }
+
+    /// <summary>
+    /// Si hay que arrancar el sondeo de <c>num_pending</c> de una suscripción.
+    /// </summary>
+    /// <remarks>
+    /// <see cref="TimeSpan.Zero"/> lo desactiva —lo permite explícitamente
+    /// 08-observability.md §2.3— y sin sink de métricas no habría dónde escribir el gauge,
+    /// así que la tarea tampoco se crea: quien no usa la métrica no paga por ella.
+    /// <para>
+    /// <c>internal</c> para poder probar la decisión sin broker, igual que
+    /// <see cref="ConsumerConfigVerifier"/> permite probar la verificación L2.
+    /// </para>
+    /// </remarks>
+    /// <param name="interval">El periodo configurado.</param>
+    /// <param name="metrics">El sink de métricas efectivo.</param>
+    /// <returns><see langword="true"/> si hay que sondear.</returns>
+    internal static bool PendingPollEnabled(TimeSpan interval, IMetricsSink metrics) =>
+        interval > TimeSpan.Zero && metrics is not NoMetrics;
 
     /// <summary>Segundos transcurridos desde una marca de <see cref="Stopwatch.GetTimestamp"/>.</summary>
     private static double Elapsed(long since) =>
@@ -1058,15 +1170,18 @@ public sealed class FluxBus : IAsyncDisposable
     internal sealed class Subscription : IFluxSubscription
     {
         private readonly FluxBus _bus;
+        private readonly string _stream;
         private readonly CancellationTokenSource _cts = new();
         private Task? _loop;
+        private Task? _pendingPoll;
         private int _stopped;
 
-        internal Subscription(FluxBus bus, string subject, string durable)
+        internal Subscription(FluxBus bus, string subject, string durable, string stream)
         {
             _bus = bus;
             Subject = subject;
             Durable = durable;
+            _stream = stream;
         }
 
         /// <inheritdoc />
@@ -1078,6 +1193,71 @@ public sealed class FluxBus : IAsyncDisposable
         internal void Start(INatsJSConsumer consumer, FluxHandler handler, string? tenantFilter)
         {
             _loop = Task.Run(() => ConsumeAsync(consumer, handler, tenantFilter), CancellationToken.None);
+
+            // Segunda fuente de flux_consumer_pending. Ver PollPendingAsync y
+            // 08-observability.md §2.3.
+            if (PendingPollEnabled(_bus._options.PendingPollInterval, _bus._metrics))
+            {
+                _pendingPoll = Task.Run(PollPendingAsync, CancellationToken.None);
+            }
+        }
+
+        /// <summary>
+        /// Sondea el <c>num_pending</c> del consumidor cada
+        /// <see cref="ConnectOptions.PendingPollInterval"/>.
+        /// </summary>
+        /// <remarks>
+        /// <c>flux_consumer_pending</c> tiene DOS fuentes y un SDK DEBE usar las dos, porque
+        /// cada una falla justo donde la otra sirve (08-observability.md §2.3):
+        /// <list type="bullet">
+        /// <item><description>
+        /// Los <b>metadatos</b> del mensaje entregado son gratis y frescos en cada evento,
+        /// pero fallan cuando <b>no llegan mensajes</b> — que es exactamente el caso que
+        /// importa. Si el bucle del consumidor muere, el gauge se queda plano en su último
+        /// valor: un panel mostraría una línea horizontal, indistinguible de "no pasa nada".
+        /// </description></item>
+        /// <item><description>
+        /// El <b>sondeo</b> cuesta una petición cada ~15 s y sigue corriendo aunque no se
+        /// entregue nada. Es el que reporta el pending creciente. Ésa es la señal.
+        /// </description></item>
+        /// </list>
+        /// </remarks>
+        private async Task PollPendingAsync()
+        {
+            try
+            {
+                using var timer = new PeriodicTimer(_bus._options.PendingPollInterval);
+                while (await timer.WaitForNextTickAsync(_cts.Token).ConfigureAwait(false))
+                {
+                    try
+                    {
+                        // Se pide el consumidor de nuevo en vez de refrescar el que está
+                        // consumiendo: así el sondeo no toca en absoluto el objeto del que
+                        // depende la entrega. `NumPending` es `ulong` en el modelo de
+                        // NATS.Net y el gauge del protocolo es un entero con signo.
+                        var consumidor = await _bus._jetStream
+                            .GetConsumerAsync(_stream, Durable, _cts.Token)
+                            .ConfigureAwait(false);
+
+                        _bus._metrics.ConsumerPending(Subject, Durable, (long)consumidor.Info.NumPending);
+                    }
+                    catch (Exception e) when (e is not OperationCanceledException)
+                    {
+                        // Un fallo del sondeo NO DEBE afectar al consumo: esto es telemetría
+                        // (08-observability.md §2.3). Y se captura DENTRO del bucle a
+                        // propósito: si escapara, un corte de red de dos segundos apagaría
+                        // el sondeo para siempre y la métrica dejaría de emitirse sin que
+                        // nada lo dijera — que es justo el fallo que esta métrica existe
+                        // para que no ocurra.
+                        _bus._options.Logger?.Warn(
+                            $"[flux] no se pudo sondear num_pending de {Durable}: {e.Message}");
+                    }
+                }
+            }
+            catch (OperationCanceledException)
+            {
+                // Unsubscribe o cierre del bus. Salida normal.
+            }
         }
 
         private async Task ConsumeAsync(INatsJSConsumer consumer, FluxHandler handler, string? tenantFilter)
@@ -1137,6 +1317,18 @@ public sealed class FluxBus : IAsyncDisposable
                 try
                 {
                     await _loop.ConfigureAwait(false);
+                }
+                catch (OperationCanceledException)
+                {
+                    // Esperado.
+                }
+            }
+
+            if (_pendingPoll is not null)
+            {
+                try
+                {
+                    await _pendingPoll.ConfigureAwait(false);
                 }
                 catch (OperationCanceledException)
                 {

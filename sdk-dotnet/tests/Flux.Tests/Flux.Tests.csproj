@@ -33,6 +33,14 @@
       firmar. Los tests sí lo referencian, porque tienen que ejercerlo.
     -->
     <ProjectReference Include="..\..\src\Flux.Signing\Flux.Signing.csproj" />
+    <!--
+      Flux.Validation tampoco es una dependencia de Flux, y por el mismo motivo: la
+      validación L3 es opt-in y System.Text.Json no valida JSON Schema, así que arrastrar un
+      evaluador al paquete base castigaría a todo servicio en L2. Los tests sí lo
+      referencian, porque tienen que ejercerlo — si no, la validación L3 solo estaría
+      probada en el SDK de Node.
+    -->
+    <ProjectReference Include="..\..\src\Flux.Validation\Flux.Validation.csproj" />
   </ItemGroup>
 
 </Project>

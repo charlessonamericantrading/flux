@@ -1,14 +1,16 @@
 # flux SDK para .NET
 
 Cliente del **flux Event Protocol v1** — CloudEvents 1.0 sobre NATS JetStream.
-Nivel de conformidad objetivo: **L2**.
+Nivel de conformidad: **L3**, con la validación de esquema **opt-in**; sin activarla, el
+SDK se comporta exactamente como en L2 y no instala nada de más.
 
 El contrato normativo vive en [`specification/`](../specification/); si algo de este
 README diverge de la spec, manda la spec.
 
 ```bash
 dotnet add package Flux
-dotnet add package Flux.Signing   # solo si vas a firmar o verificar eventos
+dotnet add package Flux.Signing      # solo si vas a firmar o verificar eventos
+dotnet add package Flux.Validation   # solo si vas a validar contra JSON Schema (L3)
 ```
 
 Requiere **.NET 8** o superior, `NATS.Net` 2.5+ (el cliente oficial de segunda
@@ -163,6 +165,108 @@ fallos de tu cliente en un tipo propio, implementa `IHttpStatusError` (o usa
 > seguirán 1 m, 5 m, 15 m, 30 m. No construyas lógica que dependa de que se respete más
 > allá de la primera vez.
 
+## Validación L3 (paquete `Flux.Validation`, opcional)
+
+Nivel **L3** de [00-protocol.md §5](../specification/00-protocol.md): el SDK resuelve y
+valida el `dataschema` **antes de publicar**, y `PublishAsync` **falla** si el payload no
+cumple su propio esquema.
+
+Sin esto, un productor puede publicar un payload que viola su contrato y nadie se entera
+hasta que un consumidor —posiblemente de otro equipo, otro lenguaje y otra semana— se
+atraganta: el error aparece lejísimos de su causa. Validar al publicar lo convierte en un
+fallo del servicio que lo provocó.
+
+```csharp
+using Flux;
+
+await using var bus = await FluxBus.ConnectAsync(new ConnectOptions
+{
+    // …
+    Validation = new ValidationOptions
+    {
+        Mode      = ValidationMode.Strict,                         // Off (default) | Warn | Strict
+        Bundle    = SchemaBundle.FromFile("schemas/bundle.json"),
+        OnConsume = true,                                          // opcional
+    }.WithSchemaValidator(),                                       // ← lo aporta Flux.Validation
+});
+```
+
+| Modo | Al publicar | Cuándo |
+|---|---|---|
+| `Off` (default) | no valida | L2. Coste cero: ni se compila un esquema. |
+| `Warn` | registra en `ConnectOptions.Logger` y publica | Introducir L3 en un ecosistema en marcha sin romper a nadie el primer día. |
+| `Strict` | **lanza `SchemaValidationException`** | L3 de verdad. |
+
+- **Reporta TODOS los errores**, no solo el primero (`SchemaValidationException.Errors`).
+  De uno en uno, arreglar un payload con tres campos mal cuesta tres despliegues.
+- `OnConsume = true` valida también al consumir. Un fallo ahí es **PERMANENT**, no
+  RETRYABLE: el evento es sintácticamente correcto pero incumple su contrato, y reintentarlo
+  seis veces da el mismo resultado bloqueando la cola 51 minutos para nada.
+- La métrica lo etiqueta `outcome="invalid_schema"` —al publicar y al consumir— mientras que
+  el `dlqreason` del evento sigue siendo `permanent`, que es el enum cerrado de
+  [04-errors.md §1](../specification/04-errors.md).
+- Pasar el `Bundle` **también resuelve el `dataschema` exacto** de cada subject: el MINOR
+  real, no el `.0.0` que se asume sin él.
+- Con `Mode` distinto de `Off` y sin `Validator`, `ConnectAsync` **falla al arrancar**
+  diciendo qué paquete falta. Descubrir en la primera publicación que la validación que
+  creías tener encendida no existía es peor que no tenerla.
+
+### El bundle es un dato, no una descarga
+
+El `dataschema` es una URI, pero un SDK L3 **NO DEBE resolverla por red** al publicar
+(00-protocol.md §5). Validar está en la ruta caliente —una petición por evento es
+inaceptable— y una caché con TTL abre una ventana en la que dos servicios validan contra
+versiones distintas del mismo esquema: eso no produce un error, produce dos verdades.
+
+Los esquemas se empaquetan con `node scripts/bundle-schemas.mjs` y se despliegan **con el
+servicio**, así que la versión del esquema queda clavada a la versión del servicio — que es
+justo lo que `producerversion` promete poder acotar.
+
+`SchemaValidator` no descarga nada: registra los esquemas del bundle en un `SchemaRegistry`
+**local** (no el global de la librería, para que dos buses del mismo proceso no se pisen) y
+deja el `Fetch` de JsonSchema.Net como viene, que por defecto devuelve `null` en vez de
+bajar la URI. Un `$ref` a algo que no está en el bundle es un error explícito en el
+arranque, no una petición HTTP silenciosa.
+
+### Por qué es un paquete aparte, y qué librería
+
+**`System.Text.Json` no valida JSON Schema.** Trae `JsonDocument`, `JsonNode` y
+serialización, pero no hay evaluador de esquemas en la BCL de .NET 8: hace falta un paquete.
+Es la misma situación que con Ed25519 (§"Firma"), y se resuelve igual — con un paquete
+opt-in, para que el paquete `Flux` siga dependiendo solo de `NATS.Net` y `System.Text.Json`.
+
+Se elige **`JsonSchema.Net` 8.0.5** (json-everything), la implementación de referencia de
+2020-12 en .NET. Las alternativas no sirven aquí:
+
+- **NJsonSchema** está anclado en draft-07. Y el fallo no se manifiesta como "versión no
+  soportada": se manifiesta como *no encuentro el esquema `.../2020-12/schema`*, que manda
+  al operador a buscar un fichero que no existe. La spec avisa de esta trampa por su nombre.
+- **Corvus.JsonSchema** es un **generador de código**: exige los esquemas en tiempo de
+  compilación, lo que hace imposible el bundle desplegado con el servicio.
+
+⚠️ **Versión clavada a 8.0.5, y no por costumbre.** La serie **9.x cambia la licencia del
+binario**: el código sigue siendo MIT, pero los paquetes 9.x se publican en NuGet bajo el
+*Open Source Maintenance Fee* EULA, que cobra una cuota mensual a quien los use en actividad
+con ingresos ≥ 10.000 USD anuales. 8.0.5 es la última con licencia MIT limpia en el paquete.
+Un SDK de protocolo no debe imponer una obligación de pago a quien solo activa la validación;
+quien quiera la 9.x puede subirla en su propio proyecto a sabiendas.
+
+**Coste real de la dependencia** (lo que entra al añadir `Flux.Validation`):
+
+```
+JsonSchema.Net 8.0.5 → JsonPointer.Net 6.0.1 → Json.More.Net 2.2.0
+                                             → Humanizer.Core 3.0.1
+```
+
+Cuatro paquetes, uno de ellos Humanizer. Por eso están aquí y no en `Flux`: un servicio en
+L2 no debe pagar nada de esto.
+
+> **Divergencia con Java, y es del ecosistema, no del port.** Allí la validación L3 es una
+> `<dependency>` marcada `<optional>true</optional>` dentro del **mismo** artefacto: Maven
+> permite que una dependencia no se propague a quien consume la librería. NuGet no tiene
+> equivalente —toda `PackageReference` es transitiva—, así que en .NET "opcional" solo puede
+> expresarse partiendo el paquete. Es la misma razón por la que `Flux.Signing` existe.
+
 ## Firma de eventos (paquete `Flux.Signing`, opcional)
 
 Extensión **opcional** de v1 — [07-signing.md](../specification/07-signing.md). El default
@@ -295,11 +399,25 @@ implementa `IMetricsSink`.
 - **El último bucket del histograma es `30` porque *es* el `ack_wait`.** Un handler que cae
   ahí está a punto de que su mensaje se reentregue mientras aún se ejecuta. Hay un test que
   lo ata a `Protocol.DefaultAckWait`: cambiar uno sin el otro rompe la suite.
-- **`flux_consumer_pending` se alimenta en cada entrega**, con el `NumPending` que ya viene
-  en los metadatos del mensaje de JetStream: no hace falta sondear al servidor. Es la única
-  señal que delata a un consumidor cuyo bucle murió, porque la conexión sigue reportándose
-  sana y el healthcheck dice que todo va bien
-  ([§4](../specification/08-observability.md)).
+- **`flux_consumer_pending` tiene DOS fuentes y el SDK usa las dos**
+  ([§2.3](../specification/08-observability.md)), porque cada una falla justo donde la otra
+  sirve:
+  1. **Los metadatos** del mensaje entregado (`NumPending`) — gratis y frescos en cada
+     evento, pero **fallan cuando no llegan mensajes**, que es el caso que importa: si el
+     bucle del consumidor muere, el gauge se queda plano en su último valor y el panel
+     muestra una línea horizontal, indistinguible de "no pasa nada".
+  2. **El sondeo periódico** de `num_pending` al servidor, cada
+     `ConnectOptions.PendingPollInterval` (15 s por defecto, `TimeSpan.Zero` lo desactiva).
+     Sigue corriendo aunque no se entregue nada, y es el que reporta el pending creciente.
+     Ésa es la señal.
+
+  Un fallo del sondeo **no afecta al consumo**: se registra como `Warn` y el bucle continúa
+  —capturar dentro del bucle es deliberado, porque una excepción que escapara apagaría el
+  sondeo para siempre tras un corte de red de dos segundos—. Sin `Metrics` configurado no se
+  crea ni la tarea.
+- **Un payload que incumple su JSON Schema se contabiliza como `outcome="invalid_schema"`**,
+  al publicar y al consumir, mientras que el `dlqreason` sigue siendo `permanent`. Ver
+  §"Validación L3".
 - **Un fallo de firma se contabiliza como `outcome="invalid_signature"`**, aunque el
   `dlqreason` del evento siga siendo `poison`. Son dos incidentes distintos —basura frente
   a suplantación— con dos respuestas distintas. La traducción vive en
@@ -520,33 +638,53 @@ dos constantes que alguien debe mantener sincronizadas. Aquí se defiende en tre
 constructor estático que impide cargar la clase si se rompe (igual que el bloque `static`
 de Java), un test, y la comprobación sobre la config **efectiva** del servidor.
 
-### H. La spec llama obligatorias a cuatro extensiones que el parser de referencia no exige
-
-Ésta es nueva y es la más incómoda del port.
+### H. Cuatro extensiones obligatorias que el modelo no puede marcar `required`
 
 [01-envelope.md §3.1](../specification/01-envelope.md) declara `correlationid`, `tenantid`,
-`producerversion` y `dataclassification` **obligatorias**. Pero la lista de atributos que el
-parser trata como obligatorios —en Node, en Python y en Go— son solo los ocho del núcleo
-CloudEvents. Un evento sin `tenantid` **no es POISON** para los tres SDKs existentes: llega
-al handler con el valor cero del lenguaje.
+`producerversion` y `dataclassification` **obligatorias**, y `ParseEvent` las exige: su
+ausencia —o un `""`, o un `null`— es `MISSING_REQUIRED_EXTENSION`. Eso está resuelto (ver
+el recuadro al final de esta sección).
+
+Lo que queda es una fricción del *modelo*: aunque el parser garantice que están, el tipo
+`FluxEvent` no puede declararlas no anulables.
 
 En un lenguaje con anulables eso obliga a elegir:
 
-1. Marcarlas `required` y que System.Text.Json lance al deserializar → .NET clasificaría
-   como POISON mensajes que los otros tres entregan. **Divergencia de comportamiento en un
-   protocolo polyglot.**
-2. Declararlas anulables → `evento.TenantId` es `string?` y cada consumidor escribe `!`.
+1. Marcarlas `required` y que System.Text.Json lance al deserializar → el fallo llegaría
+   como un error genérico de deserialización (`INVALID_ATTRIBUTE_TYPE`) en vez del código
+   estable que los otros seis SDKs devuelven ante el mismo cuerpo, y el mismo mensaje
+   quedaría agrupado bajo dos causas distintas según el lenguaje del consumidor.
+2. Declararlas anulables y **exigirlas en el parser** → `evento.TenantId` es `string?` y
+   algún consumidor escribe `!`, pero el código de POISON es el del contrato.
 3. Darles `= ""` por defecto → colapsa "ausente" y "vacío", que es justo lo que prohíbe
    §3.3.
 
-Se ha elegido (2): compatibilidad por encima de ergonomía, con el `?` como cicatriz
-visible. Java tomó la misma decisión (`Integer` en vez de `int`) por el mismo motivo.
+Se ha elegido (2): el código correcto por encima de la ergonomía del tipo, con el `?` como
+cicatriz visible. Java tomó la misma decisión (`Integer` en vez de `int`) por el mismo
+motivo. El precio es que la garantía vive en `ParseEvent` y no en el sistema de tipos:
+quien construya un `FluxEvent` a mano —no por el SDK— puede dejarlas a `null`.
 
-**Sugerencia para la spec:** decidir explícitamente si la ausencia de una extensión
-obligatoria es POISON. Si lo es, añadirlas a la lista del parser en los cuatro SDKs a la
-vez. Si no lo es, decir en §3.1 que son obligatorias **al publicar** pero tolerables **al
-consumir**, y entonces la nulabilidad de este SDK deja de ser una cicatriz y pasa a ser el
-tipo correcto.
+> ✅ **Corregido.** Durante un tiempo esta sección decía que las extensiones no se exigían
+> "porque el parser de referencia tampoco las exige". Eso dejó de ser cierto: Node, Python,
+> Go, Java, Rust y PHP las exigen hoy, y `Envelope.ParseEvent` de este SDK también, en el
+> mismo orden que fija `sdk-node/src/envelope.ts`:
+>
+> 1. núcleo de CloudEvents ausente o `null` → `MISSING_REQUIRED_ATTRIBUTE`
+>    (`TryGetProperty` da `true` para un valor `null`, así que se comprueba el `ValueKind`);
+> 2. extensión ausente, `null` o `""` → `MISSING_REQUIRED_EXTENSION`;
+> 3. `dataclassification` fuera del enum → `INVALID_DATACLASSIFICATION` — **después** del
+>    punto 2, así que `dataclassification: ""` es una extensión ausente y no un valor
+>    inválido;
+> 4. `id`, `source`, `type`, `time`, `correlationid`, `tenantid` o `producerversion` que no
+>    sean cadena JSON → `WRONG_ATTRIBUTE_TYPE`.
+>
+> No es una diferencia cosmética de códigos: un `tenantid` ausente aceptado en silencio
+> entra al handler y se cuela por cualquier filtro de tenant
+> ([06-security.md §4](../specification/06-security.md),
+> [09-multitenancy.md §3](../specification/09-multitenancy.md)).
+>
+> Lo fijan `EnvelopeTests` y los doce vectores POISON de
+> [`conformance/harness/vectors.json`](../conformance/harness/vectors.json).
 
 ### I. `dataclassification` es un enum cerrado con un valor ausente representable
 
@@ -568,6 +706,21 @@ fase 4 dejan de funcionar.
 Es una trampa gratuita y no aparece en ninguna parte de la spec, porque los tres SDKs
 existentes no la tienen. Merece una línea en 01-envelope.md §1: *"el JSON se emite en UTF-8
 sin escapes `\uXXXX` para caracteres imprimibles"*.
+
+> 🔴 **Y `UnsafeRelaxedJsonEscaping` tampoco basta: escapa todo lo que está FUERA del BMP.**
+> Emite `é` y `✅` literales, pero un emoji U+1F680 sale como los doce caracteres ASCII de
+> la pareja de suplentes —barra invertida, `u` y cuatro dígitos, dos veces— en vez de como
+> sus cuatro octetos `F0 9F 9A 80`. No es configurable: los `UnicodeRange` de .NET
+> llegan hasta U+FFFF, así que ni `JavaScriptEncoder.Create(UnicodeRanges.All)` lo evita, y
+> un `JavaScriptEncoder` propio exigiría `unsafe` en el paquete base (sus miembros
+> abstractos usan punteros). Por eso `Envelope.Serialize` deshace esas parejas sobre los
+> bytes ya serializados (`UnescapeAstralPlane`), saltándose las barras invertidas escapadas
+> para no "descodificar" un `\uD83D` que el productor escribiera como texto.
+>
+> Es **exactamente** el mismo fallo que tuvo Java con el generador de bytes de Jackson
+> (ver `sdk-java/README.md` §R), y lo caza el mismo vector: `utf8-literal` del arnés
+> cross-SDK. Ningún test de un solo SDK podía verlo, porque todos cubrían solo el BMP —
+> tener un emoji en el vector fue lo que lo destapó en dos lenguajes distintos.
 
 ### K. UUIDv7 no existe en .NET 8
 
@@ -697,6 +850,8 @@ devuelve error, y aplica otra cosa.** Ninguna se detecta leyendo código; solo m
 | `EventContext.cs` | Propagación implícita vía `AsyncLocal<T>` y `Activity.Current` |
 | `ConsumerConfigMismatchException.cs` | Verificación L2 de la config efectiva, sin tipos de NATS |
 | `Signing.cs` | Contrato y política de firma: `IEventSigner`, `IEventVerifier`, `VerificationMode`, `EventSigning.SignablePayload`, códigos POISON. **Sin criptografía** |
+| `Validation.cs` | Contrato y política de validación L3: `ValidationMode`, `ValidationOptions`, `IEventValidator`, `SchemaValidationException`, `SchemaNotFoundException`. **Sin evaluador de esquemas** |
+| `SchemaBundle.cs` | El `bundle.json` leído: subject → URI y URI → esquema. Solo `System.Text.Json` |
 | `Metrics.cs` | `IMetricsSink`, `NoMetrics`, `InMemoryMetrics` y los enums de etiquetas |
 | `TenantIsolation.cs` | `TenantIsolation`, `TenantFilterPolicy`, `TenantIsolationException` |
 | `FluxBus.cs` | `ConnectAsync`, `PublishAsync`, `SubscribeAsync`, `DisposeAsync`. **Único fichero que conoce NATS** |
@@ -707,11 +862,27 @@ Y en el paquete aparte `Flux.Signing`:
 |---|---|
 | `Ed25519Signing.cs` | `SigningOptions`, `CreateSigner`, `CreateVerifier`, `GenerateKeyPair`. **Único fichero que conoce criptografía** |
 
+Y en el paquete aparte `Flux.Validation`:
+
+| Fichero | Contenido |
+|---|---|
+| `SchemaValidator.cs` | `Create`, `WithSchemaValidator` y el evaluador. **Único fichero que conoce JSON Schema** |
+
+Y el utillaje del repositorio, que no se publica:
+
+| Fichero | Contenido |
+|---|---|
+| `tools/Flux.ConformanceHarness/Program.cs` | Arnés de [conformidad cruzada](../conformance/harness/README.md): una operación por stdin, un resultado por stdout, exit 0 siempre |
+
 ## Desarrollo
 
 ```bash
 dotnet build sdk-dotnet/Flux.sln
 dotnet test sdk-dotnet/Flux.sln
+
+# El arnés cross-SDK: compara los bytes de este SDK con los de los otros seis
+dotnet build sdk-dotnet/Flux.sln -v quiet
+node conformance/cross-sdk.mjs --only node,dotnet --verbose
 ```
 
 Los tests no requieren un broker: cubren naming, envelope, clasificación, contexto, la
@@ -726,6 +897,16 @@ verifica con [`conformance/`](../conformance/).
 > DER de las claves PKCS#8/SPKI —comprobado byte a byte contra el que emite
 > `KeyPairGenerator` de Java, que a su vez verifica contra Node— y el formato de exposición
 > de Prometheus.
+>
+> **Actualización.** La tanda que trajo la validación L3, el sondeo de `num_pending`, el
+> endurecimiento de `ParseEvent` y el arreglo del escapado fuera del BMP **sí se compiló y
+> se ejecutó**, aunque en esa máquina siga sin haber `dotnet`: se descargaron el compilador
+> (`Microsoft.Net.Compilers.Toolset`, que corre sobre .NET Framework) y el runtime de .NET 8
+> por separado, se compilaron los cuatro proyectos contra las DLL de referencia de `net8.0`
+> y se ejecutó la suite con un runner de xunit por reflexión. Sirve para lo que sirve —el
+> `dotnet test` de verdad y el `restore` de NuGet los hace el CI—, pero significa que estos
+> cambios no se escribieron a ciegas: el bug del emoji, por ejemplo, se encontró **corriendo
+> los vectores**, no leyendo el código.
 
 ## Robustez del bucle de consumo
 

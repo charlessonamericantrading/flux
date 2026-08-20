@@ -12,7 +12,7 @@
   <name>flux SDK para Java</name>
   <description>
     Cliente del flux Event Protocol v1 — CloudEvents 1.0 sobre NATS JetStream.
-    Nivel de conformidad objetivo: L2.
+    Nivel de conformidad: L3 (la validacion de esquema es opt-in; sin activarla, L2).
   </description>
 
   <properties>
@@ -33,6 +33,22 @@
       del record lleva su @JsonProperty explicito.
     -->
     <jackson.version>2.15.4</jackson.version>
+    <!--
+      Validacion L3 (00-protocol.md §5). Version CONCRETA y no un rango: el conjunto de
+      mensajes de error de un validador es parte de lo que ve el operador, y que cambie
+      solo en un `mvn install` es un cambio de comportamiento que nadie ha revisado.
+
+      1.5.9 y no la ultima (3.x) por una razon concreta: la serie 3.x migro a Jackson 3
+      (`tools.jackson.core`), un NAMESPACE DE PAQUETE distinto del Jackson 2 que usa el
+      envelope de este SDK. Adoptarla obligaria a tener las dos pilas de Jackson en el
+      classpath y a convertir cada JsonNode de una a otra para poder validar el `data` que
+      ya esta parseado. La 1.5.x sigue en la 2.x y comparte tipos con el envelope.
+
+      json-schema-validator 1.5.9 declara jackson-databind 2.18.3; este pom declara 2.15.4
+      de forma DIRECTA, asi que Maven resuelve 2.15.4 (nearest-wins) y es esa combinacion
+      la que ejercita ValidationTest.
+    -->
+    <jsonschema.version>1.5.9</jsonschema.version>
     <junit.version>5.10.2</junit.version>
   </properties>
 
@@ -47,6 +63,38 @@
       <groupId>com.fasterxml.jackson.core</groupId>
       <artifactId>jackson-databind</artifactId>
       <version>${jackson.version}</version>
+    </dependency>
+
+    <!--
+      Validacion L3 — 00-protocol.md §5.
+
+      <optional>true</optional> es la decision de diseno, no un detalle de empaquetado: L3
+      es opt-in, asi que su coste tambien debe serlo. Marcada asi, la dependencia NO se
+      propaga a quien use el SDK; un servicio en L2 no arrastra un validador de JSON Schema
+      que no va a ejecutar. Quien active `Validation.Mode.WARN` o `STRICT` la declara en su
+      propio pom — y si no lo hace, `Validation.create()` se lo dice con el snippet exacto
+      en vez de reventar con un NoClassDefFoundError en la primera publicacion.
+
+      Es el mismo patron que `Flux.Signing` en .NET y que el extra `cryptography` en
+      Python, aplicado aqui a la validacion en vez de a la firma.
+    -->
+    <dependency>
+      <groupId>com.networknt</groupId>
+      <artifactId>json-schema-validator</artifactId>
+      <version>${jsonschema.version}</version>
+      <optional>true</optional>
+      <exclusions>
+        <!--
+          Solo se validan CloudEvents, que son JSON por definicion (01-envelope.md §1): el
+          soporte de esquemas en YAML de la libreria no se usa nunca. Verificado en local
+          ejecutando ValidationTest con un classpath sin este jar ni snakeyaml: compila los
+          esquemas 2020-12 y valida sin tocarlos.
+        -->
+        <exclusion>
+          <groupId>com.fasterxml.jackson.dataformat</groupId>
+          <artifactId>jackson-dataformat-yaml</artifactId>
+        </exclusion>
+      </exclusions>
     </dependency>
 
     <dependency>

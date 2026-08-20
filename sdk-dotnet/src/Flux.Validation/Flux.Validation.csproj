@@ -1,0 +1,62 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <LangVersion>12.0</LangVersion>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+
+    <RootNamespace>Flux</RootNamespace>
+    <AssemblyName>Flux.Validation</AssemblyName>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <EnforceCodeStyleInBuild>false</EnforceCodeStyleInBuild>
+
+    <PackageId>Flux.Validation</PackageId>
+    <Version>1.0.0</Version>
+    <Description>Validación L3 de eventos de flux contra su JSON Schema (specification/00-protocol.md §5). Paquete aparte porque System.Text.Json no valida JSON Schema y L3 es opt-in: quien no la usa no debe pagar la dependencia de un evaluador de esquemas.</Description>
+    <PackageTags>cloudevents;nats;jetstream;json-schema;validacion;flux</PackageTags>
+    <Authors>flux</Authors>
+    <NeutralLanguage>es</NeutralLanguage>
+    <TreatWarningsAsErrors>false</TreatWarningsAsErrors>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\Flux\Flux.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!--
+      ⚠️ System.Text.Json NO valida JSON Schema. Trae JsonDocument, JsonNode y
+      serialización, pero no hay evaluador de esquemas en la BCL de .NET 8: no existe un
+      `JsonSchema.Validate` ni nada equivalente. Es la misma situación que con Ed25519 (ver
+      Flux.Signing), y se resuelve igual — con un paquete aparte, para que el paquete base
+      siga dependiendo solo de NATS.Net y System.Text.Json.
+
+      Se elige JsonSchema.Net (json-everything) porque es la implementación de referencia de
+      2020-12 en .NET: pasa la suite oficial JSON-Schema-Test-Suite y trae el dialecto
+      2020-12 de serie. Las alternativas serias no sirven aquí: NJsonSchema está anclado en
+      draft-07 —justo el fallo que 00-protocol.md §5 avisa que se manifiesta como "no
+      encuentro el esquema .../2020-12/schema"— y Corvus.JsonSchema es un GENERADOR de
+      código, que exige tener los esquemas en tiempo de compilación y hace imposible el
+      bundle desplegado con el servicio.
+
+      Versión CONCRETA y no un rango, por dos razones:
+
+      1. El conjunto de mensajes de error de un validador es lo que ve el operador, y que
+         cambie solo en un `restore` es un cambio de comportamiento que nadie ha revisado.
+      2. **La 9.x cambia la licencia del BINARIO.** El código sigue siendo MIT, pero los
+         paquetes 9.x de NuGet se publican bajo el "Open Source Maintenance Fee" EULA, que
+         cobra una cuota mensual a quien los use en actividad con ingresos >= 10.000 USD
+         anuales. La 8.0.5 es la última con licencia MIT limpia en el paquete. Un SDK de
+         protocolo no debe imponer una obligación de pago a quien solo activa la validación:
+         quien quiera la 9.x puede subirla en su propio proyecto a sabiendas.
+
+      COSTE REAL de esta dependencia (lo que se instala al añadir Flux.Validation):
+        JsonSchema.Net 8.0.5 → JsonPointer.Net 6.0.1 → Json.More.Net 2.2.0
+                                                    → Humanizer.Core 3.0.1
+      Cuatro paquetes. Por eso están aquí y no en Flux.
+    -->
+    <PackageReference Include="JsonSchema.Net" Version="8.0.5" />
+  </ItemGroup>
+
+</Project>
