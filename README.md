@@ -129,10 +129,10 @@ protocolo a v2.
 | SDK | Nivel | Tests | Verificado |
 |---|---|---|---|
 | [Node / TypeScript](sdk-node/) | **L3** | 105 | ✅ |
-| [Python](sdk-python/) | L2 | 166 | ✅ |
-| [Go](sdk-go/) | L2 | 127 | ✅ (también con `-race`) |
-| [Java](sdk-java/) | L2 | 121 | ✅ (Maven en el runner) |
-| [.NET](sdk-dotnet/) | L2 | 119 | ✅ |
+| [Python](sdk-python/) | **L3** | 205 | ✅ |
+| [Go](sdk-go/) | **L3** | 162 | ✅ (también con `-race`) |
+| [Java](sdk-java/) | **L3** | 144 | ✅ (Maven en el runner) |
+| [.NET](sdk-dotnet/) | **L3** | 157 | ✅ |
 | [Rust](sdk-rust/) | L2 | 175 | ✅ (incl. 14 contra NATS real) |
 | [PHP](sdk-php/) | L2 | 272 | ⚠️ el adaptador NATS no se ha probado contra un broker real |
 | [PHP](sdk-php/) | L2 | 201 | ✅ (transporte no — ver abajo) |
@@ -156,11 +156,19 @@ Un SDK **no** necesita implementarlo todo para ser útil:
   explícitos. Suficiente para integrar un servicio.
 - **L2 — Resiliente.** L1 + backoff, DLQ, clasificación de errores, propagación
   de `traceparent`.
-- **L3 — Gobernado.** L2 + validación contra Schema Registry en publish, y
-  rechazo de eventos que violen su `dataschema`.
+- **L3 — Gobernado.** L2 + validación del payload contra su `dataschema` en `publish()`,
+  que **falla la publicación** si no cumple, reportando **todos** los errores y no solo el
+  primero.
 
-Los SDKs de fase 1 (Node, Python, Go) apuntan a **L2**. L3 llega con el Schema
-Registry en fase 4.
+Node, Python, Go, Java y .NET implementan **L3** de forma opt-in: el default es `off` y
+entonces se comportan exactamente como L2, sin pagar ni la dependencia del validador. Los
+esquemas **no** se resuelven por red: se empaquetan con `node scripts/bundle-schemas.mjs` y
+se despliegan con el servicio, así que la versión del esquema queda clavada a la del
+servicio.
+
+> En Java la dependencia del validador es `<optional>true</optional>` dentro del mismo
+> artefacto; en .NET, donde toda `PackageReference` es transitiva, "opcional" solo puede
+> expresarse partiendo el paquete, y por eso la validación vive en `Flux.Validation`.
 
 ---
 

@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "flux-sdk"
 version = "0.1.0"
-description = "Cliente delgado de flux Event Protocol v1 para Python. Nivel de conformidad objetivo: L2."
+description = "Cliente delgado de flux Event Protocol v1 para Python. Nivel de conformidad: L3 (validación opt-in)."
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "UNLICENSED" }
@@ -19,8 +19,18 @@ dependencies = [
 # `uuid7` no aparece aquí a propósito: el SDK genera UUIDv7 con la stdlib
 # (flux/protocol.py). Python <3.14 no trae `uuid.uuid7()` y no compensa una dependencia
 # por 15 líneas que además hay que auditar por generar identidad de eventos.
-dev = ["pytest>=8", "cryptography>=42"]
+dev = ["pytest>=8", "cryptography>=42", "jsonschema>=4.18"]
 otel = ["opentelemetry-api>=1.20"]
+# Validación L3 — opt-in (00-protocol.md §5), de ahí el extra: un servicio en L2 no debe
+# arrastrar —ni auditar— un validador de JSON Schema que no va a ejecutar.
+#
+# ⚠️ >=4.18 y no cualquier versión: es la primera que resuelve los `$ref` con `referencing`
+# en vez del `RefResolver` obsoleto, y es lo que permite resolver el bundle ENTERO en
+# memoria sin que la biblioteca intente ir a buscar nada por red. Los esquemas de flux
+# declaran `$schema: draft/2020-12`; `flux/validation.py` elige el validador leyendo ese
+# campo, porque uno fijado a draft-07 no falla con un error de versión sino con
+# `no schema with key or ref ".../2020-12/schema"`, que no dice nada.
+validation = ["jsonschema>=4.18"]
 # Firma Ed25519 — extensión OPCIONAL de v1 (07-signing.md), de ahí el extra.
 #
 # La stdlib de Python no trae Ed25519: es la única pieza de la extensión que no sale

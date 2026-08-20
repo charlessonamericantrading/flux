@@ -19,6 +19,7 @@ from typing import Final
 __all__ = [
     "CONSUMER_DEFAULTS",
     "STREAM_DEFAULTS",
+    "DEFAULT_PENDING_POLL_MS",
     "MAX_MESSAGE_BYTES",
     "SUBJECT_PATTERN",
     "ParsedSubject",
@@ -77,6 +78,16 @@ STREAM_DEFAULTS: Final = _StreamDefaults(
 )
 
 MAX_MESSAGE_BYTES: Final = 1_048_576
+
+#: Cada cuánto se sondea `num_pending` de cada consumidor — 08-observability.md §2.3.
+#: Es el `observability.metrics.flux_consumer_pending.defaultPollMs` de protocol.json.
+#:
+#: El sondeo NO es redundante con los metadatos del mensaje: **si el bucle del consumidor
+#: muere, dejan de entregarse mensajes**, así que un gauge alimentado solo desde los
+#: metadatos se queda plano en su último valor en vez de crecer. Un panel mostraría una
+#: línea horizontal, indistinguible de "no pasa nada" — que es justo el fallo que esta
+#: métrica existe para detectar.
+DEFAULT_PENDING_POLL_MS: Final = 15_000
 
 
 def seconds(ms: float) -> float:

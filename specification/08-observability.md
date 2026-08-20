@@ -61,9 +61,29 @@ horizontal, que es indistinguible de "no pasa nada".
 El sondeo sigue corriendo y reporta el `num_pending` creciente. Es la señal.
 
 - El SDK **DEBE** actualizar el gauge desde los metadatos de cada mensaje entregado.
-- El SDK **DEBE** además sondear periódicamente (~15 s por defecto, configurable, `0`
-  lo desactiva).
+- El SDK **DEBE** además sondear periódicamente.
 - Un fallo del sondeo **NO DEBE** afectar al consumo: es telemetría.
+
+#### Semántica del intervalo — normativa
+
+| Valor | Significado |
+|---|---|
+| Positivo | Ese intervalo |
+| **`0`** | **El default (15 s)**, *no* "desactivado" |
+| Negativo | Desactivado, explícitamente |
+
+Que el cero signifique "default" y no "desactivado" **no es arbitrario**: en Go, Java y
+C# un entero sin asignar **es** `0`. Si el cero desactivara, todo servicio que no
+conozca este campo se quedaría sin la métrica **en silencio** — y son precisamente los
+servicios que nadie ha revisado los que más falta hace vigilar.
+
+Desactivar algo debe costar un gesto deliberado. Un valor negativo no se escribe sin
+querer.
+
+> Esta regla nació de una divergencia real: Node trataba el `0` como "desactivado" y Go
+> como "default". El mismo valor de configuración con sentidos opuestos en dos SDKs del
+> mismo ecosistema, y en la dirección peligrosa justo en el lenguaje donde el cero es el
+> valor por defecto del tipo.
 
 Sin ese sondeo la métrica nunca se emite, y un panel que muestra "sin datos" es
 **indistinguible de un consumidor sano** — que es exactamente el fallo que esta

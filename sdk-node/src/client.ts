@@ -140,12 +140,18 @@ export interface ConnectOptions {
   /** Se invoca al enrutar cualquier evento a la DLQ. */
   onDlq?: (info: { subject: string; event: FluxEvent; classification: Classification }) => void;
   /**
-   * Cada cuánto sondear `num_pending` de cada consumidor, en ms. `0` lo desactiva.
+   * Cada cuánto sondear `num_pending` de cada consumidor, en ms.
    *
-   * No es opcional por capricho: `flux_consumer_pending` es la ÚNICA señal que delata
-   * a un consumidor cuyo bucle murió, porque la conexión sigue reportándose sana y el
-   * healthcheck dice que todo va bien (08-observability.md §4). Pero el dato solo se
-   * obtiene preguntándole al servidor, así que hace falta un sondeo.
+   * | Valor | Significado |
+   * |---|---|
+   * | Positivo | Ese intervalo |
+   * | `0` | El default (15 s), **no** "desactivado" |
+   * | Negativo | Desactivado, explícitamente |
+   *
+   * Que el `0` sea el default y no "desactivado" viene de 08-observability.md §2.3: en
+   * Go, Java y C# un entero sin asignar ES `0`, así que si desactivara, todo servicio
+   * que no conozca este campo perdería la métrica en silencio. Desactivar algo debe
+   * costar un gesto deliberado, y un negativo no se escribe sin querer.
    *
    * @default 15000
    */
@@ -401,7 +407,9 @@ export class FluxBus {
 
     // Sondeo de num_pending. Sin esto, `flux_consumer_pending` nunca se emite y el
     // panel muestra "sin datos", que es indistinguible de "consumidor sano" — 08 §4.
-    const pollMs = this.#opts.pendingPollMs ?? 15_000;
+    const configurado = this.#opts.pendingPollMs ?? 0;
+    // 0 (o ausente) → default; negativo → desactivado — 08-observability.md §2.3.
+    const pollMs = configurado === 0 ? 15_000 : configurado;
     const poll =
       pollMs > 0 && this.#opts.metrics
         ? setInterval(() => {

@@ -15,7 +15,7 @@ from pathlib import Path
 
 import pytest
 
-from flux import CONSUMER_DEFAULTS
+from flux import CONSUMER_DEFAULTS, DEFAULT_PENDING_POLL_MS
 from flux.metrics import (
     DURATION_BUCKETS,
     NO_METRICS,
@@ -109,6 +109,23 @@ class TestContrato:
                 continue
             parametros = set(inspect.signature(metodo).parameters) - {"self"}
             assert not (parametros & prohibidas), f"{nombre} acepta {parametros & prohibidas}"
+
+
+class TestSondeoDePendientes:
+    def test_el_intervalo_por_defecto_es_el_de_protocol_json(self):
+        # 08-observability.md §2.3: el gauge tiene DOS fuentes y el SDK DEBE usar las dos.
+        # Los metadatos del mensaje son gratis pero fallan justo donde importa —si el
+        # bucle muere dejan de llegar mensajes y la métrica se queda plana—, así que el
+        # sondeo periódico no es redundante: es la señal.
+        assert (
+            DEFAULT_PENDING_POLL_MS
+            == OBSERVABILITY["metrics"]["flux_consumer_pending"]["defaultPollMs"]
+        )
+
+    def test_la_metrica_se_declara_sondeada_desde_el_servidor(self):
+        # Si alguien "optimizara" el sondeo dejando solo los metadatos, este test recuerda
+        # que el contrato dice de dónde sale el dato.
+        assert OBSERVABILITY["metrics"]["flux_consumer_pending"]["source"] == "polled-from-server"
 
 
 class TestBuckets:

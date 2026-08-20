@@ -69,6 +69,23 @@ const (
 	DefaultMaxAckPending = 256
 )
 
+// Sondeo de flux_consumer_pending — 08-observability.md §2.3.
+const (
+	// DefaultPendingPoll es cada cuánto se le pregunta al servidor por `num_pending`.
+	// Es el observability.metrics.flux_consumer_pending.defaultPollMs de protocol.json.
+	//
+	// El sondeo NO es redundante con los metadatos del mensaje entregado: si el bucle
+	// del consumidor muere, dejan de entregarse mensajes, así que un gauge alimentado
+	// solo desde los metadatos se queda plano en su último valor en vez de crecer. Un
+	// panel mostraría una línea horizontal, indistinguible de "no pasa nada" — que es
+	// justo el fallo que esta métrica existe para detectar.
+	DefaultPendingPoll = 15 * time.Second
+
+	// PendingPollDisabled apaga el sondeo. Ver ConnectOptions.PendingPollInterval sobre
+	// por qué no basta con un cero.
+	PendingPollDisabled = -1 * time.Nanosecond
+)
+
 // Configuración canónica de stream — 02-naming.md §3.2.
 const (
 	StreamMaxAge = 30 * 24 * time.Hour

@@ -1,4 +1,5 @@
-// Cliente de flux. Nivel de conformidad: L2.
+// Cliente de flux. Nivel de conformidad: L3 (validación de esquema opt-in, `off` por
+// defecto; sin activarla el comportamiento es exactamente el de L2).
 // Contrato normativo: specification/00-protocol.md §5
 //
 // Regla de diseño: este fichero NO expone ningún tipo de NATS en su API pública. Si
@@ -82,6 +83,30 @@ type ConnectOptions struct {
 	Schemas map[string]string
 	// SchemaBaseURL es la base para derivar `dataschema` cuando no está en Schemas.
 	SchemaBaseURL string
+
+	// Validation activa la validación L3 del payload contra su JSON Schema.
+	//
+	// Con Mode = ValidationStrict, publicar un payload que viola su contrato falla en el
+	// productor en vez de aparecer como un misterio en un consumidor de otro equipo la
+	// semana que viene — 00-protocol.md §5. El cero del struct es "off", que es L2.
+	Validation ValidationOptions
+
+	// PendingPollInterval es cada cuánto se sondea `num_pending` de cada consumidor.
+	//
+	// No es un capricho: flux_consumer_pending es la ÚNICA señal que delata a un
+	// consumidor cuyo bucle murió, porque la conexión sigue reportándose sana y el
+	// healthcheck dice que todo va bien (08-observability.md §4). Pero el dato solo se
+	// obtiene preguntándole al servidor, así que hace falta un sondeo.
+	//
+	// El CERO significa el default (DefaultPendingPoll, 15 s). Para desactivarlo hay que
+	// escribir un valor negativo — PendingPollDisabled.
+	//
+	// ⚠️ Divergencia deliberada con Node y Python, donde `0` desactiva: en Go el cero de
+	// un campo es "no lo he puesto" y no se distingue de "ponlo a cero". Si el cero
+	// desactivara, la métrica quedaría apagada en todo servicio que no conozca este
+	// campo — es decir, justo en los que nadie está vigilando. Es la misma clase de
+	// ambigüedad que documenta DLQAttempts en envelope.go.
+	PendingPollInterval time.Duration
 
 	// Classifier es la política de clasificación de errores. Ver classify.go.
 	Classifier ClassifierOptions
@@ -233,8 +258,10 @@ type Subscription struct {
 	Durable string
 
 	consume jetstream.ConsumeContext
-	bus     *Bus
-	once    sync.Once
+	// stopPoll para el sondeo de num_pending. Nil si el sondeo está desactivado.
+	stopPoll chan struct{}
+	bus      *Bus
+	once     sync.Once
 }
 
 // Unsubscribe detiene la entrega. Los mensajes ya en el búfer se descartan y se
@@ -242,6 +269,11 @@ type Subscription struct {
 func (s *Subscription) Unsubscribe() {
 	s.once.Do(func() {
 		s.consume.Stop()
+		if s.stopPoll != nil {
+			// Dentro del once: cerrar dos veces un canal es un pánico, y Close() llama a
+			// Unsubscribe de todas las suscripciones vivas.
+			close(s.stopPoll)
+		}
 		s.bus.forget(s)
 	})
 }
@@ -295,6 +327,8 @@ type Bus struct {
 	// caliente sería tirar el throughput por comodidad de escritura.
 	signer   *Signer
 	verifier *Verifier
+	// validate es nil en modo off: un servicio en L2 no compila ningún esquema.
+	validate *schemaValidator
 	metrics  MetricsSink
 
 	mu            sync.Mutex
@@ -320,6 +354,13 @@ func Connect(ctx context.Context, opts ConnectOptions) (*Bus, error) {
 		return nil, err
 	}
 	verifier, err := NewVerifier(opts.Signing, opts.Logger)
+	if err != nil {
+		return nil, err
+	}
+
+	// Y por lo mismo los esquemas: compilarlos por evento sería tirar el throughput, y un
+	// bundle ausente o un esquema roto deben romper el ARRANQUE — 00-protocol.md §5.
+	validate, err := newSchemaValidator(opts.Validation, opts.Logger)
 	if err != nil {
 		return nil, err
 	}
@@ -377,6 +418,7 @@ func Connect(ctx context.Context, opts ConnectOptions) (*Bus, error) {
 		source:        SourceURI(opts.Environment, opts.Service),
 		signer:        signer,
 		verifier:      verifier,
+		validate:      validate,
 		metrics:       metrics,
 		subscriptions: make(map[*Subscription]struct{}),
 		ensured:       make(map[string]struct{}),
@@ -509,6 +551,16 @@ func (b *Bus) Publish(ctx context.Context, subject string, data any, opts ...Pub
 		return Event{}, err
 	}
 
+	// L3: validar ANTES de publicar. Un payload que viola su contrato debe fallar aquí,
+	// en el servicio que lo generó, y no aparecer como un misterio en un consumidor de
+	// otro equipo la semana que viene — 00-protocol.md §5.
+	if b.validate != nil {
+		if err := b.validate.check(event, subject); err != nil {
+			b.metrics.EventPublished(subject, PublishInvalidSchema)
+			return Event{}, err
+		}
+	}
+
 	// Firmar es LO ÚLTIMO antes de serializar: la firma cubre el envelope completo, así
 	// que cualquier atributo añadido después la invalidaría — 07-signing.md §5.
 	if b.signer != nil {
@@ -542,13 +594,20 @@ func (b *Bus) schemaFor(subject string, p ParsedSubject) (string, error) {
 	if s, ok := b.opts.Schemas[subject]; ok && s != "" {
 		return s, nil
 	}
+	// El bundle L3 conoce el MINOR real de cada subject: dentro de un mayor todo es
+	// BACKWARD-compatible, así que el más alto acepta lo que aceptan los anteriores
+	// — 05-compatibility.md §2.
+	if s := SchemaURIFor(b.opts.Validation.Bundle, subject); s != "" {
+		return s, nil
+	}
 	if b.opts.SchemaBaseURL == "" {
 		return "", fmt.Errorf(
-			"flux: no hay dataschema para %q. Declara Schemas[%q] o SchemaBaseURL en ConnectOptions",
+			"flux: no hay dataschema para %q. Declara Schemas[%q], SchemaBaseURL, o pasa un "+
+				"bundle en Validation.Bundle (ConnectOptions)",
 			subject, subject)
 	}
-	// Sin registro exacto solo se puede asumir el .0.0 del mayor. Un SDK L3 resolverá
-	// el minor real contra el Schema Registry — 00-protocol.md §5.
+	// Sin bundle ni mapa explícito solo se puede asumir el .0.0 del mayor. Es suficiente
+	// para L2 —el atributo es informativo— pero no para L3.
 	return fmt.Sprintf("%s/%s/%s/%s/%d.0.0.json",
 		strings.TrimRight(b.opts.SchemaBaseURL, "/"), p.Domain, p.Aggregate, p.Event, p.Major), nil
 }
@@ -635,6 +694,31 @@ func (b *Bus) Subscribe(ctx context.Context, subject string, handler Handler, op
 	}
 	sub.consume = consumeCtx
 
+	// Sondeo de num_pending. Sin él, flux_consumer_pending solo se alimenta de los
+	// metadatos de los mensajes entregados — y si el bucle muere dejan de llegar
+	// mensajes, así que el gauge se queda PLANO en vez de crecer. Un panel mostraría una
+	// línea horizontal, indistinguible de "no pasa nada" (08-observability.md §2.3 y §4).
+	if every := b.pendingPollInterval(); every > 0 {
+		sub.stopPoll = make(chan struct{})
+		go pollPending(every, sub.stopPoll,
+			func() (uint64, error) {
+				// Un ctx con plazo: sin él, un servidor que acepta la conexión pero no
+				// responde dejaría el sondeo colgado para siempre y la métrica muda.
+				ctx, cancel := context.WithTimeout(context.Background(), every)
+				defer cancel()
+				info, err := consumer.Info(ctx)
+				if err != nil {
+					return 0, err
+				}
+				return info.NumPending, nil
+			},
+			func(pending uint64) { b.metrics.ConsumerPending(subject, durable, int(pending)) },
+			func(err error) {
+				// Un fallo del sondeo NO DEBE afectar al consumo: es telemetría.
+				b.logf(slog.LevelWarn, "no se pudo sondear num_pending de %s: %v", durable, err)
+			})
+	}
+
 	b.mu.Lock()
 	b.subscriptions[sub] = struct{}{}
 	b.mu.Unlock()
@@ -697,12 +781,77 @@ func equalDurations(a, b []time.Duration) bool {
 	return true
 }
 
+// ─── flux_consumer_pending ───────────────────────────────────────────────────
+
+// pendingPollInterval resuelve el intervalo del sondeo, o <= 0 si no procede.
+//
+// No procede con un valor negativo —desactivado explícitamente— ni con el sumidero nulo:
+// sería una petición cada 15 s por consumidor para tirar el resultado.
+func (b *Bus) pendingPollInterval() time.Duration {
+	if _, mudo := b.metrics.(NoMetrics); mudo || b.metrics == nil {
+		return 0
+	}
+	switch {
+	case b.opts.PendingPollInterval < 0:
+		return 0
+	case b.opts.PendingPollInterval == 0:
+		return DefaultPendingPoll
+	default:
+		return b.opts.PendingPollInterval
+	}
+}
+
+// pollPending sondea num_pending hasta que se cierre stop.
+//
+// Qué mide con precisión: los mensajes del stream AÚN NO ENTREGADOS a este consumidor.
+// Un handler lento NO la hace crecer (sus mensajes ya se entregaron y esperan ack: eso se
+// ve en el histograma de duración); un consumidor muerto sí, y sin techo, mientras la
+// conexión sigue reportándose sana — 08-observability.md §2.3.
+//
+// Recibe las tres dependencias como funciones para poder probarse sin broker: el error de
+// un sondeo NO puede terminar el bucle, y eso solo se demuestra haciéndolo fallar.
+func pollPending(
+	every time.Duration,
+	stop <-chan struct{},
+	fetch func() (uint64, error),
+	report func(uint64),
+	onErr func(error),
+) {
+	ticker := time.NewTicker(every)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-stop:
+			return
+		case <-ticker.C:
+			pending, err := fetch()
+			if err != nil {
+				// Se registra y se vuelve a intentar en el siguiente ciclo. Si un error
+				// terminara el bucle, la métrica se apagaría para siempre tras un hipo
+				// del broker — y nadie se enteraría, porque el consumidor seguiría
+				// consumiendo.
+				onErr(err)
+				continue
+			}
+			report(pending)
+		}
+	}
+}
+
 // ─── despacho ────────────────────────────────────────────────────────────────
 
 func (b *Bus) dispatch(msg jetstream.Msg, subject, durable string, handler Handler, cfg subscribeConfig) {
 	attempt := 1
-	if md, err := msg.Metadata(); err == nil && md.NumDelivered > 0 {
-		attempt = int(md.NumDelivered)
+	if md, err := msg.Metadata(); err == nil {
+		if md.NumDelivered > 0 {
+			attempt = int(md.NumDelivered)
+		}
+		// Los metadatos traen NumPending gratis en cada entrega: más fresco que el sondeo
+		// y sin coste. Pero NO lo sustituye — si el bucle muere dejan de llegar mensajes
+		// y el gauge se quedaría plano en su último valor en vez de crecer, que es
+		// exactamente lo contrario de la señal que hace falta (08-observability.md §2.3).
+		// Por eso el SDK usa las dos fuentes.
+		b.metrics.ConsumerPending(subject, durable, int(md.NumPending))
 	}
 
 	// POISON se detecta ANTES del handler: el mensaje no es interpretable, así que el
@@ -756,6 +905,14 @@ func (b *Bus) dispatch(msg jetstream.Msg, subject, durable string, handler Handl
 	// — 07-signing.md §5.1. En modo warn, Check registra y devuelve nil.
 	inicio := time.Now()
 	handlerErr := b.verify(event)
+	// L3 al consumir: el evento es sintácticamente válido pero incumple su contrato.
+	// Reintentarlo dará exactamente el mismo resultado, así que la clasificación correcta
+	// es PERMANENT — y la declara el propio error (validation.go), no la política del
+	// clasificador. Va DESPUÉS de la firma a propósito: si el evento fue manipulado, su
+	// payload puede validar perfectamente y aun así no ser del productor que dice.
+	if handlerErr == nil && b.opts.Validation.OnConsume && b.validate != nil {
+		handlerErr = b.validate.check(event, subject)
+	}
 	if handlerErr == nil {
 		handlerErr = b.invoke(ctx, handler, event, delivery)
 	}
@@ -845,6 +1002,12 @@ func outcomeFor(reason DLQReason, code string) ConsumeOutcome {
 	switch code {
 	case "MISSING_SIGNATURE", "INVALID_SIGNATURE", "UNKNOWN_SIGNING_KEY":
 		return ConsumeInvalidSignature
+	// Mismo motivo con la validación L3: "este consumidor rechaza el evento" y "el
+	// productor publica payloads que violan su contrato" son dos incidentes con dos
+	// dueños distintos. El `reason` de la DLQ sigue siendo `permanent`, que es el enum
+	// cerrado de 04-errors.md §1.
+	case CodeSchemaInvalid, CodeSchemaNotFound:
+		return ConsumeInvalidSchema
 	}
 	switch reason {
 	case DLQReasonRetryable:

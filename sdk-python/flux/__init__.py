@@ -1,5 +1,8 @@
 """
-flux SDK para Python — Event Protocol v1, nivel de conformidad L2.
+flux SDK para Python — Event Protocol v1, nivel de conformidad L3.
+
+L3 es **opt-in**: sin `validation=ValidationOptions(mode=...)` el SDK se comporta
+exactamente como L2 y no importa `jsonschema` siquiera (ver flux/validation.py).
 
 Especificación: https://github.com/charlessonamericantrading/flux
 
@@ -54,6 +57,7 @@ from .metrics import (
 )
 from .protocol import (
     CONSUMER_DEFAULTS,
+    DEFAULT_PENDING_POLL_MS,
     MAX_MESSAGE_BYTES,
     STREAM_DEFAULTS,
     SUBJECT_PATTERN,
@@ -85,6 +89,20 @@ from .signing import (
     create_signer,
     create_verifier,
     generate_key_pair,
+)
+
+# Validación L3 — extensión opt-in y `jsonschema` una dependencia opcional: el módulo se
+# importa siempre (es barato) pero no toca `jsonschema` hasta que alguien valida de
+# verdad. Ver flux/validation.py.
+from .validation import (
+    SchemaBundle,
+    SchemaNotFoundError,
+    SchemaValidationError,
+    ValidationMode,
+    ValidationOptions,
+    create_validator,
+    load_bundle,
+    schema_uri_for,
 )
 
 if TYPE_CHECKING:  # pragma: no cover - solo para los type checkers
@@ -161,6 +179,7 @@ __all__ = [
     # protocolo
     "CONSUMER_DEFAULTS",
     "STREAM_DEFAULTS",
+    "DEFAULT_PENDING_POLL_MS",
     "MAX_MESSAGE_BYTES",
     "SUBJECT_PATTERN",
     "ParsedSubject",
@@ -179,6 +198,15 @@ __all__ = [
     "TenantIsolation",
     "TenantIsolationError",
     "resolve_tenant_filter",
+    # validación L3 (opt-in — 00-protocol.md §5)
+    "ValidationMode",
+    "ValidationOptions",
+    "SchemaBundle",
+    "SchemaValidationError",
+    "SchemaNotFoundError",
+    "create_validator",
+    "load_bundle",
+    "schema_uri_for",
     # firma (extensión opcional — 07-signing.md)
     "SigningOptions",
     "SigningKeyError",

@@ -214,6 +214,12 @@ equipo la semana que viene.
 - Tras cambiar un esquema: `node scripts/bundle-schemas.mjs`.
 - Los esquemas declaran **draft 2020-12**. Un validador de draft-07 no da un error de
   versión: da `no schema with key or ref …/2020-12/schema`, que no dice nada.
+- El bundle también resuelve el **`dataschema` exacto** de cada subject; sin él, el SDK
+  solo puede asumir el `<major>.0.0`.
+- El validador es una **dependencia opcional** con importación diferida (Node: `ajv`;
+  Python: extra `[validation]`). Excepción: en Go no existe esa figura y va en `go.mod`.
+- Un fallo al **consumir** se clasifica **PERMANENT**, y en Python/Go lo declara el propio
+  error en vez de dejarlo en manos de la política de errores desconocidos.
 
 ### Firma Ed25519 — [07-signing.md](specification/07-signing.md)
 

@@ -450,7 +450,13 @@
     "schemaResolution": "bundle-deployed-with-service",
     "$commentL3": "El dataschema NO se resuelve por red en publish(): esta en la ruta caliente y una cache con TTL abre una ventana en la que dos servicios validan contra versiones distintas. El bundle se despliega con el servicio, asi que la version del esquema queda clavada a producerversion. Los esquemas declaran draft/2020-12: un validador de draft-07 falla con \"no schema with key or ref\", que no dice nada util.",
     "nodeImplements": "L3",
-    "implementsL3": ["node", "python", "go", "rust", "php"],
+    "implementsL3": [
+      "node",
+      "python",
+      "go",
+      "rust",
+      "php"
+    ],
     "$commentImplementsL3": "En Rust detras de la feature `validation` (crate jsonschema, sin resolucion HTTP); en PHP con opis/json-schema como dependencia opcional de Composer; en Python con el extra [validation] (jsonschema >= 4.18, import diferido). El coste de L3 se paga solo si se usa: sin activarlo, esos SDKs siguen siendo L2 y no arrastran el validador. Go es la excepcion: no existe el extra opcional, asi que santhosh-tekuri/jsonschema/v6 va en go.mod y lo pagan tambien los servicios en L2 (~1 MB de binario); en ejecucion sigue sin costar nada con Mode off."
   },
   "outOfScopeV1": [
@@ -573,7 +579,17 @@
         "source": "polled-from-server",
         "defaultPollMs": 15000,
         "measures": "mensajes del stream AUN NO ENTREGADOS a ese consumidor",
-        "$comment": "Unica metrica que no sale del flujo de eventos: hay que sondear num_pending del consumidor. Sin sondeo nunca se emite, y un panel que muestra \"sin datos\" es indistinguible de un consumidor sano, que es justo el fallo que esta metrica existe para detectar. Un handler LENTO no la hace crecer (sus mensajes ya se entregaron); un consumidor MUERTO si."
+        "$comment": "DOS fuentes obligatorias. Los metadatos del mensaje son gratis y frescos, pero si el bucle del consumidor MUERE dejan de llegar mensajes y el gauge se queda PLANO en vez de crecer: lo contrario de la señal que hace falta. El sondeo sigue corriendo y reporta el num_pending creciente. Cada fuente falla justo donde la otra sirve.",
+        "sources": [
+          "message-metadata",
+          "periodic-poll"
+        ],
+        "pollIntervalMs": {
+          "default": 15000,
+          "zeroMeans": "default",
+          "negativeMeans": "disabled"
+        },
+        "$commentInterval": "El CERO significa DEFAULT, no desactivado. En Go, Java y C# un entero sin asignar ES 0: si el cero desactivara, todo servicio que no conozca el campo perderia la metrica en silencio, y son justo los servicios que nadie ha revisado los que mas falta hace vigilar. Desactivar debe costar un gesto deliberado; un negativo no se escribe sin querer."
       },
       "flux_connection_state": {
         "type": "gauge",

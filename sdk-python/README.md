@@ -1,15 +1,18 @@
 # flux SDK — Python
 
 Cliente de **flux Event Protocol v1** (CloudEvents 1.0 sobre NATS JetStream).
-Nivel de conformidad: **L2** ([00-protocol.md §5](../specification/00-protocol.md)).
+Nivel de conformidad: **L3** ([00-protocol.md §5](../specification/00-protocol.md)) — la
+validación de esquema es **opt-in**; sin activarla el comportamiento es exactamente el de
+L2 y no se importa ningún validador.
 
 Es un port fiel del SDK de referencia de Node (`sdk-node/src/`): misma semántica, mismos
 defaults, mismos mensajes de error. Lo único que cambia son los nombres (`snake_case`) y
 las piezas de plataforma que no existen igual en Python — todas anotadas más abajo.
 
 ```bash
-pip install -e sdk-python              # requiere Python >= 3.11
-pip install -e "sdk-python[signing]"   # + firma Ed25519 (extensión opcional)
+pip install -e sdk-python                # requiere Python >= 3.11
+pip install -e "sdk-python[signing]"     # + firma Ed25519 (extensión opcional)
+pip install -e "sdk-python[validation]"  # + validación L3 de esquema (opt-in)
 ```
 
 ---
@@ -220,6 +223,65 @@ evento de un servicio aún no migrado.
 > rutinaria en la invalidación retroactiva de todo el historial
 > ([§6](../specification/07-signing.md)).
 
+## Validación de esquema — L3
+
+Sin esto, un productor puede publicar un payload que viola su propio `dataschema` y nadie
+se entera hasta que un consumidor —posiblemente de otro equipo, otro lenguaje y otra
+semana— se atraganta. El error aparece lejísimos de su causa. Validar en `publish()` lo
+convierte en un fallo del servicio que lo provocó
+([00-protocol.md §5](../specification/00-protocol.md)).
+
+```python
+from flux import ValidationOptions, load_bundle
+
+bus = await flux.connect(
+    ...,
+    validation=ValidationOptions(
+        mode="strict",                            # off (default) | warn | strict
+        bundle=load_bundle("schemas/bundle.json"),
+        on_consume=True,                          # validar también al consumir
+    ),
+)
+```
+
+| Modo | `publish()` con payload inválido | Coste |
+|---|---|---|
+| `off` (default) | Publica. Es L2. | Cero: `jsonschema` ni se importa |
+| `warn` | Registra en el logger `flux` y publica | Una validación por evento |
+| `strict` | **Lanza `SchemaValidationError`** | Una validación por evento |
+
+- **Reporta TODOS los errores, no solo el primero.** De uno en uno, arreglar un payload
+  con tres campos mal cuesta tres despliegues.
+- Con `on_consume=True` el evento que incumple su contrato va a la DLQ como **PERMANENT**:
+  es sintácticamente correcto, así que reintentarlo daría exactamente el mismo resultado
+  ([04-errors.md §1.2](../specification/04-errors.md)). La clase la declara el propio
+  error —`SchemaValidationError` hereda de `PermanentError`—, así que no depende de
+  `unknown_error_policy`. La métrica lo etiqueta `outcome="invalid_schema"`.
+- El bundle **resuelve además el `dataschema` exacto** de cada subject (gana sobre
+  `schema_base_url`, pierde ante `schemas`). Sin él, el SDK solo puede asumir el
+  `<major>.0.0`; con él usa el MINOR real, que es contra el que se valida.
+- Un bundle ausente, un modo mal escrito o un esquema roto hacen fallar `connect()`. Un
+  fallo de configuración debe romper el arranque, no la primera publicación — y un typo en
+  el modo no puede significar "no valides nada en silencio".
+
+> **El bundle se pasa como dato, no como URL.** Validar está en la ruta caliente: una
+> petición de red por evento es inaceptable, y una caché con TTL abre una ventana en la
+> que dos servicios validan contra versiones distintas del mismo esquema. `schemas/bundle.json`
+> se genera con `node scripts/bundle-schemas.mjs` y **se despliega con el servicio**, así
+> que la versión del esquema queda clavada a la del servicio — justo lo que
+> `producerversion` promete poder acotar.
+
+**El coste de la dependencia.** `jsonschema>=4.18` es un **extra** (`[validation]`) y se
+importa de forma diferida, igual que `cryptography` para la firma: L3 es opt-in, así que
+su coste también debe serlo, y un servicio en L2 no debería arrastrar —ni auditar— un
+validador de JSON Schema que no va a ejecutar. Con `mode != "off"` y el extra sin
+instalar, `connect()` falla al arrancar con el `pip install` exacto en el mensaje.
+
+> ⚠️ Los esquemas declaran `$schema: draft/2020-12`. Un validador configurado para
+> draft-07 **no** falla con un error de versión: falla con `no schema with key or ref
+> ".../2020-12/schema"`, que no dice nada. El SDK elige el validador leyendo el `$schema`
+> de cada esquema, y hay un test que comprueba que el bundle declara 2020-12.
+
 ## Métricas
 
 Siete métricas con nombres y etiquetas fijados por el protocolo
@@ -262,11 +324,28 @@ bus = await flux.connect(..., metrics=metrics)
 - `flux_connection_state` (`1` conectado, `0` desconectado, `2` reconectando) va enganchado
   a los callbacks de `nats-py`: sin eso valdría `1` hasta el `close()` y no diría nada.
 
-⚠️ `flux_consumer_pending` no lo alimenta el SDK todavía —tampoco el de Node—: sale de
-`ConsumerInfo.num_pending` y hace falta un sondeo periódico contra el broker. El método está
-en la interfaz para que quien lo sondee use el nombre correcto. Importa más de lo que
-parece: un consumidor cuyo bucle murió **sigue reportando la conexión como sana**, y solo el
-crecimiento de `pending` lo delata ([§4](../specification/08-observability.md)).
+- `flux_consumer_pending` se alimenta de **dos fuentes**, y el SDK usa las dos
+  ([§2.3](../specification/08-observability.md)):
+
+  | Fuente | Coste | Falla cuando… |
+  |---|---|---|
+  | `msg.metadata.num_pending` de cada entrega | Gratis, fresco en cada evento | **No llegan mensajes** — y ese es el caso que importa |
+  | Sondeo de `consumer_info().num_pending` | Una petición cada `pending_poll_ms` (15 s por defecto; `0` lo desactiva) | Nunca, mientras haya conexión |
+
+  El razonamiento decide la regla: **si el bucle del consumidor muere, dejan de entregarse
+  mensajes**, así que una métrica alimentada solo desde los metadatos se queda **plana en
+  su último valor** en vez de crecer. Un panel mostraría una línea horizontal,
+  indistinguible de "no pasa nada". El sondeo sigue corriendo y reporta el `num_pending`
+  creciente: **esa** es la señal. Importa más de lo que parece — un consumidor cuyo bucle
+  murió sigue reportando la conexión como sana ([§4](../specification/08-observability.md)).
+
+  Un fallo del sondeo **no afecta al consumo**: se registra y se reintenta en el ciclo
+  siguiente. Es telemetría. Y no se sondea con el sumidero nulo: sería una petición cada
+  15 s por consumidor para tirar el resultado.
+
+  Qué mide, con precisión: los mensajes del stream **aún no entregados** a ese consumidor.
+  Un handler lento **no** la hace crecer (sus mensajes ya se entregaron y esperan ack: eso
+  se ve en `flux_event_handler_duration_seconds`); un consumidor muerto sí, y sin techo.
 
 ---
 
@@ -288,6 +367,8 @@ lector que venga de Node se sorprendería.
 | `import { connect } from "@flux/sdk"` | `flux.connect` se resuelve de forma diferida | Así los tests de naming y envelope no necesitan tener `nats-py` instalado. |
 | — | `extract_syscall_code` normaliza el prefijo `WSA` | En Windows `errno.errorcode[10054]` es `WSAECONNRESET`. Sin normalizar, el mismo corte de red sería RETRYABLE en Linux y PERMANENT en Windows. |
 | `node:crypto` (sin dependencias) | `cryptography`, extra `[signing]` | La stdlib de Python no trae Ed25519. Es la única pieza de la fase que no sale gratis: se importa de forma diferida, así que un servicio que no firma no la necesita instalada. |
+| `ajv/dist/2020`, dependencia opcional | `jsonschema>=4.18`, extra `[validation]` | Mismo trato: L3 es opt-in, así que su coste también. Node elige el build 2020-12 a mano; aquí se elige el validador leyendo el `$schema` de cada esquema, que resiste mejor a que alguien añada un esquema con otro draft. Los `$ref` se resuelven contra un `Registry` construido con el bundle entero, sin `retrieve` de red. |
+| `SchemaValidationError extends Error` | `SchemaValidationError(PermanentError)` | En Node la clasificación PERMANENT al consumir depende de la política del clasificador para errores desconocidos; aquí la declara el propio error. Un evento que nunca podrá validar no debe gastar reintentos antes de llegar a la DLQ ([00-protocol.md §5](../specification/00-protocol.md)). |
 | `TenantIsolationError` en `client.ts` | `flux.tenant.TenantIsolationError` | La regla de aislamiento tiene que poder probarse **sin `nats-py`**. Una regla de seguridad que solo se ejecuta con infraestructura delante es una regla que nadie prueba. Se reexporta desde `flux` y desde `flux.client`. |
 | Firma añadida al final del objeto | Orden fijado en `FluxEvent.to_dict` | En Node el orden de claves es el de inserción y hay que cuidarlo a mano; aquí `signkeyid` y `signature` están declarados entre `tracestate` y las `dlq*`, y `data` queda último sin esfuerzo. El resultado en el cable es idéntico. |
 | `render()` sustituye `"` por `_` | `render()` **escapa** `\`, `"` y `\n` | Prometheus define el escapado; sustituir pierde el valor. Un `code` con comillas no rompe el scrape en ninguno de los dos, pero aquí además se lee. |
@@ -346,9 +427,20 @@ divergencia entre el SDK y el contrato falla en CI en vez de en producción — 
 | `test_signing.py` | Firma Ed25519: manipulación, DLQ, rotación de claves, modos |
 | `test_metrics.py` | Nombres, etiquetas, buckets y formato de exposición |
 | `test_tenant.py` | Filtro de tenant y modo estricto |
+| `test_validation.py` | Validación L3: modos, todos los errores, bundle sin red, clasificación PERMANENT |
+| `test_client_l3.py` | Que `publish()` **no publica** lo que no valida, y que el `dataschema` sale del bundle |
+| `test_consumer_pending.py` | Las dos fuentes de `flux_consumer_pending` y que un fallo del sondeo no mata el bucle |
 
-Un caso queda como `skipped` sin `nats-py` instalado: el que comprueba los campos de
-`ConnectOptions`, que vive en el único módulo que necesita el cliente de NATS.
+Los módulos que necesitan una dependencia que puede no estar —`cryptography` para la
+firma, `jsonschema` para la validación, `nats-py` para el cliente— llaman a
+`pytest.importorskip` **a nivel de módulo**. Sin eso, el fallo ocurre en la fase de
+recolección y pytest aborta con exit 2 sin ejecutar **ningún** test de **ningún** fichero:
+una dependencia opcional que tumba la suite entera no es opcional. Compruébalo así:
+
+```bash
+pip uninstall -y jsonschema && python -m pytest sdk-python/tests -q
+# → todo verde; solo se saltan los dos módulos que necesitan el extra
+```
 
 Para los invariantes que sí requieren un servidor real —que `ack_wait` sobrevive, que un
 durable con puntos es rechazado, que `dlq.` queda disjunto— ver

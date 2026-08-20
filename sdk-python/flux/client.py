@@ -1,5 +1,6 @@
 """
-Cliente de flux. Nivel de conformidad: L2.
+Cliente de flux. Nivel de conformidad: **L3** (validación de esquema opt-in, `off` por
+defecto; sin activarla el comportamiento es exactamente el de L2).
 Contrato normativo: specification/00-protocol.md §5
 
 Regla de diseño: este fichero NO debe exponer ningún tipo de NATS en su API pública.
@@ -54,6 +55,7 @@ from .errors import Classification, ErrorClass, PoisonError
 from .metrics import NO_METRICS, ConnectionState, ConsumeOutcome, MetricsSink
 from .protocol import (
     CONSUMER_DEFAULTS,
+    DEFAULT_PENDING_POLL_MS,
     STREAM_DEFAULTS,
     dlq_stream_name,
     dlq_subject,
@@ -66,6 +68,13 @@ from .protocol import (
 )
 from .signing import Signer, SigningOptions, Verifier, create_signer, create_verifier
 from .tenant import TenantIsolation, TenantIsolationError, resolve_tenant_filter
+from .validation import (
+    SchemaBundle,
+    ValidationOptions,
+    Validator,
+    create_validator,
+    schema_uri_for,
+)
 
 __all__ = [
     "Credentials",
@@ -93,6 +102,14 @@ __all__ = [
 _SIGNING_CODES: Final[frozenset[str]] = frozenset(
     {"MISSING_SIGNATURE", "INVALID_SIGNATURE", "UNKNOWN_SIGNING_KEY"}
 )
+
+#: Códigos que produce la validación L3 al consumir — 00-protocol.md §5.
+#:
+#: Mismo motivo que `_SIGNING_CODES`: el `dlqreason` sigue siendo `permanent` (es el enum
+#: cerrado de 04-errors.md §1), pero el `outcome` de la métrica distingue "este consumidor
+#: rechaza el evento" de "el productor está publicando payloads que violan su contrato".
+#: Son dos incidentes con dos dueños distintos.
+_SCHEMA_CODES: Final[frozenset[str]] = frozenset({"SCHEMA_INVALID", "SCHEMA_NOT_FOUND"})
 
 
 # ─── Opciones ────────────────────────────────────────────────────────────────
@@ -161,6 +178,19 @@ class ConnectOptions:
     schemas: Mapping[str, str] = field(default_factory=dict)
     #: Base para derivar `dataschema` cuando no está en `schemas`.
     schema_base_url: str | None = None
+    #: Validación L3 contra el JSON Schema del evento. Ver validation.py.
+    #:
+    #: Con `mode="strict"`, publicar un payload que viola su contrato falla en el
+    #: productor en vez de aparecer como un misterio en un consumidor de otro equipo la
+    #: semana que viene — 00-protocol.md §5. El default (`off`) es L2 y no cuesta nada.
+    validation: ValidationOptions | None = None
+    #: Cada cuánto sondear `num_pending` de cada consumidor, en ms. `0` lo desactiva.
+    #:
+    #: No es opcional por capricho: `flux_consumer_pending` es la ÚNICA señal que delata a
+    #: un consumidor cuyo bucle murió, porque la conexión sigue reportándose sana y el
+    #: healthcheck dice que todo va bien (08-observability.md §4). Pero el dato solo se
+    #: obtiene preguntándole al servidor, así que hace falta un sondeo.
+    pending_poll_ms: float = DEFAULT_PENDING_POLL_MS
     #: Política de clasificación de errores. Ver classify.py.
     classifier: ClassifierOptions | None = None
     credentials: Credentials | None = None
@@ -261,6 +291,11 @@ class FluxBus:
         signing = options.signing or SigningOptions()
         self._signer: Signer | None = create_signer(signing)
         self._verifier: Verifier | None = create_verifier(signing, options.logger)
+        # Igual con el validador L3: compilar los esquemas por evento sería tirar el
+        # throughput, y un bundle ausente o un esquema roto deben romper el ARRANQUE, que
+        # es donde se ve un fallo de configuración — 00-protocol.md §5.
+        self._validation = options.validation or ValidationOptions()
+        self._validate: Validator | None = create_validator(self._validation, options.logger)
         self._metrics.connection_state(ConnectionState.CONNECTED)
 
     # ─── publish ──────────────────────────────────────────────────────────────
@@ -320,6 +355,16 @@ class FluxBus:
             tracestate=inherited.tracestate if inherited is not None else None,
         )
 
+        # L3: validar ANTES de publicar. Un payload que viola su contrato debe fallar
+        # aquí, en el servicio que lo generó, y no aparecer como un misterio en un
+        # consumidor de otro equipo la semana que viene — 00-protocol.md §5.
+        if self._validate is not None:
+            try:
+                self._validate(event, subject)
+            except Exception:
+                self._metrics.event_published(subject, "invalid_schema")
+                raise
+
         # Firmar es LO ÚLTIMO antes de serializar: la firma cubre el envelope completo,
         # así que cualquier atributo añadido después la invalidaría — 07-signing.md §5.
         publicado = self._signer.sign(event) if self._signer is not None else event
@@ -340,15 +385,25 @@ class FluxBus:
         explicit = self._opts.schemas.get(subject)
         if explicit:
             return explicit
+
+        # El bundle L3 conoce el MINOR real de cada subject: dentro de un mayor todo es
+        # BACKWARD-compatible, así que el más alto acepta lo que aceptan los anteriores
+        # — 05-compatibility.md §2.
+        bundle: SchemaBundle | None = self._validation.bundle
+        if bundle is not None:
+            del_bundle = schema_uri_for(bundle, subject)
+            if del_bundle:
+                return del_bundle
+
         base = self._opts.schema_base_url
         if not base:
             raise ValueError(
-                f'no hay dataschema para "{subject}". Declara `schemas["{subject}"]` o '
-                f"`schema_base_url` en connect()."
+                f'no hay dataschema para "{subject}". Declara `schemas["{subject}"]`, '
+                f"`schema_base_url`, o pasa un bundle en `validation.bundle` (connect())."
             )
         p = parse_subject(subject)
-        # Sin registro exacto solo se puede asumir el .0.0 del mayor. Un SDK L3 resolverá
-        # el minor real contra el Schema Registry — 00-protocol.md §5.
+        # Sin bundle ni mapa explícito solo se puede asumir el .0.0 del mayor. Es
+        # suficiente para L2 —el atributo es informativo— pero no para L3.
         return f"{base.rstrip('/')}/{p.domain}/{p.aggregate}/{p.event}/{p.major}.0.0.json"
 
     # ─── subscribe ────────────────────────────────────────────────────────────
@@ -412,20 +467,40 @@ class FluxBus:
         psub = await self._js.pull_subscribe_bind(durable=durable, stream=stream)
 
         stopped = asyncio.Event()
-        task = asyncio.create_task(
-            self._pump(psub, stopped, subject, durable, handler, tenant_filter),
-            name=f"flux-pump:{durable}",
-        )
-        self._pumps.add(task)
+        tareas = [
+            asyncio.create_task(
+                self._pump(psub, stopped, subject, durable, handler, tenant_filter),
+                name=f"flux-pump:{durable}",
+            )
+        ]
+
+        # Sondeo de num_pending. Sin él, `flux_consumer_pending` solo se alimenta de los
+        # metadatos de los mensajes entregados — y si el bucle muere dejan de llegar
+        # mensajes, así que el gauge se queda PLANO en vez de crecer. Un panel mostraría
+        # una línea horizontal, indistinguible de "no pasa nada" (08-observability.md §2.3
+        # y §4). No se lanza con el sumidero nulo: sería una petición cada 15 s por
+        # consumidor para tirar el resultado.
+        intervalo = self._pending_poll_seconds()
+        if intervalo is not None:
+            tareas.append(
+                asyncio.create_task(
+                    self._poll_pending(stream, durable, subject, stopped, intervalo),
+                    name=f"flux-pending:{durable}",
+                )
+            )
+
+        self._pumps.update(tareas)
 
         async def stop() -> None:
             stopped.set()
-            task.cancel()
-            self._pumps.discard(task)
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
+            for tarea in tareas:
+                tarea.cancel()
+            for tarea in tareas:
+                self._pumps.discard(tarea)
+                try:
+                    await tarea
+                except asyncio.CancelledError:
+                    pass
             try:
                 await psub.unsubscribe()
             except Exception:  # la conexión puede estar ya cerrada
@@ -507,6 +582,58 @@ class FluxBus:
                     # Sin ack ni term: el mensaje se reentrega, que es correcto.
                     self._log("error", "[flux] fallo despachando %s: %s", subject, e)
 
+    def _pending_poll_seconds(self) -> float | None:
+        """
+        Intervalo del sondeo en segundos, o `None` si no procede.
+
+        No procede con `pending_poll_ms = 0` —desactivado explícitamente— ni con el
+        sumidero nulo: sería una petición cada 15 s por consumidor para tirar el
+        resultado.
+        """
+        ms = self._opts.pending_poll_ms
+        if ms <= 0 or self._metrics is NO_METRICS:
+            return None
+        return ms / 1000
+
+    async def _poll_pending(
+        self,
+        stream: str,
+        durable: str,
+        subject: str,
+        stopped: asyncio.Event,
+        intervalo_s: float,
+    ) -> None:
+        """
+        Sondea `num_pending` cada `pending_poll_ms` — 08-observability.md §2.3.
+
+        Qué mide con precisión: los mensajes del stream **aún no entregados** a este
+        consumidor. Un handler lento NO la hace crecer (sus mensajes ya se entregaron y
+        esperan ack: eso se ve en el histograma de duración); un consumidor muerto sí, y
+        sin techo, mientras la conexión sigue reportándose sana.
+        """
+        while not stopped.is_set():
+            try:
+                # Esperar sobre el Event y no `sleep`: al desuscribir, la parada es
+                # inmediata en vez de tardar hasta 15 s en notarse.
+                await asyncio.wait_for(stopped.wait(), timeout=intervalo_s)
+                return
+            except (asyncio.TimeoutError, TimeoutError):
+                pass
+            except asyncio.CancelledError:
+                raise
+
+            try:
+                info = await self._js.consumer_info(stream, durable)
+                self._metrics.consumer_pending(subject, durable, info.num_pending)
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                # Un fallo del sondeo NO DEBE afectar al consumo: es telemetría. Se
+                # registra y se vuelve a intentar en el siguiente ciclo.
+                self._log(
+                    "warning", "[flux] no se pudo sondear num_pending de %s: %s", durable, e
+                )
+
     async def _dispatch(
         self,
         m: Msg,
@@ -515,8 +642,16 @@ class FluxBus:
         handler: Handler,
         tenant_filter: str | None,
     ) -> None:
-        attempt = self._attempt_of(m)
+        attempt, pending = self._delivery_info(m)
         max_attempts = CONSUMER_DEFAULTS.max_deliver
+
+        # Los metadatos traen `num_pending` gratis en cada entrega: más fresco que el
+        # sondeo y sin coste. Pero NO lo sustituye — si el bucle muere dejan de llegar
+        # mensajes y el gauge se quedaría plano en su último valor en vez de crecer, que
+        # es exactamente lo contrario de la señal que hace falta (08-observability.md
+        # §2.3). Por eso el SDK usa las dos fuentes.
+        if pending is not None:
+            self._metrics.consumer_pending(subject, durable, pending)
 
         # POISON se detecta antes del handler: el mensaje no es interpretable, así que
         # el handler nunca llega a verlo — 04-errors.md §1.3.
@@ -549,6 +684,15 @@ class FluxBus:
             # del productor que dice — 07-signing.md §5.1.
             if self._verifier is not None:
                 self._verifier.check(event)
+            # L3 al consumir: el evento es sintácticamente válido pero incumple su
+            # contrato. Reintentarlo dará exactamente el mismo resultado, así que la
+            # clasificación correcta es PERMANENT — la fija el propio error, que hereda
+            # de PermanentError (validation.py), no la política del clasificador.
+            #
+            # Va DESPUÉS de la firma a propósito: si el evento fue manipulado, su payload
+            # puede validar perfectamente y aun así no ser del productor que dice.
+            if self._validation.on_consume and self._validate is not None:
+                self._validate(event, subject)
             with use_context(context_from_event(event)):
                 result = handler(event, HandlerContext(attempt, max_attempts, subject))
                 if inspect.isawaitable(result):
@@ -623,9 +767,11 @@ class FluxBus:
             # distintos —basura frente a suplantación— y la etiqueta existe para eso
             # (08-observability.md §2.1). El `reason` de la DLQ sigue siendo `poison`,
             # que es el enum de 04-errors.md §1.
-            outcome: ConsumeOutcome = (
-                "invalid_signature" if c.code in _SIGNING_CODES else reason
-            )
+            outcome: ConsumeOutcome = reason
+            if c.code in _SIGNING_CODES:
+                outcome = "invalid_signature"
+            elif c.code in _SCHEMA_CODES:
+                outcome = "invalid_schema"
             self._metrics.event_consumed(subject, durable, outcome)
             self._metrics.event_dlq(subject, durable, reason, c.code)
             self._metrics.handler_duration(subject, durable, time.monotonic() - inicio)
@@ -646,11 +792,20 @@ class FluxBus:
             wip.cancel()
 
     @staticmethod
-    def _attempt_of(m: Msg) -> int:
+    def _delivery_info(m: Msg) -> tuple[int, int | None]:
+        """
+        `(intento, num_pending)` de esta entrega.
+
+        Los dos salen del mismo objeto de metadatos y se leen a la vez porque `m.metadata`
+        reparsea el subject de reply en cada acceso. `num_pending` puede no venir (un
+        mensaje que no sea de JetStream no tiene metadatos), y entonces manda el sondeo.
+        """
         try:
-            return m.metadata.num_delivered or 1
+            meta = m.metadata
         except Exception:
-            return 1
+            return 1, None
+        pending = meta.num_pending
+        return (meta.num_delivered or 1), (pending if isinstance(pending, int) else None)
 
     async def _keep_alive(self, m: Msg) -> None:
         """Emite WIP cada ack_wait/2 mientras el handler siga vivo — 03-delivery.md §2.1."""
@@ -826,7 +981,9 @@ async def connect(
     schema_base_url: str | None = None,
     classifier: ClassifierOptions | None = None,
     signing: SigningOptions | None = None,
+    validation: ValidationOptions | None = None,
     metrics: MetricsSink | None = None,
+    pending_poll_ms: float = DEFAULT_PENDING_POLL_MS,
     credentials: Credentials | None = None,
     on_poison: Callable[[PoisonInfo], None] | None = None,
     on_dlq: Callable[[DlqInfo], None] | None = None,
@@ -854,7 +1011,9 @@ async def connect(
         schema_base_url=schema_base_url,
         classifier=classifier,
         signing=signing,
+        validation=validation,
         metrics=metrics if metrics is not None else NO_METRICS,
+        pending_poll_ms=pending_poll_ms,
         credentials=credentials,
         on_poison=on_poison,
         on_dlq=on_dlq,

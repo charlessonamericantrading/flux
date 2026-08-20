@@ -1,7 +1,8 @@
 # flux SDK para Go
 
 Cliente del **flux Event Protocol v1** — CloudEvents 1.0 sobre NATS JetStream.
-Nivel de conformidad objetivo: **L2**.
+Nivel de conformidad: **L3** — la validación de esquema es **opt-in**; sin activarla el
+comportamiento es exactamente el de L2.
 
 El contrato normativo vive en [`specification/`](../specification/); si algo de este
 README diverge de la spec, manda la spec.
@@ -18,7 +19,9 @@ import flux "github.com/charlessonamericantrading/flux/sdk-go"
 ```
 
 Requiere Go 1.22+, `github.com/nats-io/nats.go` v1.37+ (paquete `jetstream`, no la
-API legacy `nc.JetStream()`) y `github.com/google/uuid` v1.6+.
+API legacy `nc.JetStream()`), `github.com/google/uuid` v1.6+ y
+`github.com/santhosh-tekuri/jsonschema/v6` — ver
+[El coste de la dependencia](#el-coste-de-la-dependencia).
 
 ---
 
@@ -238,6 +241,92 @@ orden de claves es parte del contrato. Moverlos bajo `DLQTime` haría que el mis
 firmado produjera bytes distintos en Go y en Node, y una firma de un SDK dejaría de
 verificar en el otro. Hay un test que lo vigila.
 
+## Validación de esquema — L3
+
+Sin esto, un productor puede publicar un payload que viola su propio `dataschema` y nadie
+se entera hasta que un consumidor —posiblemente de otro equipo, otro lenguaje y otra
+semana— se atraganta. El error aparece lejísimos de su causa. Validar en `Publish` lo
+convierte en un fallo del servicio que lo provocó
+([00-protocol.md §5](../specification/00-protocol.md)).
+
+```go
+//go:embed schemas/bundle.json
+var bundleJSON []byte
+
+bundle, err := flux.ParseSchemaBundle(bundleJSON)
+if err != nil { return err }
+
+bus, err := flux.Connect(ctx, flux.ConnectOptions{
+    /* ... */
+    Validation: flux.ValidationOptions{
+        Mode:      flux.ValidationStrict, // ValidationOff (default) | Warn | Strict
+        Bundle:    bundle,
+        OnConsume: true,                  // validar también al consumir
+    },
+})
+```
+
+| Modo | `Publish` con payload inválido | Coste |
+|---|---|---|
+| `ValidationOff` (cero del struct) | Publica. Es L2. | Cero: no se compila ningún esquema |
+| `ValidationWarn` | Registra en el `Logger` y publica | Una validación por evento |
+| `ValidationStrict` | **Devuelve `*SchemaValidationError`** | Una validación por evento |
+
+- **Reporta TODOS los errores, no solo el primero.** De uno en uno, arreglar un payload
+  con tres campos mal cuesta tres despliegues:
+
+  ```
+  el payload de "pedidos.pedido.v1.creado" no cumple su esquema (…/creado/1.0.0.json):
+    · at '': additional properties 'cantidad' not allowed
+    · at '': missing property 'clienteId'
+    · at '/moneda': 'euros' does not match pattern '^[A-Z]{3}$'
+    · at '/totalCents': got string, want integer
+  ```
+
+- Con `OnConsume: true` el evento que incumple su contrato va a la DLQ como **PERMANENT**:
+  es sintácticamente correcto, así que reintentarlo daría exactamente el mismo resultado
+  ([04-errors.md §1.2](../specification/04-errors.md)). La clase la declaran
+  `*SchemaValidationError` y `*SchemaNotFoundError` con `FluxClass()`, así que no depende
+  de `UnknownErrorPolicy`. La métrica lo etiqueta `outcome="invalid_schema"`.
+- El bundle **resuelve además el `dataschema` exacto** de cada subject (gana sobre
+  `SchemaBaseURL`, pierde ante `Schemas`). Sin él, el SDK solo puede asumir el
+  `<major>.0.0`; con él usa el MINOR real, que es contra el que se valida.
+- Un bundle ausente, un modo mal escrito o un esquema roto hacen fallar `Connect`. Un
+  fallo de configuración debe romper el arranque, no la primera publicación — y un typo en
+  el modo no puede significar "no valides nada en silencio".
+
+> **El bundle se pasa como dato, no como URL.** Validar está en la ruta caliente: una
+> petición de red por evento es inaceptable, y una caché con TTL abre una ventana en la que
+> dos servicios validan contra versiones distintas del mismo esquema. `schemas/bundle.json`
+> se genera con `node scripts/bundle-schemas.mjs` y **se despliega con el servicio** —con
+> `go:embed`, dentro del propio binario—, así que la versión del esquema queda clavada a la
+> del servicio, justo lo que `producerversion` promete poder acotar. Un `$ref` que no esté
+> en el bundle **no se busca por red**: falla al arrancar diciendo qué regenerar.
+
+### El coste de la dependencia
+
+`github.com/santhosh-tekuri/jsonschema/v6` va en `go.mod`, sin más. En Go **no existe el
+extra opcional** de pip ni el `optionalDependencies` de npm, así que —a diferencia de Node
+(`ajv`) y Python (`jsonschema`, extra `[validation]`)— este coste lo pagan también los
+servicios que se queden en L2:
+
+| Qué | Cuánto |
+|---|---|
+| Tamaño del binario | ~1 MB más (la biblioteca lleva los metaesquemas embebidos) |
+| Dependencias nuevas que auditar | 1 directa. `golang.org/x/text` ya entraba por `nats.go` |
+| Coste en ejecución con `Mode: off` | Ninguno: no se compila ni un esquema |
+
+La alternativa —sacar la validación a un módulo aparte (`sdk-go/validation`)— haría
+opcional el binario a cambio de partir el SDK en dos y de que `ConnectOptions` no pudiera
+mencionar el tipo. No compensa para 1 MB.
+
+> ⚠️ Los esquemas declaran `$schema: draft/2020-12`. Un validador configurado para draft-07
+> **no** falla con un error de versión: falla con `no schema with key or ref
+> ".../2020-12/schema"`, que no dice nada. El compilador lee el `$schema` de cada esquema y
+> tiene `Draft2020` como default; hay un test que comprueba que el bundle lo declara.
+
+---
+
 ## Métricas
 
 Siete métricas con nombres y etiquetas fijados por el protocolo
@@ -279,18 +368,42 @@ http.HandleFunc("/metrics", func(w http.ResponseWriter, _ *http.Request) {
   a `DisconnectErrHandler` / `ReconnectHandler` / `ClosedHandler`: sin eso valdría `1` hasta
   el `Close()` y no diría nada.
 
-⚠️ `flux_consumer_pending` no lo alimenta el SDK todavía: sale de `ConsumerInfo.NumPending`
-y hace falta un sondeo periódico contra el broker que este SDK aún no hace. El método está
-en la interfaz para que quien lo sondee use el nombre correcto — es la métrica de la cuarta
-alerta mínima, y la que delata a un consumidor cuyo bucle murió mientras la conexión sigue
-reportándose sana.
+- `flux_consumer_pending` se alimenta de **dos fuentes**, y el SDK usa las dos
+  ([§2.3](../specification/08-observability.md)):
+
+  | Fuente | Coste | Falla cuando… |
+  |---|---|---|
+  | `msg.Metadata().NumPending` de cada entrega | Gratis, fresco en cada evento | **No llegan mensajes** — y ese es el caso que importa |
+  | Sondeo de `consumer.Info(ctx).NumPending` | Una petición cada `PendingPollInterval` (15 s por defecto) | Nunca, mientras haya conexión |
+
+  El razonamiento decide la regla: **si el bucle del consumidor muere, dejan de entregarse
+  mensajes**, así que una métrica alimentada solo desde los metadatos se queda **plana en
+  su último valor** en vez de crecer. Un panel mostraría una línea horizontal,
+  indistinguible de "no pasa nada". El sondeo sigue corriendo y reporta el `NumPending`
+  creciente: **esa** es la señal, y es la métrica de la cuarta alerta mínima — la que
+  delata a un consumidor cuyo bucle murió mientras la conexión sigue reportándose sana.
+
+  Un fallo del sondeo **no afecta al consumo**: se registra y se reintenta en el ciclo
+  siguiente. Es telemetría. Y no se sondea con `NoMetrics{}`: sería una petición cada 15 s
+  por consumidor para tirar el resultado.
+
+  ⚠️ **`PendingPollInterval: 0` NO desactiva el sondeo: significa "el default"**. Para
+  apagarlo hay que escribir `flux.PendingPollDisabled` (un valor negativo). Es una
+  divergencia deliberada con Node y Python, donde `0` apaga: en Go el cero de un campo es
+  "no lo he puesto", así que un cero que desactivara dejaría la métrica muda en todo
+  servicio que no conozca el campo — justo los que nadie vigila. Es la misma ambigüedad
+  que documenta [la fricción A](#a-omitempty-colapsa-cero-y-ausente).
+
+  Qué mide, con precisión: los mensajes del stream **aún no entregados** a ese consumidor.
+  Un handler lento **no** la hace crecer (sus mensajes ya se entregaron y esperan ack: eso
+  se ve en `flux_event_handler_duration_seconds`); un consumidor muerto sí, y sin techo.
 
 ---
 
 ## Diferencias con el SDK de referencia (Node)
 
 El envelope, el naming, la taxonomía de errores y la config de consumidor son
-**idénticos byte a byte**. Estas cinco divergencias son de lenguaje, no de contrato.
+**idénticos byte a byte**. Estas divergencias son de lenguaje, no de contrato.
 
 ### 1. Contexto explícito en vez de `AsyncLocalStorage`
 
@@ -362,6 +475,10 @@ de `ConnectOptions` (nil = silencio, como el resto del SDK). `NewVerifier` lo re
 segundo parámetro para que un verificador construido a mano en un test sea observable sin
 tocar variables globales.
 
+Lo mismo vale para el modo `warn` de la **validación L3**: sin `Logger` no verás nada.
+Es coherente con el resto del SDK, pero conviene saberlo — `Mode: ValidationWarn` sin
+logger equivale a no validar, solo que pagando el coste.
+
 ### 7. Valores de etiqueta escapados, no sustituidos
 
 Node sustituye `"`, `\` y los saltos de línea de un valor de etiqueta por `_`. Aquí se
@@ -369,6 +486,25 @@ Node sustituye `"`, `\` y los saltos de línea de un valor de etiqueta por `_`. 
 mismo —un `code` con comillas no puede partir la línea y tumbar el scrape entero— pero
 escapar conserva el valor, que es lo que un operador quiere leer cuando el `code` viene de
 un error mal formado.
+
+### 8. Los errores de validación declaran su propia clase
+
+En Node, `SchemaValidationError` es un `Error` a secas: al consumir, su clasificación acaba
+dependiendo de `unknownErrorPolicy`, que por defecto es "retryable acotado". Aquí los dos
+errores de `validation.go` implementan `FluxClass() ErrorClass` y el clasificador los
+reconoce con `errors.As`, así que van a la DLQ como **PERMANENT** sin gastar reintentos.
+
+Un evento que incumple su contrato es sintácticamente correcto y reintentarlo dará
+exactamente el mismo resultado ([00-protocol.md §5](../specification/00-protocol.md)):
+gastar seis entregas y 51 minutos de cola para llegar a la misma conclusión no ayuda a
+nadie. El SDK de Python hace lo mismo heredando de `PermanentError`.
+
+### 9. El sondeo de `num_pending` se desactiva con un negativo, no con un cero
+
+Ver [Métricas](#métricas). En Node y Python `0` apaga el sondeo; aquí `0` es "no
+configurado" y significa el default. Lo impone el lenguaje: el cero de un campo de struct
+no se distingue de "no lo he puesto", y un cero que apagara dejaría la métrica muda
+precisamente en los servicios cuyo autor no sabe que el campo existe.
 
 ---
 
@@ -465,6 +601,7 @@ servidor**, no solo sobre la solicitada.
 | `classify.go` | `NewClassifier`, `HTTPStatusError`, políticas configurables |
 | `context.go` | Propagación explícita vía `context.Context` |
 | `signing.go` | `NewSigner`, `NewVerifier`, `GenerateKeyPair`, `SigningOptions` (extensión opcional) |
+| `validation.go` | `ValidationOptions`, `SchemaBundle`, `ParseSchemaBundle`, `LoadSchemaBundle`, `SchemaURIFor`, `SchemaValidationError`, `SchemaNotFoundError` (L3, opt-in) |
 | `metrics.go` | `MetricsSink`, `NoMetrics`, `InMemoryMetrics`, `DurationBuckets` |
 | `tenant.go` | `TenantIsolation`, `TenantIsolationError`, resolución del filtro de tenant |
 | `client.go` | `Connect`, `Bus.Publish`, `Bus.Subscribe`, `Bus.Close` |
@@ -477,12 +614,18 @@ go test -race ./...
 gofmt -l .          # sin salida
 ```
 
-Los tests no requieren un broker: cubren naming, envelope, clasificación, firma, métricas
-y aislamiento de tenant, que es donde vive la semántica del protocolo. Los de métricas
-leen `../protocol.json` para que una divergencia entre el SDK y el contrato —un nombre de
-métrica renombrado, un bucket movido— falle en CI en vez de dejar un panel vacío.
+Los tests no requieren un broker: cubren naming, envelope, clasificación, firma, métricas,
+validación L3 y aislamiento de tenant, que es donde vive la semántica del protocolo. Los de
+métricas leen `../protocol.json` —incluido el intervalo por defecto del sondeo de
+`num_pending`— y los de validación leen `../schemas/bundle.json`, para que una divergencia
+entre el SDK y el contrato falle en CI en vez de dejar un panel vacío o un esquema sin
+comprobar.
 
 `-race` no es decorativo: `InMemoryMetrics` se renderiza desde el handler HTTP mientras el
-bucle de consumo sigue registrando, y hay un test que ejerce exactamente eso.
+bucle de consumo sigue registrando, y hay un test que ejerce exactamente eso. El sondeo de
+`num_pending` corre en su propia goroutine y se prueba igual: `pollPending` recibe sus
+dependencias como funciones, así que se le puede hacer fallar sin broker y comprobar que
+**el bucle sigue vivo** — un error que lo matara apagaría la métrica para siempre tras un
+hipo del broker, y nadie se enteraría.
 
 La conformidad contra un NATS real se verifica con [`conformance/`](../conformance/).
