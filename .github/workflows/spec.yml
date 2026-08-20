@@ -6,6 +6,20 @@ on:
   pull_request:
 
 jobs:
+  workflow-valido:
+    name: El propio workflow es válido
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install pyyaml
+      # Una clave duplicada rompe el workflow ENTERO y GitHub no ejecuta ni un job, así
+      # que este trabajo solo sirve en el PR: para cuando llega a main, el daño ya está
+      # hecho. Su valor real es local, antes de commitear.
+      - run: python scripts/check-workflow.py
+
   llms-up-to-date:
     name: llms-full.txt al día
     runs-on: ubuntu-latest
@@ -198,29 +212,6 @@ jobs:
           done
           echo "NATS no arrancó"; docker logs flux-nats-rust; exit 1
       - run: cargo test
-
-  sdk-php:
-    name: SDK PHP — tests
-    runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: sdk-php
-    steps:
-      - uses: actions/checkout@v4
-      - uses: shivammathur/setup-php@v2
-        with:
-          php-version: '8.2'
-          # `sockets` no es opcional: sin ella se salta el test que traduce
-          # SOCKET_ECONNRESET por NOMBRE de constante, y ese es justo el que evita que
-          # el mismo corte de red se clasifique distinto en Windows (10054) y Linux (104).
-          extensions: json, sockets
-          coverage: none
-      - run: composer validate --no-check-lock
-      - run: composer install --no-interaction --prefer-dist
-      # `php -l` sobre todo el árbol antes de phpunit: un error de sintaxis debe
-      # reportarse como tal y no como 201 tests que no arrancan.
-      - run: find src tests -name '*.php' -print0 | xargs -0 -n1 php -l
-      - run: vendor/bin/phpunit
 
   conformance:
     name: Conformidad contra NATS real
