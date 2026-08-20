@@ -1,0 +1,15 @@
+# Normalización de finales de línea.
+# Sin esto, scripts/build-llms.mjs genera CRLF en Windows y LF en el CI de Linux,
+# y `--check` fallaría en uno de los dos sin que nada esté realmente mal.
+* text=auto eol=lf
+
+*.png binary
+*.jpg binary
+*.pdf binary
+
+# Generado por scripts/build-llms.mjs — GitHub lo colapsa en los diffs y lo excluye
+# de las estadísticas de lenguaje del repo.
+llms-full.txt linguist-generated=true
+
+# La spec es el producto de este repo, no "documentación" secundaria.
+specification/*.md linguist-documentation=false

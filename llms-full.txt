@@ -1,0 +1,1325 @@
+# flux — Event Protocol v1 (documento completo)
+
+> Contrato de eventos polyglot. Envelope CloudEvents 1.0 sobre NATS JetStream,
+> entrega at-least-once con idempotencia obligatoria en el consumidor.
+>
+> Este fichero es la spec ENTERA en un solo documento, pensado para que un agente de
+> IA la cargue de una sola descarga. GENERADO — no lo edites a mano; edita
+> AGENTS.md o specification/*.md y ejecuta `node scripts/build-llms.mjs`.
+>
+> Fuente:      https://github.com/charlessonamericantrading/flux
+> Constantes:  https://raw.githubusercontent.com/charlessonamericantrading/flux/main/protocol.json
+> Este fichero: https://raw.githubusercontent.com/charlessonamericantrading/flux/main/llms-full.txt
+
+---
+
+
+==============================================================================
+== AGENTS.md
+==============================================================================
+
+# AGENTS.md — flux Event Protocol v1
+
+> Instrucciones canónicas para agentes de IA (Claude Code, Codex, Cursor, Grok,
+> Replit, Copilot, Aider, Zed, Windsurf, Jules…) que escriban código que **publique o
+> consuma eventos** de este ecosistema.
+>
+> Este fichero es la fuente de verdad para agentes. `CLAUDE.md`,
+> `.cursor/rules/flux.mdc` y `.github/copilot-instructions.md` son punteros a esto.
+
+---
+
+## 0. Carga el contrato antes de escribir código
+
+Si vas a tocar código que publica o consume eventos, **primero descarga la spec
+completa** (un solo fichero, ~40 KB, sin auth):
+
+```
+https://raw.githubusercontent.com/charlessonamericantrading/flux/main/llms-full.txt
+```
+
+Constantes verificables en JSON (regex de naming, defaults de consumidor, extensiones
+obligatorias) — úsalo para **validar**, no para recordar:
+
+```
+https://raw.githubusercontent.com/charlessonamericantrading/flux/main/protocol.json
+```
+
+Índice curado por si prefieres cargar solo una parte:
+[`llms.txt`](llms.txt) · Documentos individuales: [`specification/`](specification/)
+
+---
+
+## 1. Reglas duras (violarlas rompe el ecosistema)
+
+1. **Nunca inventes un subject.** Formato exacto, 4 tokens:
+   `<dominio>.<agregado>.v<major>.<evento>` — minúsculas, `kebab-case`,
+   dominio plural, agregado singular, evento en **pasado**.
+   ✅ `pedidos.pedido.v1.creado` ❌ `pedidos.crear-pedido` ❌ `Pedidos.Pedido.V1.Creado`
+
+2. **Nunca escribas el envelope a mano.** El SDK rellena `id`, `source`, `time`,
+   `specversion`, `type`, `dataschema`, `correlationid`, `causationid`,
+   `producerversion`, `traceparent`. Si tu código asigna alguno de estos
+   manualmente, está mal.
+   El desarrollador solo escribe: **subject, `data`, y opcionalmente `aggregateId`**.
+
+3. **Todo consumidor DEBE ser idempotente.** La garantía es *at-least-once*: los
+   duplicados llegan, no son un fallo. Un handler sin deduplicación está roto aunque
+   los tests pasen. Ver §4.
+
+4. **Nunca asumas orden.** flux no garantiza orden ni global ni por agregado. Usa
+   `aggregateVersion` y un `WHERE aggregate_version < $n`. Ver §5.
+
+5. **Nunca metas PII en `data`.** Publica referencias (`clienteId`), no valores
+   (`email`, `nombre`, `dni`). Un stream de JetStream es una base de datos persistente
+   sujeta a RGPD, y un log append-only no puede satisfacer el derecho de supresión.
+
+6. **Nunca modifiques un JSON Schema ya publicado.** Son inmutables. Se añade una
+   versión nueva. Ver §6.
+
+7. **Importes monetarios: enteros en la unidad mínima** (`totalCents: 9990`) más
+   moneda ISO 4217. Nunca `float`.
+
+---
+
+## 2. Publicar un evento
+
+```ts
+await bus.publish("pedidos.pedido.v1.creado", {
+  pedidoId: "ped-123",
+  clienteId: "cli-987",
+  aggregateVersion: 1,
+  totalCents: 9990,
+  moneda: "EUR",
+  lineas: [{ sku: "ABC-1", cantidad: 2, precioUnitarioCents: 4995 }],
+}, { aggregateId: "ped-123" });
+```
+
+Reglas:
+- Solo el **servicio dueño del agregado** publica en su dominio. El broker lo aplica
+  por ACL: publicar en un dominio ajeno es rechazado en el servidor, no en tu código.
+- Payload > **1 MiB** → claim-check: publica `{ uri, sha256, bytes }`, no el contenido.
+- `data` **DEBE** ser un objeto JSON en la raíz. Ni array ni escalar.
+- Claves en `camelCase`. Sin `null` para "ausente" — se omite el campo.
+
+## 3. Consumir un evento
+
+```ts
+await bus.subscribe("pedidos.pedido.v1.creado", async (evento, ctx) => {
+  if (await yaProcesado(evento.id)) return ctx.ack();   // OBLIGATORIO
+  await hacerElTrabajo(evento.data);
+  await marcarProcesado(evento.id);
+  return ctx.ack();
+});
+```
+
+- Ack **explícito** siempre. Nunca auto-ack.
+- Un handler que tarde > 30 s (`ack_wait`) provoca **reentrega concurrente del mismo
+  evento**. Si el trabajo es largo, el SDK debe emitir work-in-progress; si tu handler
+  bloquea 30 s sin ceder control, es un bug de la aplicación.
+
+## 4. Idempotencia — elige UNA de las tres
+
+| Estrategia | Cuándo | Cómo |
+|---|---|---|
+| **A. Tabla de procesados** | El efecto vive en tu BD transaccional | `INSERT` del `event_id` con PK única **en la misma transacción** que el efecto |
+| **B. Operación naturalmente idempotente** | Siempre que sea posible — la mejor | `SET estado='confirmado'` ✅ · `SET intentos = intentos + 1` ❌ |
+| **C. Clave de idempotencia externa** | El efecto es una API de terceros | `Idempotency-Key: <evento.id>` — **derivada del id del evento**, nunca generada en el handler |
+
+Nunca dependas de `duplicate_window` de JetStream para esto: esa ventana deduplica
+**publicaciones**, no reentregas de consumo. Es el malentendido más frecuente.
+
+## 5. Orden — no lo pidas, diséñalo fuera
+
+```json
+"data": { "pedidoId": "ped-123", "aggregateVersion": 7, "estado": "confirmado" }
+```
+```sql
+UPDATE pedidos SET estado = $2, aggregate_version = $3
+ WHERE id = $1 AND aggregate_version < $3;
+```
+
+Convierte el orden de un problema de infraestructura a una condición del `WHERE`.
+Incluye `aggregateVersion` en todo evento de cambio de estado.
+
+## 6. Versionado
+
+| Cambio | Resultado |
+|---|---|
+| Añadir campo **opcional**, relajar restricción, deprecar | MINOR en `dataschema`. Mismo subject. |
+| Eliminar/renombrar campo, cambiar tipo, opcional→requerido, endurecer restricción, **cambiar unidades o semántica** | **MAYOR** → subject nuevo `…v2.…` + doble publicación ≥ 90 días |
+
+⚠️ Cambiar semántica sin cambiar forma (euros → céntimos) **pasa toda validación
+automática**. Si detectas uno, márcalo como breaking aunque el esquema valide.
+
+Enums: solo se pueden añadir valores si están marcados `"x-extensible-enum": true`, y
+el consumidor **DEBE** tener rama por defecto no destructiva (log + ack, nunca throw).
+
+## 7. Errores — clasifica, no reintentes a ciegas
+
+| Clase | Qué es | Acción |
+|---|---|---|
+| `RETRYABLE` | Timeout, ECONNRESET, HTTP 429/502/503/504, deadlock | `nak` + backoff |
+| `PERMANENT` | Falla el schema, regla de negocio lo rechaza, HTTP 400/403/404/422 | `term()` + DLQ **inmediato** |
+| `POISON` | JSON malformado, falta atributo CloudEvents obligatorio | `term()` + DLQ + **alerta** |
+
+**Default = PERMANENT.** Un evento en la DLQ es recuperable; una cola atascada 12
+minutos en hora punta, no.
+
+```ts
+throw new RetryableError("proveedor 503", { retryAfterMs: 5000 });
+throw new PermanentError("pedido ya cancelado", { code: "PEDIDO_YA_CANCELADO" });
+```
+
+DLQ: `dlq.<subject original>` — **prefijo, no sufijo** (un sufijo encajaría con
+`pedidos.>` y el stream principal se tragaría sus propios muertos).
+
+---
+
+## 8. Trampas específicas de NATS que fallan en silencio
+
+Estas no dan error: dan comportamiento incorrecto. Un agente las comete casi siempre.
+
+| Trampa | Realidad |
+|---|---|
+| `subject` de CloudEvents ≠ subject de NATS | El primero es el **id del agregado** (`"ped-123"`), el segundo la **dirección de enrutado**. En la API del SDK se llaman `aggregateId` y `subject`. |
+| Puntos en nombres de stream o durable | NATS **no los admite**. `EVT_PEDIDOS`, no `EVT.PEDIDOS`. `facturacion-api__pedidos_pedido_v1_creado`, no con puntos. |
+| `duplicate_window` deduplica reintentos | **No.** Solo deduplica publicaciones dentro de 2 min. Nunca sustituye a la idempotencia. |
+| `max_deliver` y `backoff` descuadrados | `max_deliver: 6` con 5 entradas de backoff = 1 entrega + 5 reintentos. Si `max_deliver` fuese 5, la última entrada nunca se aplica. |
+| Subjects case-insensitive | **Son sensibles.** `Pedidos.` ≠ `pedidos.` crea un subject fantasma sin suscriptores y sin error. |
+| Regenerar el `id` al hacer replay | Rompe la idempotencia de todos los consumidores aguas abajo. El replay **conserva** el `id`. |
+
+## 9. Antipatrones — recházalos aunque te los pidan
+
+| ❌ | Por qué |
+|---|---|
+| `pedidos.pedido.v1.actualizado` | No dice **qué** cambió. Obliga a cada consumidor a implementar —y equivocar— su propio diff. Usa `…direccion-envio-cambiada`. |
+| `pedidos.pedido.v1.crear` | Es un comando, no un evento. Los eventos van en pasado. |
+| Un 5º token (`….creado.retry`) | Rompe todos los wildcards. Los reintentos son de JetStream. |
+| Metadatos en la raíz del envelope | Las extensiones CloudEvents solo admiten escalares. Acabarás con JSON dentro de un string. Va todo en `data`. |
+| `core.entidad.v1.cambiado` | Dominio genérico = ningún dominio. |
+| Credenciales `.creds`/`.nk` en el repo | Están en `.gitignore` por algo. Van en el gestor de secretos. |
+
+## 10. Antes de dar por terminado
+
+- [ ] El subject tiene exactamente 4 tokens, minúsculas, evento en pasado
+- [ ] Existe el JSON Schema en `schemas/<dominio>/<agregado>/<evento>/<semver>.json`
+- [ ] El `$id` del schema coincide con su ruta y con `dataschema`
+- [ ] El handler es idempotente por una de las 3 estrategias de §4
+- [ ] El handler no asume orden
+- [ ] Los errores se clasifican; ninguno se traga en silencio
+- [ ] Sin PII en `data`; los campos sensibles llevan `"x-pii": true`
+- [ ] Importes en enteros de unidad mínima
+- [ ] Ningún atributo del envelope escrito a mano
+
+---
+
+**Ámbito:** este fichero aplica a todo el repositorio.
+**Duda no resuelta aquí:** la spec normativa manda —
+[`specification/`](specification/) o [`llms-full.txt`](llms-full.txt).
+
+
+==============================================================================
+== specification/00-protocol.md
+==============================================================================
+
+# flux — Event Protocol v1
+
+> **Estado:** Draft normativo
+> **Versión:** 1.0.0
+> **Última revisión:** 2026-08-20
+
+---
+
+## 1. Propósito
+
+Este documento define el contrato que **todo** productor y consumidor de eventos del
+ecosistema debe cumplir, con independencia del lenguaje en que esté escrito.
+
+El objetivo explícito es que **añadir un lenguaje nuevo al ecosistema sea un trabajo
+de días, no de meses**. Eso solo es posible si la totalidad de la semántica vive en
+el protocolo y ninguna vive en los SDKs.
+
+## 2. Lenguaje normativo
+
+Las palabras **DEBE**, **NO DEBE**, **DEBERÍA**, **NO DEBERÍA** y **PUEDE** se
+interpretan según [RFC 2119](https://www.rfc-editor.org/rfc/rfc2119).
+
+## 3. Modelo de capas
+
+Cada capa depende únicamente de la inmediatamente inferior. Una capa **NO DEBE**
+filtrar detalles hacia arriba.
+
+| # | Capa | Responsabilidad | ¿Reemplazable? |
+|---|---|---|---|
+| 4 | **Aplicación** | Lógica de negocio, handlers | — |
+| 3 | **SDK** | Serialización, acks, retries, contexto, DLQ | Sí, por lenguaje |
+| 2 | **Protocolo** | Envelope, naming, semántica de entrega, errores | No sin RFC |
+| 1 | **Binding** | Mapeo protocolo ↔ broker concreto | Sí, por broker |
+| 0 | **Broker** | Transporte y persistencia (NATS JetStream) | Sí |
+
+La consecuencia práctica: sustituir NATS por Kafka es un cambio en las capas 0–1.
+Las capas 2–4 no se enteran. **Ese desacoplamiento es la razón de ser de flux**; si
+un SDK expone un tipo de NATS en su API pública, es un bug del SDK.
+
+## 4. Qué es y qué no es un evento en flux
+
+Un evento es **un hecho consumado del pasado, inmutable, emitido por el dueño del
+dato.**
+
+**DEBE** cumplir:
+- Nombrarse en pasado (`creado`, `cancelado`, `enviado`), nunca en imperativo.
+- Ser publicado únicamente por el servicio propietario del agregado.
+- Contener suficiente información para que un consumidor razonable actúe sin tener
+  que llamar de vuelta al productor.
+- Ser válido para siempre: reprocesar un evento de hace un año **DEBE** seguir
+  siendo posible.
+
+**NO DEBE** usarse como:
+- **Comando disfrazado.** `pedidos.pedido.v1.crear` no es un evento. Si necesitas
+  request/reply, usa NATS Core request/reply — está fuera del alcance de v1.
+- **Transporte de blobs.** Si el payload supera **1 MiB**, publica una referencia
+  (URI + checksum), no el contenido. Ver [01-envelope.md §6](01-envelope.md).
+- **Sustituto de una tabla.** Un evento no es una fila. Un evento es un cambio.
+
+## 5. Niveles de conformidad
+
+Un SDK declara su nivel. Los consumidores del SDK saben así qué esperar.
+
+### L1 — Publisher/Subscriber
+- **DEBE** producir CloudEvents 1.0 válidos según [01-envelope.md](01-envelope.md).
+- **DEBE** rellenar automáticamente `id`, `source`, `time`, `specversion`, `type`.
+- **DEBE** usar ack explícito (nunca auto-ack).
+- **DEBE** establecer la cabecera `Nats-Msg-Id` = `id` del CloudEvent.
+
+### L2 — Resiliente
+L1, más:
+- **DEBE** implementar la taxonomía de errores de [04-errors.md](04-errors.md).
+- **DEBE** aplicar el backoff canónico y enrutar a DLQ al agotarlo.
+- **DEBE** propagar `correlationid` y `traceparent` desde el evento entrante al
+  saliente sin intervención del desarrollador.
+- **DEBE** reconectar con backoff exponencial y jitter.
+
+### L3 — Gobernado
+L2, más:
+- **DEBE** resolver y validar `dataschema` contra el Schema Registry antes de
+  publicar, y fallar el `publish()` si el payload no valida.
+- **DEBE** exponer las reglas de compatibilidad de
+  [05-compatibility.md](05-compatibility.md) como error en tiempo de publicación.
+
+Los SDKs de fase 1 apuntan a **L2**.
+
+## 6. Fuera del alcance de v1
+
+Declarado explícitamente para evitar scope creep:
+
+- Request/reply y RPC.
+- Sagas y orquestación de procesos de larga duración.
+- Protobuf y Avro (opt-in por subject en v2).
+- Cifrado a nivel de campo.
+- Firma criptográfica de eventos (ver [06-security.md §7](06-security.md)).
+- Federación multi-cluster.
+
+## 7. Índice normativo
+
+| Documento | Contenido |
+|---|---|
+| [01-envelope.md](01-envelope.md) | Atributos CloudEvents, extensiones, payload |
+| [02-naming.md](02-naming.md) | Subjects, types, streams, durable consumers |
+| [03-delivery.md](03-delivery.md) | JetStream, acks, retries, idempotencia, orden |
+| [04-errors.md](04-errors.md) | Taxonomía de errores, DLQ, replay |
+| [05-compatibility.md](05-compatibility.md) | Evolución de esquemas, deprecación |
+| [06-security.md](06-security.md) | Accounts, ACLs, clasificación de datos |
+
+
+==============================================================================
+== specification/01-envelope.md
+==============================================================================
+
+# 01 — Envelope
+
+**Base normativa:** [CloudEvents 1.0](https://github.com/cloudevents/spec/blob/v1.0.2/cloudevents/spec.md).
+Todo lo que CloudEvents 1.0 declara obligatorio lo es aquí. Este documento define el
+**perfil flux**: qué extensiones añadimos, cuáles prohibimos y cómo se estructura
+`data`.
+
+---
+
+## 1. Modo de codificación
+
+flux v1 usa **structured mode**: el CloudEvent completo viaja serializado como JSON
+en el cuerpo del mensaje NATS.
+
+```
+datacontenttype del mensaje NATS: application/cloudevents+json; charset=utf-8
+```
+
+**Por qué structured y no binary:** en binary mode los atributos viajan en cabeceras
+`ce-*` y el payload en el cuerpo. Es más eficiente, pero fragmenta el evento entre
+dos lugares — un `nats stream get` devuelve el cuerpo sin las cabeceras, y depurar
+se vuelve doloroso. En structured mode, **un mensaje es un fichero JSON completo**:
+lo copias, lo pegas en un test, lo reproduces. Esa propiedad vale más que los bytes
+que ahorras.
+
+> Binary mode **PUEDE** habilitarse por subject en v2, cuando el throughput lo
+> justifique con datos medidos.
+
+## 2. Atributos de contexto — núcleo CloudEvents
+
+| Atributo | Tipo | Obl. | Regla flux |
+|---|---|:--:|---|
+| `specversion` | String | ✅ | **DEBE** ser exactamente `"1.0"`. |
+| `id` | String | ✅ | **DEBE** ser un [UUIDv7](https://www.rfc-editor.org/rfc/rfc9562) en formato canónico. Lo genera el SDK. |
+| `source` | URI-ref | ✅ | **DEBE** ser `/<entorno>/<servicio>`. Ej.: `/produccion/pedidos-api`. |
+| `type` | String | ✅ | Reverse-DNS. Ver [02-naming.md §2](02-naming.md). |
+| `time` | Timestamp | ✅ | RFC 3339 en **UTC**, precisión de milisegundos. **DEBE** ser el instante en que ocurrió el hecho, no el de publicación. |
+| `datacontenttype` | String | ✅ | `application/json` en v1. |
+| `dataschema` | URI | ✅ | URI absoluta al JSON Schema, con SemVer. Ver [05-compatibility.md](05-compatibility.md). |
+| `subject` | String | ⚠️ | **DEBE** ser el identificador del agregado (ej. `"ped-123"`). Ver el aviso de §2.1. |
+
+### 2.1 ⚠️ `subject` de CloudEvents ≠ subject de NATS
+
+Son dos cosas distintas con el mismo nombre y confundirlas es el error más frecuente
+al adoptar CloudEvents sobre NATS:
+
+| | Significado | Ejemplo |
+|---|---|---|
+| **subject de NATS** | Dirección de enrutado. Determina quién recibe el mensaje. | `pedidos.pedido.v1.creado` |
+| **`subject` de CloudEvents** | Identidad del agregado *dentro* de la fuente. Es un dato, no una dirección. | `ped-123` |
+
+Un SDK **NO DEBE** exponer una API donde ambos se confundan. En flux el subject de
+NATS se llama siempre `subject` en las firmas de `publish`/`subscribe`, y el atributo
+de CloudEvents se llama `aggregateId` en la API del SDK, mapeándose a `subject` solo
+al serializar.
+
+### 2.2 Unicidad
+
+`id` + `source` **DEBEN** ser únicos en su conjunto. Esa pareja es la clave de
+deduplicación del ecosistema entero. Como `id` es UUIDv7 (monotónico en el tiempo),
+ordenar por `id` dentro de un mismo `source` equivale a ordenar por instante de
+generación — útil al reconstruir historiales desde la DLQ.
+
+## 3. Extensiones — perfil flux
+
+CloudEvents restringe los nombres de extensión a **minúsculas y dígitos ASCII, sin
+separadores**, con un máximo recomendado de 20 caracteres. De ahí `correlationid` y
+no `correlation_id`. No es un capricho de estilo: es la especificación.
+
+### 3.1 Obligatorias
+
+| Extensión | Tipo | Descripción |
+|---|---|---|
+| `correlationid` | String | Identificador del flujo de negocio completo. Se propaga sin modificar a través de toda la cadena de eventos. Si un evento no nace de otro, el SDK lo inicializa con el `id` del propio evento. |
+| `tenantid` | String | Tenant propietario del dato. `"system"` para eventos de plataforma. Base de las ACLs de [06-security.md](06-security.md). |
+| `producerversion` | String | Versión SemVer del servicio emisor. Sin esto, un bug de payload en producción es imposible de acotar a un despliegue. |
+| `dataclassification` | String | Uno de `public`, `internal`, `confidential`, `restricted`. Ver [06-security.md §5](06-security.md). |
+
+### 3.2 Opcionales
+
+| Extensión | Tipo | Descripción |
+|---|---|---|
+| `causationid` | String | `id` del evento concreto que provocó éste. `correlationid` responde "¿de qué flujo forma parte?"; `causationid` responde "¿quién lo causó exactamente?". |
+| `partitionkey` | String | Clave de ordenación. Ver [03-delivery.md §5](03-delivery.md). Por convención, igual a `subject` (el id del agregado). |
+| `traceparent` | String | W3C Trace Context. [CloudEvents Distributed Tracing extension](https://github.com/cloudevents/spec/blob/main/cloudevents/extensions/distributed-tracing.md). |
+| `tracestate` | String | W3C Trace Context. |
+| `dlqreason` | String | Solo presente en la DLQ. Lo añade el SDK. Ver [04-errors.md](04-errors.md). |
+| `dlqattempts` | Integer | Solo presente en la DLQ. |
+
+### 3.3 Prohibidas
+
+Cualquier atributo de nivel raíz que no aparezca en §2 o §3. **Todo lo demás va
+dentro de `data`.**
+
+La razón es dura pero necesaria: las extensiones de CloudEvents solo admiten
+`String`, `Integer`, `Boolean`, `Binary`, `URI` y `Timestamp` — **no admiten objetos
+ni arrays**. Un equipo que empieza a colgar metadatos del nivel raíz acaba
+inevitablemente serializando JSON dentro de un string, y a partir de ahí el envelope
+deja de ser interoperable. Un SDK L2 **DEBE** rechazar en `publish()` cualquier
+atributo raíz desconocido, en lugar de dejarlo pasar.
+
+## 4. Payload (`data`)
+
+- **DEBE** ser un objeto JSON. Ni array ni escalar en la raíz — para poder añadir
+  campos después sin romper el esquema.
+- **DEBE** usar `camelCase` en las claves. Elegido por coherencia con el envelope de
+  CloudEvents y con JSON en general; la consistencia importa más que la elección.
+- **DEBE** representar importes monetarios como **entero en la unidad mínima**
+  (céntimos) junto a un campo de moneda ISO 4217. Nunca `float`.
+- **DEBE** usar RFC 3339 UTC para fechas.
+- **NO DEBE** contener `null` para significar "ausente". Se omite el campo.
+- **DEBERÍA** ser autocontenido: el consumidor no debería necesitar llamar de vuelta
+  al productor para actuar.
+
+```json
+{
+  "specversion": "1.0",
+  "id": "01924f8e-7c3a-7b2d-9e14-3f8a1c9d0e55",
+  "source": "/produccion/pedidos-api",
+  "type": "com.flux.pedidos.pedido.creado.v1",
+  "subject": "ped-123",
+  "time": "2026-08-20T10:25:39.412Z",
+  "datacontenttype": "application/json",
+  "dataschema": "https://schemas.internal/pedidos/pedido/creado/1.2.0.json",
+  "correlationid": "01924f8e-7c3a-7b2d-9e14-3f8a1c9d0e55",
+  "causationid": "01924f8d-1a2b-7c3d-8e4f-5a6b7c8d9e01",
+  "tenantid": "acme",
+  "producerversion": "3.4.1",
+  "dataclassification": "confidential",
+  "partitionkey": "ped-123",
+  "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+  "data": {
+    "pedidoId": "ped-123",
+    "clienteId": "cli-987",
+    "totalCents": 9990,
+    "moneda": "EUR",
+    "lineas": [
+      { "sku": "ABC-1", "cantidad": 2, "precioUnitarioCents": 4995 }
+    ]
+  }
+}
+```
+
+## 5. Reglas de relleno automático
+
+Un SDK L1 **DEBE** rellenar sin intervención del desarrollador:
+
+| Atributo | Origen |
+|---|---|
+| `id` | UUIDv7 generado en `publish()` |
+| `source` | Configuración de `connect()` |
+| `time` | Reloj del sistema en UTC, salvo que se pase explícitamente |
+| `specversion` | Constante `"1.0"` |
+| `type` | Derivado del subject de NATS ([02-naming.md §2](02-naming.md)) |
+| `dataschema` | Registro local subject → URI de esquema |
+| `producerversion` | Configuración de `connect()` |
+| `correlationid` | Heredado del evento en curso; si no hay, `= id` |
+| `causationid` | `id` del evento en curso; ausente si no hay |
+| `traceparent` | Contexto OpenTelemetry activo |
+
+**El desarrollador solo escribe `subject`, `data` y opcionalmente `aggregateId`.**
+Todo lo demás es responsabilidad del SDK. Si un desarrollador tiene que rellenar
+`correlationid` a mano, el SDK ha fallado en su único trabajo.
+
+## 6. Límite de tamaño
+
+- El mensaje serializado **NO DEBE** superar **1 MiB**.
+- Un SDK L2 **DEBE** fallar en `publish()` al superarlo, con un error accionable.
+- Para payloads mayores, aplicar **claim-check**: subir el contenido a
+  almacenamiento de objetos y publicar la referencia.
+
+```json
+"data": {
+  "documentoId": "doc-778",
+  "contenidoUri": "s3://facturas/2026/08/doc-778.pdf",
+  "contenidoSha256": "e3b0c44298fc1c149afbf4c8996fb924...",
+  "contenidoBytes": 4718592
+}
+```
+
+El `sha256` no es decorativo: sin él, el consumidor no puede distinguir entre "el
+fichero aún no está replicado" y "el fichero fue sustituido".
+
+
+==============================================================================
+== specification/02-naming.md
+==============================================================================
+
+# 02 — Naming
+
+Los nombres son la única parte del protocolo que un humano lee a las 3 de la mañana.
+Se optimizan para **legibilidad y filtrabilidad**, no para brevedad.
+
+---
+
+## 1. Subject de NATS
+
+```
+<dominio>.<agregado>.v<major>.<evento>
+```
+
+| Token | Regla | Ejemplos |
+|---|---|---|
+| `dominio` | Bounded context. Sustantivo plural, `kebab-case`. | `pedidos`, `facturacion`, `logistica` |
+| `agregado` | Raíz de agregado. Sustantivo **singular**, `kebab-case`. | `pedido`, `factura`, `linea-envio` |
+| `v<major>` | Versión mayor del contrato. Literal `v` + entero ≥ 1. | `v1`, `v2` |
+| `evento` | Hecho en **pasado**, `kebab-case`. | `creado`, `cancelado`, `pago-fallido` |
+
+```
+pedidos.pedido.v1.creado
+pedidos.pedido.v1.cancelado
+facturacion.factura.v2.emitida
+logistica.envio.v1.entrega-fallida
+```
+
+### 1.1 Reglas duras
+
+- **DEBE** tener exactamente 4 tokens. Ni más, ni menos.
+- **DEBE** ir todo en minúsculas. NATS distingue mayúsculas y `Pedidos.` ≠ `pedidos.`
+  — un solo despiste crea un subject fantasma al que nadie está suscrito y que no
+  produce ningún error.
+- **NO DEBE** contener `_`, espacios, `*` ni `>`. Solo `[a-z0-9-]` dentro de cada token.
+- El plural del dominio y el singular del agregado son deliberados: leído en voz alta,
+  `pedidos.pedido` es "el agregado *pedido*, del dominio *pedidos*".
+
+### 1.2 Wildcards que esto habilita
+
+El orden de los tokens está elegido para que los filtros útiles sean expresables:
+
+| Patrón | Captura |
+|---|---|
+| `pedidos.>` | Todo el dominio de pedidos |
+| `pedidos.pedido.v1.>` | Todos los eventos v1 del agregado pedido |
+| `pedidos.pedido.*.creado` | `creado` en cualquier versión mayor — útil solo en migraciones |
+| `*.*.v1.creado` | Todos los `creado` v1 del ecosistema — auditoría |
+
+> Poner la versión **antes** del evento es intencionado. Con `pedidos.pedido.creado.v1`,
+> el filtro "todos los eventos v1 de este agregado" sería `pedidos.pedido.*.v1` —
+> que además captura `pedidos.pedido.cancelado.v1`, pero **no** captura eventos con
+> nombres de dos tokens. Fijando la versión en la posición 3, la forma del subject es
+> invariante y `>` siempre significa "de aquí hacia abajo".
+
+## 2. `type` de CloudEvents
+
+Reverse-DNS, derivado **determinísticamente** del subject:
+
+```
+com.flux.<dominio>.<agregado>.<evento>.v<major>
+```
+
+```
+subject: pedidos.pedido.v1.creado
+type:    com.flux.pedidos.pedido.creado.v1
+```
+
+La transformación es mecánica en ambos sentidos, así que un SDK **DEBE** calcularla y
+**NO DEBE** pedirla al desarrollador. Los dos formatos existen porque sirven a
+consumidores distintos: el subject enruta (y necesita la versión en posición fija
+para los wildcards), el `type` identifica el contrato en un catálogo (y ahí lee mejor
+con la versión al final, como un sufijo SemVer).
+
+## 3. Streams de JetStream
+
+```
+EVT_<DOMINIO>        subjects: <dominio>.>
+DLQ_<DOMINIO>        subjects: dlq.<dominio>.>
+```
+
+```
+EVT_PEDIDOS          pedidos.>
+DLQ_PEDIDOS          dlq.pedidos.>
+```
+
+- Un stream **por dominio**, no por evento. Un stream por evento multiplica ficheros
+  y consumidores sin ganar aislamiento real.
+- **Los nombres de stream de NATS no admiten `.`, `*`, `>`, `/`, `\` ni espacios.**
+  De ahí `EVT_PEDIDOS` con guion bajo y no `EVT.PEDIDOS`. Mayúsculas por convención,
+  para distinguir de un vistazo un stream de un subject en los logs.
+
+### 3.1 Por qué la DLQ va en `dlq.<dominio>.…` y no en `<dominio>.….dlq`
+
+Si el subject de DLQ fuese `pedidos.pedido.v1.creado.dlq`, encajaría con `pedidos.>`
+y **el stream `EVT_PEDIDOS` lo capturaría también**. Consecuencias: los mensajes
+fallidos contarían contra la retención del stream principal, un consumidor con
+`pedidos.pedido.v1.>` recibiría los mensajes muertos, y un replay masivo desde la DLQ
+podría reinyectarse en su propia DLQ.
+
+Prefijando `dlq.` el espacio de nombres queda **disjunto por construcción**, y la DLQ
+puede tener retención, replicación y ACLs propias.
+
+### 3.2 Configuración de referencia
+
+```
+EVT_PEDIDOS
+  subjects:     pedidos.>
+  storage:      file
+  retention:    limits
+  max_age:      30d
+  replicas:     3
+  discard:      old
+  duplicate_window: 2m        # ver 03-delivery.md §3
+
+DLQ_PEDIDOS
+  subjects:     dlq.pedidos.>
+  storage:      file
+  retention:    limits
+  max_age:      90d           # más larga: la DLQ es material forense
+  replicas:     3
+  discard:      old
+```
+
+## 4. Durable consumers
+
+```
+<servicio>__<subject con los puntos sustituidos por guiones bajos>
+```
+
+```
+subject:  pedidos.pedido.v1.creado
+servicio: facturacion-api
+durable:  facturacion-api__pedidos_pedido_v1_creado
+```
+
+**Los nombres de durable consumer de NATS tampoco admiten `.`** — sustituirlos por
+`_` y separar el servicio con `__` mantiene la reversibilidad: partiendo por `__`
+recuperas servicio y subject exactos. Un nombre de consumidor que no dice qué servicio
+lo tiene abierto es inútil en `nats consumer ls` cuando hay que decidir a las 3 de la
+mañana si se puede borrar.
+
+Un SDK L1 **DEBE** derivar este nombre automáticamente a partir del nombre de servicio
+de `connect()` y del subject de `subscribe()`.
+
+## 5. Antipatrones
+
+| ❌ | Por qué | ✅ |
+|---|---|---|
+| `pedidos.crear-pedido` | Comando, no evento. Y le faltan tokens. | `pedidos.pedido.v1.creado` |
+| `pedidos.pedido.v1.actualizado` | No dice **qué** cambió. Obliga a diffear. | `pedidos.pedido.v1.direccion-envio-cambiada` |
+| `pedido.pedidos.v1.creado` | Dominio/agregado invertidos. | `pedidos.pedido.v1.creado` |
+| `pedidos.pedido.v1.creado.retry` | Un 5º token rompe todos los wildcards. | Los reintentos son de JetStream, no del subject |
+| `pedidos.pedido.v1.OrderCreated` | Mayúsculas + idioma mezclado. | `pedidos.pedido.v1.creado` |
+| `core.entidad.v1.cambiado` | Dominio genérico = ningún dominio. | Nombra el bounded context real |
+
+> **Sobre `actualizado`:** es el antipatrón más caro de los seis. Obliga a cada
+> consumidor a comparar contra su propia copia para averiguar qué pasó, lo que
+> significa que cada consumidor implementa —y equivoca— su propia lógica de diff.
+> Un evento debe declarar el hecho, no delegar su descubrimiento.
+
+
+==============================================================================
+== specification/03-delivery.md
+==============================================================================
+
+# 03 — Semántica de entrega
+
+> **Garantía del protocolo: at-least-once.**
+> Todo consumidor **DEBE** ser idempotente. No es una recomendación: es la condición
+> de admisión al ecosistema.
+
+---
+
+## 1. La garantía, dicha en voz alta
+
+flux entrega cada evento **al menos una vez**. Eso significa, literalmente:
+
+- Un consumidor **verá duplicados**. No "podría": los verá.
+- Los duplicados **no son un fallo**. Son el precio de no perder eventos.
+- Un consumidor que asume unicidad **está roto**, aunque hoy funcione.
+
+La alternativa —exactly-once— no existe de forma honesta en un sistema distribuido
+con consumidores que tocan bases de datos externas. Lo que se vende como
+exactly-once es siempre at-least-once más deduplicación en algún punto. flux pone
+esa deduplicación **en el consumidor**, porque es el único lugar donde hay contexto
+de negocio para decidir qué significa "el mismo evento".
+
+## 2. Configuración canónica de consumidor
+
+```
+ack_policy:       explicit
+ack_wait:         30s
+max_deliver:      6
+backoff:          [1s, 5s, 30s, 2m, 10m]
+max_ack_pending:  256
+deliver_policy:   all
+replay_policy:    instant
+```
+
+`max_deliver: 6` con 5 entradas de backoff = **1 entrega inicial + 5 reintentos**.
+Los dos números tienen que cuadrar: si `max_deliver` fuese 5, la última entrada del
+backoff (`10m`) no se aplicaría nunca y la configuración mentiría sobre su propio
+comportamiento.
+
+**Tiempo total hasta la DLQ ≈ 12 min 36 s.** Ese número es una decisión de producto,
+no un detalle técnico: es cuánto tiempo estás dispuesto a que un evento se quede
+atascado antes de que un humano se entere.
+
+### 2.1 `ack_wait` y handlers lentos
+
+Si un handler tarda más de `ack_wait` (30 s), JetStream **reentrega el mensaje
+mientras el original sigue procesándose**. Eso produce ejecución concurrente del
+mismo evento — el peor escenario para efectos secundarios.
+
+Un SDK L2 **DEBE** enviar `WPI` (work-in-progress / `AckWait` extension) de forma
+automática cada `ack_wait / 2` mientras el handler siga vivo, y **DEBE** documentar
+que un handler que supere los 30 s sin ceder control es un bug de la aplicación.
+
+## 3. Deduplicación de productor
+
+Un SDK L1 **DEBE** establecer la cabecera NATS:
+
+```
+Nats-Msg-Id: <id del CloudEvent>
+```
+
+Con `duplicate_window: 2m` en el stream, JetStream descarta mensajes con el mismo
+`Nats-Msg-Id` recibidos dentro de esa ventana.
+
+**Qué protege esto exactamente:** un productor que hace `publish()`, no recibe el ACK
+del broker por un corte de red, y reintenta. Sin `Nats-Msg-Id` el stream acabaría con
+dos copias.
+
+**Qué NO protege:**
+
+- Reintentos **después** de 2 minutos → dos copias en el stream.
+- Reintentos con un `id` nuevo → son eventos distintos para JetStream; solo la lógica
+  de negocio del consumidor puede saber que son el mismo hecho.
+- Reentregas al consumidor. La ventana de duplicados es del **stream**, no del
+  consumidor. Un `nak` reentrega el mismo mensaje con el mismo `Nats-Msg-Id` y eso es
+  correcto y deseado.
+
+> Esa última línea es el malentendido más común: `duplicate_window` no deduplica
+> reintentos de consumo. **Nunca sustituye a la idempotencia del consumidor.**
+
+## 4. Idempotencia del consumidor — obligatoria
+
+Un consumidor **DEBE** implementar una de estas tres estrategias. El SDK **NO** la
+elige por ti, porque la elección correcta depende de qué hace el handler.
+
+### A. Tabla de eventos procesados
+
+Insertas el `id` del evento en una tabla con clave única, **en la misma transacción**
+que el efecto de negocio.
+
+```sql
+BEGIN;
+  INSERT INTO eventos_procesados (event_id, consumer, processed_at)
+  VALUES ($1, 'facturacion-api', now());   -- PK compuesta → falla si ya existe
+  INSERT INTO facturas (...) VALUES (...);
+COMMIT;
+```
+
+Si el `INSERT` viola la clave, la transacción entera aborta y el evento se `ack`ea sin
+efecto. **Atómico y correcto.** Requiere que el efecto de negocio viva en la misma base
+de datos transaccional; si el handler llama a una API externa, esta estrategia no
+aplica.
+
+### B. Operación naturalmente idempotente
+
+La mejor: no hay nada que deduplicar porque repetir la operación no cambia el
+resultado.
+
+```
+UPDATE pedidos SET estado = 'confirmado' WHERE id = $1;   -- idempotente
+UPDATE pedidos SET intentos = intentos + 1 WHERE id = $1; -- NO idempotente
+```
+
+### C. Clave de idempotencia hacia el tercero
+
+Si el efecto es una llamada externa, se propaga el `id` del evento como clave de
+idempotencia del proveedor.
+
+```
+POST /v1/charges
+Idempotency-Key: 01924f8e-7c3a-7b2d-9e14-3f8a1c9d0e55
+```
+
+**Regla:** la clave **DEBE** derivarse del `id` del evento, nunca generarse en el
+handler. Una clave generada en el handler es distinta en cada reintento y no
+deduplica nada.
+
+## 5. Orden
+
+> **flux v1 no garantiza orden global. Tampoco lo garantiza por agregado.**
+
+JetStream entrega en orden de stream a un consumidor, pero con `max_ack_pending > 1`
+o varias instancias del mismo durable, el **procesamiento** se solapa. Un `nak` con
+backoff reordena de forma explícita: el mensaje reintentado llega después de otros
+más recientes.
+
+Las tres salidas posibles, con su coste real:
+
+| Opción | Cómo | Coste |
+|---|---|---|
+| Handlers insensibles al orden | Diseño | Ninguno. **Es la opción por defecto de flux.** |
+| `max_ack_pending: 1` | Config de consumidor | Serializa el consumidor entero. Throughput ≈ 1/latencia del handler. |
+| Consumidor por partición | Un durable con filtro por rango de `partitionkey` | Complejidad operativa; rebalanceo manual |
+
+### 5.1 Cómo se escriben handlers insensibles al orden
+
+Se incluye en `data` un contador monotónico del agregado, y el consumidor descarta lo
+que ya ha superado:
+
+```json
+"data": {
+  "pedidoId": "ped-123",
+  "aggregateVersion": 7,
+  "estado": "confirmado"
+}
+```
+
+```sql
+UPDATE pedidos
+   SET estado = $2, aggregate_version = $3
+ WHERE id = $1
+   AND aggregate_version < $3;   -- un evento viejo no pisa uno nuevo
+```
+
+Esto convierte el orden de un problema de infraestructura (caro, frágil) en una
+condición del `WHERE` (barata, local, verificable en un test). Un productor
+**DEBERÍA** incluir `aggregateVersion` en todo evento que represente un cambio de
+estado de un agregado con ciclo de vida.
+
+## 6. Reconexión
+
+Un SDK L2 **DEBE**:
+
+- Reconectar indefinidamente con backoff exponencial **con jitter** — sin jitter,
+  mil servicios reconectan en el mismo milisegundo y tiran el cluster que acaba de
+  levantarse.
+- Encolar los `publish()` en memoria durante la desconexión, con un límite explícito,
+  y **fallar en alto** al alcanzarlo. Encolar sin límite convierte un corte de red en
+  un OOM.
+- **NO DEBE** perder acks pendientes en silencio: un mensaje sin ack antes de la caída
+  se reentregará, y eso es correcto — es exactamente el caso que la idempotencia
+  cubre.
+- Exponer el estado de conexión como un healthcheck consultable.
+
+
+==============================================================================
+== specification/04-errors.md
+==============================================================================
+
+# 04 — Errores y DLQ
+
+El error más caro de un sistema de eventos no es perder un mensaje. Es **reintentar
+durante 12 minutos algo que nunca va a funcionar**, mientras el consumidor se atasca
+y los eventos sanos se acumulan detrás.
+
+Por eso flux no tiene "una política de reintentos". Tiene una **taxonomía**.
+
+---
+
+## 1. Las tres clases
+
+| Clase | Significado | Acción NATS | ¿Reintenta? |
+|---|---|---|---|
+| **RETRYABLE** | El fallo es del entorno y podría desaparecer solo. | `nak(delay)` | Sí, con backoff |
+| **PERMANENT** | El evento es válido pero este consumidor nunca podrá procesarlo. | `term()` + DLQ | **No** |
+| **POISON** | El mensaje ni siquiera es interpretable. | `term()` + DLQ + alerta | **No** |
+
+La distinción entre RETRYABLE y PERMANENT es **la decisión de diseño más importante
+de un consumidor**. Equivocarla en un sentido atasca la cola; equivocarla en el otro
+tira eventos buenos a la basura por un hipo de red.
+
+### 1.1 RETRYABLE
+
+El fallo no dice nada sobre el evento — dice algo sobre el mundo en este instante.
+
+- Timeout de red, DNS, conexión rechazada
+- HTTP 429, 502, 503, 504
+- Deadlock o lock timeout de base de datos
+- Pool de conexiones agotado
+- Dependencia en arranque o en despliegue
+
+→ `nak` con el backoff de [03-delivery.md §2](03-delivery.md). Tras agotar
+`max_deliver`, JetStream deja de entregar y el SDK enruta a la DLQ.
+
+### 1.2 PERMANENT
+
+El evento es sintácticamente correcto, pero este consumidor no puede actuar sobre él
+**por mucho que espere**.
+
+- Falla la validación contra `dataschema`
+- Regla de negocio que rechaza el hecho (`el pedido ya estaba cancelado`)
+- Referencia a una entidad que no existe y no va a existir
+- HTTP 400, 403, 404, 422 de una dependencia
+- Versión de contrato no soportada por este consumidor
+
+→ `term()` **inmediato** y publicación en la DLQ. Reintentar es puro desperdicio: 12
+minutos de cola bloqueada para llegar al mismo sitio.
+
+### 1.3 POISON
+
+El SDK no logra siquiera construir un evento a partir del mensaje.
+
+- JSON malformado
+- Falta un atributo obligatorio de CloudEvents
+- `specversion` desconocida
+- `datacontenttype` no soportado
+
+→ `term()` + DLQ + **alerta inmediata**. Un POISON casi siempre significa que un
+productor está roto o que alguien publicó a mano en el subject equivocado. Es el único
+caso que **DEBE** despertar a alguien.
+
+## 2. Cómo se clasifica un error
+
+Un SDK L2 **DEBE**:
+
+1. Clasificar POISON él mismo, antes de invocar al handler.
+2. Ofrecer un default razonable para errores del handler.
+3. **Permitir que la aplicación anule la clasificación**, porque solo ella conoce sus
+   dependencias.
+
+El default de flux es **PERMANENT salvo que se demuestre lo contrario**:
+
+> Un fallo desconocido tratado como RETRYABLE bloquea la cola durante 12 minutos y se
+> repite con cada mensaje siguiente que falle igual — el modo de fallo se amplifica.
+> Tratado como PERMANENT, va a la DLQ, la cola sigue fluyendo y el evento se puede
+> reproducir cuando se entienda qué pasó. **Un evento en la DLQ es recuperable; una
+> cola atascada durante una hora punta, no.**
+
+Un SDK L2 **DEBE** exponer errores tipados para que la aplicación señale la clase:
+
+```
+throw new RetryableError("proveedor de pagos 503", { retryAfterMs: 5000 })
+throw new PermanentError("pedido ya cancelado", { code: "PEDIDO_YA_CANCELADO" })
+```
+
+> 🔨 **La función que traduce un error cualquiera a una de estas tres clases se
+> implementa en `sdk-node/src/classify.ts`.** Es una decisión de política, no de
+> infraestructura — ver la nota al final de ese fichero.
+
+## 3. Formato del mensaje en DLQ
+
+El mensaje de DLQ es **el CloudEvent original, íntegro**, con extensiones añadidas.
+No se envuelve en otro sobre.
+
+```json
+{
+  "specversion": "1.0",
+  "id": "01924f8e-7c3a-7b2d-9e14-3f8a1c9d0e55",
+  "source": "/produccion/pedidos-api",
+  "type": "com.flux.pedidos.pedido.creado.v1",
+  "time": "2026-08-20T10:25:39.412Z",
+  "dataschema": "https://schemas.internal/pedidos/pedido/creado/1.2.0.json",
+  "correlationid": "01924f8e-7c3a-7b2d-9e14-3f8a1c9d0e55",
+  "tenantid": "acme",
+  "producerversion": "3.4.1",
+  "dataclassification": "confidential",
+  "data": { "pedidoId": "ped-123", "totalCents": 9990 },
+
+  "dlqreason": "permanent",
+  "dlqattempts": 1,
+  "dlqconsumer": "facturacion-api__pedidos_pedido_v1_creado",
+  "dlqerror": "PEDIDO_YA_CANCELADO: el pedido ped-123 estaba cancelado",
+  "dlqtime": "2026-08-20T10:25:40.117Z"
+}
+```
+
+**Por qué el original íntegro y no un wrapper:** para reproducir un mensaje de la DLQ
+solo hay que borrar las extensiones `dlq*` y republicar en el subject original. Con
+un wrapper habría que desenvolver, y cada consumidor de la DLQ tendría que conocer dos
+formatos. El replay se convierte en `jq 'del(.dlq*)'`.
+
+`dlqattempts` distingue de un vistazo un PERMANENT (`1`) de un RETRYABLE agotado (`6`).
+
+Subject de destino: `dlq.<subject original>` — ver
+[02-naming.md §3.1](02-naming.md).
+
+```
+pedidos.pedido.v1.creado  →  dlq.pedidos.pedido.v1.creado
+```
+
+## 4. La DLQ no es un cementerio
+
+Una DLQ que nadie mira es una pérdida de datos con pasos extra. El protocolo exige:
+
+- **DEBE** existir una alerta sobre `dlq.>` con umbral distinto por razón:
+  `poison` → inmediata; `permanent` → agregada; `retryable` → por tasa.
+- **DEBERÍA** revisarse la DLQ en cada ciclo operativo, no cuando algo se rompe.
+- `max_age: 90d` en el stream de DLQ da margen forense, pero **es un límite real**: a
+  los 90 días el evento desaparece.
+
+### 4.1 Replay
+
+```bash
+# Inspeccionar sin consumir
+nats stream view DLQ_PEDIDOS --subject 'dlq.pedidos.pedido.v1.creado'
+
+# Reproducir: quitar extensiones dlq* y republicar en el subject original
+nats stream get DLQ_PEDIDOS --last-for 'dlq.pedidos.pedido.v1.creado' --json \
+  | jq '.data | @base64d | fromjson | del(.dlqreason, .dlqattempts, .dlqconsumer, .dlqerror, .dlqtime)' \
+  | nats pub 'pedidos.pedido.v1.creado' --force-stdin
+```
+
+**Antes de reproducir, dos comprobaciones obligatorias:**
+
+1. **¿Se ha arreglado la causa?** Reproducir contra el mismo bug devuelve el evento a
+   la DLQ y ensucia el rastro.
+2. **¿Sigue siendo idempotente el consumidor para este `id`?** El replay conserva el
+   `id` original, así que si el consumidor llegó a aplicar un efecto parcial antes de
+   fallar, la tabla de eventos procesados **DEBE** ser lo que impida duplicarlo. Si el
+   handler no es idempotente, el replay es más peligroso que el fallo original.
+
+> El replay **DEBE** conservar el `id` original. Regenerarlo rompe la idempotencia de
+> todos los consumidores aguas abajo y convierte una recuperación en un incidente
+> nuevo.
+
+
+==============================================================================
+== specification/05-compatibility.md
+==============================================================================
+
+# 05 — Compatibilidad y versionado
+
+**Regla:** SemVer aplicado al contrato, con el **mayor visible en el router** y el
+**minor/patch en el esquema**.
+
+```
+subject:    pedidos.pedido.v1.creado                             ← MAYOR
+dataschema: https://schemas.internal/pedidos/pedido/creado/1.4.0.json  ← MINOR.PATCH
+```
+
+---
+
+## 1. Qué significa cada número
+
+| Componente | Dónde vive | Cuándo sube | ¿Afecta a consumidores? |
+|---|---|---|---|
+| **MAYOR** | Subject NATS | Cambio incompatible | Sí — deben re-suscribirse |
+| **MINOR** | `dataschema` | Adición compatible | No |
+| **PATCH** | `dataschema` | Doc, descripción, ejemplo | No |
+
+El mayor está en el subject **para que la incompatibilidad sea física, no
+contractual**. Un consumidor suscrito a `pedidos.pedido.v1.creado` no puede recibir un
+v2 aunque el productor se equivoque, aunque el Schema Registry esté caído, aunque
+nadie haya leído esta página. El enrutado es el mecanismo de aplicación.
+
+## 2. Compatibilidad BACKWARD dentro de un mayor
+
+Dentro de `v1`, todo cambio **DEBE** ser BACKWARD-compatible: **un consumidor escrito
+contra 1.0.0 debe seguir funcionando con 1.9.0 sin tocar una línea.**
+
+### 2.1 Permitido (sube MINOR)
+
+| Cambio | Condición |
+|---|---|
+| Añadir un campo **opcional** | Nunca `required` |
+| Añadir un valor a un enum | Solo si los consumidores lo tratan como abierto — ver §2.3 |
+| Relajar una restricción | `maxLength: 50 → 100`, quitar un `pattern` |
+| Marcar un campo como deprecado | `"deprecated": true` + `x-deprecated-since` |
+| Añadir documentación | Es PATCH, no MINOR |
+
+### 2.2 Prohibido (obliga a MAYOR nuevo)
+
+| Cambio | Por qué rompe |
+|---|---|
+| Eliminar un campo | El consumidor lee `undefined` y falla o, peor, calcula mal en silencio |
+| Renombrar un campo | Eliminar + añadir. Doblemente roto |
+| Cambiar el tipo | `string → number`, `number → string`. Incluye `"9990" → 9990` |
+| Opcional → requerido | Los productores viejos no lo envían |
+| Endurecer una restricción | `maxLength: 100 → 50` invalida datos ya emitidos |
+| Cambiar unidades o semántica | **El más peligroso: el esquema valida igual.** Euros → céntimos pasa todos los tests y descuadra la contabilidad |
+
+> El último merece énfasis. Un cambio de semántica sin cambio de forma es invisible
+> para cualquier validador automático. **La única defensa es la revisión humana del
+> PR de esquema**, y es la razón por la que los esquemas viven en este repo con
+> CODEOWNERS y no se generan desde el código del productor.
+
+### 2.3 Enums: la trampa
+
+Añadir un valor a un enum es BACKWARD-compatible **solo si los consumidores tratan los
+valores desconocidos con gracia**. Si un consumidor hace `switch` exhaustivo con
+`default: throw`, añadir `"reembolsado"` lo rompe — y el esquema decía que era
+compatible.
+
+flux resuelve esto por contrato, no por esperanza:
+
+- Un esquema **DEBE** marcar los enums extensibles con `"x-extensible-enum": true`.
+- Un consumidor **DEBE** tener una rama por defecto no destructiva para esos enums:
+  registrar y `ack`, nunca lanzar.
+- Un enum **cerrado** (sin la marca) **NO DEBE** recibir valores nuevos dentro del
+  mismo mayor. Nunca.
+
+## 3. Ciclo de vida de un mayor
+
+```
+        ┌──────────┐
+   ─────► ACTIVE   │  Único estado que acepta nuevos consumidores.
+        └────┬─────┘
+             │  se publica v(N+1)
+        ┌────▼─────┐
+        │DEPRECATED│  Se sigue publicando. Prohibido añadir consumidores.
+        └────┬─────┘   Mínimo 90 días.
+             │  0 consumidores durante 30 días
+        ┌────▼─────┐
+        │  SUNSET  │  Se deja de publicar. Stream retenido 90 días más.
+        └──────────┘
+```
+
+### 3.1 Migración v1 → v2
+
+1. Publicar el esquema `2.0.0` y el subject `…v2.…`.
+2. **Doble publicación.** El productor emite en `v1` y `v2` simultáneamente. Un solo
+   hecho, dos representaciones. El productor asume la traducción — no los consumidores.
+3. Los consumidores migran a su ritmo. Ningún despliegue coordinado.
+4. Cuando `nats consumer ls EVT_PEDIDOS` no muestre consumidores de v1 durante 30
+   días, parar la publicación de v1.
+5. Borrar el subject v1 tras el sunset.
+
+**El paso 2 es innegociable.** Sin doble publicación, la migración exige un despliegue
+sincronizado de todos los consumidores, que es exactamente el acoplamiento que este
+protocolo existe para eliminar. Si la doble publicación resulta demasiado cara, es
+señal de que el cambio no merecía un mayor.
+
+## 4. Ubicación y forma de los esquemas
+
+```
+schemas/<dominio>/<agregado>/<evento>/<major>.<minor>.<patch>.json
+schemas/pedidos/pedido/creado/1.0.0.json
+```
+
+- Un fichero **por versión**. Los esquemas son **inmutables una vez publicados**.
+  Editar `1.0.0` in situ invalida todos los eventos ya emitidos que lo referencian.
+- El `$id` **DEBE** coincidir exactamente con la URI que aparece en `dataschema`.
+- Extensiones flux permitidas en el esquema: `x-pii`, `x-extensible-enum`,
+  `x-deprecated-since`.
+
+## 5. Verificación en CI
+
+Un pipeline **DEBE** rechazar el PR si:
+
+1. Un fichero de esquema existente ha sido **modificado** (solo se permite añadir).
+2. Un esquema nuevo con el mismo mayor no es BACKWARD-compatible con el anterior.
+3. `$id` no coincide con la ruta del fichero.
+4. Un evento nuevo no tiene un `CODEOWNER` que sea el equipo dueño del dominio.
+
+Sin (1) y (2) automatizados, el resto de este documento es una sugerencia amable.
+
+
+==============================================================================
+== specification/06-security.md
+==============================================================================
+
+# 06 — Seguridad
+
+Un bus de eventos es, por diseño, el lugar donde converge todo el dato del ecosistema.
+Eso lo convierte en el objetivo de mayor valor de la infraestructura. La postura por
+defecto de flux es **denegar salvo concesión explícita**.
+
+---
+
+## 1. Aislamiento por NATS accounts
+
+Las *accounts* de NATS son un límite de aislamiento duro: los subjects de una account
+son invisibles desde otra salvo export/import explícito.
+
+```
+Account SYS          operación del cluster. Ningún servicio de negocio entra aquí.
+Account PROD         eventos de producción
+Account STAGING      eventos de staging
+Account DEV          eventos de desarrollo
+```
+
+- Un entorno **NO DEBE** compartir account con otro. Sin esta separación, un bug en
+  staging puede publicar en un subject de producción, y ningún ACL a nivel de subject
+  lo impide de forma fiable.
+- Los servicios **NO DEBEN** tener credenciales de la account `SYS`.
+
+## 2. Identidad de servicio
+
+- Cada servicio **DEBE** tener sus propias credenciales (JWT + NKey). **Ninguna
+  credencial compartida entre servicios, jamás.** Una credencial compartida hace
+  imposible responder "¿quién publicó esto?" e imposible rotar sin coordinación global.
+- Las credenciales **DEBEN** inyectarse desde un gestor de secretos en tiempo de
+  ejecución. **NO DEBEN** aparecer en imágenes, repos, variables de entorno de CI ni
+  ficheros de config versionados.
+- Rotación **DEBERÍA** ser ≤ 90 días, automatizada.
+- TLS **DEBE** ser obligatorio en el listener. Sin `allow_non_tls`.
+
+## 3. ACLs a nivel de subject
+
+El principio es simple y se aplica sin excepciones:
+
+> **Un servicio solo publica en el dominio del que es dueño. Solo se suscribe a lo
+> que se le ha concedido explícitamente.**
+
+```jsonc
+// pedidos-api — dueño del dominio de pedidos
+{
+  "pub": { "allow": ["pedidos.>"] },
+  "sub": {
+    "allow": [
+      "inventario.stock.v1.>",         // concesión explícita
+      "_INBOX.>"                       // respuestas de request/reply
+    ]
+  }
+}
+
+// facturacion-api — consume pedidos, no puede publicarlos
+{
+  "pub": { "allow": ["facturacion.>", "dlq.facturacion.>"] },
+  "sub": { "allow": ["pedidos.pedido.v1.>", "_INBOX.>"] }
+}
+```
+
+Esto convierte el **ownership del dato en una regla aplicada por el broker**. Un
+servicio no puede falsificar un evento de otro dominio aunque su código lo intente:
+la publicación es rechazada en el servidor. Es el mismo principio del mayor en el
+subject — el enrutado aplica el contrato, la documentación solo lo describe.
+
+### 3.1 DLQ
+
+Un consumidor **DEBE** poder publicar en `dlq.<subject que consume>`, y eso significa
+concederle `pub` sobre un subject de un dominio ajeno. Es la única excepción al §3, y
+es acotada: solo el prefijo `dlq.`, solo los subjects que ya consume.
+
+## 4. Multi-tenant
+
+`tenantid` es obligatorio en el envelope, pero **el envelope no es un mecanismo de
+seguridad**: es un dato que el productor rellena y que un productor comprometido puede
+falsificar.
+
+En v1, el aislamiento de tenant es **responsabilidad del consumidor**: filtrar por
+`tenantid` antes de actuar y nunca cruzar datos entre tenants. Un SDK L2 **DEBERÍA**
+ofrecer un filtro declarativo en `subscribe()` para que ese filtrado no dependa de que
+cada handler se acuerde.
+
+> Aislamiento real por tenant (account o subject prefix por tenant) queda en **fase 4**.
+> Se documenta aquí para que nadie asuma que ya existe.
+
+## 5. Clasificación de datos
+
+`dataclassification` es obligatorio y toma uno de cuatro valores:
+
+| Valor | Significado | Retención | Consecuencias |
+|---|---|---|---|
+| `public` | Difundible fuera de la organización | 30 d | — |
+| `internal` | Datos internos sin PII | 30 d | — |
+| `confidential` | PII, datos de negocio sensibles | **7 d** | Logs sin payload; DLQ con acceso restringido |
+| `restricted` | Datos financieros, credenciales, salud | **24 h** | Prohibido en logs; DLQ auditada; requiere aprobación de seguridad para el subject |
+
+- Los campos con PII **DEBEN** marcarse `"x-pii": true` en el JSON Schema.
+- Un SDK L2 **DEBERÍA** redactar los campos `x-pii` al escribir el evento en logs.
+- La retención más corta para `confidential`/`restricted` no es teatro de cumplimiento:
+  **un stream de JetStream es una base de datos persistente**. Un evento con PII en un
+  stream con `max_age: 30d` es PII almacenada 30 días, sujeta a las mismas obligaciones
+  de GDPR que cualquier tabla — incluido el derecho de supresión, que un log
+  append-only no puede satisfacer.
+
+### 5.1 Derecho de supresión
+
+Los eventos son inmutables; el RGPD exige poder borrar. La contradicción se resuelve
+**no metiendo PII en el evento**:
+
+- El evento lleva **referencias** (`clienteId`), no PII (`email`, `nombre`, `dni`).
+- La PII vive en el servicio dueño, donde se puede borrar de verdad.
+- Un consumidor que necesite la PII la pide al dueño y aplica su propia retención.
+
+Un subject cuyo `data` contenga PII directa **DEBE** documentarlo y **DEBERÍA**
+rediseñarse. La alternativa —cripto-borrado con clave por sujeto— queda fuera de v1.
+
+## 6. Superficie operativa
+
+- El puerto de monitorización (`8222`) **NO DEBE** exponerse fuera de la red de
+  gestión.
+- `nats-account-server` / el operador JWT **NO DEBEN** ser accesibles desde las redes
+  de aplicación.
+- Los `nats` CLI con credenciales de operador **DEBEN** vivir en un bastion auditado,
+  no en portátiles.
+
+## 7. Fuera de alcance en v1 (declarado, no olvidado)
+
+| Tema | Estado | Nota |
+|---|---|---|
+| Firma de eventos (JWS) | Fase 4 | Hoy la autenticidad la garantiza la ACL del broker, no el evento. Un evento sacado del stream y reinyectado no es distinguible de uno legítimo. |
+| Cifrado a nivel de campo | Fase 4 | Hoy: no metas ahí lo que no puedas guardar en claro. |
+| Aislamiento real de tenant | Fase 4 | Ver §4. |
+| Auditoría inmutable de acceso | Fase 4 | Hoy: logs del servidor NATS. |
+
+Esta tabla existe para que nadie confunda "no está en el documento" con "está
+resuelto".
+
+
+==============================================================================
+== FIN — 8 documentos
+==============================================================================

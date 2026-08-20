@@ -1,0 +1,70 @@
+name: spec
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  llms-up-to-date:
+    name: llms-full.txt al día
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      # Sin esto, llms-full.txt diverge de specification/ en la primera semana,
+      # y un agente que carga documentación obsoleta actúa con confianza sobre
+      # reglas que ya no existen — peor que no cargar ninguna.
+      - name: Verificar que el agregado está regenerado
+        run: node scripts/build-llms.mjs --check
+
+  schemas-valid:
+    name: Schemas válidos e inmutables
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: JSON parseable y $id coincide con la ruta
+        run: |
+          fail=0
+          for f in $(find schemas -name '*.json'); do
+            if ! jq empty "$f" 2>/dev/null; then
+              echo "✗ $f: JSON inválido"; fail=1; continue
+            fi
+            id=$(jq -r '.["$id"] // empty' "$f")
+            expected="https://schemas.internal/${f#schemas/}"
+            if [ "$id" != "$expected" ]; then
+              echo "✗ $f: \$id es '$id', se esperaba '$expected'"; fail=1
+            fi
+          done
+          exit $fail
+
+      # 05-compatibility.md §4: los esquemas publicados son inmutables.
+      # Editar 1.0.0 in situ invalida todos los eventos ya emitidos que lo referencian.
+      - name: Ningún schema existente modificado
+        if: github.event_name == 'pull_request'
+        run: |
+          changed=$(git diff --name-status \
+            origin/${{ github.base_ref }}...HEAD -- schemas/ \
+            | awk '$1 == "M" || $1 ~ /^R/ { print $2 }')
+          if [ -n "$changed" ]; then
+            echo "✗ Schemas publicados modificados (son inmutables — añade una versión nueva):"
+            echo "$changed"
+            exit 1
+          fi
+          echo "✓ Solo adiciones"
+
+  protocol-json-valid:
+    name: protocol.json parseable
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: jq empty protocol.json && echo "✓ protocol.json válido"

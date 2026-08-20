@@ -27,6 +27,48 @@ clase del ecosistema, tenga o no un SDK oficial.
 
 ---
 
+## 🤖 Para agentes de IA
+
+Este repo está diseñado para que **cualquier agente cargue el contrato entero en una
+sola descarga**, sin auth y sin clonar.
+
+| Recurso | Qué es | Tamaño |
+|---|---|---|
+| [`llms-full.txt`](https://raw.githubusercontent.com/charlessonamericantrading/flux/main/llms-full.txt) | **La spec completa en un fichero.** Si solo cargas uno, es este. | ~55 KB |
+| [`llms.txt`](https://raw.githubusercontent.com/charlessonamericantrading/flux/main/llms.txt) | Índice curado con enlaces raw, por si prefieres cargar solo una parte | ~4 KB |
+| [`AGENTS.md`](AGENTS.md) | Reglas accionables: cómo publicar, cómo consumir, qué nunca hacer | ~9 KB |
+| [`protocol.json`](https://raw.githubusercontent.com/charlessonamericantrading/flux/main/protocol.json) | Constantes verificables — regex de naming, defaults, taxonomía de errores. Para **validar**, no para recordar | ~8 KB |
+
+**Pégale esto a tu agente:**
+
+```
+Lee https://raw.githubusercontent.com/charlessonamericantrading/flux/main/llms-full.txt
+y sigue ese protocolo para publicar y consumir eventos.
+```
+
+**O por línea de comandos:**
+
+```bash
+curl -sL https://raw.githubusercontent.com/charlessonamericantrading/flux/main/llms-full.txt -o flux-spec.txt
+```
+
+### Convenciones soportadas
+
+| Fichero | Lo leen |
+|---|---|
+| [`AGENTS.md`](AGENTS.md) | **Fuente canónica.** Codex, Cursor, Zed, Aider, Jules, Devin, Windsurf, Amp |
+| [`CLAUDE.md`](CLAUDE.md) | Claude Code, Claude Desktop |
+| [`.cursor/rules/flux.mdc`](.cursor/rules/flux.mdc) | Cursor |
+| [`.github/copilot-instructions.md`](.github/copilot-instructions.md) | GitHub Copilot |
+| [`llms.txt`](llms.txt) / [`llms-full.txt`](llms-full.txt) | Cualquier agente con acceso web — Grok, ChatGPT, Replit, Gemini, Perplexity |
+
+Los tres últimos son **punteros finos** a `AGENTS.md`, no copias. La fuente es una.
+
+> `llms-full.txt` está **generado**. Tras editar `AGENTS.md` o `specification/*.md`:
+> `node scripts/build-llms.mjs`. CI rechaza el PR si diverge.
+
+---
+
 ## Decisiones fundacionales (cerradas)
 
 | Decisión | Elección | Documento |
@@ -48,6 +90,12 @@ protocolo a v2.
 
 ```
 .
+├── AGENTS.md               ← instrucciones canónicas para agentes de IA
+├── CLAUDE.md               ← puntero fino a AGENTS.md
+├── llms.txt                ← índice curado (llmstxt.org)
+├── llms-full.txt           ← GENERADO: spec completa en un fichero
+├── protocol.json           ← constantes verificables para validación/codegen
+│
 ├── specification/          ← source of truth. Todo lo demás se deriva de aquí.
 │   ├── 00-protocol.md      ← visión general, capas, niveles de conformidad
 │   ├── 01-envelope.md      ← CloudEvents + extensiones obligatorias
@@ -58,6 +106,7 @@ protocolo a v2.
 │   └── 06-security.md      ← accounts, ACLs, clasificación de datos
 ├── schemas/                ← JSON Schemas versionados por evento
 │   └── <dominio>/<agregado>/<evento>/<semver>.json
+├── scripts/build-llms.mjs  ← regenera llms-full.txt
 ├── sdk-node/               ← fase 1
 ├── sdk-python/             ← fase 1
 └── sdk-go/                 ← fase 1

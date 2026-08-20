@@ -1,0 +1,195 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$comment": "Constantes verificables del flux Event Protocol v1. Pensado para que un agente o un generador de código VALIDE en vez de recordar. La prosa normativa vive en specification/ y llms-full.txt; si algo diverge, manda la prosa.",
+
+  "protocol": "flux",
+  "version": "1.0.0",
+  "specUrl": "https://raw.githubusercontent.com/charlessonamericantrading/flux/main/llms-full.txt",
+  "envelope": "CloudEvents/1.0",
+  "transport": "nats-jetstream",
+  "encoding": "structured",
+  "deliveryGuarantee": "at-least-once",
+  "consumerIdempotency": "required",
+  "orderingGuarantee": "none",
+
+  "naming": {
+    "subject": {
+      "format": "<dominio>.<agregado>.v<major>.<evento>",
+      "tokens": 4,
+      "pattern": "^[a-z0-9]+(-[a-z0-9]+)*\\.[a-z0-9]+(-[a-z0-9]+)*\\.v[1-9][0-9]*\\.[a-z0-9]+(-[a-z0-9]+)*$",
+      "rules": {
+        "dominio": "sustantivo plural, kebab-case",
+        "agregado": "sustantivo singular, kebab-case",
+        "major": "literal 'v' + entero >= 1",
+        "evento": "verbo en pasado, kebab-case"
+      },
+      "valid": ["pedidos.pedido.v1.creado", "logistica.envio.v1.entrega-fallida"],
+      "invalid": ["pedidos.crear-pedido", "Pedidos.Pedido.V1.Creado", "pedidos.pedido.v1.creado.retry"]
+    },
+    "type": {
+      "format": "com.flux.<dominio>.<agregado>.<evento>.v<major>",
+      "pattern": "^com\\.flux\\.[a-z0-9-]+\\.[a-z0-9-]+\\.[a-z0-9-]+\\.v[1-9][0-9]*$",
+      "derivedFromSubject": true,
+      "$comment": "Transformacion mecanica y biyectiva con el subject. El SDK la calcula; nunca se pide al desarrollador."
+    },
+    "stream": {
+      "eventPattern": "^EVT_[A-Z0-9_]+$",
+      "dlqPattern": "^DLQ_[A-Z0-9_]+$",
+      "example": { "name": "EVT_PEDIDOS", "subjects": ["pedidos.>"] },
+      "forbiddenChars": [".", "*", ">", "/", "\\", " "]
+    },
+    "durableConsumer": {
+      "format": "<servicio>__<subject con . sustituido por _>",
+      "pattern": "^[a-z0-9-]+__[a-z0-9_]+$",
+      "example": "facturacion-api__pedidos_pedido_v1_creado",
+      "forbiddenChars": [".", "*", ">", "/", "\\", " "]
+    },
+    "dlqSubject": {
+      "rule": "prefix",
+      "format": "dlq.<subject original>",
+      "example": "dlq.pedidos.pedido.v1.creado",
+      "$comment": "PREFIJO, no sufijo. Un sufijo encajaria con '<dominio>.>' y el stream principal capturaria sus propios muertos."
+    },
+    "schemaPath": {
+      "format": "schemas/<dominio>/<agregado>/<evento>/<major>.<minor>.<patch>.json",
+      "immutableOncePublished": true
+    }
+  },
+
+  "cloudevents": {
+    "requiredAttributes": {
+      "specversion": { "type": "string", "const": "1.0" },
+      "id": { "type": "string", "format": "uuid", "uuidVersion": 7, "generatedBy": "sdk" },
+      "source": { "type": "string", "format": "uri-reference", "pattern": "^/[a-z0-9-]+/[a-z0-9-]+$", "example": "/produccion/pedidos-api", "generatedBy": "sdk" },
+      "type": { "type": "string", "generatedBy": "sdk" },
+      "time": { "type": "string", "format": "date-time", "timezone": "UTC", "precision": "milliseconds", "generatedBy": "sdk", "$comment": "Instante en que OCURRIO el hecho, no el de publicacion." },
+      "datacontenttype": { "type": "string", "const": "application/json" },
+      "dataschema": { "type": "string", "format": "uri", "generatedBy": "sdk" },
+      "subject": { "type": "string", "$comment": "TRAMPA: es el ID DEL AGREGADO (p.ej. 'ped-123'), NO el subject de NATS. En la API del SDK se llama aggregateId." }
+    },
+    "requiredExtensions": {
+      "correlationid": { "type": "string", "generatedBy": "sdk", "description": "Identificador del flujo de negocio completo. Se propaga sin modificar. Si el evento no nace de otro, se inicializa con su propio id." },
+      "tenantid": { "type": "string", "description": "Tenant propietario. 'system' para eventos de plataforma." },
+      "producerversion": { "type": "string", "generatedBy": "sdk", "description": "SemVer del servicio emisor. Sin esto, un bug de payload no se puede acotar a un despliegue." },
+      "dataclassification": { "type": "string", "enum": ["public", "internal", "confidential", "restricted"] }
+    },
+    "optionalExtensions": {
+      "causationid": { "type": "string", "generatedBy": "sdk" },
+      "partitionkey": { "type": "string" },
+      "traceparent": { "type": "string", "generatedBy": "sdk" },
+      "tracestate": { "type": "string" },
+      "dlqreason": { "type": "string", "enum": ["retryable", "permanent", "poison"], "dlqOnly": true },
+      "dlqattempts": { "type": "integer", "dlqOnly": true },
+      "dlqconsumer": { "type": "string", "dlqOnly": true },
+      "dlqerror": { "type": "string", "dlqOnly": true },
+      "dlqtime": { "type": "string", "format": "date-time", "dlqOnly": true }
+    },
+    "extensionNameRule": {
+      "pattern": "^[a-z0-9]{1,20}$",
+      "$comment": "CloudEvents solo admite minusculas y digitos ASCII, sin separadores. De ahi 'correlationid' y no 'correlation_id'. No es estilo: es la especificacion."
+    },
+    "extensionValueTypes": ["String", "Integer", "Boolean", "Binary", "URI", "Timestamp"],
+    "rootAttributesClosed": true,
+    "$comment": "Cualquier atributo raiz fuera de las tres listas anteriores DEBE ser rechazado en publish(). Las extensiones no admiten objetos ni arrays; permitirlas lleva a serializar JSON dentro de un string y el envelope deja de ser interoperable."
+  },
+
+  "data": {
+    "rootType": "object",
+    "keyCase": "camelCase",
+    "maxMessageBytes": 1048576,
+    "money": { "representation": "integer-minor-units", "currencyField": "ISO-4217", "floatForbidden": true },
+    "dates": "RFC3339-UTC",
+    "nullForAbsent": false,
+    "claimCheckAbove": 1048576,
+    "claimCheckShape": ["uri", "sha256", "bytes"],
+    "recommendedFields": {
+      "aggregateVersion": { "type": "integer", "minimum": 1, "description": "Contador monotonico. Habilita handlers insensibles al orden via 'WHERE aggregate_version < $n'." }
+    }
+  },
+
+  "consumer": {
+    "ackPolicy": "explicit",
+    "ackWaitSeconds": 30,
+    "maxDeliver": 6,
+    "backoffMs": [1000, 5000, 30000, 120000, 600000],
+    "maxAckPending": 256,
+    "deliverPolicy": "all",
+    "replayPolicy": "instant",
+    "totalTimeToDlqSeconds": 756,
+    "$comment": "maxDeliver 6 = 1 entrega inicial + 5 reintentos, uno por entrada de backoffMs. Los dos numeros DEBEN cuadrar: con maxDeliver 5 la ultima entrada nunca se aplicaria."
+  },
+
+  "stream": {
+    "event": { "storage": "file", "retention": "limits", "maxAge": "30d", "replicas": 3, "discard": "old", "duplicateWindow": "2m" },
+    "dlq": { "storage": "file", "retention": "limits", "maxAge": "90d", "replicas": 3, "discard": "old" },
+    "duplicateWindowScope": "publish-only",
+    "$comment": "duplicateWindow NO deduplica reentregas de consumo. Solo descarta publicaciones repetidas con el mismo Nats-Msg-Id dentro de la ventana. Nunca sustituye a la idempotencia del consumidor."
+  },
+
+  "publish": {
+    "requiredHeaders": { "Nats-Msg-Id": "<id del CloudEvent>" }
+  },
+
+  "errors": {
+    "default": "permanent",
+    "$comment": "Un evento en la DLQ es recuperable; una cola atascada 12 minutos en hora punta no lo es. La asimetria del coste decide el default.",
+    "classes": {
+      "retryable": {
+        "action": "nak",
+        "retries": true,
+        "httpStatus": [429, 502, 503, 504],
+        "syscallCodes": ["ECONNRESET", "ECONNREFUSED", "ETIMEDOUT", "EPIPE", "EHOSTUNREACH", "ENETUNREACH", "EAI_AGAIN"]
+      },
+      "permanent": {
+        "action": "term+dlq",
+        "retries": false,
+        "httpStatus": [400, 403, 404, 422],
+        "examples": ["schema validation failed", "business rule rejection", "unsupported contract version"]
+      },
+      "poison": {
+        "action": "term+dlq+alert",
+        "retries": false,
+        "detectedBy": "sdk",
+        "beforeHandler": true,
+        "examples": ["malformed JSON", "missing required CloudEvents attribute", "unknown specversion"]
+      }
+    },
+    "replay": { "preserveOriginalId": true, "stripExtensions": ["dlqreason", "dlqattempts", "dlqconsumer", "dlqerror", "dlqtime"] }
+  },
+
+  "compatibility": {
+    "withinMajor": "BACKWARD",
+    "majorLocation": "subject",
+    "minorPatchLocation": "dataschema",
+    "allowedInMinor": ["add optional field", "add value to x-extensible-enum", "relax constraint", "mark deprecated"],
+    "requiresMajor": ["remove field", "rename field", "change type", "optional to required", "tighten constraint", "change units or semantics"],
+    "semanticChangeWarning": "Un cambio de unidades o semantica sin cambio de forma pasa TODA validacion automatica (euros -> centimos). Solo lo detecta la revision humana del PR de esquema.",
+    "dualPublishMinDays": 90,
+    "sunsetAfterZeroConsumersDays": 30,
+    "extensibleEnumMarker": "x-extensible-enum",
+    "piiMarker": "x-pii",
+    "deprecationMarker": "x-deprecated-since"
+  },
+
+  "security": {
+    "tlsRequired": true,
+    "credentialsPerService": true,
+    "sharedCredentialsForbidden": true,
+    "rotationMaxDays": 90,
+    "accountPerEnvironment": true,
+    "publishScope": "<dominio propio>.>",
+    "dlqPublishException": "dlq.<subject consumido>",
+    "subscribeScope": "explicit-grant-only",
+    "piiInPayload": "forbidden",
+    "retentionByClassification": { "public": "30d", "internal": "30d", "confidential": "7d", "restricted": "24h" }
+  },
+
+  "conformanceLevels": {
+    "L1": ["valid cloudevents", "auto-fill envelope", "explicit ack", "Nats-Msg-Id header"],
+    "L2": ["L1", "error taxonomy", "canonical backoff", "dlq routing", "correlationid+traceparent propagation", "reconnect with jitter"],
+    "L3": ["L2", "schema registry validation on publish", "compatibility rules enforced at publish time"],
+    "phase1Target": "L2"
+  },
+
+  "outOfScopeV1": ["request/reply", "sagas", "protobuf", "avro", "field-level encryption", "event signing", "real tenant isolation", "multi-cluster federation"]
+}

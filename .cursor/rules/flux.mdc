@@ -1,0 +1,51 @@
+---
+description: flux Event Protocol v1 — reglas para publicar y consumir eventos
+globs: ["**/*.ts", "**/*.js", "**/*.py", "**/*.go", "**/*.java", "**/*.cs", "**/*.rs", "**/*.php", "schemas/**/*.json"]
+alwaysApply: true
+---
+
+# flux Event Protocol v1
+
+Fuente canónica: [AGENTS.md](mdc:AGENTS.md) · Spec completa: [llms-full.txt](mdc:llms-full.txt)
+· Constantes verificables: [protocol.json](mdc:protocol.json)
+
+## Reglas duras
+
+1. **Subject:** `<dominio>.<agregado>.v<major>.<evento>` — exactamente 4 tokens,
+   minúsculas, `kebab-case`, dominio plural, agregado singular, evento en **pasado**.
+   ✅ `pedidos.pedido.v1.creado` ❌ `pedidos.crear-pedido`
+2. **Nunca escribas el envelope a mano.** El SDK rellena `id`, `source`, `time`,
+   `specversion`, `type`, `dataschema`, `correlationid`, `causationid`,
+   `producerversion`, `traceparent`. El desarrollador solo escribe subject, `data` y
+   opcionalmente `aggregateId`.
+3. **Todo consumidor debe ser idempotente** — la garantía es at-least-once.
+   Tabla de procesados en la misma transacción, u operación naturalmente idempotente,
+   o `Idempotency-Key` derivada del `id` del evento.
+4. **No asumas orden.** `aggregateVersion` + `WHERE aggregate_version < $n`.
+5. **Sin PII en `data`.** Referencias (`clienteId`), no valores (`email`, `dni`).
+6. **Schemas publicados son inmutables.** Se añade versión, no se edita.
+7. **Dinero en enteros de unidad mínima** (`totalCents: 9990`) + ISO 4217.
+
+## Errores
+
+| Clase | Qué es | Acción |
+|---|---|---|
+| `RETRYABLE` | Timeout, ECONNRESET, HTTP 429/502/503/504 | `nak` + backoff |
+| `PERMANENT` | Schema inválido, regla de negocio, HTTP 400/403/404/422 | `term()` + DLQ ya |
+| `POISON` | JSON malformado, atributo CloudEvents ausente | `term()` + DLQ + alerta |
+
+Default: **PERMANENT**. DLQ en `dlq.<subject>` (prefijo, no sufijo).
+
+## Trampas que no dan error, dan comportamiento incorrecto
+
+- `subject` de CloudEvents = id del agregado, **no** el subject de NATS.
+- Nombres de stream/durable de NATS **no admiten puntos** (`EVT_PEDIDOS`).
+- `duplicate_window` deduplica **publicaciones**, nunca reentregas de consumo.
+- Subjects **case-sensitive**: `Pedidos.` ≠ `pedidos.`, sin error.
+- Replay desde DLQ **conserva el `id` original**.
+- `…actualizado` es un antipatrón: nombra qué cambió (`…direccion-envio-cambiada`).
+
+## Al editar la spec
+
+`llms-full.txt` es generado. Tras tocar `AGENTS.md` o `specification/*.md`:
+`node scripts/build-llms.mjs`

@@ -1,0 +1,37 @@
+# flux — Event Protocol v1
+
+> Contrato de eventos polyglot para arquitecturas dirigidas por eventos. Envelope
+> CloudEvents 1.0 sobre NATS JetStream, entrega at-least-once con idempotencia
+> obligatoria en el consumidor, versionado mayor en el subject. La API pública es el
+> protocolo, no una librería: cualquier lenguaje que lo hable es ciudadano de primera
+> clase, tenga o no SDK oficial.
+
+Si solo vas a cargar un fichero, carga
+[llms-full.txt](https://raw.githubusercontent.com/charlessonamericantrading/flux/main/llms-full.txt)
+— es la especificación entera (~45 KB) en un solo documento.
+
+## Empieza aquí
+
+- [AGENTS.md](https://raw.githubusercontent.com/charlessonamericantrading/flux/main/AGENTS.md): Reglas accionables para agentes de IA. Cómo publicar, cómo consumir, qué nunca hacer, y las trampas de NATS que fallan en silencio. **Léelo antes de escribir código.**
+- [protocol.json](https://raw.githubusercontent.com/charlessonamericantrading/flux/main/protocol.json): Constantes verificables en JSON — regex de naming, atributos obligatorios, defaults de consumidor, taxonomía de errores. Para validar en vez de recordar.
+- [llms-full.txt](https://raw.githubusercontent.com/charlessonamericantrading/flux/main/llms-full.txt): Especificación completa concatenada, una sola descarga.
+
+## Especificación normativa
+
+- [00-protocol.md](https://raw.githubusercontent.com/charlessonamericantrading/flux/main/specification/00-protocol.md): Modelo de capas, niveles de conformidad L1/L2/L3, qué es un evento y qué no, alcance de v1.
+- [01-envelope.md](https://raw.githubusercontent.com/charlessonamericantrading/flux/main/specification/01-envelope.md): Atributos CloudEvents, las 4 extensiones obligatorias, reglas de `data`, claim-check por encima de 1 MiB. Incluye el aviso de que `subject` de CloudEvents no es el subject de NATS.
+- [02-naming.md](https://raw.githubusercontent.com/charlessonamericantrading/flux/main/specification/02-naming.md): `<dominio>.<agregado>.v<major>.<evento>`, derivación del `type`, streams, durable consumers, por qué la DLQ va prefijada, 6 antipatrones.
+- [03-delivery.md](https://raw.githubusercontent.com/charlessonamericantrading/flux/main/specification/03-delivery.md): at-least-once, configuración canónica de consumidor, qué protege y qué no protege `duplicate_window`, las 3 estrategias de idempotencia, por qué no hay garantía de orden y cómo prescindir de ella.
+- [04-errors.md](https://raw.githubusercontent.com/charlessonamericantrading/flux/main/specification/04-errors.md): Taxonomía RETRYABLE / PERMANENT / POISON, por qué el default es PERMANENT, formato del mensaje en DLQ, procedimiento de replay.
+- [05-compatibility.md](https://raw.githubusercontent.com/charlessonamericantrading/flux/main/specification/05-compatibility.md): Qué sube MINOR y qué obliga a MAYOR, la trampa de los enums, migración con doble publicación, verificaciones de CI.
+- [06-security.md](https://raw.githubusercontent.com/charlessonamericantrading/flux/main/specification/06-security.md): Accounts por entorno, ACLs por dominio, clasificación de datos, RGPD y derecho de supresión.
+
+## Ejemplos
+
+- [schemas/pedidos/pedido/creado/1.0.0.json](https://raw.githubusercontent.com/charlessonamericantrading/flux/main/schemas/pedidos/pedido/creado/1.0.0.json): JSON Schema de referencia. Muestra `x-pii`, `x-extensible-enum` y `aggregateVersion` en uso.
+- [sdk-node/src/errors.ts](https://raw.githubusercontent.com/charlessonamericantrading/flux/main/sdk-node/src/errors.ts): Taxonomía de errores tipada en TypeScript.
+
+## Opcional
+
+- [README.md](https://raw.githubusercontent.com/charlessonamericantrading/flux/main/README.md): Visión general, roadmap por fases, estructura del repositorio.
+- [sdk-node/src/classify.ts](https://raw.githubusercontent.com/charlessonamericantrading/flux/main/sdk-node/src/classify.ts): Clasificación de errores. Contiene una decisión de política deliberadamente sin implementar.
