@@ -503,5 +503,88 @@
       "autenticacion del broker",
       "sustituto de las ACLs"
     ]
+  },
+  "observability": {
+    "status": "normative-for-L2",
+    "spec": "specification/08-observability.md",
+    "$comment": "Los nombres y etiquetas son parte del CONTRATO. Si dos SDKs los nombran distinto, la tasa de DLQ de los servicios Node no se puede sumar con la de los de Go y un panel del ecosistema es imposible. Mismo argumento que los codigos POISON de 01-envelope.md 3.1.",
+    "metrics": {
+      "flux_events_published_total": {
+        "type": "counter",
+        "labels": [
+          "subject",
+          "outcome"
+        ]
+      },
+      "flux_events_consumed_total": {
+        "type": "counter",
+        "labels": [
+          "subject",
+          "consumer",
+          "outcome"
+        ]
+      },
+      "flux_event_handler_duration_seconds": {
+        "type": "histogram",
+        "labels": [
+          "subject",
+          "consumer"
+        ]
+      },
+      "flux_events_dlq_total": {
+        "type": "counter",
+        "labels": [
+          "subject",
+          "consumer",
+          "reason",
+          "code"
+        ]
+      },
+      "flux_events_retried_total": {
+        "type": "counter",
+        "labels": [
+          "subject",
+          "consumer",
+          "attempt"
+        ]
+      },
+      "flux_consumer_pending": {
+        "type": "gauge",
+        "labels": [
+          "subject",
+          "consumer"
+        ]
+      },
+      "flux_connection_state": {
+        "type": "gauge",
+        "labels": [],
+        "values": {
+          "0": "desconectado",
+          "1": "conectado",
+          "2": "reconectando"
+        }
+      }
+    },
+    "durationBucketsSeconds": [
+      0.005,
+      0.01,
+      0.025,
+      0.05,
+      0.1,
+      0.25,
+      0.5,
+      1,
+      2.5,
+      5,
+      10,
+      30
+    ],
+    "$commentBuckets": "El ultimo bucket es 30 porque ES el ack_wait. Un handler en el bucket superior esta a punto de que su mensaje se reentregue mientras aun se ejecuta, asi que ese bucket mide directamente cuantos eventos rozan la ejecucion concurrente. DEBE moverse si se cambia ack_wait.",
+    "forbiddenLabels": [
+      "tenantid",
+      "id",
+      "correlationid"
+    ],
+    "$commentCardinality": "Un tenant nuevo no debe crear series temporales nuevas; para eso estan las trazas, donde la cardinalidad no es problema. El fallo no avisa: funciona en desarrollo con tres tenants y muere en produccion con diez mil, y se manifiesta como \"Prometheus se ha quedado sin memoria\", no como \"alguien etiqueto por tenant\". `code` DEBE ser un identificador estable, nunca el mensaje de error."
   }
 }

@@ -40,6 +40,7 @@ import {
 } from "./envelope.js";
 import { ErrorClass, PoisonError, type Classification } from "./errors.js";
 import { createClassifier, type ClassifierOptions } from "./classify.js";
+import { NO_METRICS, type MetricsSink } from "./metrics.js";
 import {
   createSigner,
   createVerifier,
@@ -104,6 +105,12 @@ export interface ConnectOptions {
    * verificable dentro de un fichero, un backup o un correo, donde ya no hay ACL.
    */
   signing?: SigningOptions;
+  /**
+   * Destino de métricas. Los nombres y etiquetas los fija el protocolo
+   * (08-observability.md), no la aplicación: si cada SDK nombrara a su manera, un
+   * panel del ecosistema sería imposible.
+   */
+  metrics?: MetricsSink;
   /**
    * Réplicas de los streams que el SDK crea si no existen.
    *
@@ -189,6 +196,7 @@ export class FluxBus {
   readonly #opts: ConnectOptions;
   readonly #classify: (e: unknown) => Classification;
   readonly #source: string;
+  readonly #metrics: MetricsSink;
   readonly #subscriptions = new Set<{ stop: () => void }>();
   readonly #ensured = new Set<string>();
   #validate: ((e: FluxEvent, subject: string) => void) | null = null;
@@ -207,6 +215,8 @@ export class FluxBus {
     this.#opts = opts;
     this.#classify = createClassifier(opts.classifier);
     this.#source = sourceUri(opts.environment, opts.service);
+    this.#metrics = opts.metrics ?? NO_METRICS;
+    this.#metrics.connectionState(1);
   }
 
   // ─── publish ───────────────────────────────────────────────────────────────
@@ -261,6 +271,7 @@ export class FluxBus {
     // msgID pone la cabecera Nats-Msg-Id: deduplica reintentos de PUBLICACIÓN dentro
     // de duplicate_window. NO deduplica reentregas de consumo — 03-delivery.md §3.
     await this.#js.publish(subject, serialize(publicado), { msgID: publicado.id });
+    this.#metrics.eventPublished(subject, "ok");
     return publicado as FluxEvent<T>;
   }
 
@@ -419,6 +430,8 @@ export class FluxBus {
     } catch (e) {
       const err = e instanceof PoisonError ? e : new PoisonError(String(e));
       this.#opts.onPoison?.({ subject, error: err, raw: m.data });
+      this.#metrics.eventConsumed(subject, durable, "poison");
+      this.#metrics.eventDlq(subject, durable, "poison", err.opts.code ?? "POISON");
       this.#opts.logger?.error(`[flux] POISON en ${subject}: ${err.message}`);
       try {
         await this.#sendRawToDlq(subject, m.data, durable, err.message);
@@ -440,6 +453,7 @@ export class FluxBus {
 
     // WIP mientras el handler vive: extiende ack_wait y evita que el mismo evento se
     // ejecute en concurrencia consigo mismo — 03-delivery.md §2.1.
+    const inicio = Date.now();
     const wip = setInterval(() => {
       try {
         m.working();
@@ -465,6 +479,8 @@ export class FluxBus {
         }),
       );
       m.ack();
+      this.#metrics.eventConsumed(subject, durable, "ok");
+      this.#metrics.handlerDuration(subject, durable, (Date.now() - inicio) / 1000);
     } catch (e) {
       const c = this.#classify(e);
       const message = e instanceof Error ? e.message : String(e);
@@ -485,6 +501,7 @@ export class FluxBus {
         this.#opts.logger?.warn(
           `[flux] RETRYABLE ${c.code} en ${subject} (intento ${attempt}/${budget}), reintento en ${delay}ms`,
         );
+        this.#metrics.eventRetried(subject, durable, attempt);
         m.nak(delay);
         return;
       }
@@ -510,6 +527,9 @@ export class FluxBus {
         return;
       }
 
+      this.#metrics.eventConsumed(subject, durable, reason);
+      this.#metrics.eventDlq(subject, durable, reason, c.code);
+      this.#metrics.handlerDuration(subject, durable, (Date.now() - inicio) / 1000);
       this.#opts.onDlq?.({ subject, event, classification: c });
       this.#opts.logger?.error(
         `[flux] DLQ (${reason}) ${c.code} en ${subject} tras ${attempt} intento(s): ${message}`,
@@ -630,6 +650,7 @@ export class FluxBus {
   async close(): Promise<void> {
     for (const s of this.#subscriptions) s.stop();
     this.#subscriptions.clear();
+    this.#metrics.connectionState(0);
     await this.#nc.drain();
   }
 }

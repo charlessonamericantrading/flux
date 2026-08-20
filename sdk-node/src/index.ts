@@ -78,5 +78,13 @@ export {
 } from "./signing.js";
 export type { SigningOptions, VerificationMode, Signer, Verifier } from "./signing.js";
 
+export { InMemoryMetrics, NO_METRICS, DURATION_BUCKETS } from "./metrics.js";
+export type {
+  MetricsSink,
+  PublishOutcome,
+  ConsumeOutcome,
+  ConnectionState,
+} from "./metrics.js";
+
 export { currentContext } from "./context.js";
 export type { EventContext } from "./context.js";

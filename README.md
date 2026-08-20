@@ -104,7 +104,8 @@ protocolo a v2.
 │   ├── 04-errors.md        ← taxonomía de errores y DLQ
 │   ├── 05-compatibility.md ← reglas de evolución de esquemas
 │   ├── 06-security.md      ← accounts, ACLs, clasificación de datos
-│   └── 07-signing.md       ← firma Ed25519 (extensión opcional)
+│   ├── 07-signing.md       ← firma Ed25519 (extensión opcional)
+│   └── 08-observability.md ← métricas, trazas y alertas
 ├── schemas/                ← JSON Schemas versionados por evento
 │   └── <dominio>/<agregado>/<evento>/<semver>.json
 ├── cli/                    ← flux doctor · tail · dlq · validate
@@ -125,7 +126,7 @@ protocolo a v2.
 
 | SDK | Nivel | Tests | Verificado |
 |---|---|---|---|
-| [Node / TypeScript](sdk-node/) | **L3** | 74 | ✅ |
+| [Node / TypeScript](sdk-node/) | **L3** | 100 | ✅ |
 | [Python](sdk-python/) | L2 | 104 | ✅ |
 | [Go](sdk-go/) | L2 | 75 | ✅ (también con `-race`) |
 | [Java](sdk-java/) | L2 | 75 | ✅ (Maven en el runner) |
@@ -177,4 +178,4 @@ propaga `correlationid` / `traceparent`. El desarrollador nunca los escribe a ma
 | **2 — Cobertura** | SDK Java ✅ · .NET ✅ · Rust, PHP ⏳ | 🚧 |
 | **3 — Operación** | CLI `flux`: doctor, tail, triaje y replay de DLQ | ✅ |
 | **4 — Gobierno** | Validación L3, verificador de compatibilidad, generador de ACLs | ✅ |
-| **5 — Confianza** | Firma Ed25519 ✅ · aislamiento de tenant, métricas ⏳ | 🚧 |
+| **5 — Confianza** | Firma Ed25519 ✅ · observabilidad ✅ · aislamiento de tenant ⏳ | 🚧 |
