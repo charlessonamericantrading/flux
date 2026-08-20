@@ -18,6 +18,12 @@ venv/
 .pytest_cache/
 *.egg-info/
 
+# .NET
+bin/
+obj/
+*.user
+TestResults/
+
 .DS_Store
 Thumbs.db
 .idea/

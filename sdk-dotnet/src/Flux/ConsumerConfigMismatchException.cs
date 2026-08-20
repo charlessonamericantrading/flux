@@ -46,7 +46,7 @@ public sealed class ConsumerConfigMismatchException : Exception
     /// <summary>Los campos que difieren.</summary>
     public IReadOnlyList<ConfigDifference> Differences { get; }
 
-    private static string BuildMessage(string durable, IReadOnlyList<ConfigDifference> differences)
+    private static string BuildMessage(string durable, IReadOnlyList<ConfigDifference>? differences)
     {
         var sb = new StringBuilder()
             .Append(CultureInfo.InvariantCulture, $"el servidor devolvió una configuración distinta de la solicitada para \"{durable}\":")

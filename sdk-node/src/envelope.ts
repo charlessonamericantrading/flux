@@ -61,6 +61,26 @@ const REQUIRED_ATTRIBUTES = [
   "datacontenttype", "dataschema", "data",
 ] as const;
 
+/**
+ * Extensiones del perfil flux cuya ausencia es POISON — 01-envelope.md §3.1.
+ *
+ * Se exigen de verdad, no solo en la prosa. Si no se exigieran no serían
+ * obligatorias, serían recomendadas, y cada consumidor tendría que tratar el caso
+ * ausente — que es exactamente lo que declararlas obligatorias pretendía evitar.
+ *
+ * Además, asumir un valor por defecto es peligroso en las cuatro: un
+ * `dataclassification` ausente tomado como `internal` hace que PII circule con 30
+ * días de retención en vez de 7, y un `tenantid` ausente tomado como `system` cruza
+ * fronteras de tenant. Ver 06-security.md §4 y §5.
+ */
+const REQUIRED_EXTENSIONS = [
+  "correlationid", "tenantid", "producerversion", "dataclassification",
+] as const;
+
+const VALID_CLASSIFICATIONS = new Set([
+  "public", "internal", "confidential", "restricted",
+]);
+
 export class EnvelopeError extends Error {
   constructor(message: string) {
     super(message);
@@ -171,12 +191,47 @@ export function parseEvent(bytes: Uint8Array): FluxEvent {
     );
   }
 
-  const missing = REQUIRED_ATTRIBUTES.filter((a) => e[a] === undefined);
+  // `null` cuenta como ausente: 01-envelope.md §4 prohíbe usar null para "no aplica",
+  // así que un atributo obligatorio a null está igual de mal que no estar.
+  const missing = REQUIRED_ATTRIBUTES.filter((a) => e[a] === undefined || e[a] === null);
   if (missing.length > 0) {
     throw new PoisonError(
       `faltan atributos obligatorios de CloudEvents: ${missing.join(", ")}`,
       { code: "MISSING_REQUIRED_ATTRIBUTE" },
     );
+  }
+
+  const missingExt = REQUIRED_EXTENSIONS.filter(
+    (a) => e[a] === undefined || e[a] === null || e[a] === "",
+  );
+  if (missingExt.length > 0) {
+    throw new PoisonError(
+      `faltan extensiones obligatorias del perfil flux: ${missingExt.join(", ")}. ` +
+        `Su ausencia no es recuperable asumiendo un valor: un dataclassification ` +
+        `ausente tomado como "internal" haría circular PII con la retención larga ` +
+        `(01-envelope.md §3.1)`,
+      { code: "MISSING_REQUIRED_EXTENSION" },
+    );
+  }
+
+  if (!VALID_CLASSIFICATIONS.has(e.dataclassification as string)) {
+    throw new PoisonError(
+      `dataclassification inválido: ${JSON.stringify(e.dataclassification)}. ` +
+        `Valores permitidos: ${[...VALID_CLASSIFICATIONS].join(", ")}`,
+      { code: "INVALID_DATACLASSIFICATION" },
+    );
+  }
+
+  // Los tipos son exactos: {"tenantid": 42} es POISON, no el tenant "42".
+  // Los deserializadores discrepan por defecto (Jackson coacciona, Go rechaza, Node
+  // propaga el número), y el que "funciona" es el peor — 01-envelope.md §2.4.
+  for (const a of ["id", "source", "type", "time", "correlationid", "tenantid", "producerversion"]) {
+    if (typeof e[a] !== "string") {
+      throw new PoisonError(
+        `${a} debe ser una cadena, llegó ${typeof e[a]} (${JSON.stringify(e[a])})`,
+        { code: "WRONG_ATTRIBUTE_TYPE" },
+      );
+    }
   }
 
   if (e.datacontenttype !== "application/json") {

@@ -264,7 +264,7 @@ public sealed class Classifier
         //    HttpRequestException lleva el StatusCode, así que la mayoría de aplicaciones
         //    no tienen que implementar nada.
         var status = FindInChain<IHttpStatusError>(error)?.HttpStatus
-                     ?? (int?)FindInChain<HttpRequestException>(error)?.StatusCode;
+                     ?? (int?)(FindInChain<HttpRequestException>(error)?.StatusCode);
         if (status is not null)
         {
             var code = "HTTP_" + status.Value.ToString(System.Globalization.CultureInfo.InvariantCulture);

@@ -93,6 +93,38 @@ describe("parseo — todo fallo es POISON", () => {
     );
   });
 
+  test("falta una extensión obligatoria del perfil flux → POISON", () => {
+    // La spec las llamaba obligatorias y ningún parser las exigía. Asumir un default
+    // es peligroso en las cuatro: un dataclassification ausente tomado como
+    // "internal" haría circular PII con 30 días de retención en vez de 7.
+    const e = buildEvent({ ...base, data: {} });
+    for (const ext of ["correlationid", "tenantid", "producerversion", "dataclassification"]) {
+      const { [ext]: _, ...sinExt } = e as unknown as Record<string, unknown>;
+      assert.throws(
+        () => parseEvent(enc(sinExt)),
+        (err: Error) => (err as PoisonError).opts.code === "MISSING_REQUIRED_EXTENSION",
+        `debería rechazar un evento sin ${ext}`,
+      );
+    }
+  });
+
+  test("dataclassification fuera del enum → POISON", () => {
+    const e = buildEvent({ ...base, data: {} });
+    assert.throws(
+      () => parseEvent(enc({ ...e, dataclassification: "secreto" })),
+      (err: Error) => (err as PoisonError).opts.code === "INVALID_DATACLASSIFICATION",
+    );
+  });
+
+  test("un tipo coaccionable → POISON, no coerción silenciosa", () => {
+    // Jackson convertiría {"tenantid": 42} en "42" sin avisar. Ver 01-envelope.md §2.4.
+    const e = buildEvent({ ...base, data: {} });
+    assert.throws(
+      () => parseEvent(enc({ ...e, tenantid: 42 })),
+      (err: Error) => (err as PoisonError).opts.code === "WRONG_ATTRIBUTE_TYPE",
+    );
+  });
+
   test("rechaza atributos raíz desconocidos", () => {
     // Estricto a propósito: permitirlos lleva a serializar JSON dentro de un string
     // y el envelope deja de ser interoperable.

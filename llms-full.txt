@@ -392,6 +392,22 @@ que ahorras.
 > Binary mode **PUEDE** habilitarse por subject en v2, cuando el throughput lo
 > justifique con datos medidos.
 
+### 1.1 UTF-8 literal, sin escapes `\u`
+
+El JSON **DEBE** emitirse en UTF-8 con los caracteres no-ASCII **literales**. `"café"`
+se serializa como `café`, no como `café`.
+
+Ambas formas son JSON válido y se parsean al mismo string, pero **no son los mismos
+bytes** — y §6 explica por qué eso importa. El encoder por defecto de
+`System.Text.Json` escapa todo lo no-ASCII además de `<>&'+`, así que un payload en
+español producido por .NET no coincide byte a byte con el de Node o Go. Hace falta
+`JavaScriptEncoder.UnsafeRelaxedJsonEscaping` — cuyo nombre asusta pero solo significa
+"no escapes lo que no hace falta escapar en un contexto que no es HTML".
+
+> No estaba en la spec porque los tres primeros SDKs no lo sufren: `JSON.stringify`,
+> `json.dumps(ensure_ascii=False)` y `encoding/json` de Go emiten UTF-8 literal. Un
+> ecosistema que solo hable inglés tampoco lo notaría nunca.
+
 ## 2. Atributos de contexto — núcleo CloudEvents
 
 | Atributo | Tipo | Obl. | Regla flux |
@@ -500,7 +516,28 @@ CloudEvents restringe los nombres de extensión a **minúsculas y dígitos ASCII
 separadores**, con un máximo recomendado de 20 caracteres. De ahí `correlationid` y
 no `correlation_id`. No es un capricho de estilo: es la especificación.
 
-### 3.1 Obligatorias
+### 3.1 Obligatorias — y exigidas de verdad
+
+> **Su ausencia es POISON.** Un SDK **DEBE** rechazar al parsear un evento al que le
+> falte cualquiera de estas cuatro, igual que rechaza uno sin `id`.
+>
+> Esta regla se escribió tarde: la spec las llamaba obligatorias y **ningún parser las
+> exigía**. Lo destapó el port a .NET, donde los tipos anulables obligan a decidir qué
+> hacer con un `tenantid` ausente. Las tres opciones eran malas —marcarlas `required`
+> y divergir de los otros SDKs, declararlas anulables y arrastrar comprobaciones de
+> null por todas partes, o darles `""` y colapsar ausente con vacío (prohibido por
+> §3.3)— y la raíz era que la spec no había decidido.
+>
+> **Por qué POISON y no un valor por defecto:** asumir un default es peligroso en las
+> cuatro. Un `dataclassification` ausente tomado como `internal` hace circular PII con
+> 30 días de retención en vez de 7 ([06-security.md §5](06-security.md)); un
+> `tenantid` ausente tomado como `system` cruza fronteras de tenant (§4); un
+> `correlationid` ausente rompe la trazabilidad sin que nadie lo note; un
+> `producerversion` ausente impide acotar un bug de payload a un despliegue.
+>
+> Si no se exigieran, no serían obligatorias: serían recomendadas, y cada consumidor
+> tendría que tratar el caso ausente — justo lo que declararlas obligatorias pretendía
+> evitar.
 
 | Extensión | Tipo | Descripción |
 |---|---|---|

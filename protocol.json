@@ -151,7 +151,8 @@
           "internal",
           "confidential",
           "restricted"
-        ]
+        ],
+        "invalidValueIs": "POISON"
       }
     },
     "optionalExtensions": {
@@ -212,7 +213,23 @@
     "$comment": "Cualquier atributo raiz fuera de las tres listas anteriores DEBE ser rechazado en publish(). Las extensiones no admiten objetos ni arrays; permitirlas lleva a serializar JSON dentro de un string y el envelope deja de ser interoperable.",
     "attributeNameComparison": "case-sensitive",
     "optionalAbsentNotEmpty": true,
-    "$commentAbsentNotEmpty": "Un atributo opcional se OMITE cuando no aplica; NUNCA usa un valor vacio (0, \"\", false) con significado propio. omitempty de Go y el default de System.Text.Json colapsan cero y ausente."
+    "$commentAbsentNotEmpty": "Un atributo opcional se OMITE cuando no aplica; NUNCA usa un valor vacio (0, \"\", false) con significado propio. omitempty de Go y el default de System.Text.Json colapsan cero y ausente.",
+    "requiredExtensionsAreEnforced": true,
+    "missingRequiredExtension": "POISON",
+    "$commentRequiredExtensions": "La ausencia de correlationid, tenantid, producerversion o dataclassification es POISON. Asumir un default es peligroso en las cuatro: un dataclassification ausente tomado como internal hace circular PII con 30d de retencion en vez de 7; un tenantid ausente tomado como system cruza fronteras de tenant. Si no se exigieran no serian obligatorias, serian recomendadas.",
+    "typeCoercion": "forbidden",
+    "stringAttributes": [
+      "id",
+      "source",
+      "type",
+      "time",
+      "correlationid",
+      "tenantid",
+      "producerversion"
+    ],
+    "$commentTypeCoercion": "Un atributo declarado String DEBE llegar como cadena JSON. {\"tenantid\": 42} es POISON, no el tenant \"42\". Jackson coacciona por defecto, Go rechaza, Node lo propagaba como numero: el mismo mensaje, tres comportamientos, y el que \"funciona\" es el peor.",
+    "attributeOrder": "declaration-order-with-data-last",
+    "$commentAttributeOrder": "data va SIEMPRE el ultimo, en el envelope normal y en el de DLQ. JSON no define orden pero flux depende de la secuencia de BYTES: replay verbatim, firma futura, dedupe por hash y fixtures compartidos."
   },
   "data": {
     "rootType": "object",
@@ -237,7 +254,9 @@
         "minimum": 1,
         "description": "Contador monotonico. Habilita handlers insensibles al orden via 'WHERE aggregate_version < $n'."
       }
-    }
+    },
+    "encoding": "utf-8-literal",
+    "$commentEncoding": "UTF-8 con no-ASCII LITERAL, sin escapes de la forma backslash-u-XXXX. El encoder por defecto de System.Text.Json escapa todo lo no-ASCII, asi que un payload en espanol producido por .NET no coincide byte a byte con Node/Go. Requiere JavaScriptEncoder.UnsafeRelaxedJsonEscaping."
   },
   "consumer": {
     "ackPolicy": "explicit",
@@ -299,7 +318,15 @@
           503,
           504
         ],
-        "syscallCodes": [
+        "$comment": "Los codigos listados son EJEMPLOS, no norma. EAI_AGAIN no existe como errno en Go (*net.DNSError.IsTemporary); en Windows los codigos llevan prefijo WSA. Un SDK DEBE usar el mecanismo idiomatico de su plataforma y NO DEBE hacer matching de substrings sobre mensajes de error.",
+        "categories": [
+          "red no disponible o interrumpida",
+          "resolucion de nombres temporal",
+          "rechazo por carga (HTTP 429/502/503/504)",
+          "contencion en base de datos",
+          "dependencia arrancando"
+        ],
+        "syscallCodesExample": [
           "ECONNRESET",
           "ECONNREFUSED",
           "ETIMEDOUT",
@@ -308,14 +335,7 @@
           "ENETUNREACH",
           "EAI_AGAIN"
         ],
-        "$comment": "Los codigos listados son EJEMPLOS, no norma. EAI_AGAIN no existe como errno en Go (*net.DNSError.IsTemporary); en Windows los codigos llevan prefijo WSA. Un SDK DEBE usar el mecanismo idiomatico de su plataforma y NO DEBE hacer matching de substrings sobre mensajes de error.",
-        "categories": [
-          "red no disponible o interrumpida",
-          "resolucion de nombres temporal",
-          "rechazo por carga (HTTP 429/502/503/504)",
-          "contencion en base de datos",
-          "dependencia arrancando"
-        ]
+        "syscallCodesNote": "EJEMPLOS, no norma. EAI_AGAIN no existe como errno en Go (*net.DNSError.IsTemporary); en Windows llevan prefijo WSA; en .NET son SocketError y en Java tipos de excepcion. Un SDK DEBE usar el mecanismo idiomatico de su plataforma."
       },
       "permanent": {
         "action": "term+dlq",

@@ -113,8 +113,24 @@ protocolo a v2.
 ├── scripts/                ← build-llms · check-compat · bundle-schemas · gen-acl
 ├── sdk-node/               ← fase 1
 ├── sdk-python/             ← fase 1
-└── sdk-go/                 ← fase 1
+├── sdk-go/                 ← fase 1
+├── sdk-java/               ← fase 2
+└── sdk-dotnet/             ← fase 2
 ```
+
+---
+
+## Estado de los SDKs
+
+| SDK | Nivel | Tests | Verificado |
+|---|---|---|---|
+| [Node / TypeScript](sdk-node/) | **L3** | 74 | ✅ ejecutados |
+| [Python](sdk-python/) | L2 | 87 | ✅ ejecutados |
+| [Go](sdk-go/) | L2 | 50 | ✅ ejecutados, también con `-race` |
+| [Java](sdk-java/) | L2 | 71 | ✅ ejecutados (javac + JUnit; Maven no disponible) |
+| [.NET](sdk-dotnet/) | L2 | 5 ficheros | ⚠️ **nunca compilado** — ver su README |
+
+La suite de conformidad corre aparte, contra un NATS real: **14/14**.
 
 ---
 
@@ -156,7 +172,7 @@ propaga `correlationid` / `traceparent`. El desarrollador nunca los escribe a ma
 | Fase | Alcance | Estado |
 |---|---|---|
 | **1 — Core** | Especificación v1, JetStream, SDK Node/Python/Go a nivel L2 | ✅ |
-| **2 — Cobertura** | SDK Java, .NET, Rust, PHP | 🚧 en curso |
+| **2 — Cobertura** | SDK Java ✅ · .NET ⚠️ sin verificar · Rust, PHP ⏳ | 🚧 |
 | **3 — Operación** | CLI `flux`: doctor, tail, triaje y replay de DLQ | ✅ |
 | **4 — Gobierno** | Validación L3, verificador de compatibilidad, generador de ACLs | ✅ |
 | **5 — Pendiente** | Firma de eventos, aislamiento real de tenant, métricas | ⏳ |
