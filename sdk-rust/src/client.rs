@@ -48,6 +48,14 @@ use crate::protocol::{
 
 // ─── Observabilidad ──────────────────────────────────────────────────────────
 
+/// Cada cuánto se pregunta al servidor por el `num_pending` de cada consumidor
+/// — 08-observability.md §2.3.
+///
+/// 15 s es el orden de magnitud que fija la spec: una petición cada 15 segundos por
+/// consumidor es despreciable frente al tráfico de eventos, y es de sobra frecuente para
+/// una alerta de "consumidor atascado" que dispara a los 10 minutos.
+pub const DEFAULT_PENDING_POLL: Duration = Duration::from_secs(15);
+
 /// Severidad de un mensaje del SDK.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LogLevel {
@@ -174,10 +182,34 @@ pub struct ConnectOptions {
     #[cfg(feature = "signing")]
     pub signing: crate::signing::SigningOptions,
 
+    /// Validación del payload contra su JSON Schema — **L3**, detrás de la feature
+    /// `validation`.
+    ///
+    /// Con `mode = Strict`, publicar un payload que viola su propio contrato falla en el
+    /// productor en vez de aparecer como un misterio en un consumidor de otro equipo la
+    /// semana que viene — 00-protocol.md §5.
+    #[cfg(feature = "validation")]
+    pub validation: crate::validation::ValidationOptions,
+
     /// Mapa exacto subject → URI de `dataschema`. Gana sobre [`Self::schema_base_url`].
     pub schemas: HashMap<String, String>,
     /// Base para derivar `dataschema` cuando el subject no está en [`Self::schemas`].
     pub schema_base_url: Option<String>,
+
+    /// Cada cuánto preguntar al servidor el `num_pending` de cada consumidor.
+    /// [`Duration::ZERO`] lo desactiva. Default: 15 s.
+    ///
+    /// No es un capricho de configuración: `flux_consumer_pending` tiene **dos** fuentes y
+    /// un SDK L2 **DEBE** usar las dos, porque cada una falla justo donde la otra sirve
+    /// (08-observability.md §2.3). Los metadatos de cada entrega son gratis y frescos,
+    /// pero **si el bucle del consumidor muere dejan de llegar mensajes**: el gauge se
+    /// queda plano en su último valor en vez de crecer, y un panel dibuja una línea
+    /// horizontal indistinguible de "no pasa nada". El sondeo sigue corriendo y reporta el
+    /// `num_pending` creciente. Ésa es la señal.
+    ///
+    /// Solo se sondea si hay [`Self::metrics`] configurado: sin destino, la petición al
+    /// servidor no le sirve a nadie.
+    pub pending_poll: Duration,
 
     /// Política de clasificación de errores. Ver [`crate::classify`].
     pub classifier: ClassifierOptions,
@@ -210,6 +242,7 @@ impl fmt::Debug for ConnectOptions {
             .field("tenant_isolation", &self.tenant_isolation)
             .field("classification", &self.classification)
             .field("schema_base_url", &self.schema_base_url)
+            .field("pending_poll", &self.pending_poll)
             .field("classifier", &self.classifier)
             // Las credenciales NUNCA se imprimen: un Debug acaba en un log.
             .field("credentials", &"<oculto>")
@@ -237,8 +270,11 @@ impl ConnectOptions {
             metrics: None,
             #[cfg(feature = "signing")]
             signing: crate::signing::SigningOptions::default(),
+            #[cfg(feature = "validation")]
+            validation: crate::validation::ValidationOptions::default(),
             schemas: HashMap::new(),
             schema_base_url: None,
+            pending_poll: DEFAULT_PENDING_POLL,
             classifier: ClassifierOptions::default(),
             credentials: Credentials::None,
             traceparent: None,
@@ -274,6 +310,33 @@ impl ConnectOptions {
     #[must_use]
     pub fn with_signing(mut self, signing: crate::signing::SigningOptions) -> Self {
         self.signing = signing;
+        self
+    }
+
+    /// Validación L3 del payload contra su JSON Schema — 00-protocol.md §5.
+    ///
+    /// ```no_run
+    /// # fn ejemplo() -> Result<(), flux::FluxError> {
+    /// use flux::validation::{SchemaBundle, ValidationOptions};
+    ///
+    /// let bundle = SchemaBundle::from_file("schemas/bundle.json")?;
+    /// let opts = flux::ConnectOptions::new("nats://localhost:4222", "pedidos-api", "produccion", "3.4.1")
+    ///     .with_validation(ValidationOptions::strict(bundle));
+    /// # let _ = opts;
+    /// # Ok(()) }
+    /// ```
+    #[cfg(feature = "validation")]
+    #[must_use]
+    pub fn with_validation(mut self, validation: crate::validation::ValidationOptions) -> Self {
+        self.validation = validation;
+        self
+    }
+
+    /// Cada cuánto sondear `num_pending`. [`Duration::ZERO`] lo desactiva
+    /// — 08-observability.md §2.3.
+    #[must_use]
+    pub fn with_pending_poll(mut self, every: Duration) -> Self {
+        self.pending_poll = every;
         self
     }
 
@@ -530,6 +593,9 @@ struct BusInner {
     signer: Option<crate::signing::Signer>,
     #[cfg(feature = "signing")]
     verifier: Option<crate::signing::Verifier>,
+    /// `None` cuando el modo es `Off`: en L2 no se compila ni un esquema.
+    #[cfg(feature = "validation")]
+    validator: Option<crate::validation::Validator>,
     ensured: Mutex<HashSet<String>>,
     stops: Mutex<Vec<watch::Sender<bool>>>,
 }
@@ -604,6 +670,13 @@ pub async fn connect(mut opts: ConnectOptions) -> Result<Bus, FluxError> {
         crate::signing::Verifier::new(&opts.signing, opts.logger.clone())?,
     );
 
+    // Los esquemas se compilan UNA vez aquí, no por evento: compilar un JSON Schema es
+    // caro y hacerlo en la ruta caliente tiraría el throughput. Y como el signer, es un
+    // fallo de ARRANQUE: un bundle roto descubierto con el primer publish sería un
+    // servicio que pasa el healthcheck y no puede publicar.
+    #[cfg(feature = "validation")]
+    let validator = crate::validation::Validator::new(&opts.validation, opts.logger.clone())?;
+
     let mut nats = async_nats::ConnectOptions::new()
         .name(format!("{}@{}", opts.service, opts.environment))
         // -1 en Go, None aquí: reconexión indefinida.
@@ -654,6 +727,8 @@ pub async fn connect(mut opts: ConnectOptions) -> Result<Bus, FluxError> {
             signer,
             #[cfg(feature = "signing")]
             verifier,
+            #[cfg(feature = "validation")]
+            validator,
             ensured: Mutex::new(HashSet::new()),
             stops: Mutex::new(Vec::new()),
         }),
@@ -818,6 +893,25 @@ impl Bus {
             tracestate,
         })?;
 
+        // L3: validar ANTES de publicar. Un payload que viola su contrato debe fallar aquí,
+        // en el servicio que lo generó, y no aparecer como un misterio en un consumidor de
+        // otro equipo la semana que viene — 00-protocol.md §5.
+        //
+        // Va antes de firmar porque la firma es lo último antes de serializar, y porque
+        // firmar un evento que se va a rechazar es trabajo tirado.
+        #[cfg(feature = "validation")]
+        if let Some(validator) = &self.inner.validator {
+            if let Err(e) = validator.validate(&event, subject) {
+                // `invalid_schema` y no `error`: "el broker rechazó la publicación" y "el
+                // payload incumple su contrato" son dos incidentes distintos con dos
+                // dueños distintos — 08-observability.md §2.1.
+                self.inner
+                    .metrics
+                    .event_published(subject, PublishOutcome::InvalidSchema);
+                return Err(e);
+            }
+        }
+
         // Firmar es LO ÚLTIMO antes de serializar: la firma cubre el envelope completo, así
         // que cualquier atributo añadido después la invalidaría — 07-signing.md §5.
         #[cfg(feature = "signing")]
@@ -896,14 +990,31 @@ impl Bus {
         {
             return Ok(s.clone());
         }
+
+        // El bundle L3 conoce el MINOR real de cada subject: dentro de un mayor todo es
+        // BACKWARD-compatible, así que el más alto acepta lo que aceptan los anteriores
+        // — 00-protocol.md §5. Se consulta ANTES de derivar la URI a mano porque derivarla
+        // es adivinar, y adivinar mal aquí significa validar contra el esquema equivocado.
+        #[cfg(feature = "validation")]
+        if let Some(uri) = self
+            .inner
+            .opts
+            .validation
+            .bundle
+            .as_ref()
+            .and_then(|b| b.uri_for(subject))
+        {
+            return Ok(uri.to_string());
+        }
+
         let Some(base) = &self.inner.opts.schema_base_url else {
             return Err(FluxError::Config(format!(
-                "no hay dataschema para `{subject}`. Declara schemas[\"{subject}\"] o \
-                 schema_base_url en ConnectOptions"
+                "no hay dataschema para `{subject}`. Declara schemas[\"{subject}\"], \
+                 schema_base_url, o pasa un bundle en ConnectOptions::with_validation"
             )));
         };
-        // Sin registro exacto solo se puede asumir el `.0.0` del mayor. Un SDK L3
-        // resolverá el minor real contra el Schema Registry — 00-protocol.md §5.
+        // Sin bundle ni mapa explícito solo se puede asumir el `.0.0` del mayor. Es
+        // suficiente para L2 —el atributo es informativo— pero no para L3.
         Ok(format!(
             "{}/{}/{}/{}/{}.0.0.json",
             base.trim_end_matches('/'),
@@ -1012,6 +1123,8 @@ impl Bus {
         let (stop_tx, mut stop_rx) = watch::channel(false);
         lock(&self.inner.stops).push(stop_tx.clone());
 
+        self.spawn_pending_poll(&js_stream, subject, &durable, &stop_tx);
+
         let bus = self.clone();
         let handler: Arc<dyn Handler> = Arc::new(handler);
         let sub_subject = subject.to_string();
@@ -1069,6 +1182,59 @@ impl Bus {
             durable,
             stop: stop_tx,
         })
+    }
+
+    /// Arranca el sondeo periódico de `num_pending` de este consumidor.
+    ///
+    /// **La segunda fuente obligatoria de `flux_consumer_pending`** — 08-observability.md
+    /// §2.3. La primera son los metadatos de cada entrega, que son gratis y más frescos,
+    /// pero que fallan exactamente en el caso que la métrica existe para detectar: si el
+    /// bucle del consumidor muere, dejan de entregarse mensajes, así que el gauge se queda
+    /// **plano en su último valor** en vez de crecer. Un panel dibuja entonces una línea
+    /// horizontal, que es indistinguible de "no pasa nada", mientras la conexión sigue
+    /// reportándose sana y el healthcheck dice que todo va bien.
+    ///
+    /// El sondeo sigue corriendo y reporta el `num_pending` creciente. Ésa es la señal.
+    ///
+    /// Se salta si no hay destino de métricas —la petición no le serviría a nadie— o si el
+    /// intervalo es cero.
+    fn spawn_pending_poll(
+        &self,
+        js_stream: &stream::Stream,
+        subject: &str,
+        durable: &str,
+        stop_tx: &watch::Sender<bool>,
+    ) {
+        let every = self.inner.opts.pending_poll;
+        if every.is_zero() || self.inner.opts.metrics.is_none() {
+            return;
+        }
+
+        let stream = js_stream.clone();
+        let metrics = Arc::clone(&self.inner.metrics);
+        let mut stop = stop_tx.subscribe();
+        let subject = subject.to_string();
+        let durable = durable.to_string();
+
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(every);
+            tick.tick().await; // el primer tick de un interval es inmediato
+
+            loop {
+                tokio::select! {
+                    _ = stop.changed() => break,
+                    _ = tick.tick() => {
+                        // Un fallo del sondeo **NO DEBE** afectar al consumo: esto es
+                        // telemetría, y una petición perdida se recupera sola en el
+                        // siguiente tick. Ni se propaga ni se registra: un broker con hipos
+                        // llenaría el log de ruido y escondería los fallos de verdad.
+                        if let Ok(info) = stream.consumer_info(&durable).await {
+                            metrics.consumer_pending(&subject, &durable, info.num_pending);
+                        }
+                    }
+                }
+            }
+        });
     }
 
     // ─── despacho ────────────────────────────────────────────────────────────
@@ -1212,21 +1378,51 @@ impl Bus {
         delivery: Delivery,
     ) -> (bool, Result<HandlerResult, Box<dyn std::any::Any + Send>>) {
         #[cfg(feature = "signing")]
-        match self
+        let signature_warning = match self
             .inner
             .verifier
             .as_ref()
             .map_or(Ok(None), |v| v.check(event))
         {
-            Ok(aviso) => (
-                aviso.is_some(),
-                self.run_handler(handler, msg, event, delivery).await,
-            ),
-            Err(e) => (false, Ok(Err(Box::new(e) as HandlerError))),
-        }
+            Ok(aviso) => aviso.is_some(),
+            Err(e) => return (false, Ok(Err(Box::new(e) as HandlerError))),
+        };
 
         #[cfg(not(feature = "signing"))]
-        (false, self.run_handler(handler, msg, event, delivery).await)
+        let signature_warning = false;
+
+        // L3 al consumir, DESPUÉS de la firma y ANTES del handler. El fallo se clasifica
+        // PERMANENT: el evento es sintácticamente correcto pero incumple su contrato, y
+        // reintentarlo dará exactamente el mismo resultado — 04-errors.md §1.2.
+        if let Err(e) = self.validate_on_consume(event, &delivery.subject) {
+            return (signature_warning, Ok(Err(e)));
+        }
+
+        (
+            signature_warning,
+            self.run_handler(handler, msg, event, delivery).await,
+        )
+    }
+
+    /// Validación L3 opcional al consumir. Sin la feature, o con `on_consume = false`, no
+    /// hace nada.
+    ///
+    /// Es defensa en profundidad y por eso es opt-in dentro de lo opt-in: el sitio donde un
+    /// contrato roto se arregla es el productor. Aquí solo evita que un evento inválido
+    /// llegue a un handler que asume que su `data` cumple lo que promete.
+    fn validate_on_consume(&self, event: &Event, subject: &str) -> HandlerResult {
+        #[cfg(feature = "validation")]
+        if self.inner.opts.validation.on_consume {
+            if let Some(validator) = &self.inner.validator {
+                validator
+                    .validate(event, subject)
+                    .map_err(|e| Box::new(e) as HandlerError)?;
+            }
+        }
+        #[cfg(not(feature = "validation"))]
+        let _ = (event, subject);
+
+        Ok(())
     }
 
     /// El final del despacho: guardar en la DLQ, contar y terminar el mensaje.
@@ -1279,11 +1475,17 @@ impl Bus {
         // son suyos", un incidente de seguridad o una migración a medias. Mezclarlas hace
         // que `rate(…{outcome="poison"})` mida cosas distintas según el lenguaje del
         // consumidor, que es justo lo que 08-observability.md §1 existe para impedir.
+        // `invalid_schema` sigue la misma lógica y por el mismo motivo: su `dlqreason` es
+        // `permanent` —el consumidor lo rechazó definitivamente— pero el `outcome` tiene
+        // que poder distinguir "un productor publica payloads que violan su contrato" de
+        // "mi lógica de negocio rechazó el evento". Son dos preguntas con dos dueños.
         self.inner.metrics.event_consumed(
             subject,
             durable,
             if signature_warning || is_signature_code(&c.code) {
                 ConsumeOutcome::InvalidSignature
+            } else if is_schema_code(&c.code) {
+                ConsumeOutcome::InvalidSchema
             } else {
                 ConsumeOutcome::from(reason)
             },
@@ -1621,6 +1823,11 @@ fn is_signature_code(code: &str) -> bool {
         code,
         "MISSING_SIGNATURE" | "INVALID_SIGNATURE" | "UNKNOWN_SIGNING_KEY"
     )
+}
+
+/// Los dos códigos de la validación L3 — 00-protocol.md §5.
+fn is_schema_code(code: &str) -> bool {
+    code == crate::errors::INVALID_SCHEMA_CODE || code == crate::errors::SCHEMA_NOT_FOUND_CODE
 }
 
 impl From<DlqReason> for ConsumeOutcome {
@@ -1999,6 +2206,37 @@ mod tests {
         for code in ["MALFORMED_JSON", "HTTP_503", "PEDIDO_YA_CANCELADO"] {
             assert!(!is_signature_code(code), "{code}");
         }
+    }
+
+    /// Un fallo de esquema muere con `dlqreason = permanent` pero se cuenta como
+    /// `outcome = invalid_schema`: "un productor publica payloads que violan su contrato" y
+    /// "mi lógica rechazó el evento" son dos preguntas con dos dueños distintos
+    /// — 08-observability.md §2.1.
+    #[test]
+    fn los_codigos_de_esquema_producen_el_outcome_invalid_schema() {
+        for code in [
+            crate::errors::INVALID_SCHEMA_CODE,
+            crate::errors::SCHEMA_NOT_FOUND_CODE,
+        ] {
+            assert!(is_schema_code(code), "{code}");
+            assert!(!is_signature_code(code), "{code}");
+        }
+        for code in ["MALFORMED_JSON", "HTTP_503", "PEDIDO_YA_CANCELADO"] {
+            assert!(!is_schema_code(code), "{code}");
+        }
+    }
+
+    /// El default del sondeo es el de la spec, y `Duration::ZERO` lo desactiva
+    /// — 08-observability.md §2.3.
+    #[test]
+    fn el_sondeo_de_pendientes_viene_activado_por_defecto() {
+        let opts = ConnectOptions::new("nats://x", "svc", "produccion", "1.0.0");
+        assert_eq!(opts.pending_poll, DEFAULT_PENDING_POLL);
+        assert_eq!(DEFAULT_PENDING_POLL, Duration::from_secs(15));
+
+        let sin_sondeo = ConnectOptions::new("nats://x", "svc", "produccion", "1.0.0")
+            .with_pending_poll(Duration::ZERO);
+        assert!(sin_sondeo.pending_poll.is_zero());
     }
 
     #[test]

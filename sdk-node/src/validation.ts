@@ -10,6 +10,7 @@
  * Validar en `publish()` lo convierte en un fallo del servicio que lo provocó.
  */
 
+import { PermanentError } from "./errors.js";
 import type { FluxEvent } from "./envelope.js";
 
 export type ValidationMode = "off" | "warn" | "strict";
@@ -46,7 +47,17 @@ export interface ValidationOptions {
   onConsume?: boolean;
 }
 
-export class SchemaValidationError extends Error {
+/**
+ * Extiende `PermanentError` a propósito: un evento que incumple su contrato es
+ * sintácticamente correcto pero **nunca va a validar por mucho que se reintente**, así
+ * que la clase correcta es PERMANENT (04-errors.md §1.2).
+ *
+ * Sin esa herencia el error caía en la política de lo DESCONOCIDO —`retryable-bounded`,
+ * 2 entregas— y llegaba a la DLQ como `retryable`: gastaba un reintento inútil y, peor,
+ * la DLQ lo agrupaba por una causa equivocada. Lo destapó el port a Rust al comparar su
+ * clasificación con la de esta referencia.
+ */
+export class SchemaValidationError extends PermanentError {
   constructor(
     readonly subject: string,
     readonly dataschema: string,
@@ -55,16 +66,19 @@ export class SchemaValidationError extends Error {
     super(
       `el payload de "${subject}" no cumple su esquema (${dataschema}):\n` +
         errors.map((e) => `  · ${e}`).join("\n"),
+      { code: "INVALID_SCHEMA" },
     );
     this.name = "SchemaValidationError";
   }
 }
 
-export class SchemaNotFoundError extends Error {
+/** También PERMANENT: si el esquema no está en el bundle, reintentar no lo traerá. */
+export class SchemaNotFoundError extends PermanentError {
   constructor(readonly subject: string, readonly dataschema: string) {
     super(
       `no hay esquema para "${subject}" (${dataschema}) en el bundle. ` +
         `Regenera con \`node scripts/bundle-schemas.mjs\`, o baja \`validation.mode\` a "warn".`,
+      { code: "SCHEMA_NOT_FOUND" },
     );
     this.name = "SchemaNotFoundError";
   }

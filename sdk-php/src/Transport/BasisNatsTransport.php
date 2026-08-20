@@ -123,6 +123,22 @@ final class BasisNatsTransport implements NatsTransport
         return $effective;
     }
 
+    public function consumerPending(string $stream, string $durable): ?int
+    {
+        // `allowError: true` porque un consumidor que aún no existe —o que acaba de
+        // borrarse— es una respuesta legítima de la API, no un fallo del que avisar. El
+        // sondeo es telemetría: no puede convertir un estado transitorio en un error.
+        $response = $this->apiRequest(
+            self::API . '.CONSUMER.INFO.' . $stream . '.' . $durable,
+            [],
+            allowError: true,
+        );
+
+        $pending = $response['num_pending'] ?? null;
+
+        return is_int($pending) ? $pending : null;
+    }
+
     public function fetch(string $stream, string $durable, int $batch, int $timeoutMs): array
     {
         // Petición de pull. `expires` en nanosegundos, un poco por debajo del timeout del

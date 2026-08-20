@@ -173,6 +173,79 @@ impl StdError for Failure {
     }
 }
 
+// ─── Errores de validación L3 ────────────────────────────────────────────────
+
+/// Código estable de un payload que incumple su esquema. Etiqueta `code` de
+/// `flux_events_dlq_total` y motivo del `outcome="invalid_schema"`
+/// — 08-observability.md §2.1.
+pub const INVALID_SCHEMA_CODE: &str = "INVALID_SCHEMA";
+
+/// Código estable de un `dataschema` que no está en el bundle desplegado.
+///
+/// Es un código distinto de [`INVALID_SCHEMA_CODE`] a propósito: "el payload está mal" y
+/// "el servicio se desplegó con un bundle viejo" son dos incidentes con dos respuestas
+/// distintas, y mezclarlos bajo una etiqueta común obliga a leer mensajes de error para
+/// distinguirlos.
+pub const SCHEMA_NOT_FOUND_CODE: &str = "SCHEMA_NOT_FOUND";
+
+/// El payload no cumple el JSON Schema que su propio `dataschema` declara — L3.
+///
+/// Vive en la taxonomía y no en [`crate::validation`] porque es un error del protocolo:
+/// se puede construir, propagar y clasificar sin la feature `validation` activada, que
+/// solo hace falta para *detectarlo*.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SchemaValidationError {
+    /// Subject del evento que no validó.
+    pub subject: String,
+    /// URI del esquema contra el que se validó.
+    pub dataschema: String,
+    /// **TODOS** los incumplimientos, no solo el primero.
+    ///
+    /// Reportarlos de uno en uno convierte arreglar un payload con tres campos mal en
+    /// tres despliegues, que es exactamente el coste que L3 existe para evitar
+    /// — 00-protocol.md §5.
+    pub errors: Vec<String>,
+}
+
+impl fmt::Display for SchemaValidationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "el payload de `{}` no cumple su esquema ({}):",
+            self.subject, self.dataschema
+        )?;
+        for e in &self.errors {
+            write!(f, "\n  · {e}")?;
+        }
+        Ok(())
+    }
+}
+
+impl StdError for SchemaValidationError {}
+
+/// El `dataschema` del evento no está en el bundle desplegado con el servicio — L3.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SchemaNotFoundError {
+    /// Subject del evento.
+    pub subject: String,
+    /// URI que se buscó en el bundle.
+    pub dataschema: String,
+}
+
+impl fmt::Display for SchemaNotFoundError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "no hay esquema para `{}` ({}) en el bundle. Regenéralo con \
+             `node scripts/bundle-schemas.mjs` y despliégalo con el servicio, o baja el modo \
+             de validación a `warn`",
+            self.subject, self.dataschema
+        )
+    }
+}
+
+impl StdError for SchemaNotFoundError {}
+
 /// Un campo en el que el servidor no honró lo solicitado.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConfigDifference {
@@ -236,6 +309,23 @@ pub enum FluxError {
     /// Configuración de `connect()` incompleta o incoherente.
     #[error("{0}")]
     Config(String),
+
+    /// El payload no cumple su `dataschema` — requisito **L3**, 00-protocol.md §5.
+    ///
+    /// Al **publicar** hace fallar el `publish()`: es lo que convierte un contrato roto en
+    /// un fallo del servicio que lo generó, en vez de un misterio que aparece en un
+    /// consumidor de otro equipo la semana que viene.
+    ///
+    /// Al **consumir** se clasifica PERMANENT: el evento es sintácticamente correcto pero
+    /// incumple su contrato, así que reintentarlo dará exactamente el mismo resultado
+    /// — 04-errors.md §1.2.
+    #[error("{0}")]
+    SchemaValidation(#[source] SchemaValidationError),
+
+    /// El `dataschema` del evento no está en el bundle. Se clasifica igual que
+    /// [`FluxError::SchemaValidation`] y por la misma razón: reintentar no lo arregla.
+    #[error("{0}")]
+    SchemaNotFound(#[source] SchemaNotFoundError),
 
     /// Material de clave o configuración de firma inválidos — 07-signing.md.
     ///
@@ -392,7 +482,13 @@ impl FluxError {
     pub fn class(&self) -> Option<ErrorClass> {
         match self {
             Self::Retryable(_) => Some(ErrorClass::Retryable),
-            Self::Permanent(_) => Some(ErrorClass::Permanent),
+            // Las dos de esquema SÍ declaran clase, y comparten la de PERMANENT: el evento
+            // es sintácticamente correcto —se parseó, no es POISON— pero incumple su
+            // contrato, y reintentarlo seis veces dará seis veces lo mismo
+            // — 00-protocol.md §5 y 04-errors.md §1.2.
+            Self::Permanent(_) | Self::SchemaValidation(_) | Self::SchemaNotFound(_) => {
+                Some(ErrorClass::Permanent)
+            }
             Self::Poison(_) => Some(ErrorClass::Poison),
             _ => None,
         }
@@ -402,6 +498,14 @@ impl FluxError {
     /// quedan sin etiqueta.
     #[must_use]
     pub fn code(&self) -> Option<&str> {
+        // Las dos de esquema no llevan `Failure`: su código es fijo porque es lo que
+        // agrupa el panel del ecosistema, y dejar que la aplicación lo cambiara rompería
+        // esa agrupación — 08-observability.md §2.2.
+        match self {
+            Self::SchemaValidation(_) => return Some(INVALID_SCHEMA_CODE),
+            Self::SchemaNotFound(_) => return Some(SCHEMA_NOT_FOUND_CODE),
+            _ => {}
+        }
         let f = self.failure()?;
         Some(match (&f.code, self) {
             (Some(c), _) => c.as_str(),
@@ -483,6 +587,61 @@ mod tests {
         );
         assert_eq!(FluxError::poison("x").class(), Some(ErrorClass::Poison));
         assert_eq!(FluxError::Envelope("x".into()).class(), None);
+    }
+
+    /// L3: un payload que incumple su contrato es PERMANENT, no RETRYABLE. Si cayera en la
+    /// política de lo desconocido —`retryable-bounded`— el mismo evento inválido gastaría
+    /// dos entregas y ~30 s de cola para acabar en el mismo sitio.
+    #[test]
+    fn los_errores_de_esquema_son_permanent() {
+        let invalido = FluxError::SchemaValidation(SchemaValidationError {
+            subject: "pedidos.pedido.v1.creado".into(),
+            dataschema: "https://schemas.internal/x/1.0.0.json".into(),
+            errors: vec!["/totalCents no es un entero".into()],
+        });
+        let ausente = FluxError::SchemaNotFound(SchemaNotFoundError {
+            subject: "pedidos.pedido.v1.creado".into(),
+            dataschema: "https://schemas.internal/x/1.0.0.json".into(),
+        });
+
+        assert_eq!(invalido.class(), Some(ErrorClass::Permanent));
+        assert_eq!(ausente.class(), Some(ErrorClass::Permanent));
+        // Códigos distintos: "el payload está mal" y "el bundle está viejo" son dos
+        // incidentes con dos respuestas — 08-observability.md §2.1.
+        assert_eq!(invalido.code(), Some(INVALID_SCHEMA_CODE));
+        assert_eq!(ausente.code(), Some(SCHEMA_NOT_FOUND_CODE));
+    }
+
+    /// El mensaje lleva los TRES errores, no el primero: es lo que decide si arreglarlo
+    /// cuesta un despliegue o tres — 00-protocol.md §5.
+    #[test]
+    fn el_mensaje_de_validacion_lista_todos_los_errores() {
+        let err = FluxError::SchemaValidation(SchemaValidationError {
+            subject: "pedidos.pedido.v1.creado".into(),
+            dataschema: "https://schemas.internal/x/1.0.0.json".into(),
+            errors: vec![
+                "/totalCents no es un entero".into(),
+                "/moneda no encaja".into(),
+            ],
+        })
+        .to_string();
+
+        assert!(err.contains("pedidos.pedido.v1.creado"), "{err}");
+        assert!(err.contains("/totalCents"), "{err}");
+        assert!(err.contains("/moneda"), "{err}");
+    }
+
+    /// Envuelto por una capa de la aplicación sigue clasificándose bien: es el mismo
+    /// recorrido de `source()` que usa el clasificador con las tres clases.
+    #[test]
+    fn un_error_de_esquema_envuelto_se_sigue_clasificando() {
+        let envuelto = Envuelto(FluxError::SchemaValidation(SchemaValidationError {
+            subject: "s".into(),
+            dataschema: "u".into(),
+            errors: vec!["e".into()],
+        }));
+        let encontrado = as_classified(&envuelto).expect("se encuentra en la cadena");
+        assert_eq!(encontrado.class(), Some(ErrorClass::Permanent));
     }
 
     #[test]

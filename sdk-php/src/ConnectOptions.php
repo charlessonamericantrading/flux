@@ -6,6 +6,7 @@ namespace Flux;
 
 use Flux\Metrics\MetricsSink;
 use Flux\Signing\SigningOptions;
+use Flux\Validation\ValidationOptions;
 use Psr\Log\LoggerInterface;
 
 /**
@@ -48,6 +49,24 @@ final readonly class ConnectOptions
      *        despertar a alguien — 04-errors.md §1.3.
      * @param (\Closure(string,FluxEvent,Classification):void)|null $onDlq Se invoca al
      *        enrutar cualquier evento a la DLQ.
+     * @param ValidationOptions|null $validation Validación L3 del payload contra su JSON
+     *        Schema — 00-protocol.md §5. `null` (default) es nivel L2 y no cuesta nada.
+     *        Con `ValidationMode::Strict`, publicar un payload que viola su contrato falla
+     *        en el productor en vez de aparecer como un misterio en un consumidor de otro
+     *        equipo la semana que viene.
+     * @param int $pendingPollMs Cada cuánto preguntar al servidor por el `num_pending` de
+     *        cada consumidor, en milisegundos. `0` lo desactiva.
+     *
+     *        No es un capricho de configuración: `flux_consumer_pending` tiene DOS fuentes
+     *        obligatorias (08-observability.md §2.3) y esta es la segunda. Los metadatos de
+     *        cada mensaje entregado son gratis y frescos, pero **si el bucle del consumidor
+     *        muere dejan de llegar mensajes**, así que un gauge alimentado solo desde ahí se
+     *        queda PLANO en su último valor en vez de crecer — una línea horizontal,
+     *        indistinguible de "no pasa nada". El sondeo sigue corriendo y reporta el
+     *        `num_pending` creciente, que es la señal.
+     *
+     *        ⚠️ En PHP el sondeo solo corre **dentro de `run()`**, en el worker CLI. Ver la
+     *        sección "El modelo de ejecución de PHP" del README.
      */
     public function __construct(
         public string $service,
@@ -65,6 +84,8 @@ final readonly class ConnectOptions
         public ?\Closure $onPoison = null,
         public ?\Closure $onDlq = null,
         public ?LoggerInterface $logger = null,
+        public ?ValidationOptions $validation = null,
+        public int $pendingPollMs = 15_000,
     ) {
     }
 }

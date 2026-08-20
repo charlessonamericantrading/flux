@@ -56,6 +56,24 @@ interface NatsTransport
     public function createDurableConsumer(string $stream, string $durable, array $config): array;
 
     /**
+     * Mensajes del stream **aún no entregados** a este consumidor (`num_pending`), o
+     * `null` si no se puede determinar.
+     *
+     * Es la segunda fuente obligatoria de `flux_consumer_pending` — 08-observability.md
+     * §2.3. La primera (los metadatos del subject de respuesta, ver `Ack::pending()`) es
+     * gratis pero **solo llega cuando llegan mensajes**, y el fallo que esta métrica existe
+     * para detectar es precisamente que dejen de llegar. Preguntándoselo al servidor el
+     * dato sigue apareciendo con el consumidor parado, que es cuando hace falta.
+     *
+     * Devuelve `null` y no `0` cuando no se sabe: un cero se dibuja en el panel como "no hay
+     * nada pendiente", que es justo la conclusión contraria a "no lo sabemos".
+     *
+     * ⚠️ Un fallo aquí **NO DEBE** afectar al consumo: esto es telemetría. Quien lo llama
+     * captura y sigue.
+     */
+    public function consumerPending(string $stream, string $durable): ?int;
+
+    /**
      * Pide hasta `$batch` mensajes al consumidor pull y espera como mucho `$timeoutMs`.
      *
      * Devuelve una lista vacía si no había nada — no es un error: un consumidor ocioso es

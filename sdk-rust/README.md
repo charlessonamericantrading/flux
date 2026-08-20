@@ -1,7 +1,8 @@
 # flux SDK para Rust
 
 Cliente del **flux Event Protocol v1** — CloudEvents 1.0 sobre NATS JetStream.
-Nivel de conformidad objetivo: **L2**.
+Nivel de conformidad: **L2**, y **L3** con la feature `validation` activada
+([00-protocol.md §5](../specification/00-protocol.md)).
 
 El contrato normativo vive en [`specification/`](../specification/); si algo de este
 README diverge de la spec, manda la spec.
@@ -17,15 +18,24 @@ Requiere **Rust 1.83+** (por `io::ErrorKind::{HostUnreachable, NetworkUnreachabl
 el clasificador usa para reconocer lo transitorio por semántica), `async-nats` 0.50+ y un
 runtime Tokio.
 
-| Feature | Por defecto | Qué añade |
-|---|---|---|
-| `signing` | **no** | Firma Ed25519 de eventos ([07-signing.md](../specification/07-signing.md)) vía `ed25519-dalek` 2.x |
+| Feature | Por defecto | Qué añade | Coste |
+|---|---|---|---|
+| `signing` | **no** | Firma Ed25519 de eventos ([07-signing.md](../specification/07-signing.md)) | `ed25519-dalek` 2.x + `curve25519-dalek` |
+| `validation` | **no** | Validación L3 del payload contra su JSON Schema ([00-protocol.md §5](../specification/00-protocol.md)) | `jsonschema` 0.46 **sin features por defecto** (sin `reqwest`, sin `rustls`) |
 
-La firma va detrás de una feature porque es una **extensión opcional del protocolo** —un
-evento sin firma sigue siendo válido— y arrastrar `curve25519-dalek` al árbol de
-dependencias de todo servicio del ecosistema, con su tiempo de compilación y su superficie
-de auditoría, sería cobrar a todos por lo que usan unos pocos. Las métricas y el
-aislamiento de tenant **no** son opcionales: son parte del contrato L2 y van siempre.
+Las dos van detrás de una feature por el mismo motivo: son **opt-in en el protocolo** —un
+evento sin firma sigue siendo válido, y L3 es un nivel al que un SDK sube cuando quiere—
+así que su coste también debe ser opt-in. Arrastrar `curve25519-dalek` o un validador de
+JSON Schema al árbol de dependencias de **todo** servicio del ecosistema, con su tiempo de
+compilación y su superficie de auditoría, sería cobrar a todos por lo que usan unos pocos.
+`cargo build` sin features sigue funcionando y sigue siendo un SDK L2 completo.
+
+Las métricas y el aislamiento de tenant **no** son opcionales: son parte del contrato L2 y
+van siempre.
+
+`flux::CONFORMANCE_LEVEL` refleja la compilación (`"L3"` con `validation`, `"L2"` sin
+ella). Es lo honesto: un binario sin la feature no valida nada, y declarar L3 sería mentir
+en la única constante que alguien va a mirar para saber qué esperar del SDK.
 
 ---
 
@@ -235,6 +245,87 @@ producen y aceptan por igual este SDK, `node:crypto` y `sodium_crypto_sign_detac
 Si alguien toca el serializador, el orden de claves o el formato de `time`, ese test cae
 antes que cualquier despliegue.
 
+## Validación de esquema — L3 (opcional)
+
+[00-protocol.md §5](../specification/00-protocol.md). Sin esto, un productor puede publicar
+un payload que viola su propio `dataschema` y **nadie se entera** hasta que un consumidor
+—posiblemente de otro equipo, en otro lenguaje y otra semana— se atraganta. El error
+aparece lejísimos de su causa: el que lo ve no puede arreglarlo y el que puede arreglarlo no
+lo ve. Validar en `publish()` lo convierte en un fallo del servicio que lo generó.
+
+```toml
+flux = { path = "../sdk-rust", features = ["validation"] }
+```
+
+```rust
+use flux::validation::{SchemaBundle, ValidationOptions};
+
+// El bundle se despliega CON el servicio. Con include_str! viaja dentro del binario.
+let bundle = SchemaBundle::from_json(include_str!("../schemas/bundle.json"))?;
+
+let bus = flux::connect(
+    flux::ConnectOptions::new("nats://localhost:4222", "pedidos-api", "produccion", "3.4.1")
+        .with_validation(ValidationOptions::strict(bundle)),
+).await?;
+
+// Ahora esto devuelve Err(FluxError::SchemaValidation) y NO llega al bus:
+bus.publish("pedidos.pedido.v1.creado", &json!({ "totalCents": "9990" })).await?;
+```
+
+| Modo | Qué hace |
+|---|---|
+| `Off` (**default**) | No valida. Nivel L2, coste cero: no se compila ni un esquema |
+| `Warn` | Registra por el `logger` y publica igual |
+| `Strict` | **`publish()` falla.** El contrato roto es un fallo del productor |
+
+`Warn` no es un adorno: introducir validación en un ecosistema en marcha exige un periodo en
+el que se sabe qué se rompería **antes** de romperlo. Pasar directo a `Strict` convierte en
+fallo de publicación todo payload que llevaba meses circulando mal sin que nadie lo supiera.
+
+`ValidationOptions::strict(bundle).with_on_consume(true)` valida **también al consumir**. Un
+fallo ahí se clasifica **PERMANENT** —el evento es sintácticamente correcto pero incumple su
+contrato, así que reintentarlo dará exactamente lo mismo— y va directo a la DLQ con
+`dlqreason = permanent` y `outcome = invalid_schema`. Es defensa en profundidad: el sitio
+donde un contrato roto se arregla es el productor.
+
+**Se reportan TODOS los errores, no solo el primero.** De uno en uno, arreglar un payload con
+tres campos mal cuesta tres despliegues:
+
+```text
+el payload de `pedidos.pedido.v1.creado` no cumple su esquema (…/creado/1.0.0.json):
+  · /totalCents "9990" is not of type "integer"
+  · /moneda "euros" does not match "^[A-Z]{3}$"
+```
+
+Dos errores propios, con códigos estables para las métricas: `FluxError::SchemaValidation`
+(`INVALID_SCHEMA`) y `FluxError::SchemaNotFound` (`SCHEMA_NOT_FOUND`). Son códigos distintos
+a propósito — "el payload está mal" y "el servicio se desplegó con un bundle viejo" son dos
+incidentes con dos respuestas.
+
+### El bundle es dato, no una petición HTTP
+
+El `dataschema` es una URI, pero un SDK L3 **NO DEBE** resolverla por red al publicar
+(§5). Validar está en la ruta caliente —una petición por evento es inaceptable— y una caché
+con TTL es peor que el problema: abre una ventana en la que dos servicios validan el mismo
+subject contra versiones distintas del mismo esquema, y ninguno de los dos falla.
+
+El bundle lo genera [`scripts/bundle-schemas.mjs`](../scripts/bundle-schemas.mjs) y se
+despliega con el servicio, así que la versión del esquema queda clavada a la versión del
+servicio — que es justo lo que `producerversion` promete poder acotar. Por eso `jsonschema`
+se compila **sin sus features por defecto**: las de serie traen `resolve-http`, y con él
+`reqwest` y `rustls`, para ir a buscar `$ref`s por red. Un `$ref` remoto en el bundle falla
+al **arrancar**, no en producción.
+
+El bundle resuelve además el `dataschema` exacto de cada subject: gana sobre
+`schema_base_url`, que solo puede asumir el `.0.0` del mayor. Dentro de un mayor todo es
+BACKWARD-compatible, así que el MINOR más alto acepta lo que aceptan los anteriores.
+
+> ⚠️ **La trampa del draft.** Los esquemas de flux declaran
+> `$schema: .../draft/2020-12/schema`. Un validador configurado para draft-07 **no falla con
+> un error de versión**: falla con `no schema with key or ref ".../2020-12/schema"`, que no
+> dice nada útil y manda a buscar un fichero que no falta. Aquí el draft se detecta del
+> propio `$schema` y no se fuerza ninguno.
+
 ## Métricas
 
 [08-observability.md](../specification/08-observability.md), normativo para L2. Las siete
@@ -266,6 +357,36 @@ El último bucket del histograma es `30` porque **es el `ack_wait`**: un handler
 está a punto de que su mensaje se reentregue mientras aún se ejecuta. Un test
 (`metrics::tests::el_ultimo_bucket_es_el_ack_wait`) lo ata a `DEFAULT_ACK_WAIT` para que no
 se desincronicen.
+
+### `flux_consumer_pending`: metadatos **y** sondeo
+
+Es la única de las siete que no sale limpiamente del flujo de eventos, y
+[§2.3](../specification/08-observability.md) exige **las dos** fuentes, porque cada una falla
+justo donde la otra sirve:
+
+| Fuente | Coste | Falla cuando… |
+|---|---|---|
+| Metadatos de cada entrega | Gratis, fresco en cada evento | **No llegan mensajes** — y ése es el caso que importa |
+| Sondeo de `num_pending` | Una petición cada ~15 s | Nunca, mientras haya conexión |
+
+El razonamiento es el que decide la regla: **si el bucle del consumidor muere, dejan de
+entregarse mensajes**, así que una métrica alimentada solo desde los metadatos se queda
+plana en su último valor en vez de crecer. Un panel dibuja una línea horizontal, que es
+indistinguible de "no pasa nada" — mientras `is_connected()` sigue diciendo que todo va
+bien. El sondeo sigue corriendo y reporta el `num_pending` creciente: **ésa** es la señal, y
+es la que dispara la alerta de "consumidor atascado" de §4.
+
+```rust
+flux::ConnectOptions::new(/* … */)
+    .with_metrics(metrics.clone())
+    .with_pending_poll(std::time::Duration::from_secs(15));  // el default
+    // .with_pending_poll(Duration::ZERO)                    // lo desactiva
+```
+
+Un fallo del sondeo **no afecta al consumo**: es telemetría, corre en su propio task y una
+petición perdida se recupera sola en el siguiente tick. Solo se sondea si hay `metrics`
+configurado —sin destino, la petición no le sirve a nadie— y el task muere con
+`unsubscribe()` o `close()`.
 
 ## Aislamiento de tenant
 
@@ -547,15 +668,20 @@ que el SDK de PHP lleva idéntico.
 signkeyid, signature, dlqreason, …, dlqtime, data`— en vez de "antes de `data`". Un SDK
 nuevo no puede deducirla, y el primero que la deduzca al revés no se enterará.
 
-### K. Que la firma sea opcional obliga a probar **dos** configuraciones
+### K. Que la firma y la validación sean opcionales obliga a probar **dos** configuraciones
 
-`signing` es una feature, así que hay dos crates posibles y los dos tienen que compilar y
-pasar. Un `#[cfg(feature = "signing")]` mal puesto no lo detecta `cargo test --all-features`
-—que es lo que apetece ejecutar— sino `cargo test` a secas, y al revés. Por eso la tabla de
-abajo tiene dos columnas y CI ejecuta las dos.
+`signing` y `validation` son features, así que hay varios crates posibles y todos tienen que
+compilar y pasar. Un `#[cfg(feature = "…")]` mal puesto no lo detecta
+`cargo test --all-features` —que es lo que apetece ejecutar— sino `cargo test` a secas, y al
+revés. Por eso la tabla de abajo tiene dos columnas y CI ejecuta las dos.
 
-Es el coste real de que la extensión sea opcional, y aun así compensa: la alternativa es que
-todo servicio del ecosistema arrastre `curve25519-dalek` para no usarlo.
+Es el coste real de que las extensiones sean opcionales, y aun así compensa: la alternativa
+es que todo servicio del ecosistema arrastre `curve25519-dalek` y un validador de JSON
+Schema para no usarlos.
+
+La validación añade un matiz que la firma no tiene: **el nivel de conformidad declarado
+depende de la compilación**. `CONFORMANCE_LEVEL` es `"L3"` con la feature y `"L2"` sin ella,
+porque un binario que no valida no es L3 por mucho que el repositorio lo sea.
 
 ---
 
@@ -565,11 +691,12 @@ todo servicio del ecosistema arrastre `curve25519-dalek` para no usarlo.
 |---|---|
 | `protocol.rs` | Constantes verificadas y naming (`parse_subject`, `subject_to_type`, `stream_name`, `durable_name`, `dlq_subject`, `source_uri`, `validate_service_name`) |
 | `envelope.rs` | `Event`, `build_event`, `serialize`, `parse_event`, `Event::data_as`, `to_dlq_event`, `strip_dlq_extensions` |
-| `errors.rs` | `ErrorClass`, `FluxError`, `Failure`, `Classification`, `as_classified`, `describe` |
+| `errors.rs` | `ErrorClass`, `FluxError`, `Failure`, `Classification`, `as_classified`, `describe`, `SchemaValidationError`, `SchemaNotFoundError` |
 | `classify.rs` | `Classifier`, `ClassifierOptions`, `UnknownPolicy`, `HttpError` |
 | `context.rs` | Propagación por task-local con override explícito |
 | `metrics.rs` | `MetricsSink`, `NoMetrics`, `InMemoryMetrics`, `DURATION_BUCKETS` y los enums de etiqueta |
 | `signing.rs` | `Signer`, `Verifier`, `SigningOptions`, `VerificationMode`, `generate_key_pair` — feature `signing` |
+| `validation.rs` | `Validator`, `SchemaBundle`, `ValidationOptions`, `ValidationMode` — feature `validation` |
 | `client.rs` | `connect`, `Bus::publish`, `Bus::subscribe`, `Bus::close`, `Bus::replay_from_dlq`, `TenantIsolation` |
 | `tests/cross_sdk.rs` | Los fixtures compartidos de `conformance/cases/`, sin broker |
 | `tests/integration.rs` | Conformidad contra un NATS real |
@@ -579,20 +706,21 @@ todo servicio del ecosistema arrastre `curve25519-dalek` para no usarlo.
 ```bash
 cargo fmt --check
 cargo clippy --all-targets --all-features -- -D warnings
-cargo test --all-features        # 175 tests
+cargo test --all-features        # 200 tests
 ```
 
 | Suite | Tests (`--all-features`) | Sin features | Requiere broker |
 |---|--:|--:|---|
-| Unitarios (en cada módulo) | 150 | 117 | no |
+| Unitarios (en cada módulo) | 170 | 122 | no |
 | `tests/cross_sdk.rs` | 3 | 3 | no |
-| `tests/integration.rs` | 14 | 11 | **sí** |
-| Doctests | 8 | 8 | no |
+| `tests/integration.rs` | 17 | 13 | **sí** |
+| Doctests | 10 | 8 | no |
 
-La diferencia entre las dos columnas son los tests de `signing`, que solo existen con la
-feature activa. **Conviene ejecutar las dos formas en CI**: sin ella se comprueba que el
-crate compila y pasa cuando nadie usa la firma —que es el caso por defecto—, y con ella que
-la firma funciona.
+La diferencia entre las dos columnas son los tests de `signing` y `validation`, que solo
+existen con su feature activa. **Conviene ejecutar las dos formas en CI**: sin ellas se
+comprueba que el crate compila y pasa cuando nadie usa la firma ni la validación —que es el
+caso por defecto y el único que le cuesta algo a quien no las usa—, y con ellas que las dos
+funcionan.
 
 Los unitarios cubren naming, envelope, clasificación, métricas y firma, que es donde vive la
 semántica del protocolo. `cross_sdk.rs` ejecuta **los fixtures compartidos de
@@ -604,7 +732,7 @@ Los de integración requieren un broker y **se saltan solos** si no lo encuentra
 
 ```bash
 docker compose up -d                             # en la raíz del repo
-cargo test --all-features --test integration     # 14 tests contra NATS real
+cargo test --all-features --test integration     # 17 tests contra NATS real
 ```
 
 Cubren lo que los unitarios no pueden: que la config canónica de consumidor sobreviva al
@@ -617,3 +745,9 @@ que en modo `require` uno sin firma acabe en la DLQ con `MISSING_SIGNATURE`, que
 `warn` ese mismo evento llegue al handler **y aun así se cuente** como
 `invalid_signature` (§7.1), que el modo estricto de tenant falle al suscribirse y que el
 evento de otro tenant se ACKee sin llegar al handler.
+
+Y los tres que cierran L3 y §2.3: que un payload inválido **no llegue al bus** —con los dos
+errores en el mismo `SchemaValidationError` y `outcome = invalid_schema`, mientras el válido
+publicado justo después sí llega al consumidor—, y que `flux_consumer_pending` se emita
+**sin que llegue ni un mensaje** gracias al sondeo, cosa que los metadatos por sí solos no
+pueden hacer. Ese último es el test que distingue "consumidor sano" de "panel sin datos".

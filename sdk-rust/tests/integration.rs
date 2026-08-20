@@ -891,3 +891,189 @@ async fn warn_acepta_el_evento_pero_lo_cuenta_como_invalid_signature() {
     productor.close().await.expect("close");
     consumidor.close().await.expect("close");
 }
+
+// ─── L3 — validación de esquema (00-protocol.md §5) ──────────────────────────
+
+/// El punto entero de L3, contra un broker real: un payload que viola su propio
+/// `dataschema` **no llega al bus**. El fallo ocurre en el productor, que es el único sitio
+/// donde alguien puede arreglarlo.
+#[cfg(feature = "validation")]
+#[tokio::test]
+async fn strict_falla_el_publish_de_un_payload_invalido() {
+    let url = broker!();
+    // El subject real del bundle: es el que resuelve `subjects` y el único con esquema.
+    let subject = "pedidos.pedido.v1.creado";
+    let metrics = Arc::new(flux::InMemoryMetrics::new());
+    let bundle =
+        flux::validation::SchemaBundle::from_json(include_str!("../../schemas/bundle.json"))
+            .expect("bundle del repositorio");
+
+    let bus = connect(
+        ConnectOptions::new(&url, "pedidos-api", "test", "1.0.0")
+            .with_tenant_id("acme")
+            .with_metrics(metrics.clone())
+            .with_validation(flux::ValidationOptions::strict(bundle)),
+    )
+    .await
+    .expect("conexión");
+
+    let recibido: Arc<Mutex<Option<Event>>> = Arc::new(Mutex::new(None));
+    let sink = recibido.clone();
+    let sub = bus
+        .subscribe(subject, move |ev: Event, _d| {
+            let sink = sink.clone();
+            async move {
+                *sink.lock().unwrap() = Some(ev);
+                Ok(())
+            }
+        })
+        .await
+        .expect("suscripción");
+
+    // `totalCents` como texto: el caso que la spec llama el más peligroso, porque pasa
+    // cualquier revisión visual y rompe toda aritmética aguas abajo.
+    let invalido = json!({
+        "pedidoId": "ped-123",
+        "clienteId": "cli-987",
+        "aggregateVersion": 1,
+        "totalCents": "9990",
+        "moneda": "euros",
+        "lineas": [{ "sku": "ABC-1", "cantidad": 2, "precioUnitarioCents": 4995 }],
+    });
+    let err = bus
+        .publish(subject, &invalido)
+        .await
+        .expect_err("un payload inválido NO debe publicarse");
+    let flux::FluxError::SchemaValidation(detalle) = &err else {
+        panic!("se esperaba SchemaValidation, llegó {err:?}");
+    };
+    // Los DOS campos malos en el mismo error: de uno en uno serían dos despliegues.
+    assert!(
+        detalle.errors.len() >= 2,
+        "esperaba ≥2 errores, hubo {:?}",
+        detalle.errors
+    );
+
+    // Y el `dataschema` sale del bundle, no de una URI derivada a mano.
+    let valido = json!({
+        "pedidoId": "ped-123",
+        "clienteId": "cli-987",
+        "aggregateVersion": 1,
+        "totalCents": 9990,
+        "moneda": "EUR",
+        "lineas": [{ "sku": "ABC-1", "cantidad": 2, "precioUnitarioCents": 4995 }],
+    });
+    let publicado = bus.publish(subject, &valido).await.expect("payload válido");
+    assert_eq!(
+        publicado.dataschema,
+        "https://schemas.internal/pedidos/pedido/creado/1.0.0.json"
+    );
+
+    // Lo único que llega al consumidor es el evento válido: el inválido nunca entró.
+    let llegado = esperar(&recibido)
+        .await
+        .expect("el evento válido debería llegar");
+    assert_eq!(llegado.id, publicado.id);
+
+    let salida = metrics.render();
+    assert!(
+        salida.contains(&format!(
+            "flux_events_published_total{{subject=\"{subject}\",outcome=\"invalid_schema\"}} 1"
+        )),
+        "el fallo de contrato tiene outcome propio, no `error`:\n{salida}"
+    );
+    assert!(
+        salida.contains(&format!(
+            "flux_events_published_total{{subject=\"{subject}\",outcome=\"ok\"}} 1"
+        )),
+        "{salida}"
+    );
+
+    sub.unsubscribe();
+    bus.close().await.expect("close");
+}
+
+// ─── flux_consumer_pending — el sondeo (08-observability.md §2.3) ────────────
+
+/// La razón de ser del sondeo: **sin que llegue ni un mensaje**, el gauge se emite igual.
+///
+/// Alimentado solo desde los metadatos de entrega, un consumidor que no recibe nada no
+/// emite la serie, y un panel que muestra "sin datos" es indistinguible de un consumidor
+/// sano — que es exactamente el fallo que esta métrica existe para detectar.
+#[tokio::test]
+async fn el_sondeo_emite_pending_aunque_no_llegue_ningun_mensaje() {
+    let url = broker!();
+    let subject = subject("itrust14");
+    let metrics = Arc::new(flux::InMemoryMetrics::new());
+
+    let bus = connect(
+        ConnectOptions::new(&url, "pedidos-api", "test", "1.0.0")
+            .with_tenant_id("acme")
+            .with_metrics(metrics.clone())
+            .with_schema_base_url("https://schemas.internal")
+            .with_pending_poll(Duration::from_millis(150)),
+    )
+    .await
+    .expect("conexión");
+
+    let sub = bus
+        .subscribe(&subject, |_ev: Event, _d| async move { Ok(()) })
+        .await
+        .expect("suscripción");
+
+    // No se publica NADA a propósito.
+    tokio::time::sleep(Duration::from_millis(600)).await;
+
+    let clave = format!(
+        "flux_consumer_pending{{subject=\"{subject}\",consumer=\"{}\"}}",
+        sub.durable
+    );
+    assert_eq!(
+        metrics.gauge(&clave),
+        Some(0.0),
+        "el sondeo debe emitir la serie sin entregas:\n{}",
+        metrics.render()
+    );
+
+    sub.unsubscribe();
+    bus.close().await.expect("close");
+}
+
+/// `0` desactiva el sondeo. Sin entregas y sin sondeo, la serie no existe — que es
+/// justamente el agujero que §2.3 obliga a tapar por defecto.
+#[tokio::test]
+async fn un_sondeo_a_cero_no_pregunta_nada() {
+    let url = broker!();
+    let subject = subject("itrust15");
+    let metrics = Arc::new(flux::InMemoryMetrics::new());
+
+    let bus = connect(
+        ConnectOptions::new(&url, "pedidos-api", "test", "1.0.0")
+            .with_tenant_id("acme")
+            .with_metrics(metrics.clone())
+            .with_schema_base_url("https://schemas.internal")
+            .with_pending_poll(Duration::ZERO),
+    )
+    .await
+    .expect("conexión");
+
+    let sub = bus
+        .subscribe(&subject, |_ev: Event, _d| async move { Ok(()) })
+        .await
+        .expect("suscripción");
+
+    tokio::time::sleep(Duration::from_millis(600)).await;
+
+    assert_eq!(
+        metrics.gauge(&format!(
+            "flux_consumer_pending{{subject=\"{subject}\",consumer=\"{}\"}}",
+            sub.durable
+        )),
+        None,
+        "{}",
+        metrics.render()
+    );
+
+    sub.unsubscribe();
+    bus.close().await.expect("close");
+}

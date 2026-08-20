@@ -106,9 +106,20 @@ anteriores.
 > **Nota de implementación.** Los esquemas de flux declaran `$schema: draft/2020-12`.
 > Un validador configurado para draft-07 no falla con un error de versión: falla con
 > `no schema with key or ref ".../draft/2020-12/schema"`, que no dice nada útil.
-> En `ajv` hay que usar `ajv/dist/2020`, no el export por defecto.
+> En `ajv` hay que usar `ajv/dist/2020`, no el export por defecto; en Rust, el crate
+> `jsonschema`; en PHP, `opis/json-schema` 2.4+; en Python, `jsonschema` 4.18+ eligiendo
+> el validador por el `$schema` de cada esquema; en Go, `santhosh-tekuri/jsonschema/v6`.
 
-Los SDKs de fase 1 apuntan a **L2**; el de Node implementa ya **L3** de forma opt-in.
+Los SDKs de fase 1 apuntan a **L2**; los de **Node, Python, Go, Rust y PHP** implementan ya
+**L3** de forma opt-in. El coste de L3 se paga solo si se usa: en Rust va detrás de la
+feature `validation`, en PHP de una dependencia opcional de Composer y en Python del extra
+`[validation]` con importación diferida, así que un servicio que se conforma con L2 no
+arrastra el validador.
+
+> **Go es la excepción, y conviene decirlo.** No existe allí la figura de la dependencia
+> opcional, así que el validador va en `go.mod` y lo paga también quien se quede en L2
+> (~1 MB de binario). En ejecución sigue sin costar nada: con el modo `off` no se compila
+> ni un esquema. Es una limitación del ecosistema, no una decisión del protocolo.
 
 ## 6. Fuera del alcance de v1
 

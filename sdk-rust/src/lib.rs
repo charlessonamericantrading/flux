@@ -112,6 +112,19 @@ pub mod protocol;
 #[cfg(feature = "signing")]
 pub mod signing;
 
+/// Validación del payload contra su JSON Schema — **nivel L3**, detrás de la feature
+/// `validation`.
+///
+/// No se activa por defecto, igual que `signing` y por el mismo motivo: L3 es opt-in, así
+/// que su coste también debe serlo. Un servicio que se conforma con L2 no debería arrastrar
+/// un validador de JSON Schema que no va a ejecutar.
+///
+/// ```toml
+/// flux = { path = "../sdk-rust", features = ["validation"] }
+/// ```
+#[cfg(feature = "validation")]
+pub mod validation;
+
 pub use classify::{Classifier, ClassifierOptions, HttpError, Rule, UnknownPolicy};
 pub use client::{
     connect, Bus, ConnectOptions, Credentials, Delivery, DlqEventInfo, Handler, LogFn, LogLevel,
@@ -125,7 +138,8 @@ pub use envelope::{
 };
 pub use errors::{
     as_classified, describe, Classification, ConfigDifference, ErrorClass, Failure, FluxError,
-    HandlerError, HandlerResult,
+    HandlerError, HandlerResult, SchemaNotFoundError, SchemaValidationError, INVALID_SCHEMA_CODE,
+    SCHEMA_NOT_FOUND_CODE,
 };
 pub use metrics::{
     ConnectionState, ConsumeOutcome, DlqReasonLabel, InMemoryMetrics, MetricsSink, NoMetrics,
@@ -140,3 +154,5 @@ pub use protocol::{
 };
 #[cfg(feature = "signing")]
 pub use signing::{generate_key_pair, Signer, SigningOptions, VerificationMode, Verifier};
+#[cfg(feature = "validation")]
+pub use validation::{SchemaBundle, ValidationMode, ValidationOptions, Validator};

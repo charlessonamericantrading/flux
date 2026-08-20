@@ -449,7 +449,9 @@
     "phase1Target": "L2",
     "schemaResolution": "bundle-deployed-with-service",
     "$commentL3": "El dataschema NO se resuelve por red en publish(): esta en la ruta caliente y una cache con TTL abre una ventana en la que dos servicios validan contra versiones distintas. El bundle se despliega con el servicio, asi que la version del esquema queda clavada a producerversion. Los esquemas declaran draft/2020-12: un validador de draft-07 falla con \"no schema with key or ref\", que no dice nada util.",
-    "nodeImplements": "L3"
+    "nodeImplements": "L3",
+    "implementsL3": ["node", "python", "go", "rust", "php"],
+    "$commentImplementsL3": "En Rust detras de la feature `validation` (crate jsonschema, sin resolucion HTTP); en PHP con opis/json-schema como dependencia opcional de Composer; en Python con el extra [validation] (jsonschema >= 4.18, import diferido). El coste de L3 se paga solo si se usa: sin activarlo, esos SDKs siguen siendo L2 y no arrastran el validador. Go es la excepcion: no existe el extra opcional, asi que santhosh-tekuri/jsonschema/v6 va en go.mod y lo pagan tambien los servicios en L2 (~1 MB de binario); en ejecucion sigue sin costar nada con Mode off."
   },
   "outOfScopeV1": [
     "request/reply",

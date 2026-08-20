@@ -601,7 +601,14 @@ export class FluxBus {
       // legítimo), pero la métrica debe decir `invalid_signature`. "Un productor
       // publica basura" y "alguien publica eventos que no son suyos" son dos
       // preguntas distintas — 07-signing.md §7.2.
-      const outcome = this.#pendingSignatureFailure ? "invalid_signature" : reason;
+      const outcome = this.#pendingSignatureFailure
+        ? "invalid_signature"
+        // Un fallo de esquema tiene outcome propio: "el productor rompio el
+        // contrato" es otra pregunta que "la regla de negocio rechazo el evento",
+        // aunque ambos sean PERMANENT — 08-observability.md §2.1.
+        : c.code === "INVALID_SCHEMA" || c.code === "SCHEMA_NOT_FOUND"
+          ? "invalid_schema"
+          : reason;
       this.#pendingSignatureFailure = null;
 
       try {

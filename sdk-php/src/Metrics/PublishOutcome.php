@@ -14,8 +14,12 @@ enum PublishOutcome: string
     case Ok = 'ok';
 
     /**
-     * El payload no cumple su JSON Schema (L3). El SDK de PHP es L2 y todavía no lo emite;
-     * el valor existe porque la etiqueta es del protocolo, no del SDK.
+     * El payload no cumple su JSON Schema, así que `publish()` falló y el evento **no**
+     * llegó al stream — L3, 00-protocol.md §5.
+     *
+     * Se cuenta aparte de `Error` a propósito: "el broker rechazó la publicación" y "mi
+     * servicio intentó publicar algo que incumple su propio contrato" son dos problemas con
+     * dos dueños distintos, y un panel que los suma no sirve para ninguno de los dos.
      */
     case InvalidSchema = 'invalid_schema';
 

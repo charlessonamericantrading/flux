@@ -14,9 +14,13 @@ use Flux\Signing\Verifier;
 use Flux\Transport\Ack;
 use Flux\Transport\NatsTransport;
 use Flux\Transport\RawMessage;
+use Flux\Validation\SchemaNotFoundError;
+use Flux\Validation\SchemaValidationError;
+use Flux\Validation\Validator;
 
 /**
- * Cliente de flux. Nivel de conformidad: **L2**.
+ * Cliente de flux. Nivel de conformidad: **L3** (la validación de esquema es opt-in;
+ * sin ella el comportamiento es exactamente el de L2 y no cuesta nada).
  * Contrato normativo: specification/00-protocol.md §5
  *
  * Regla de diseño: este fichero NO expone ningún tipo de NATS en su API pública. Si lo
@@ -29,6 +33,12 @@ use Flux\Transport\RawMessage;
  * llamar desde un proceso CLI de larga vida (un worker), nunca desde un handler web.
  * `publish()`, en cambio, es directamente utilizable desde cualquier petición. Ver la
  * sección "El modelo de ejecución de PHP" del README.
+ *
+ * Consecuencia honesta de ese modelo: el **sondeo de `num_pending`** que exige
+ * 08-observability.md §2.3 vive dentro de `run()`, porque PHP no tiene temporizadores en
+ * segundo plano. Un proceso que solo publica —una petición web— no sondea nada, y no puede.
+ * No es una carencia disimulable: sin worker no hay `flux_consumer_pending`, igual que sin
+ * worker tampoco hay consumo.
  */
 final class FluxBus
 {
@@ -37,12 +47,20 @@ final class FluxBus
     private readonly MetricsSink $metrics;
     private readonly ?Signer $signer;
     private readonly ?Verifier $verifier;
+    private readonly ?Validator $validator;
 
     /** @var list<Subscription> */
     private array $subscriptions = [];
 
     /** @var array<string,true> Streams ya comprobados en esta conexión. */
     private array $ensured = [];
+
+    /**
+     * Instante del último sondeo de `num_pending`, por durable. Ver `pollConsumerPending()`.
+     *
+     * @var array<string,float>
+     */
+    private array $lastPendingPoll = [];
 
     private function __construct(
         private readonly NatsTransport $transport,
@@ -58,6 +76,13 @@ final class FluxBus
         // llegar el primer mensaje — 07-signing.md §7.
         $this->signer = Signer::fromOptions($options->signing);
         $this->verifier = Verifier::fromOptions($options->signing, $options->logger);
+
+        // Los esquemas se compilan UNA vez, aquí, y no por evento: parsear un JSON Schema
+        // en la ruta caliente del productor tiraría el throughput. Por el mismo motivo que
+        // el firmante, un bundle ausente o una librería que falta es un fallo de ARRANQUE:
+        // un servicio con `mode: strict` mal configurado no debe pasar el healthcheck y
+        // descubrirlo al publicar el primer evento.
+        $this->validator = Validator::fromOptions($options->validation, $options->logger);
 
         $this->metrics->connectionState(
             $transport->isConnected() ? ConnectionState::Connected : ConnectionState::Disconnected
@@ -171,6 +196,22 @@ final class FluxBus
             tracestate: $inherited?->tracestate,
         );
 
+        // L3: validar ANTES de publicar, y antes de firmar. Un payload que viola su propio
+        // contrato debe fallar AQUÍ, en el servicio que lo generó, en vez de aparecer como
+        // un misterio en un consumidor de otro equipo la semana que viene — 00-protocol.md
+        // §5. Para entonces el evento malo ya estaría en el stream y no hay forma de
+        // retirarlo.
+        try {
+            $this->validator?->validate($event, $subject);
+        } catch (SchemaValidationError|SchemaNotFoundError $e) {
+            // `invalid_schema` y no `error`: "el broker rechazó la publicación" y "mi
+            // servicio intentó publicar basura" son dos problemas distintos con dos dueños
+            // distintos, y un panel que los suma no sirve para ninguno de los dos.
+            $this->metrics->eventPublished($subject, PublishOutcome::InvalidSchema);
+
+            throw $e;
+        }
+
         // Firmar es LO ÚLTIMO antes de serializar: la firma cubre el envelope completo, así
         // que cualquier atributo añadido después la invalidaría — 07-signing.md §5.
         $event = $this->signer?->sign($event) ?? $event;
@@ -198,23 +239,34 @@ final class FluxBus
 
     private function schemaFor(string $subject): string
     {
+        // Lo declarado a mano gana siempre: es la única forma de apuntar a un esquema que no
+        // está en el bundle.
         if (isset($this->options->schemas[$subject])) {
             return $this->options->schemas[$subject];
         }
 
+        // El bundle L3 conoce el MINOR real de cada subject. Dentro de un mayor todo es
+        // BACKWARD-compatible (05-compatibility.md), así que el MINOR más alto acepta todo
+        // lo que aceptan los anteriores y es el que corresponde anunciar.
+        $fromBundle = $this->options->validation?->bundle?->uriFor($subject);
+        if ($fromBundle !== null) {
+            return $fromBundle;
+        }
+
         if ($this->options->schemaBaseUrl === null) {
             throw new EnvelopeException(
-                "no hay dataschema para \"{$subject}\". Declara schemas[\"{$subject}\"] o "
-                . 'schemaBaseUrl en ConnectOptions.'
+                "no hay dataschema para \"{$subject}\". Declara schemas[\"{$subject}\"], "
+                . 'schemaBaseUrl, o pasa un bundle en validation.bundle (ConnectOptions).'
             );
         }
 
         $p = Protocol::parseSubject($subject);
 
-        // Sin registro exacto solo se puede asumir el `.0.0` del mayor. El dataschema NO se
-        // resuelve por red en publish(): está en la ruta caliente, y una caché con TTL abre
-        // una ventana en la que dos servicios validan contra versiones distintas. Un SDK L3
-        // resuelve el minor real desde el bundle desplegado con el servicio.
+        // Sin bundle ni mapa explícito solo se puede asumir el `.0.0` del mayor: es
+        // suficiente para L2 —donde el atributo es informativo— pero no para L3, donde se
+        // valida contra él. El dataschema NO se resuelve por red en publish(): está en la
+        // ruta caliente, y una caché con TTL abre una ventana en la que dos servicios validan
+        // contra versiones distintas del mismo esquema (00-protocol.md §5).
         return rtrim($this->options->schemaBaseUrl, '/')
             . "/{$p->domain}/{$p->aggregate}/{$p->event}/{$p->major}.0.0.json";
     }
@@ -429,6 +481,12 @@ final class FluxBus
             $gotSomething = false;
 
             foreach ($active as $subscription) {
+                // Antes de pedir mensajes, no después: si `fetch` se queda bloqueado el
+                // `idleTimeoutMs` entero, el sondeo de la vuelta anterior ya emitió su valor
+                // y el gauge no se queda sin actualizar mientras la cola está vacía — que es
+                // precisamente cuando esta métrica importa.
+                $this->pollConsumerPending($subscription);
+
                 try {
                     // batch = 1 no es una limitación: es la consecuencia de procesar los
                     // mensajes en serie. Con batch = N, los N-1 que esperan turno gastan su
@@ -469,6 +527,76 @@ final class FluxBus
             if (!$gotSomething && $stopWhenIdle) {
                 return $processed;
             }
+        }
+    }
+
+    /**
+     * Pregunta al servidor por el `num_pending` del consumidor, como mucho una vez cada
+     * `pendingPollMs` — 08-observability.md §2.3.
+     *
+     * ## Por qué hace falta, si los metadatos ya lo traen
+     *
+     * `dispatch()` actualiza el gauge desde los metadatos de cada mensaje entregado, que es
+     * gratis y fresquísimo. Pero esa fuente falla **exactamente donde importa**: si el bucle
+     * del consumidor muere, dejan de entregarse mensajes, así que el gauge se queda PLANO en
+     * su último valor en vez de crecer. En un panel eso es una línea horizontal —
+     * indistinguible de "no pasa nada"— mientras la cola crece sin techo y la conexión se
+     * sigue reportando sana. Es el bug que apareció de verdad en el SDK de Node
+     * (08-observability.md §4).
+     *
+     * El sondeo no depende de que lleguen mensajes, así que reporta el `num_pending`
+     * creciente. Las dos fuentes son obligatorias porque cada una cubre el punto ciego de la
+     * otra.
+     *
+     * ## Y por qué un fallo aquí se traga
+     *
+     * Esto es telemetría. Un `CONSUMER.INFO` que falla —permisos, un servidor recargado, un
+     * consumidor recién borrado— no puede impedir que se procesen eventos: sería cambiar una
+     * métrica ausente por un worker parado.
+     */
+    private function pollConsumerPending(Subscription $subscription): void
+    {
+        $intervalMs = $this->options->pendingPollMs;
+
+        if ($intervalMs <= 0) {
+            return;
+        }
+
+        $now = microtime(true);
+        $last = $this->lastPendingPoll[$subscription->durable] ?? null;
+
+        if ($last !== null && ($now - $last) * 1000 < $intervalMs) {
+            return;
+        }
+
+        // El instante se apunta ANTES de preguntar: si el sondeo tarda o falla, el siguiente
+        // intento sigue respetando el intervalo en vez de reintentar en cada vuelta del
+        // bucle y convertir un servidor con problemas en una tormenta de peticiones.
+        $this->lastPendingPoll[$subscription->durable] = $now;
+
+        try {
+            $pending = $this->transport->consumerPending(
+                $subscription->stream,
+                $subscription->durable,
+            );
+        } catch (\Throwable $e) {
+            $this->log('warning', sprintf(
+                '[flux] falló el sondeo de num_pending de %s: %s. El consumo continúa.',
+                $subscription->durable,
+                $e->getMessage(),
+            ));
+
+            return;
+        }
+
+        // `null` es "no lo sabemos" y NO se emite: publicar un 0 se dibujaría como "no hay
+        // nada pendiente", que es la conclusión contraria.
+        if ($pending !== null) {
+            $this->metrics->consumerPending(
+                $subscription->subject,
+                $subscription->durable,
+                $pending,
+            );
         }
     }
 
@@ -540,6 +668,20 @@ final class FluxBus
             // migración—, y la pregunta "¿cuántos eventos siguen sin firma?" habría que
             // buscarla a mano en los logs de siete servicios (§7.1).
             $signatureWarning = $this->verifier?->check($event) !== null;
+
+            // L3 al consumir. Va DESPUÉS de la firma y ANTES del handler: un evento
+            // manipulado puede tener un `data` impecable, así que comprobar el esquema
+            // primero respondería la pregunta equivocada.
+            //
+            // El fallo se clasifica PERMANENT —`SchemaValidationError::fluxClass()`— y por
+            // eso se lanza dentro de este `try`: recorre el mismo camino que cualquier otro
+            // fallo del handler (clasificar, contar, DLQ) en vez de tener una rama propia.
+            // El evento parseó como CloudEvent, así que no es POISON; y su `data` no va a
+            // cambiar entre entregas, así que reintentarlo son 51 minutos de cola bloqueada
+            // para llegar al mismo sitio — 04-errors.md §1.2.
+            if ($this->options->validation?->onConsume === true) {
+                $this->validator?->validate($event, $subject);
+            }
 
             EventContext::run(
                 EventContext::fromEvent($event),
@@ -659,12 +801,22 @@ final class FluxBus
         // incidente de seguridad o una migración a medias. Mezclarlas hace que
         // `rate(…{outcome="poison"})` mida cosas distintas según el lenguaje del consumidor,
         // que es justo lo que 08-observability.md §1 existe para impedir.
+        // Por la misma razón, `invalid_schema` tampoco es una clase de error aparte: su
+        // `dlqreason` en la DLQ es `permanent` y así se registra. Pero como `outcome` sí es
+        // propio, porque responde otra pregunta: `permanent` es "mi lógica de negocio
+        // rechazó este evento" —una decisión— mientras que `invalid_schema` es "alguien
+        // publicó algo que incumple su propio contrato" —un bug de un productor, y en otro
+        // servicio—. Sumarlos haría que un productor roto se leyese como reglas de negocio
+        // funcionando, que es lo contrario de una alerta.
         $this->metrics->eventConsumed(
             $subscription->subject,
             $subscription->durable,
-            $signatureWarning || self::isSignatureCode($classification->code)
-                ? ConsumeOutcome::InvalidSignature
-                : ConsumeOutcome::fromErrorClass($reason),
+            match (true) {
+                $signatureWarning || self::isSignatureCode($classification->code)
+                    => ConsumeOutcome::InvalidSignature,
+                self::isSchemaCode($classification->code) => ConsumeOutcome::InvalidSchema,
+                default => ConsumeOutcome::fromErrorClass($reason),
+            },
         );
         $this->metrics->eventDlq(
             $subscription->subject,
@@ -699,6 +851,12 @@ final class FluxBus
             ['MISSING_SIGNATURE', 'INVALID_SIGNATURE', 'UNKNOWN_SIGNING_KEY'],
             true,
         );
+    }
+
+    /** Los códigos de la validación L3 — 00-protocol.md §5. */
+    private static function isSchemaCode(string $code): bool
+    {
+        return in_array($code, [SchemaValidationError::CODE, SchemaNotFoundError::CODE], true);
     }
 
     /** Backoff canónico para el intento `$attempt` (1-based). */

@@ -1,6 +1,6 @@
 {
     "name": "flux/sdk",
-    "description": "SDK de PHP para el flux Event Protocol v1 — CloudEvents 1.0 sobre NATS JetStream. Nivel de conformidad L2.",
+    "description": "SDK de PHP para el flux Event Protocol v1 — CloudEvents 1.0 sobre NATS JetStream. Nivel de conformidad L3 (validación de esquema opt-in).",
     "type": "library",
     "license": "MIT",
     "keywords": ["cloudevents", "nats", "jetstream", "event-driven", "flux"],
@@ -10,10 +10,12 @@
         "psr/log": "^2.0 || ^3.0"
     },
     "require-dev": {
+        "opis/json-schema": "^2.4",
         "phpunit/phpunit": "^10.5"
     },
     "suggest": {
         "ext-sodium": "Necesaria SOLO para la firma Ed25519 de eventos (specification/07-signing.md), que es una extensión OPCIONAL del protocolo. Está en el core de PHP desde 7.2, así que la firma no añade ninguna dependencia de Composer; pero muchas distribuciones la empaquetan aparte (php-sodium) y en Windows viene comentada en php.ini. Sin ella, todo lo demás del SDK funciona igual.",
+        "opis/json-schema": "Necesaria SOLO para la validación de esquema del nivel L3 (specification/00-protocol.md §5), que es opt-in: sin ella el SDK se comporta como L2 y no cuesta nada. Hace falta ^2.4 o superior porque los esquemas de flux declaran draft 2020-12; un validador de draft-07 NO da un error de versión, da `no schema with key or ref`, que no dice nada útil. Añade tres paquetes al árbol de dependencias (opis/json-schema, opis/string, opis/uri), y ese es exactamente el coste que un servicio en L2 no debería pagar.",
         "basis-company/nats": "Cliente de NATS necesario para Flux\\Transport\\BasisNatsTransport. Si usas otro cliente, implementa Flux\\Transport\\NatsTransport.",
         "open-telemetry/api": "Si está presente, el SDK rellena `traceparent` desde el span activo.",
         "ext-mbstring": "No es necesario, pero mejora los mensajes de error con texto multibyte."

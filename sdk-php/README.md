@@ -1,7 +1,9 @@
 # flux SDK — PHP
 
 Cliente de **flux Event Protocol v1** (CloudEvents 1.0 sobre NATS JetStream).
-Nivel de conformidad objetivo: **L2** ([00-protocol.md §5](../specification/)).
+Nivel de conformidad: **L3** ([00-protocol.md §5](../specification/)) — la validación de
+esquema es **opt-in**; sin activarla el comportamiento es exactamente el de L2 y no cuesta
+ni una dependencia. Ver [Validación de esquema (L3)](#validación-de-esquema-l3).
 
 Port del SDK de referencia de Node (`sdk-node/src/`), siguiendo de cerca al de Python por
 ser el otro lenguaje dinámico: misma semántica, mismos defaults, mismos códigos de error.
@@ -14,14 +16,16 @@ composer require flux/sdk        # requiere PHP >= 8.2
 
 > ### Estado de verificación
 >
-> ✅ **Suite ejecutada y en verde: 272 tests, 740 assertions** (PHP 8.3.30 con `ext-sodium`,
-> PHPUnit 10.5.64). Cubre naming, envelope, serialización byte a byte, clasificación de
-> errores, firma Ed25519, métricas, aislamiento de tenant y todo el runtime del consumidor.
+> ✅ **Suite ejecutada y en verde: 301 tests, 567 assertions** (PHP 8.3.30, PHPUnit
+> 10.5.64, sin `ext-sodium`: 38 saltados). Cubre naming, envelope, serialización byte a
+> byte, clasificación de errores, firma Ed25519, validación L3 contra el bundle real del
+> repositorio, métricas, aislamiento de tenant y todo el runtime del consumidor.
 > **Ninguno necesita broker.**
 >
-> Sin `ext-sodium` la suite sigue en verde con 37 tests saltados —los de firma—, que es
+> Sin `ext-sodium` la suite sigue en verde con los tests de firma saltados, que es
 > exactamente el comportamiento que se quiere: la firma es una extensión **opcional** del
-> protocolo y no debe impedir usar el resto del SDK.
+> protocolo y no debe impedir usar el resto del SDK. Lo mismo vale para
+> `opis/json-schema` y la validación L3.
 >
 > ⚠️ `Flux\Transport\BasisNatsTransport` **sigue sin verificarse contra un servidor NATS
 > real.** Sus tests usan un cliente falso: fijan cómo reacciona ante un PubAck correcto, un
@@ -343,6 +347,100 @@ FIJO** —la semilla del TEST 1 de RFC 8032, un evento literal y su firma en bas
 producen y aceptan por igual este SDK, `node:crypto` y `ed25519-dalek` de Rust. Lleva además
 el evento de DLQ firmado **byte a byte**, el mismo literal que tiene el SDK de Rust.
 
+## Validación de esquema (L3)
+
+[00-protocol.md §5](../specification/). Es lo que separa L2 de L3, y cierra el hueco más
+grande que quedaba: **sin ella, un productor puede publicar un payload que viola su propio
+`dataschema` y nadie se entera** hasta que un consumidor —posiblemente de otro equipo, otro
+lenguaje y otra semana— se atraganta. Para entonces el evento malo ya está en el stream y
+no hay forma de retirarlo. Validar en `publish()` lo convierte en un fallo del servicio que
+lo provocó.
+
+```bash
+composer require opis/json-schema     # opcional: solo si vas a usar L3
+node scripts/bundle-schemas.mjs       # genera schemas/bundle.json
+```
+
+```php
+use Flux\Validation\{SchemaBundle, ValidationMode, ValidationOptions};
+
+$bus = FluxBus::connect(new ConnectOptions(
+    service: 'pedidos-api',
+    environment: 'produccion',
+    version: '3.4.1',
+    validation: new ValidationOptions(
+        mode: ValidationMode::Strict,           // off (default) | warn | strict
+        bundle: SchemaBundle::fromFile(__DIR__ . '/schemas/bundle.json'),
+        onConsume: false,                       // validar también al consumir
+    ),
+), $transport);
+```
+
+| Modo | Qué hace |
+|---|---|
+| `Off` (default) | No valida. Es L2 y **no cuesta nada**: no compila esquemas y la librería no hace falta |
+| `Warn` | Registra el incumplimiento por el `logger` y publica igual. El modo de la migración |
+| `Strict` | **`publish()` lanza `SchemaValidationError`.** El evento no llega al stream |
+
+**Reporta TODOS los errores, no solo el primero.** No es un detalle de presentación: de uno
+en uno, arreglar un payload con tres campos mal cuesta tres despliegues. Cada línea lleva su
+ruta dentro del payload (`/lineas/0/cantidad`).
+
+```
+el payload de "pedidos.pedido.v1.creado" no cumple su esquema (https://…/1.0.0.json):
+  · /totalCents The data (string) must match the type: integer
+  · /moneda The string should match pattern: ^[A-Z]{3}$
+```
+
+### El bundle se despliega con el servicio; el `dataschema` NO se resuelve por red
+
+El `dataschema` es una URI y la tentación evidente es resolverla por HTTP. Un SDK L3 **NO
+DEBE** hacerlo, y las dos razones no se arreglan con más ingeniería:
+
+1. **Validar está en la ruta caliente.** Una petición por evento publicado es inaceptable.
+2. **Una caché con TTL abre una ventana de incoherencia** en la que dos servicios validan
+   contra versiones distintas del mismo esquema, y ninguno se entera.
+
+Por eso el bundle es un **dato que se despliega con el servicio**: así la versión del
+esquema queda clavada a la versión del servicio, que es justo lo que `producerversion`
+promete poder acotar. El bundle resuelve además el `dataschema` **exacto** de cada subject
+(el MINOR más alto de su mayor); sin él solo se puede asumir el `.0.0`, que basta para L2
+pero no para L3.
+
+### Al consumir: PERMANENT, nunca reintento
+
+Con `onConsume: true`, un evento que incumple su esquema va **directo a la DLQ** con
+`dlqreason: permanent` y sin gastar reintentos. El evento parseó como CloudEvent, así que no
+es POISON; y su `data` no va a cambiar entre entregas, así que reintentarlo son 51 minutos de
+cola bloqueada para llegar al mismo sitio ([04-errors.md §1.2](../specification/)). En
+métricas sale como `outcome="invalid_schema"`, no como `permanent`: "un productor publica
+algo que incumple su contrato" es un bug de **otro servicio**, mientras que `permanent` es
+"mi lógica de negocio rechazó este evento" —una decisión—, y sumarlos haría que un productor
+roto se leyese como reglas de negocio funcionando.
+
+### El coste de la dependencia, y qué pasa sin ella
+
+`opis/json-schema` está en `suggest`, no en `require`. **L3 es opt-in, así que su coste
+también debe serlo**: un servicio en L2 no debería arrastrar un validador de JSON Schema
+—tres paquetes: `opis/json-schema`, `opis/string`, `opis/uri`— que no va a ejecutar nunca.
+Es la misma decisión que `ext-sodium` para la firma.
+
+Sin la librería instalada, `ValidationMode::Off` funciona con normalidad y cualquier otro
+modo falla **al conectar** (no al publicar el primer evento) con un mensaje que dice qué
+instalar y por qué.
+
+> ⚠️ **Hace falta soporte de draft 2020-12** (`opis/json-schema ^2.4`; verificado con
+> 2.6.0). Los esquemas de flux declaran `$schema: .../draft/2020-12/schema`, y un validador
+> de draft-07 **no da un error de versión**: da `no schema with key or ref "…/2020-12/…"`,
+> que no dice absolutamente nada sobre la causa real.
+
+> ⚠️ **Trampa de la librería, ya resuelta dentro del SDK.** Opis arranca con
+> `maxErrors = 1`: con los defaults reportaría un solo error e incumpliría el requisito de
+> L3. El SDK lo sube al construir el validador. En sentido contrario, `stopAtFirstError` se
+> deja en `true` a propósito — ponerlo en `false` hace que `additionalProperties` reporte el
+> conjunto entero de propiedades examinadas, así que un payload con dos campos mal produce
+> además un error que afirma que los campos **válidos** "no están permitidos".
+
 ## Métricas
 
 [08-observability.md](../specification/), normativo para L2. Las siete métricas, con sus
@@ -374,6 +472,43 @@ El último bucket del histograma es `30` porque **es el `ack_wait`**: un handler
 está a punto de que su mensaje se reentregue mientras aún se ejecuta.
 `MetricsTest::testElUltimoBucketEsElAckWait()` lo ata a `Protocol::ACK_WAIT_MS` para que no
 se desincronicen, y otro test los compara con `protocol.json`.
+
+### `flux_consumer_pending`: dos fuentes, y una de ellas solo existe en el worker
+
+[08-observability.md §2.3](../specification/) exige **las dos**, porque cada una falla justo
+donde la otra sirve:
+
+| Fuente | Coste | Falla cuando… |
+|---|---|---|
+| Metadatos del mensaje entregado | Gratis, fresco en cada evento | **No llegan mensajes** — y ese es el caso que importa |
+| Sondeo de `num_pending` al servidor | Una petición cada ~15 s | Nunca, mientras haya conexión |
+
+El razonamiento decide la regla: **si el bucle del consumidor muere, dejan de entregarse
+mensajes**, así que un gauge alimentado solo desde los metadatos se queda **plano en su
+último valor** en vez de crecer. En un panel eso es una línea horizontal, indistinguible de
+"no pasa nada", mientras la cola crece sin techo y la conexión se sigue reportando sana.
+
+El intervalo se configura con `pendingPollMs` (default `15000`; `0` lo desactiva), y **un
+fallo del sondeo nunca afecta al consumo**: es telemetría, se registra y se sigue.
+
+```php
+new ConnectOptions(/* … */, pendingPollMs: 15_000);
+```
+
+> ⚠️ **Limitación real de PHP, sin maquillaje.** El sondeo vive **dentro de `run()`**, y en
+> PHP no puede vivir en otro sitio: no hay temporizadores en segundo plano ni bucle de
+> eventos donde colgar un `setInterval`. Consecuencias concretas:
+>
+> - **En el worker CLI funciona como en los demás SDKs.** El sondeo corre entre vueltas del
+>   bucle, respeta el intervalo y emite el gauge aunque no llegue ni un mensaje — que es
+>   exactamente el caso que la métrica existe para detectar.
+> - **Bajo FPM no sondea, y no puede.** Un proceso que solo publica no tiene bucle. Pero eso
+>   no deja ningún hueco de observabilidad: un proceso que no consume tampoco tiene
+>   consumidores de los que reportar `num_pending`. La métrica pertenece al worker, y el
+>   worker sí la emite.
+> - **Si el worker entero muere**, no queda nadie sondeando. Ningún SDK puede resolver eso
+>   desde dentro del proceso que se ha muerto: se detecta por ausencia de scrape o por
+>   `up == 0`, no con esta métrica.
 
 > ⚠️ **`InMemoryMetrics` vive en la memoria del proceso.** En un worker CLI de larga vida
 > (`$bus->run()`) es justo lo que se quiere. **Bajo FPM no**: cada petición es un proceso
@@ -610,8 +745,8 @@ Dos reglas que un port suele dar por hechas y no lo están:
 ```bash
 cd sdk-php
 composer install
-vendor/bin/phpunit                                    # 272 tests, 740 assertions (1 saltado)
-php -d extension=sodium -d extension=sockets vendor/bin/phpunit   # 744 assertions, 0 saltados
+vendor/bin/phpunit                                    # 301 tests, 567 assertions (38 saltados)
+php -d extension=sodium -d extension=sockets vendor/bin/phpunit   # 0 saltados
 ```
 
 Ninguno necesita broker. Varios leen `protocol.json` del repositorio directamente, de modo
@@ -623,6 +758,7 @@ las etiquetas prohibidas.
 |---|--:|---|
 | `EnvelopeTest`, `ProtocolTest`, `ClassifierTest`, `FluxBusTest`, `AckTest`, … | 203 | 1 de ellos, `ext-sockets` |
 | `SigningTest` | 33 | `ext-sodium` |
+| `ValidationTest` (bundle real del repositorio, publish, consumo y sondeo) | 29 | — |
 | `MetricsTest` | 19 | — |
 | `TenantIsolationTest` (incluye firma y métricas **a través del bus**) | 17 | 4 de ellos, `ext-sodium` |
 

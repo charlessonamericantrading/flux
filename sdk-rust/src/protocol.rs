@@ -24,6 +24,21 @@ pub const SPEC_VERSION: &str = "1.0";
 pub const DATA_CONTENT_TYPE: &str = "application/json";
 
 /// Nivel de conformidad declarado por este SDK — 00-protocol.md §5.
+///
+/// Depende de la compilación, y decirlo así es lo honesto: L3 exige validar el
+/// `dataschema` y **fallar el `publish()`** si el payload no cumple, y eso vive detrás de
+/// la feature `validation`. Un binario compilado sin ella no valida nada, así que declarar
+/// "L3" sería mentir en la única constante que un operador va a mirar para saber qué
+/// esperar del SDK.
+#[cfg(feature = "validation")]
+pub const CONFORMANCE_LEVEL: &str = "L3";
+
+/// Nivel de conformidad declarado por este SDK — 00-protocol.md §5.
+///
+/// Sin la feature `validation`, este SDK es **L2**: cumple la taxonomía de errores, el
+/// backoff canónico, la DLQ, la propagación de contexto y la reconexión, pero no valida
+/// esquemas. Compílalo con `features = ["validation"]` para L3.
+#[cfg(not(feature = "validation"))]
 pub const CONFORMANCE_LEVEL: &str = "L2";
 
 /// Techo del mensaje serializado (1 MiB).

@@ -71,6 +71,29 @@ final class InMemoryTransport implements NatsTransport
      */
     public array $failRespondTokens = [];
 
+    /**
+     * `num_pending` que devolverá el sondeo, por durable. Un durable sin entrada devuelve
+     * `null` — "no lo sabemos", que no es lo mismo que cero.
+     *
+     * @var array<string,int|null>
+     */
+    public array $pendingByDurable = [];
+
+    /**
+     * Cuántas veces se ha sondeado, por durable. Sin esto, un test no puede distinguir
+     * "el sondeo devolvió el valor correcto" de "el sondeo nunca llegó a ejecutarse y el
+     * gauge lo puso el metadato del mensaje".
+     *
+     * @var array<string,int>
+     */
+    public array $pendingPolls = [];
+
+    /**
+     * Si es `true`, `consumerPending()` lanza. Sirve para el test de "un fallo del sondeo
+     * NO afecta al consumo": es telemetría, no puede tumbar el worker.
+     */
+    public bool $failConsumerPending = false;
+
     public function isConnected(): bool
     {
         return $this->connected;
@@ -100,6 +123,17 @@ final class InMemoryTransport implements NatsTransport
         return $this->replaceConsumerConfig
             ? $this->consumerConfigOverride
             : array_merge($config, $this->consumerConfigOverride);
+    }
+
+    public function consumerPending(string $stream, string $durable): ?int
+    {
+        $this->pendingPolls[$durable] = ($this->pendingPolls[$durable] ?? 0) + 1;
+
+        if ($this->failConsumerPending) {
+            throw new \RuntimeException("sondeo de num_pending rechazado para {$durable} (simulado)");
+        }
+
+        return $this->pendingByDurable[$durable] ?? null;
     }
 
     public function fetch(string $stream, string $durable, int $batch, int $timeoutMs): array

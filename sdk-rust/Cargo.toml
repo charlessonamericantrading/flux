@@ -53,9 +53,30 @@ async-nats = "0.50"
 ed25519-dalek = { version = "2.2", features = ["rand_core"], optional = true }
 rand_core = { version = "0.6", features = ["getrandom"], optional = true }
 
+# ─── Validación L3 — opt-in (00-protocol.md §5) ──────────────────────────────
+#
+# Mismo trato que `signing` y por el mismo motivo: L3 es opt-in, así que su coste también
+# debe serlo. Un servicio en L2 no tiene por qué arrastrar un validador de JSON Schema que
+# no va a ejecutar nunca, y `cargo build` sin features tiene que seguir funcionando.
+#
+# `default-features = false` NO es una optimización: las features por defecto del crate son
+# `resolve-http` + `resolve-file` + TLS, es decir, `reqwest` y `rustls` en el árbol de
+# dependencias para ir a buscar `$ref`s por red. Un SDK L3 **NO DEBE** resolver el
+# `dataschema` por HTTP —está en la ruta caliente, y una caché con TTL abre una ventana en
+# la que dos servicios validan contra versiones distintas del mismo esquema—, así que apagar
+# esa resolución es exactamente lo que manda el protocolo. El bundle llega como dato y es
+# autocontenido.
+#
+# Versión 0.46 y no la 0.50: la 0.50 sube el MSRV por encima del 1.83 que este crate declara,
+# y subirlo obligaría a actualizar el toolchain de todo servicio que consuma el SDK por una
+# feature que la mayoría no activa. La 0.46 entiende draft 2020-12, que es lo único que hace
+# falta aquí.
+jsonschema = { version = "0.46", default-features = false, optional = true }
+
 [features]
 default = []
 signing = ["dep:ed25519-dalek", "dep:rand_core"]
+validation = ["dep:jsonschema"]
 
 # ─── Arnés de conformidad cruzada ────────────────────────────────────────────
 #
