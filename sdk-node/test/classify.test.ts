@@ -59,22 +59,51 @@ describe("errores de sistema", () => {
     });
   }
 
-  test("un código de sistema desconocido cae en el default", () => {
+  test("un código de sistema desconocido cae en el default acotado", () => {
+    // EPERM no está en la lista de transitorios, así que no es un RETRYABLE
+    // reconocido: recibe el presupuesto acotado, no los 6 intentos.
     const c = classify(Object.assign(new Error(), { code: "EPERM" }));
-    assert.equal(c.class, ErrorClass.PERMANENT);
+    assert.equal(c.class, ErrorClass.RETRYABLE);
+    assert.equal(c.maxAttempts, 2);
     assert.equal(c.code, "EPERM", "el código se conserva para métricas");
   });
 });
 
-describe("política", () => {
-  test("el default de lo desconocido es PERMANENT — la cola sigue fluyendo", () => {
-    assert.equal(classify(new Error("¿?")).class, ErrorClass.PERMANENT);
-    assert.equal(classify(new Error("¿?")).code, "UNKNOWN");
+describe("política ante lo desconocido", () => {
+  test("el default es RETRYABLE con presupuesto acotado de 2 entregas", () => {
+    // Domina a las dos alternativas: el transitorio se recupera en el 2º intento,
+    // el sistemático llega a la DLQ en ~30s sin atascar la cola. 04-errors.md §2.1.
+    const c = classify(new Error("¿?"));
+    assert.equal(c.class, ErrorClass.RETRYABLE);
+    assert.equal(c.code, "UNKNOWN");
+    assert.equal(c.maxAttempts, 2);
   });
 
-  test("unknownErrorPolicy: retryable invierte el default", () => {
+  test("el presupuesto acotado NO recorta los RETRYABLE reconocidos", () => {
+    // Un ECONNRESET conserva sus 6 intentos: el presupuesto es por error, no por
+    // consumidor. Bajarlo en max_deliver los habría recortado a todos.
+    assert.equal(classify({ status: 503 }).maxAttempts, undefined);
+    assert.equal(
+      classify(Object.assign(new Error(), { code: "ECONNRESET" })).maxAttempts,
+      undefined,
+    );
+  });
+
+  test("el presupuesto es configurable", () => {
+    const c = createClassifier({ unknownRetryBudget: 3 });
+    assert.equal(c(new Error("¿?")).maxAttempts, 3);
+  });
+
+  test("unknownErrorPolicy: permanent no gasta ningún reintento", () => {
+    const c = createClassifier({ unknownErrorPolicy: "permanent" });
+    assert.equal(c(new Error("¿?")).class, ErrorClass.PERMANENT);
+    assert.equal(c(new Error("¿?")).maxAttempts, undefined);
+  });
+
+  test("unknownErrorPolicy: retryable da el backoff completo", () => {
     const c = createClassifier({ unknownErrorPolicy: "retryable" });
     assert.equal(c(new Error("¿?")).class, ErrorClass.RETRYABLE);
+    assert.equal(c(new Error("¿?")).maxAttempts, undefined, "sin tope propio = el del consumidor");
   });
 
   test("los timeouts son RETRYABLE por defecto y configurables", () => {

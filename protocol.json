@@ -287,8 +287,8 @@
     }
   },
   "errors": {
-    "default": "permanent",
-    "$comment": "Un evento en la DLQ es recuperable; una cola atascada 51 minutos en hora punta no lo es. La asimetria del coste decide el default.",
+    "default": "retryable-bounded",
+    "$comment": "Default para lo DESCONOCIDO: RETRYABLE con presupuesto acotado de 2 entregas. Domina a las alternativas: PERMANENT manda a la DLQ un evento valido por un hipo de red; RETRYABLE completo atasca la cola 51 min y amplifica el modo de fallo. El acotado cuesta 30s de latencia sobre los permanentes genuinos y elimina ambos. El presupuesto NO va en max_deliver (es por consumidor, recortaria tambien los RETRYABLE reconocidos): el SDK lo aplica por error via Classification.maxAttempts.",
     "classes": {
       "retryable": {
         "action": "nak",
@@ -354,7 +354,13 @@
         "dlqtime"
       ]
     },
-    "dlqAttemptsSemantics": "numero de entrega en que el evento murio, NO una propiedad de la clase. Un PERMANENT lanzado en la 3a entrega registra 3."
+    "dlqAttemptsSemantics": "numero de entrega en que el evento murio, NO una propiedad de la clase. Un PERMANENT lanzado en la 3a entrega registra 3.",
+    "unknownRetryBudget": 2,
+    "budgets": {
+      "recognizedRetryable": 6,
+      "unknown": 2,
+      "permanent": 1
+    }
   },
   "compatibility": {
     "withinMajor": "BACKWARD",

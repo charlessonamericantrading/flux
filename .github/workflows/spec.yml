@@ -115,3 +115,41 @@ jobs:
         run: |
           npm install --no-audit --no-fund
           npm test
+
+      # `flux doctor` sale con 1 si encuentra errores, así que se prueba en ambos
+      # sentidos: un cluster conforme pasa, y uno con el bug del ack_wait sembrado
+      # DEBE fallar. Un doctor que solo se prueba en verde no demuestra nada.
+      - name: flux doctor detecta un cluster roto
+        working-directory: cli
+        run: |
+          npm install --no-audit --no-fund
+          node src/index.mjs validate pedidos.pedido.v1.creado
+          ! node src/index.mjs validate 'Pedidos.pedido.v1.actualizado'
+          node -e "
+            const {connect} = await import('@nats-io/transport-node');
+            const {jetstreamManager} = await import('@nats-io/jetstream');
+            const nc = await connect({servers:'nats://127.0.0.1:4222'});
+            const jsm = await jetstreamManager(nc); const S=1e9;
+            await jsm.streams.add({name:'EVT_CITEST',subjects:['citest.>'],storage:'file',
+              retention:'limits',discard:'old',max_age:30*86400*S,duplicate_window:120*S});
+            await jsm.streams.add({name:'DLQ_CITEST',subjects:['dlq.citest.>'],storage:'file',
+              retention:'limits',discard:'old',max_age:90*86400*S});
+            await jsm.consumers.add('EVT_CITEST',{durable_name:'ok-api__citest_p_v1_creado',
+              filter_subject:'citest.p.v1.creado',ack_policy:'explicit',ack_wait:30*S,
+              max_deliver:6,backoff:[30*S,60*S,300*S,900*S,1800*S],max_ack_pending:256});
+            await nc.drain();
+          " --input-type=module
+          echo '--- cluster conforme: doctor debe salir 0 ---'
+          node src/index.mjs doctor
+          node -e "
+            const {connect} = await import('@nats-io/transport-node');
+            const {jetstreamManager} = await import('@nats-io/jetstream');
+            const nc = await connect({servers:'nats://127.0.0.1:4222'});
+            const jsm = await jetstreamManager(nc); const S=1e9;
+            await jsm.consumers.add('EVT_CITEST',{durable_name:'roto-api__citest_p_v1_creado',
+              filter_subject:'citest.p.v1.creado',ack_policy:'explicit',ack_wait:30*S,
+              max_deliver:6,backoff:[1*S,5*S,30*S,120*S,600*S]});
+            await nc.drain();
+          " --input-type=module
+          echo '--- ack_wait sembrado a 1s: doctor DEBE salir 1 ---'
+          ! node src/index.mjs doctor

@@ -1,0 +1,14 @@
+{
+  "name": "@flux/cli",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "CLI operativa del flux Event Protocol v1: doctor, tail y triaje/replay de DLQ.",
+  "bin": { "flux": "./src/index.mjs" },
+  "scripts": { "start": "node src/index.mjs" },
+  "dependencies": {
+    "@nats-io/jetstream": "^3.4.0",
+    "@nats-io/transport-node": "^3.4.0"
+  },
+  "engines": { "node": ">=20" }
+}

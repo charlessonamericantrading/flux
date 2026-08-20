@@ -1087,13 +1087,38 @@ Un SDK L2 **DEBE**:
 3. **Permitir que la aplicación anule la clasificación**, porque solo ella conoce sus
    dependencias.
 
-El default de flux es **PERMANENT salvo que se demuestre lo contrario**:
+### 2.1 El default para lo desconocido: RETRYABLE acotado
 
-> Un fallo desconocido tratado como RETRYABLE bloquea la cola durante 51 minutos y se
-> repite con cada mensaje siguiente que falle igual — el modo de fallo se amplifica.
-> Tratado como PERMANENT, va a la DLQ, la cola sigue fluyendo y el evento se puede
-> reproducir cuando se entienda qué pasó. **Un evento en la DLQ es recuperable; una
-> cola atascada durante una hora punta, no.**
+El default de flux es **RETRYABLE con presupuesto reducido: 2 entregas, no 6.**
+
+Las dos opciones obvias fallan cada una en un extremo:
+
+| Política | Transitorio desconocido | Sistemático desconocido |
+|---|---|---|
+| PERMANENT | ❌ A la DLQ por un hipo de red. Alguien reproduce a mano cada mañana. | ✅ Falla rápido |
+| RETRYABLE completo | ✅ Se recupera solo | ❌ 51 min de cola atascada, y el modo de fallo **se amplifica** con cada mensaje siguiente |
+| **RETRYABLE acotado (2)** | ✅ Se recupera en el 2º intento | ✅ A la DLQ en ~30 s |
+
+El presupuesto acotado **domina a ambas**: cuesta 30 segundos de latencia sobre los
+errores genuinamente permanentes, y a cambio elimina los dos modos de fallo. No es un
+punto medio, es estrictamente mejor.
+
+Implementación: el presupuesto **NO** se configura en el consumidor. `max_deliver` es
+por consumidor, no por mensaje, y bajarlo a 2 recortaría también los reintentos de los
+errores que sí sabemos que son transitorios. El SDK lleva la cuenta con `attempt` y
+enruta a la DLQ cuando un error de clase desconocida supera su presupuesto, dejando
+intactos los 6 intentos de los RETRYABLE reconocidos.
+
+```
+Error reconocido como transitorio (ECONNRESET, 503) → 6 entregas, hasta 51 min
+Error desconocido                                   → 2 entregas, ~30 s
+Error reconocido como permanente (400, 422)         → 1 entrega, sin espera
+```
+
+Un SDK L2 **DEBE** exponer esta política como configurable
+(`permanent` / `retryable` / `retryable-bounded` + presupuesto), porque el equilibrio
+correcto depende de cómo fallen las dependencias de cada ecosistema. El default es
+`retryable-bounded` con presupuesto 2.
 
 Un SDK L2 **DEBE** exponer errores tipados para que la aplicación señale la clase:
 

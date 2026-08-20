@@ -416,7 +416,12 @@ export class FluxBus {
       const c = this.#classify(e);
       const message = e instanceof Error ? e.message : String(e);
 
-      if (c.class === ErrorClass.RETRYABLE && attempt < maxAttempts) {
+      // El presupuesto efectivo es el menor entre el del consumidor y el que la
+      // clasificación imponga para ESTE error. Así un error desconocido agota su
+      // presupuesto acotado sin recortar los 6 intentos de un ECONNRESET reconocido.
+      const budget = Math.min(maxAttempts, c.maxAttempts ?? maxAttempts);
+
+      if (c.class === ErrorClass.RETRYABLE && attempt < budget) {
         // Retraso explícito según el backoff canónico, en vez de dejar expirar
         // ack_wait: no retiene la ranura de ack_pending 30 s de más.
         const delay =
@@ -425,7 +430,7 @@ export class FluxBus {
             Math.min(attempt - 1, CONSUMER_DEFAULTS.backoffMs.length - 1)
           ];
         this.#opts.logger?.warn(
-          `[flux] RETRYABLE ${c.code} en ${subject} (intento ${attempt}/${maxAttempts}), reintento en ${delay}ms`,
+          `[flux] RETRYABLE ${c.code} en ${subject} (intento ${attempt}/${budget}), reintento en ${delay}ms`,
         );
         m.nak(delay);
         return;

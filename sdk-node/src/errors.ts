@@ -23,6 +23,15 @@ export interface Classification {
    * Úsalo cuando la dependencia dice explícitamente cuánto esperar (Retry-After).
    */
   readonly retryAfterMs?: number;
+  /**
+   * Solo para RETRYABLE: número máximo de entregas para ESTE error, por debajo del
+   * `max_deliver` del consumidor.
+   *
+   * Existe porque `max_deliver` es por consumidor, no por mensaje: bajarlo a 2 para
+   * acotar los errores desconocidos recortaría también los reintentos de los que sí
+   * sabemos transitorios. Ver 04-errors.md §2.1.
+   */
+  readonly maxAttempts?: number;
 }
 
 /**
