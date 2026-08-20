@@ -86,7 +86,18 @@ return flux.NewPermanentError("pedido ya cancelado", flux.WithCode("PEDIDO_YA_CA
 |---|---|---|
 | `ClassRetryable` | Timeout, ECONNRESET, HTTP 429/502/503/504 | `nak` + backoff |
 | `ClassPermanent` | Falla el schema, regla de negocio, HTTP 400/403/404/422 | `term` + DLQ inmediato |
-| `ClassPoison` | JSON malformado, falta atributo CloudEvents | `term` + DLQ + alerta |
+| `ClassPoison` | JSON malformado, falta un atributo CloudEvents o una extensión obligatoria del perfil flux | `term` + DLQ + alerta |
+
+`ParseEvent` etiqueta cada fallo con un `Code` estable —el mismo que dan Node, Python y
+Java ante el mismo cuerpo— porque es lo que acaba en la columna de la DLQ y en las
+métricas. Además de `MALFORMED_JSON`, `NOT_AN_OBJECT`, `UNSUPPORTED_SPECVERSION`,
+`MISSING_REQUIRED_ATTRIBUTE`, `UNSUPPORTED_CONTENT_TYPE` y `UNKNOWN_ROOT_ATTRIBUTE`:
+
+| `Code` | Cuándo |
+|---|---|
+| `MISSING_REQUIRED_EXTENSION` | Falta —o vale `null` o `""`— `correlationid`, `tenantid`, `producerversion` o `dataclassification`. No se les asume un default: uno tomado como `internal` haría circular PII con 30 días de retención en vez de 7, y un `tenantid` tomado como `system` cruzaría fronteras de tenant ([§3.1](../specification/01-envelope.md)) |
+| `INVALID_DATACLASSIFICATION` | `dataclassification` fuera de `{public, internal, confidential, restricted}` |
+| `WRONG_ATTRIBUTE_TYPE` | Un atributo de texto llegó como número, booleano u objeto. `encoding/json` ya lo rechazaría al decodificar el struct, pero con el código genérico de desajuste de tipo; se comprueba antes para que el operador distinga un `{"tenantid": 42}` de un `{"dlqattempts": "seis"}` ([§2.4](../specification/01-envelope.md)) |
 
 **Default de lo desconocido: `RETRYABLE` con presupuesto acotado de 2 entregas**
 ([04-errors.md §2.1](../specification/04-errors.md)).
@@ -247,8 +258,10 @@ silencio, y `Id`, `iD` e `ID` acabarían siendo el mismo atributo — precisamen
 tipo de subject/atributo fantasma que la spec combate en NATS. **La regla de atributos
 raíz cerrados de [01-envelope.md §3.3](../specification/01-envelope.md) tapa el
 agujero por accidente**, porque las claves se comparan exactas contra
-`AllowedRootAttributes` antes de decodificar. Vale la pena que la spec diga que la
-comparación de nombres de atributo es **case-sensitive**: hoy se deduce, no se afirma.
+`AllowedRootAttributes` antes de decodificar. La spec ya no lo deja al accidente:
+[§2.3](../specification/01-envelope.md) afirma que la comparación de nombres de atributo
+es **case-sensitive**, y [§2.4](../specification/01-envelope.md) hace lo propio con los
+*valores* — los tipos son exactos y `{"tenantid": 42}` es POISON, no el tenant `"42"`.
 
 ### F. La lista de errores transitorios está escrita en códigos de Node
 

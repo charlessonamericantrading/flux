@@ -332,6 +332,98 @@ func TestParseEventDetectaPoison(t *testing.T) {
 	}
 }
 
+func TestParseEventExigeLasExtensionesObligatorias(t *testing.T) {
+	// La spec las llamaba obligatorias y ningún parser las exigía. Asumir un default es
+	// peligroso en las cuatro: un dataclassification ausente tomado como "internal"
+	// haría circular PII con 30 días de retención en vez de 7, y un tenantid ausente
+	// tomado como "system" cruzaría fronteras de tenant — 01-envelope.md §3.1.
+	for _, ext := range []string{"correlationid", "tenantid", "producerversion", "dataclassification"} {
+		t.Run(ext, func(t *testing.T) {
+			var raw map[string]json.RawMessage
+			if err := json.Unmarshal([]byte(envelopeValido), &raw); err != nil {
+				t.Fatal(err)
+			}
+			// Ausente, `null` y `""` son el mismo caso: ausente != vacío va en las dos
+			// direcciones, o el envelope tendría tres formas de decir "no lo sé" y solo
+			// una sería POISON — 01-envelope.md §3.3.
+			for _, valor := range []json.RawMessage{nil, json.RawMessage(`null`), json.RawMessage(`""`)} {
+				if valor == nil {
+					delete(raw, ext)
+				} else {
+					raw[ext] = valor
+				}
+				cuerpo, err := json.Marshal(raw)
+				if err != nil {
+					t.Fatal(err)
+				}
+				_, err = ParseEvent(cuerpo)
+				var pe *PoisonError
+				if !errors.As(err, &pe) || pe.Code != "MISSING_REQUIRED_EXTENSION" {
+					t.Fatalf("%s = %s: se esperaba MISSING_REQUIRED_EXTENSION, se obtuvo %v", ext, valor, err)
+				}
+				if !strings.Contains(pe.Error(), ext) {
+					t.Errorf("el error debe nombrar la extensión que falta: %v", pe)
+				}
+			}
+		})
+	}
+}
+
+func TestParseEventRechazaDataclassificationFueraDelEnum(t *testing.T) {
+	// La retención y las ACLs se derivan de este valor, así que un valor desconocido no
+	// se puede degradar a nada seguro — 01-envelope.md §3.1 y 06-security.md §5.
+	//
+	// `"Confidential"` está en la lista porque la comparación es case-sensitive
+	// (01-envelope.md §2.3), y los dos últimos porque un valor que ni siquiera es una
+	// cadena tiene que dar ESTE código y no el genérico de desajuste de tipo.
+	for _, valor := range []string{`"secreto"`, `"Confidential"`, `""`, `42`, `{"a":1}`} {
+		t.Run(valor, func(t *testing.T) {
+			cuerpo := strings.Replace(envelopeValido, `"confidential"`, valor, 1)
+			_, err := ParseEvent([]byte(cuerpo))
+			var pe *PoisonError
+			if !errors.As(err, &pe) {
+				t.Fatalf("se esperaba POISON, se obtuvo %v", err)
+			}
+			// La cadena vacía se detecta antes, como extensión ausente: ausente != vacío.
+			esperado := "INVALID_DATACLASSIFICATION"
+			if valor == `""` {
+				esperado = "MISSING_REQUIRED_EXTENSION"
+			}
+			if pe.Code != esperado {
+				t.Fatalf("code = %q, se esperaba %q (%v)", pe.Code, esperado, err)
+			}
+		})
+	}
+}
+
+func TestParseEventNoCoaccionaLosTipos(t *testing.T) {
+	// {"tenantid": 42} es POISON, no el tenant "42". encoding/json ya rechazaría el
+	// número al decodificar el struct, pero con el código genérico de desajuste de tipo;
+	// el contrato pide ESTE código para que los cuatro SDKs digan lo mismo ante el mismo
+	// cuerpo — 01-envelope.md §2.4.
+	for _, attr := range stringAttributes {
+		t.Run(attr, func(t *testing.T) {
+			var raw map[string]json.RawMessage
+			if err := json.Unmarshal([]byte(envelopeValido), &raw); err != nil {
+				t.Fatal(err)
+			}
+			raw[attr] = json.RawMessage(`42`)
+			cuerpo, err := json.Marshal(raw)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, err = ParseEvent(cuerpo)
+			var pe *PoisonError
+			if !errors.As(err, &pe) || pe.Code != "WRONG_ATTRIBUTE_TYPE" {
+				t.Fatalf("se esperaba WRONG_ATTRIBUTE_TYPE, se obtuvo %v", err)
+			}
+			if !strings.Contains(pe.Error(), attr) {
+				t.Errorf("el error debe nombrar el atributo: %v", pe)
+			}
+		})
+	}
+}
+
 func TestParseEventRechazaContentTypeNoSoportado(t *testing.T) {
 	cuerpo := strings.Replace(envelopeValido,
 		`"datacontenttype": "application/json"`,

@@ -82,7 +82,19 @@ throw new FluxErrors.PermanentException("pedido ya cancelado", "PEDIDO_YA_CANCEL
 | `RETRYABLE` reconocido | `SocketException`, `ConnectException`, HTTP 429/502/503/504 | `nak` + backoff | 6 entregas (~51 min) |
 | **desconocido (default)** | cualquier otra excepción | `nak` acotado | **2 entregas (~30 s)** |
 | `PERMANENT` | falla el schema, regla de negocio, HTTP 400/403/404/422 | `term` + DLQ | 1 entrega |
-| `POISON` | JSON malformado, falta un atributo CloudEvents | `term` + DLQ + alerta | 1 entrega |
+| `POISON` | JSON malformado, falta un atributo CloudEvents o una extensión obligatoria del perfil flux | `term` + DLQ + alerta | 1 entrega |
+
+`Envelope.parseEvent` etiqueta cada fallo con un `code` estable —el mismo que dan Node,
+Python y Go ante el mismo cuerpo— porque es lo que acaba en la columna de la DLQ y en las
+métricas. Además de `MALFORMED_JSON`, `NOT_AN_OBJECT`, `UNSUPPORTED_SPECVERSION`,
+`MISSING_REQUIRED_ATTRIBUTE`, `UNSUPPORTED_CONTENT_TYPE`, `UNKNOWN_ROOT_ATTRIBUTE` e
+`INVALID_ATTRIBUTE_TYPE`:
+
+| `code` | Cuándo |
+|---|---|
+| `MISSING_REQUIRED_EXTENSION` | Falta —o vale `null` o `""`— `correlationid`, `tenantid`, `producerversion` o `dataclassification`. No se les asume un default: uno tomado como `internal` haría circular PII con 30 días de retención en vez de 7, y un `tenantid` tomado como `system` cruzaría fronteras de tenant ([§3.1](../specification/01-envelope.md)) |
+| `INVALID_DATACLASSIFICATION` | `dataclassification` fuera de `{public, internal, confidential, restricted}`. Gana al `@JsonCreator` del enum, que daría el código genérico de deserialización |
+| `WRONG_ATTRIBUTE_TYPE` | Un atributo de texto llegó como número, booleano u objeto ([§2.4](../specification/01-envelope.md)) |
 
 **El default de lo desconocido es `RETRYABLE_BOUNDED` con presupuesto 2**
 ([04-errors.md §2.1](../specification/04-errors.md)). Domina a las dos alternativas: un
@@ -224,21 +236,27 @@ parse→serialize, o bien que el replay solo garantiza equivalencia semántica. 
 deduce del uso, no se afirma — y un SDK que use el serializador por defecto de su
 lenguaje lo incumple sin enterarse.
 
-### D. La spec no dice nada sobre la COERCIÓN de tipos de los atributos
+### D. ✅ La COERCIÓN de tipos ya está en la spec — y Java es el lenguaje que la necesitaba
 
-§2.3 fija que los *nombres* de atributo se comparan respetando mayúsculas. No dice nada de
-los *valores*. Y ahí los SDKs divergen hoy:
+§2.3 fijaba que los *nombres* de atributo se comparan respetando mayúsculas y no decía nada
+de los *valores*, así que cada SDK hacía una cosa:
 
 | Cuerpo | Go | Node | Java (default de Jackson) |
 |---|---|---|---|
-| `"tenantid": 42` | POISON | acepta, `tenantid` es `42` | **aceptaba** como `"42"` |
+| `"tenantid": 42` | POISON | aceptaba, `tenantid` era `42` | aceptaba como `"42"` |
 
-Jackson convierte por su cuenta escalares a `String`. Este SDK lo desactiva
-(`CoercionAction.Fail` para Integer/Float/Boolean → Textual) para alinearse con Go, pero
-es una decisión que ha tenido que tomar el SDK, no la spec.
+Los tres comportamientos eran distintos y el que "funcionaba" era el peor: propagar `"42"`
+significa que el mensaje se acepta con un valor que el productor nunca escribió.
+[§2.4](../specification/01-envelope.md) lo cierra: los tipos son exactos y un tipo
+incompatible es POISON.
 
-**Sugerencia:** añadir a §2.3 que los tipos de los atributos son exactos y que un tipo
-incompatible es POISON. Es la misma clase de fantasma que la comparación case-insensitive.
+Aquí se defiende **por partida doble**, y a propósito. El mapper desactiva la coerción
+(`CoercionAction.Fail` para Integer/Float/Boolean → Textual), y `parseEvent` comprueba
+además sobre el `JsonNode` que los siete atributos de texto son textuales. La comprobación
+explícita no sobra: la configuración del mapper es un default que una versión futura de
+Jackson podría cambiar, y sin ella el fallo llegaría con el código genérico
+`INVALID_ATTRIBUTE_TYPE`, indistinguible de un `"dlqattempts": "seis"`. El contrato pide
+`WRONG_ATTRIBUTE_TYPE`.
 
 ### E. `subject` significa dos cosas, y en Java el desajuste queda por escrito
 

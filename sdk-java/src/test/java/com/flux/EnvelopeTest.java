@@ -15,11 +15,15 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.MapperFeature;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.NullNode;
+import com.fasterxml.jackson.databind.node.ObjectNode;
+import com.fasterxml.jackson.databind.node.TextNode;
 import java.nio.charset.StandardCharsets;
 import java.time.Instant;
 import java.time.ZoneOffset;
 import java.time.ZonedDateTime;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -304,13 +308,22 @@ class EnvelopeTest {
                         // Sin la config de coercion, Jackson lo aceptaria como la cadena
                         // "42" y el mismo cuerpo seria POISON en Go: divergencia silenciosa.
                         ENVELOPE_VALIDO.replace("\"tenantid\":\"acme\"", "\"tenantid\":42"),
-                        "INVALID_ATTRIBUTE_TYPE"),
+                        "WRONG_ATTRIBUTE_TYPE"),
                 new Caso("dlqattempts no numerico",
                         ENVELOPE_VALIDO.replace("\"data\":{", "\"dlqattempts\":\"seis\",\"data\":{"),
                         "INVALID_ATTRIBUTE_TYPE"),
                 new Caso("dataclassification fuera del enum",
                         ENVELOPE_VALIDO.replace("\"confidential\"", "\"secretisimo\""),
-                        "INVALID_ATTRIBUTE_TYPE"));
+                        "INVALID_DATACLASSIFICATION"),
+                new Caso("falta una extension obligatoria del perfil flux",
+                        ENVELOPE_VALIDO.replace("\"tenantid\":\"acme\",", ""),
+                        "MISSING_REQUIRED_EXTENSION"),
+                new Caso("un atributo obligatorio del nucleo a null cuenta como ausente",
+                        // 01-envelope.md §4 prohibe usar null para "no aplica": aceptarlo
+                        // daria dos formas de decir "no esta" y solo una seria POISON.
+                        ENVELOPE_VALIDO.replace("\"source\":\"/produccion/pedidos-api\"",
+                                "\"source\":null"),
+                        "MISSING_REQUIRED_ATTRIBUTE"));
 
         for (Caso caso : casos) {
             FluxErrors.PoisonException e = assertThrows(FluxErrors.PoisonException.class,
@@ -319,6 +332,120 @@ class EnvelopeTest {
             assertEquals(caso.code(), e.code(), caso.descripcion() + " → " + e.getMessage());
             assertEquals(ErrorClass.POISON, e.errorClass());
         }
+    }
+
+    @Test
+    @DisplayName("falta una extension obligatoria del perfil flux → POISON")
+    void faltaUnaExtensionObligatoria() throws Exception {
+        // La spec las llamaba obligatorias y ningun parser las exigia. Asumir un default es
+        // peligroso en las cuatro: un dataclassification ausente tomado como "internal" haria
+        // circular PII con 30 dias de retencion en vez de 7, y un tenantid ausente tomado como
+        // "system" cruzaria fronteras de tenant — 01-envelope.md §3.1.
+        for (String extension : List.of("correlationid", "tenantid", "producerversion",
+                "dataclassification")) {
+            // Ausente, `null` y `""` son el mismo caso: ausente != vacio va en las dos
+            // direcciones, o el envelope tendria tres formas de decir "no lo se" y solo una
+            // seria POISON — 01-envelope.md §3.3.
+            for (JsonNode valor : Arrays.asList(null, NullNode.getInstance(), TextNode.valueOf(""))) {
+                ObjectNode raw = (ObjectNode) PLAIN.readTree(ENVELOPE_VALIDO);
+                if (valor == null) {
+                    raw.remove(extension);
+                } else {
+                    raw.set(extension, valor);
+                }
+                byte[] cuerpo = PLAIN.writeValueAsBytes(raw);
+                String caso = extension + " = " + valor;
+
+                FluxErrors.PoisonException e = assertThrows(FluxErrors.PoisonException.class,
+                        () -> Envelope.parseEvent(cuerpo), caso);
+                assertEquals("MISSING_REQUIRED_EXTENSION", e.code(), caso);
+                assertEquals(ErrorClass.POISON, e.errorClass(), caso);
+                assertTrue(e.getMessage().contains(extension), e.getMessage());
+            }
+        }
+    }
+
+    @Test
+    @DisplayName("dataclassification fuera del enum → POISON con codigo propio")
+    void dataclassificationFueraDelEnum() {
+        // La retencion y las ACLs se derivan de este valor, asi que un valor desconocido no se
+        // puede degradar a nada seguro — 01-envelope.md §3.1 y 06-security.md §5. El
+        // @JsonCreator del enum ya lanzaria, pero con el codigo generico de deserializacion:
+        // el contrato pide este.
+        // "Confidential" esta en la lista porque la comparacion es case-sensitive
+        // (01-envelope.md §2.3), y los dos ultimos porque un valor que ni siquiera es una
+        // cadena tiene que dar ESTE codigo y no el generico de desajuste de tipo.
+        for (String valor : List.of("\"secreto\"", "\"Confidential\"", "42", "{\"a\":1}")) {
+            String cuerpo = ENVELOPE_VALIDO.replace("\"confidential\"", valor);
+            FluxErrors.PoisonException e = assertThrows(FluxErrors.PoisonException.class,
+                    () -> Envelope.parseEvent(cuerpo.getBytes(StandardCharsets.UTF_8)), valor);
+            assertEquals("INVALID_DATACLASSIFICATION", e.code(), valor);
+            assertEquals(ErrorClass.POISON, e.errorClass(), valor);
+        }
+    }
+
+    @Test
+    @DisplayName("un tipo coaccionable → POISON, no la coercion silenciosa de Jackson")
+    void tiposExactosSinCoercion() throws Exception {
+        // Jackson convierte {"tenantid": 42} en "42" sin avisar: el mensaje se aceptaria con un
+        // valor que el productor nunca escribio, y el mismo cuerpo seria POISON en Go, que no
+        // coacciona escalares a string. Un envelope que significa cosas distintas en dos SDKs
+        // deja de ser un contrato — 01-envelope.md §2.4.
+        for (String attribute : List.of("id", "source", "type", "time", "correlationid",
+                "tenantid", "producerversion")) {
+            ObjectNode raw = (ObjectNode) PLAIN.readTree(ENVELOPE_VALIDO);
+            raw.put(attribute, 42);
+            byte[] cuerpo = PLAIN.writeValueAsBytes(raw);
+
+            FluxErrors.PoisonException e = assertThrows(FluxErrors.PoisonException.class,
+                    () -> Envelope.parseEvent(cuerpo), attribute);
+            assertEquals("WRONG_ATTRIBUTE_TYPE", e.code(), attribute);
+            assertTrue(e.getMessage().contains(attribute), e.getMessage());
+        }
+
+        // Y el mapper tampoco coacciona por su cuenta: la comprobacion sobre el JsonNode y la
+        // configuracion de coercion se cubren la una a la otra, porque cualquiera de las dos
+        // podria retirarse por descuido dejando el agujero abierto.
+        assertThrows(Exception.class, () -> Envelope.mapper().readValue(
+                ENVELOPE_VALIDO.replace("\"tenantid\":\"acme\"", "\"tenantid\":42"),
+                FluxEvent.class));
+    }
+
+    @Test
+    @DisplayName("el JSON viaja en UTF-8 literal, sin escapes \\uXXXX")
+    void serializeEmiteUtf8Literal() {
+        // Ambas formas son JSON valido y se parsean al mismo String, pero NO son los mismos
+        // BYTES, y de la secuencia de bytes dependen el replay verbatim desde la DLQ, la firma
+        // criptografica futura y los fixtures cross-SDK — 01-envelope.md §1.1. Jackson acierta
+        // por defecto; el encoder por defecto de System.Text.Json escapa todo lo no ASCII, asi
+        // que la regla es normativa y este test la fija en vez de dejarla al default.
+        Map<String, Object> data = new LinkedHashMap<>();
+        data.put("nota", "café ñandú 東京 €");
+        byte[] bytes = Envelope.serialize(entradaValida().data(data).build());
+
+        assertTrue(new String(bytes, StandardCharsets.UTF_8).contains("café ñandú 東京 €"));
+
+        // A nivel de BYTES: si Jackson hubiese escapado, la salida seria ASCII puro y la 'e'
+        // acentuada apareceria como los seis caracteres "é" en vez de los dos octetos
+        // 0xC3 0xA9 que le corresponden en UTF-8.
+        assertFalse(new String(bytes, StandardCharsets.US_ASCII).contains("\\u"),
+                "no debe salir ningun escape \\uXXXX");
+        assertTrue(contieneSecuencia(bytes, "café".getBytes(StandardCharsets.UTF_8)),
+                "los caracteres no ASCII deben viajar como sus octetos UTF-8 literales");
+    }
+
+    /** Busca una subsecuencia de bytes. Sin esto, la asercion recaeria en un String. */
+    private static boolean contieneSecuencia(byte[] haystack, byte[] needle) {
+        outer:
+        for (int i = 0; i <= haystack.length - needle.length; i++) {
+            for (int j = 0; j < needle.length; j++) {
+                if (haystack[i + j] != needle[j]) {
+                    continue outer;
+                }
+            }
+            return true;
+        }
+        return false;
     }
 
     @Test

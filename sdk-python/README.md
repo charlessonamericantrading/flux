@@ -82,7 +82,7 @@ raise PermanentError("pedido ya cancelado", code="PEDIDO_YA_CANCELADO")  # term 
 |---|---|---|
 | `RETRYABLE` | Timeout, ECONNRESET, HTTP 429/502/503/504 | `nak` + backoff canónico |
 | `PERMANENT` | Falla el schema, regla de negocio, HTTP 400/403/404/422 | `term()` + DLQ inmediato |
-| `POISON` | JSON malformado, falta un atributo CloudEvents | `term()` + DLQ + alerta |
+| `POISON` | JSON malformado, falta un atributo CloudEvents o una extensión obligatoria del perfil flux | `term()` + DLQ + alerta |
 
 **Lo desconocido es RETRYABLE con presupuesto acotado: 2 entregas, no 6**
 ([04-errors.md §2.1](../specification/04-errors.md)).
@@ -155,6 +155,36 @@ Además, `parse_event` trata un atributo obligatorio con valor `null` como **aus
 (POISON), donde Node solo comprueba `undefined`. `null` para significar "ausente" está
 prohibido por [01-envelope.md §4](../specification/01-envelope.md), así que la
 divergencia va en la dirección estricta a propósito.
+
+## Qué rechaza `parse_event`
+
+Todo fallo de parseo es POISON: el mensaje ni siquiera es interpretable, así que nunca
+llega al handler ([04-errors.md §1.3](../specification/04-errors.md)). El `code` es el
+mismo que dan Node, Go y Java ante el mismo cuerpo.
+
+| `code` | Cuándo |
+|---|---|
+| `MALFORMED_JSON` | El cuerpo no es JSON |
+| `NOT_AN_OBJECT` | Es JSON pero no un objeto en la raíz |
+| `UNSUPPORTED_SPECVERSION` | `specversion` != `"1.0"` |
+| `MISSING_REQUIRED_ATTRIBUTE` | Falta —o vale `null`— un atributo del núcleo CloudEvents |
+| `MISSING_REQUIRED_EXTENSION` | Falta —o vale `null` o `""`— `correlationid`, `tenantid`, `producerversion` o `dataclassification` |
+| `INVALID_DATACLASSIFICATION` | `dataclassification` fuera de `{public, internal, confidential, restricted}` |
+| `WRONG_ATTRIBUTE_TYPE` | Un atributo de texto llegó como número, booleano u objeto |
+| `UNSUPPORTED_CONTENT_TYPE` | `datacontenttype` != `application/json` |
+| `UNKNOWN_ROOT_ATTRIBUTE` | Un atributo raíz fuera de la lista cerrada |
+
+Las tres reglas del medio son las que un port suele dar por hechas y no lo están:
+
+- Las cuatro extensiones son **obligatorias de verdad**
+  ([§3.1](../specification/01-envelope.md)). No se les asume un default porque asumirlo
+  es peligroso en las cuatro: un `dataclassification` ausente tomado como `internal` hace
+  circular PII con 30 días de retención en vez de 7, y un `tenantid` ausente tomado como
+  `system` cruza fronteras de tenant.
+- Los tipos son **exactos** ([§2.4](../specification/01-envelope.md)): `{"tenantid": 42}`
+  es POISON, no el tenant `"42"`. En Python hay que comprobarlo con `isinstance`, porque
+  `json.loads` devuelve el `int` tal cual y nadie más lo mira hasta que una comparación
+  con `==` falla en producción.
 
 ## Tests
 

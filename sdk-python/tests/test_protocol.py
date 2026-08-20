@@ -317,6 +317,59 @@ class TestParseEvent:
         assert exc.value.code == "MISSING_REQUIRED_ATTRIBUTE"
         assert attr in str(exc.value)
 
+    @pytest.mark.parametrize(
+        "ext", ["correlationid", "tenantid", "producerversion", "dataclassification"]
+    )
+    def test_falta_una_extension_obligatoria_es_poison(self, ext):
+        # La spec las llamaba obligatorias y ningún parser las exigía. Asumir un default
+        # es peligroso en las cuatro: un dataclassification ausente tomado como
+        # "internal" haría circular PII con 30 días de retención en vez de 7, y un
+        # tenantid ausente tomado como "system" cruzaría fronteras de tenant
+        # (01-envelope.md §3.1).
+        raw = json.loads(serialize(_event()))
+        del raw[ext]
+        with pytest.raises(PoisonError) as exc:
+            parse_event(json.dumps(raw).encode())
+        assert exc.value.code == "MISSING_REQUIRED_EXTENSION"
+        assert ext in str(exc.value)
+
+    @pytest.mark.parametrize("valor", [None, ""])
+    def test_una_extension_obligatoria_vacia_cuenta_como_ausente(self, valor):
+        # Ausente != vacío va en las dos direcciones: si `""` colara, el envelope tendría
+        # dos formas de decir "no lo sé" y solo una sería POISON (01-envelope.md §3.3).
+        raw = json.loads(serialize(_event()))
+        raw["tenantid"] = valor
+        with pytest.raises(PoisonError) as exc:
+            parse_event(json.dumps(raw).encode())
+        assert exc.value.code == "MISSING_REQUIRED_EXTENSION"
+
+    # `{"a": 1}` no es solo "fuera del enum": comparado contra un frozenset da TypeError,
+    # así que sin el isinstance previo el mensaje corrupto tumbaría el runtime del
+    # consumidor en vez de acabar en la DLQ.
+    @pytest.mark.parametrize("valor", ["secreto", "Confidential", 42, {"a": 1}])
+    def test_dataclassification_fuera_del_enum_es_poison(self, valor):
+        # La retención y las ACLs se derivan de este valor, así que un valor desconocido
+        # no se puede degradar a nada seguro (01-envelope.md §3.1, 06-security.md §5).
+        raw = json.loads(serialize(_event()))
+        raw["dataclassification"] = valor
+        with pytest.raises(PoisonError) as exc:
+            parse_event(json.dumps(raw).encode())
+        assert exc.value.code == "INVALID_DATACLASSIFICATION"
+
+    @pytest.mark.parametrize(
+        "attr", ["id", "source", "type", "time", "correlationid", "tenantid", "producerversion"]
+    )
+    def test_un_tipo_coaccionable_es_poison(self, attr):
+        # {"tenantid": 42} es POISON, no el tenant "42". Jackson lo coaccionaría en
+        # silencio y `json.loads` lo dejaría pasar como int hasta que una comparación
+        # con `==` fallase en producción (01-envelope.md §2.4).
+        raw = json.loads(serialize(_event()))
+        raw[attr] = 42
+        with pytest.raises(PoisonError) as exc:
+            parse_event(json.dumps(raw).encode())
+        assert exc.value.code == "WRONG_ATTRIBUTE_TYPE"
+        assert attr in str(exc.value)
+
     def test_content_type_no_soportado(self):
         raw = json.loads(serialize(_event()))
         raw["datacontenttype"] = "application/xml"
@@ -448,7 +501,10 @@ class TestClassify:
         e = exc(codes[exc], "red")
         c = classify(e)
         assert c.error_class is ErrorClass.RETRYABLE
-        assert c.code in PROTOCOL["errors"]["classes"]["retryable"]["syscallCodes"]
+        # La clave es `syscallCodesExample` y no `syscallCodes` porque protocol.json
+        # dejó de presentar esa lista como norma: EAI_AGAIN no existe como errno en Go y
+        # en Windows los códigos llevan prefijo WSA, así que son ejemplos.
+        assert c.code in PROTOCOL["errors"]["classes"]["retryable"]["syscallCodesExample"]
 
     def test_default_de_lo_desconocido_es_retryable_acotado(self):
         # Domina a las dos alternativas: el transitorio se recupera en el 2º intento,

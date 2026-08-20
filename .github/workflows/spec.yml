@@ -97,6 +97,66 @@ jobs:
       - run: npm test
       - run: npm run build
 
+  # Los tests de estos SDKs LEEN protocol.json para no divergir de la spec. Eso es
+  # deliberado, pero significa que un cambio en protocol.json puede romperlos — y
+  # pasó: renombrar `syscallCodes` a `syscallCodesExample` tumbó tres tests de Python
+  # que nadie ejecutó hasta días después, porque el CI solo corría Node.
+
+  sdk-python:
+    name: SDK Python — tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pip install pytest
+      - run: python -m pytest sdk-python/tests -q
+
+  sdk-go:
+    name: SDK Go — vet, test y gofmt
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: sdk-go
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+      - run: go vet ./...
+      - run: go test -race ./...
+      - name: gofmt sin cambios pendientes
+        run: test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
+
+  sdk-java:
+    name: SDK Java — tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      # Aquí sí hay Maven, a diferencia de la máquina donde se escribió el SDK.
+      - run: mvn -B -q -f sdk-java/pom.xml test
+
+  sdk-dotnet:
+    name: SDK .NET — build y tests
+    runs-on: ubuntu-latest
+    # ⚠️ Este SDK nunca se compiló en la máquina donde se escribió (no había .NET).
+    # continue-on-error mientras no esté verificado: el trabajo REPORTA el estado real
+    # sin bloquear el resto del CI. Quitar este flag es el paso que lo promueve a
+    # ciudadano de primera clase — ver sdk-dotnet/README.md.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+      - run: dotnet build sdk-dotnet/Flux.sln
+      - run: dotnet test sdk-dotnet/Flux.sln
+
   conformance:
     name: Conformidad contra NATS real
     runs-on: ubuntu-latest

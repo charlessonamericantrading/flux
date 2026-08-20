@@ -539,6 +539,23 @@ no `correlation_id`. No es un capricho de estilo: es la especificación.
 > tendría que tratar el caso ausente — justo lo que declararlas obligatorias pretendía
 > evitar.
 
+**Ausente, `null` y `""` son lo mismo aquí.** §3.3 prohíbe darle significado propio a
+un valor vacío, así que los tres producen el mismo error. Los códigos son estables y
+todos los SDKs **DEBEN** devolver el mismo ante la misma entrada:
+
+| Entrada | Código |
+|---|---|
+| Falta `tenantid` | `MISSING_REQUIRED_EXTENSION` |
+| `"tenantid": null` | `MISSING_REQUIRED_EXTENSION` |
+| `"tenantid": ""` | `MISSING_REQUIRED_EXTENSION` |
+| `"tenantid": 42` | `WRONG_ATTRIBUTE_TYPE` |
+| `"dataclassification": "secreto"` | `INVALID_DATACLASSIFICATION` |
+| `"dataclassification": ""` | `MISSING_REQUIRED_EXTENSION` — vacío se evalúa antes que el enum |
+
+El código acaba en la extensión `dlqerror` del evento en la DLQ y en las métricas. Si
+dos SDKs emiten códigos distintos para el mismo fallo, agrupar por causa deja de
+funcionar en cuanto el ecosistema es polyglot — que es siempre.
+
 | Extensión | Tipo | Descripción |
 |---|---|---|
 | `correlationid` | String | Identificador del flujo de negocio completo. Se propaga sin modificar a través de toda la cadena de eventos. Si un evento no nace de otro, el SDK lo inicializa con el `id` del propio evento. |

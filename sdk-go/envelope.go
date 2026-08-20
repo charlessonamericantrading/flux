@@ -216,6 +216,33 @@ var requiredAttributes = []string{
 	"datacontenttype", "dataschema", "data",
 }
 
+// requiredExtensions son las extensiones del perfil flux cuya ausencia es POISON
+// — 01-envelope.md §3.1.
+//
+// Se exigen de verdad, no solo en la prosa. Si no se exigieran no serían obligatorias,
+// serían recomendadas, y cada consumidor tendría que tratar el caso ausente — que es
+// exactamente lo que declararlas obligatorias pretendía evitar.
+//
+// Además, asumir un valor por defecto es peligroso en las cuatro: un dataclassification
+// ausente tomado como "internal" hace que PII circule con 30 días de retención en vez de
+// 7, y un tenantid ausente tomado como "system" cruza fronteras de tenant. Ver
+// 06-security.md §4 y §5.
+var requiredExtensions = []string{
+	"correlationid", "tenantid", "producerversion", "dataclassification",
+}
+
+// stringAttributes DEBEN llegar como cadena JSON — 01-envelope.md §2.4.
+//
+// encoding/json ya rechaza un número en un campo string, pero lo hace al decodificar el
+// struct entero y el error acabaría clasificado como INVALID_ATTRIBUTE_TYPE, el mismo
+// código que un `"dlqattempts": "seis"`. Se comprueban aquí para que el operador
+// distinga "el productor mandó el tipo equivocado en un atributo de identidad" de un
+// desajuste cualquiera, y para que el código coincida con el de los demás SDKs ante el
+// mismo cuerpo.
+var stringAttributes = []string{
+	"id", "source", "type", "time", "correlationid", "tenantid", "producerversion",
+}
+
 // EnvelopeError señala un envelope que el SDK se niega a construir o serializar.
 // A diferencia de PoisonError, se produce del lado del productor: es un bug local,
 // no un mensaje ajeno corrupto.
@@ -446,7 +473,7 @@ func ParseEvent(b []byte) (Event, error) {
 
 	var missing []string
 	for _, a := range requiredAttributes {
-		if _, ok := raw[a]; !ok {
+		if rawNullOrAbsent(raw, a) {
 			missing = append(missing, a)
 		}
 	}
@@ -454,6 +481,46 @@ func ParseEvent(b []byte) (Event, error) {
 		return Event{}, NewPoisonError(
 			"faltan atributos obligatorios de CloudEvents: "+strings.Join(missing, ", "),
 			WithCode("MISSING_REQUIRED_ATTRIBUTE"))
+	}
+
+	var missingExt []string
+	for _, a := range requiredExtensions {
+		// `""` cuenta como ausente igual que `null`: 01-envelope.md §3.3 prohíbe darle
+		// significado propio a un valor vacío, así que un `tenantid: ""` no es un tenant.
+		if rawNullOrAbsent(raw, a) || string(bytes.TrimSpace(raw[a])) == `""` {
+			missingExt = append(missingExt, a)
+		}
+	}
+	if len(missingExt) > 0 {
+		return Event{}, NewPoisonError(
+			"faltan extensiones obligatorias del perfil flux: "+strings.Join(missingExt, ", ")+
+				". Su ausencia no es recuperable asumiendo un valor: un dataclassification "+
+				"ausente tomado como \"internal\" haría circular PII con la retención larga "+
+				"(01-envelope.md §3.1)",
+			WithCode("MISSING_REQUIRED_EXTENSION"))
+	}
+
+	// Un valor fuera del enum no se puede degradar a algo seguro: la retención y las ACLs
+	// de 06-security.md §5 se derivan de él, así que inventarle un sentido es peor que
+	// rechazar el mensaje. rawString devuelve "" si el valor no es una cadena, de modo
+	// que un `"dataclassification": 42` cae aquí y no en la comprobación de tipos.
+	if !DataClassification(rawString(raw, "dataclassification")).IsValid() {
+		return Event{}, NewPoisonError(fmt.Sprintf(
+			"dataclassification inválido: %s. Valores permitidos: public, internal, confidential, restricted",
+			rawOrAbsent(raw, "dataclassification")),
+			WithCode("INVALID_DATACLASSIFICATION"))
+	}
+
+	// Los tipos son exactos: {"tenantid": 42} es POISON, no el tenant "42".
+	// Los deserializadores discrepan por defecto (Jackson coacciona, Node propaga el
+	// número) y el que "funciona" es el peor — 01-envelope.md §2.4.
+	for _, a := range stringAttributes {
+		var s string
+		if err := json.Unmarshal(raw[a], &s); err != nil {
+			return Event{}, NewPoisonError(fmt.Sprintf(
+				"%s debe ser una cadena, llegó %s", a, rawOrAbsent(raw, a)),
+				WithCode("WRONG_ATTRIBUTE_TYPE"), WithCause(err))
+		}
 	}
 
 	if ct := rawString(raw, "datacontenttype"); ct != DataContentType {
@@ -486,6 +553,16 @@ func ParseEvent(b []byte) (Event, error) {
 			WithCode("INVALID_ATTRIBUTE_TYPE"), WithCause(err))
 	}
 	return e, nil
+}
+
+// rawNullOrAbsent informa si un atributo falta o llega como el literal `null`.
+//
+// Un atributo obligatorio a null cuenta como AUSENTE: 01-envelope.md §4 prohíbe usar
+// null para "no aplica", así que aceptarlo daría dos formas distintas de decir "no está"
+// y solo una de ellas sería POISON.
+func rawNullOrAbsent(raw map[string]json.RawMessage, key string) bool {
+	v, ok := raw[key]
+	return !ok || string(bytes.TrimSpace(v)) == "null"
 }
 
 // rawString extrae un atributo raíz como string, o "" si falta o no es string.

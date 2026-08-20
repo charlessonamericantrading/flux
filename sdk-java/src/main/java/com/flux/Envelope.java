@@ -80,6 +80,10 @@ public final class Envelope {
      * <p>No se toca el escapado: Jackson NO escapa {@code <}, {@code >}, {@code &} ni
      * caracteres no ASCII, que es justo lo que hace {@code JSON.stringify} de Node. Go
      * necesita desactivar el escapado de HTML explicitamente; aqui el default ya coincide.
+     * Que coincida por defecto no lo hace opcional: 01-envelope.md §1.1 exige UTF-8 literal
+     * y prohibe los escapes {@code \\uXXXX} —el encoder por defecto de
+     * {@code System.Text.Json} los emite y rompe la paridad byte a byte—, asi que
+     * {@code EnvelopeTest.serializeEmiteUtf8Literal} lo fija en vez de confiar en el default.
      */
     private static final ObjectMapper MAPPER = JsonMapper.builder()
             .disable(MapperFeature.ACCEPT_CASE_INSENSITIVE_PROPERTIES)
@@ -172,6 +176,38 @@ public final class Envelope {
     /** Los que, si faltan, hacen POISON al mensaje — 04-errors.md §1.3. */
     private static final List<String> REQUIRED_ATTRIBUTES = List.of(
             "specversion", "id", "source", "type", "time", "datacontenttype", "dataschema", "data");
+
+    /**
+     * Extensiones del perfil flux cuya ausencia es POISON — 01-envelope.md §3.1.
+     *
+     * <p>Se exigen de verdad, no solo en la prosa. Si no se exigieran no serian
+     * obligatorias, serian recomendadas, y cada consumidor tendria que tratar el caso
+     * ausente — que es exactamente lo que declararlas obligatorias pretendia evitar.
+     *
+     * <p>Ademas, asumir un valor por defecto es peligroso en las cuatro: un
+     * {@code dataclassification} ausente tomado como {@code internal} hace que PII circule
+     * con 30 dias de retencion en vez de 7, y un {@code tenantid} ausente tomado como
+     * {@code system} cruza fronteras de tenant. Ver 06-security.md §4 y §5.
+     */
+    private static final List<String> REQUIRED_EXTENSIONS = List.of(
+            "correlationid", "tenantid", "producerversion", "dataclassification");
+
+    /** Los cuatro valores del enum de 01-envelope.md §3.1. */
+    private static final Set<String> VALID_CLASSIFICATIONS =
+            Set.of("public", "internal", "confidential", "restricted");
+
+    /**
+     * Atributos que DEBEN llegar como cadena JSON — 01-envelope.md §2.4.
+     *
+     * <p>La configuracion de coercion del mapper ya impide que Jackson convierta un
+     * {@code 42} en {@code "42"}, pero ese fallo llega envuelto en un error de
+     * deserializacion generico e indistinguible de un {@code "dlqattempts": "seis"}. Se
+     * comprueban aqui, sobre el {@link JsonNode}, para que el codigo sea el mismo que dan
+     * Node, Python y Go ante el mismo cuerpo, y para que el operador vea que atributo de
+     * identidad llego con el tipo equivocado.
+     */
+    private static final List<String> STRING_ATTRIBUTES = List.of(
+            "id", "source", "type", "time", "correlationid", "tenantid", "producerversion");
 
     /** Limite del texto de {@code dlqerror}. */
     private static final int DLQ_ERROR_MAX_CHARS = 1024;
@@ -473,7 +509,10 @@ public final class Envelope {
 
         List<String> missing = new ArrayList<>();
         for (String attribute : REQUIRED_ATTRIBUTES) {
-            if (!root.has(attribute)) {
+            // hasNonNull y no has: un obligatorio a `null` cuenta como AUSENTE, porque
+            // 01-envelope.md §4 prohibe usar null para "no aplica" y aceptarlo daria dos
+            // formas distintas de decir "no esta" de las que solo una seria POISON.
+            if (!root.hasNonNull(attribute)) {
                 missing.add(attribute);
             }
         }
@@ -481,6 +520,49 @@ public final class Envelope {
             throw new FluxErrors.PoisonException(
                     "faltan atributos obligatorios de CloudEvents: " + String.join(", ", missing),
                     "MISSING_REQUIRED_ATTRIBUTE");
+        }
+
+        List<String> missingExtensions = new ArrayList<>();
+        for (String extension : REQUIRED_EXTENSIONS) {
+            JsonNode value = root.get(extension);
+            // `""` cuenta como ausente igual que `null`: 01-envelope.md §3.3 prohibe darle
+            // significado propio a un valor vacio, asi que un `tenantid: ""` no es un tenant.
+            if (value == null || value.isNull() || (value.isTextual() && value.textValue().isEmpty())) {
+                missingExtensions.add(extension);
+            }
+        }
+        if (!missingExtensions.isEmpty()) {
+            throw new FluxErrors.PoisonException(
+                    "faltan extensiones obligatorias del perfil flux: "
+                            + String.join(", ", missingExtensions)
+                            + ". Su ausencia no es recuperable asumiendo un valor: un "
+                            + "dataclassification ausente tomado como \"internal\" haria circular PII "
+                            + "con la retencion larga (01-envelope.md §3.1)",
+                    "MISSING_REQUIRED_EXTENSION");
+        }
+
+        // Un valor fuera del enum no se puede degradar a algo seguro: la retencion y las ACLs
+        // de 06-security.md §5 se derivan de el, asi que inventarle un sentido es peor que
+        // rechazar el mensaje. Se comprueba sobre el JsonNode y no se deja al @JsonCreator del
+        // enum porque este llega antes y da un codigo propio, en vez del generico de
+        // deserializacion que daria treeToValue.
+        JsonNode classification = root.get("dataclassification");
+        if (!classification.isTextual() || !VALID_CLASSIFICATIONS.contains(classification.textValue())) {
+            throw new FluxErrors.PoisonException(
+                    "dataclassification invalido: " + rawOrAbsent(root, "dataclassification")
+                            + ". Valores permitidos: public, internal, confidential, restricted",
+                    "INVALID_DATACLASSIFICATION");
+        }
+
+        // Los tipos son exactos: {"tenantid": 42} es POISON, no el tenant "42". Jackson lo
+        // coacciona en silencio salvo que se le desactive (ver MAPPER), y un envelope que
+        // significa cosas distintas en dos SDKs deja de ser un contrato — 01-envelope.md §2.4.
+        for (String attribute : STRING_ATTRIBUTES) {
+            if (!root.get(attribute).isTextual()) {
+                throw new FluxErrors.PoisonException(
+                        attribute + " debe ser una cadena, llego " + rawOrAbsent(root, attribute),
+                        "WRONG_ATTRIBUTE_TYPE");
+            }
         }
 
         JsonNode contentType = root.get("datacontenttype");

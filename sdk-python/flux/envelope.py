@@ -20,6 +20,9 @@ __all__ = [
     "EnvelopeError",
     "ALLOWED_ROOT_ATTRIBUTES",
     "REQUIRED_ATTRIBUTES",
+    "REQUIRED_EXTENSIONS",
+    "STRING_ATTRIBUTES",
+    "VALID_CLASSIFICATIONS",
     "build_event",
     "serialize",
     "parse_event",
@@ -177,6 +180,43 @@ REQUIRED_ATTRIBUTES: Final[tuple[str, ...]] = (
     "data",
 )
 
+#: Extensiones del perfil flux cuya ausencia es POISON — 01-envelope.md §3.1.
+#:
+#: Se exigen de verdad, no solo en la prosa. Si no se exigieran no serían obligatorias,
+#: serían recomendadas, y cada consumidor tendría que tratar el caso ausente — que es
+#: exactamente lo que declararlas obligatorias pretendía evitar.
+#:
+#: Además, asumir un valor por defecto es peligroso en las cuatro: un
+#: `dataclassification` ausente tomado como `internal` hace que PII circule con 30 días
+#: de retención en vez de 7, y un `tenantid` ausente tomado como `system` cruza fronteras
+#: de tenant. Ver 06-security.md §4 y §5.
+REQUIRED_EXTENSIONS: Final[tuple[str, ...]] = (
+    "correlationid",
+    "tenantid",
+    "producerversion",
+    "dataclassification",
+)
+
+VALID_CLASSIFICATIONS: Final[frozenset[str]] = frozenset(
+    {"public", "internal", "confidential", "restricted"}
+)
+
+#: Atributos que DEBEN llegar como cadena JSON — 01-envelope.md §2.4.
+#:
+#: `json.loads` no coacciona nada, así que sin esta lista un `{"tenantid": 42}` se
+#: colaría hasta el handler como el entero 42 y reventaría en la primera comparación con
+#: `==`. Jackson en cambio lo convertiría en `"42"` sin avisar: el mismo cuerpo daría
+#: tres comportamientos según el SDK, y el que "funciona" es el peor.
+STRING_ATTRIBUTES: Final[tuple[str, ...]] = (
+    "id",
+    "source",
+    "type",
+    "time",
+    "correlationid",
+    "tenantid",
+    "producerversion",
+)
+
 
 class EnvelopeError(ValueError):
     pass
@@ -289,6 +329,45 @@ def parse_event(payload: bytes | bytearray | memoryview | str) -> FluxEvent[Any]
             f"faltan atributos obligatorios de CloudEvents: {', '.join(missing)}",
             code="MISSING_REQUIRED_ATTRIBUTE",
         )
+
+    # `""` cuenta como ausente igual que `null`: 01-envelope.md §3.3 prohíbe darle
+    # significado propio a un valor vacío, así que un `tenantid: ""` no es un tenant.
+    missing_ext = [a for a in REQUIRED_EXTENSIONS if raw.get(a) is None or raw.get(a) == ""]
+    if missing_ext:
+        raise PoisonError(
+            f"faltan extensiones obligatorias del perfil flux: {', '.join(missing_ext)}. "
+            f"Su ausencia no es recuperable asumiendo un valor: un dataclassification "
+            f"ausente tomado como \"internal\" haría circular PII con la retención larga "
+            f"(01-envelope.md §3.1)",
+            code="MISSING_REQUIRED_EXTENSION",
+        )
+
+    classification = raw["dataclassification"]
+    # El `isinstance` va delante y no sobra: `{"a": 1} in frozenset(...)` no es False,
+    # es un TypeError, y el mensaje corrupto tumbaría el runtime del consumidor en vez
+    # de acabar en la DLQ como POISON.
+    if not isinstance(classification, str) or classification not in VALID_CLASSIFICATIONS:
+        # Un valor fuera del enum no se puede degradar a algo seguro: la retención y las
+        # ACLs de 06-security.md §5 se derivan de él, así que inventarle un sentido es
+        # peor que rechazar el mensaje.
+        raise PoisonError(
+            f"dataclassification inválido: {json.dumps(classification)}. "
+            f"Valores permitidos: {', '.join(sorted(VALID_CLASSIFICATIONS))}",
+            code="INVALID_DATACLASSIFICATION",
+        )
+
+    # Los tipos son exactos: {"tenantid": 42} es POISON, no el tenant "42".
+    # Aquí hay que comprobarlo a mano porque `json.loads` devuelve el int tal cual y
+    # nadie más lo mira hasta que una comparación con `==` falla en producción
+    # — 01-envelope.md §2.4.
+    for attribute in STRING_ATTRIBUTES:
+        value = raw[attribute]
+        if not isinstance(value, str):
+            raise PoisonError(
+                f"{attribute} debe ser una cadena, llegó {type(value).__name__} "
+                f"({json.dumps(value)})",
+                code="WRONG_ATTRIBUTE_TYPE",
+            )
 
     if raw.get("datacontenttype") != "application/json":
         raise PoisonError(
