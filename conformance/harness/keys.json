@@ -1,0 +1,8 @@
+{
+  "$comment": "Clave del vector TEST 1 de RFC 8032 §7.1. Es PUBLICA y estandar: NO es un secreto y NO debe usarse fuera de los tests. Existe para que los siete SDKs firmen con la MISMA clave y las firmas sean comparables byte a byte.",
+  "rfc": "RFC 8032 §7.1 TEST 1",
+  "seedHex": "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60",
+  "keyId": "pedidos-api-1",
+  "privateKeyPem": "-----BEGIN PRIVATE KEY-----\nMC4CAQAwBQYDK2VwBCIEIJ1hsZ3v/VpguoRK9JLsLMREScVpezJpGXA7rAMcrn9g\n-----END PRIVATE KEY-----\n",
+  "publicKeyPem": "-----BEGIN PUBLIC KEY-----\nMCowBQYDK2VwAyEA11qYAYKxCrfVS/7TyWQHOg7hcvPapiMlrwIaaPcHURo=\n-----END PUBLIC KEY-----\n"
+}

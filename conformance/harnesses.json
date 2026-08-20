@@ -1,0 +1,16 @@
+{
+  "$comment": "Registro de arneses de conformidad cruzada. Un SDK listado en `pending` se reporta como NO VERIFICADO en cada ejecución — nunca se salta en silencio. Ver conformance/harness/README.md.",
+
+  "harnesses": [
+    {
+      "sdk": "node",
+      "reference": true,
+      "$comment": "Referencia: su salida fija lo esperado. No por ser mejor, sino porque necesita haber una y es la implementación contra la que se escribió la spec.",
+      "cmd": "node",
+      "args": ["conformance-harness.mjs"],
+      "cwd": "sdk-node"
+    }
+  ],
+
+  "pending": ["python", "go", "java", "dotnet", "rust", "php"]
+}

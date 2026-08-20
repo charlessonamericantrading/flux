@@ -1,0 +1,235 @@
+{
+  "$comment": "Vectores compartidos del arnés de conformidad cruzada. Todos los SDKs los ejecutan y el runner compara las salidas BYTE A BYTE. Todo es determinista —id, time, dlqtime y la clave vienen dados— porque si algo lo generase el SDK las salidas no serían comparables.",
+  "spec": "conformance/harness/README.md",
+
+  "vectors": [
+    {
+      "id": "envelope-minimo",
+      "spec": "01-envelope.md §2, §6",
+      "why": "El caso base. Si dos SDKs difieren aquí, no difieren en nada más: difieren en todo.",
+      "op": "build",
+      "event": {
+        "subject": "pedidos.pedido.v1.creado",
+        "id": "01924f8e-7c3a-7b2d-9e14-3f8a1c9d0e55",
+        "source": "/produccion/pedidos-api",
+        "time": "2025-08-20T10:25:39.410Z",
+        "dataschema": "https://schemas.internal/pedidos/pedido/creado/1.0.0.json",
+        "correlationid": "01924f8e-7c3a-7b2d-9e14-3f8a1c9d0e55",
+        "tenantid": "acme",
+        "producerversion": "3.4.1",
+        "dataclassification": "internal",
+        "data": { "pedidoId": "ped-123", "totalCents": 9990 }
+      }
+    },
+    {
+      "id": "envelope-completo",
+      "spec": "01-envelope.md §3.2, §6",
+      "why": "Con todas las extensiones opcionales presentes: fija su ORDEN, que es normativo y que ningún test de un solo SDK detecta.",
+      "op": "build",
+      "event": {
+        "subject": "logistica.linea-envio.v2.entrega-fallida",
+        "id": "01924f8e-7c3a-7b2d-9e14-3f8a1c9d0e56",
+        "source": "/produccion/logistica-api",
+        "time": "2025-08-20T10:25:39.000Z",
+        "dataschema": "https://schemas.internal/logistica/linea-envio/entrega-fallida/2.1.0.json",
+        "correlationid": "corr-0000-1111-2222",
+        "causationid": "01924f8d-1a2b-7c3d-8e4f-5a6b7c8d9e01",
+        "tenantid": "globex",
+        "producerversion": "1.0.0",
+        "dataclassification": "confidential",
+        "aggregateId": "env-987",
+        "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+        "data": { "envioId": "env-987", "aggregateVersion": 3, "motivo": "ausente" }
+      }
+    },
+    {
+      "id": "utf8-literal",
+      "spec": "01-envelope.md §1.1",
+      "why": "Acentos, eñes y <>&'+ literales. System.Text.Json escapa todo lo no-ASCII por defecto y json_encode de PHP también, así que este vector es el único que lo detecta. Los milisegundos terminan en 0 a propósito: RFC3339Nano de Go los recortaría.",
+      "op": "build",
+      "event": {
+        "subject": "pedidos.pedido.v1.creado",
+        "id": "01924f8e-7c3a-7b2d-9e14-3f8a1c9d0e57",
+        "source": "/produccion/pedidos-api",
+        "time": "2025-08-20T10:25:39.400Z",
+        "dataschema": "https://schemas.internal/pedidos/pedido/creado/1.0.0.json",
+        "correlationid": "corr-utf8",
+        "tenantid": "acme",
+        "producerversion": "3.4.1",
+        "dataclassification": "internal",
+        "data": {
+          "pedidoId": "ped-123",
+          "nota": "Café con leche & pan <tostado>, para el señor Muñoz — 5€",
+          "emoji": "✅ 🚀",
+          "ruta": "https://ejemplo.test/a/b?x=1&y=2"
+        }
+      }
+    },
+    {
+      "id": "dlq-orden-de-claves",
+      "spec": "01-envelope.md §6, 04-errors.md §3",
+      "why": "Node construía el evento de DLQ con {...event, dlq*}, dejando las extensiones DESPUÉS de `data`; el resto las ponía antes. Mismo evento, bytes distintos. No lo veía ningún test de un solo SDK.",
+      "op": "dlq",
+      "event": {
+        "subject": "pedidos.pedido.v1.creado",
+        "id": "01924f8e-7c3a-7b2d-9e14-3f8a1c9d0e55",
+        "source": "/produccion/pedidos-api",
+        "time": "2025-08-20T10:25:39.410Z",
+        "dataschema": "https://schemas.internal/pedidos/pedido/creado/1.0.0.json",
+        "correlationid": "01924f8e-7c3a-7b2d-9e14-3f8a1c9d0e55",
+        "tenantid": "acme",
+        "producerversion": "3.4.1",
+        "dataclassification": "internal",
+        "data": { "pedidoId": "ped-123" }
+      },
+      "dlq": {
+        "reason": "permanent",
+        "attempts": 1,
+        "consumer": "facturacion-api__pedidos_pedido_v1_creado",
+        "error": "PEDIDO_YA_CANCELADO: el pedido ped-123 estaba cancelado",
+        "dlqtime": "2025-08-20T10:25:40.117Z"
+      }
+    },
+    {
+      "id": "firma-determinista",
+      "spec": "07-signing.md §5",
+      "why": "Ed25519 es determinista: la MISMA clave sobre los MISMOS bytes da la MISMA firma. Si dos SDKs producen firmas distintas aquí, es que sus bytes canónicos difieren — y este vector lo dice sin ambigüedad.",
+      "op": "sign",
+      "event": {
+        "subject": "pedidos.pedido.v1.creado",
+        "id": "01924f8e-7c3a-7b2d-9e14-3f8a1c9d0e55",
+        "source": "/produccion/pedidos-api",
+        "time": "2025-08-20T10:25:39.410Z",
+        "dataschema": "https://schemas.internal/pedidos/pedido/creado/1.0.0.json",
+        "correlationid": "01924f8e-7c3a-7b2d-9e14-3f8a1c9d0e55",
+        "tenantid": "acme",
+        "producerversion": "3.4.1",
+        "dataclassification": "internal",
+        "aggregateId": "ped-123",
+        "data": { "pedidoId": "ped-123", "totalCents": 9990 }
+      }
+    },
+    {
+      "id": "firma-con-acentos",
+      "spec": "07-signing.md §5, 01-envelope.md §1.1",
+      "why": "Cruza firma y UTF-8: un SDK que escape los no-ASCII firma sobre bytes distintos y su firma no verificará en ningún otro. Es el fallo más difícil de diagnosticar de los dos por separado.",
+      "op": "sign",
+      "event": {
+        "subject": "pedidos.pedido.v1.creado",
+        "id": "01924f8e-7c3a-7b2d-9e14-3f8a1c9d0e58",
+        "source": "/produccion/pedidos-api",
+        "time": "2025-08-20T10:25:39.410Z",
+        "dataschema": "https://schemas.internal/pedidos/pedido/creado/1.0.0.json",
+        "correlationid": "corr-firma-utf8",
+        "tenantid": "acme",
+        "producerversion": "3.4.1",
+        "dataclassification": "internal",
+        "data": { "nota": "señor Muñoz — 5€ ✅" }
+      }
+    },
+    {
+      "id": "firma-en-dlq",
+      "spec": "07-signing.md §4.1, §5.1",
+      "why": "Fija la posición de signkeyid/signature RESPECTO a las dlq*. Ponerlas detrás no rompe la verificación —el verificador quita las dlq* igual— pero sí la igualdad byte a byte del evento en la DLQ. Pasa todos los tests de firma de un solo SDK.",
+      "op": "dlq",
+      "signFirst": true,
+      "event": {
+        "subject": "pedidos.pedido.v1.creado",
+        "id": "01924f8e-7c3a-7b2d-9e14-3f8a1c9d0e55",
+        "source": "/produccion/pedidos-api",
+        "time": "2025-08-20T10:25:39.410Z",
+        "dataschema": "https://schemas.internal/pedidos/pedido/creado/1.0.0.json",
+        "correlationid": "01924f8e-7c3a-7b2d-9e14-3f8a1c9d0e55",
+        "tenantid": "acme",
+        "producerversion": "3.4.1",
+        "dataclassification": "internal",
+        "data": { "pedidoId": "ped-123" }
+      },
+      "dlq": {
+        "reason": "poison",
+        "attempts": 1,
+        "consumer": "facturacion-api__pedidos_pedido_v1_creado",
+        "error": "MALFORMED_JSON",
+        "dlqtime": "2025-08-20T10:25:40.117Z"
+      }
+    }
+  ],
+
+  "poisonVectors": [
+    {
+      "id": "poison-json-malformado",
+      "spec": "04-errors.md §1.3",
+      "rawUtf8": "{no soy json",
+      "expect": "MALFORMED_JSON"
+    },
+    {
+      "id": "poison-no-es-objeto",
+      "spec": "01-envelope.md §4",
+      "rawUtf8": "[1,2,3]",
+      "expect": "NOT_AN_OBJECT"
+    },
+    {
+      "id": "poison-specversion",
+      "spec": "01-envelope.md §2",
+      "mutate": { "specversion": "0.3" },
+      "expect": "UNSUPPORTED_SPECVERSION"
+    },
+    {
+      "id": "poison-falta-atributo-nucleo",
+      "spec": "01-envelope.md §2",
+      "remove": ["dataschema"],
+      "expect": "MISSING_REQUIRED_ATTRIBUTE"
+    },
+    {
+      "id": "poison-atributo-nucleo-null",
+      "spec": "01-envelope.md §4",
+      "mutate": { "source": null },
+      "expect": "MISSING_REQUIRED_ATTRIBUTE"
+    },
+    {
+      "id": "poison-falta-extension",
+      "spec": "01-envelope.md §3.1",
+      "remove": ["tenantid"],
+      "expect": "MISSING_REQUIRED_EXTENSION"
+    },
+    {
+      "id": "poison-extension-vacia",
+      "spec": "01-envelope.md §3.1",
+      "mutate": { "tenantid": "" },
+      "expect": "MISSING_REQUIRED_EXTENSION"
+    },
+    {
+      "id": "poison-clasificacion-vacia",
+      "spec": "01-envelope.md §3.1",
+      "mutate": { "dataclassification": "" },
+      "expect": "MISSING_REQUIRED_EXTENSION",
+      "why": "El vacío se evalúa ANTES que el enum. Un SDK que invierta el orden devuelve INVALID_DATACLASSIFICATION y la agrupación de la DLQ por causa deja de coincidir."
+    },
+    {
+      "id": "poison-clasificacion-invalida",
+      "spec": "01-envelope.md §3.1",
+      "mutate": { "dataclassification": "secreto" },
+      "expect": "INVALID_DATACLASSIFICATION"
+    },
+    {
+      "id": "poison-tipo-coaccionable",
+      "spec": "01-envelope.md §2.4",
+      "mutate": { "tenantid": 42 },
+      "expect": "WRONG_ATTRIBUTE_TYPE",
+      "why": "Jackson lo convertiría en \"42\" en silencio. El código debe ser este y no uno genérico de parseo."
+    },
+    {
+      "id": "poison-atributo-raiz-desconocido",
+      "spec": "01-envelope.md §3.4",
+      "mutate": { "miMetadato": "algo" },
+      "expect": "UNKNOWN_ROOT_ATTRIBUTE"
+    },
+    {
+      "id": "poison-clave-con-otra-caja",
+      "spec": "01-envelope.md §2.3",
+      "mutate": { "ID": "otro" },
+      "expect": "UNKNOWN_ROOT_ATTRIBUTE",
+      "why": "encoding/json de Go empareja campos SIN distinguir mayúsculas: sin la regla de atributos raíz cerrados, {\"ID\":…} poblaría Event.ID en silencio."
+    }
+  ]
+}
