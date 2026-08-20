@@ -487,7 +487,7 @@ public sealed class FluxBus : IAsyncDisposable
             AckPolicy = ConsumerConfigAckPolicy.Explicit,
             // ack_wait DEBE ser backoff[0]: JetStream lo sobrescribe con ese valor sin
             // avisar. Ver 03-delivery.md §2.1 y Protocol.CanonicalBackoff.
-            AckWait = ToNanos(Protocol.DefaultAckWait),
+            AckWait = Protocol.DefaultAckWait,
             MaxDeliver = Protocol.DefaultMaxDeliver,
             Backoff = Protocol.CanonicalBackoff.Select(ToNanos).ToArray(),
             MaxAckPending = maxAckPending,
@@ -520,17 +520,22 @@ public sealed class FluxBus : IAsyncDisposable
     /// Este método es la frontera: a partir de aquí no hay tipos de NATS. Es lo que permite
     /// probar la verificación L2 en un test unitario, sin broker.
     /// </remarks>
-    // NATS.Net expresa las duraciones como nanosegundos (long) en el cable; flux las
-    // maneja como TimeSpan. La conversion vive AQUI y solo aqui: es la frontera de la
-    // capa 1 del protocolo, y dejar escapar un long de nanosegundos hacia la API
-    // publica seria filtrar un detalle del broker (00-protocol.md 3).
-    private static long ToNanos(TimeSpan t) => (long)(t.Ticks * 100L);
+    // ⚠️ NATS.Net tipa las dos duraciones del mismo objeto de forma DISTINTA:
+    //   ConsumerConfig.AckWait  → TimeSpan
+    //   ConsumerConfig.Backoff  → ICollection<long> en NANOSEGUNDOS
+    //
+    // Y son precisamente los dos campos que el protocolo obliga a mantener iguales
+    // (ack_wait == backoff[0], 03-delivery.md §2.1). Comparar un TimeSpan con un long
+    // de nanos "parece" correcto y da 30 vs 30000000000 sin que nada avise, así que la
+    // conversión se hace explícita y vive solo aquí: es la frontera de la capa 1 del
+    // protocolo (00-protocol.md §3).
+    private static long ToNanos(TimeSpan t) => t.Ticks * 100L;
 
     private static TimeSpan FromNanos(long nanos) => TimeSpan.FromTicks(nanos / 100L);
 
     private static ConsumerConfigSnapshot Snapshot(ConsumerConfig config) => new()
     {
-        AckWait = FromNanos(config.AckWait),
+        AckWait = config.AckWait,
         MaxDeliver = (int)config.MaxDeliver,
         MaxAckPending = (int)config.MaxAckPending,
         AckPolicy = config.AckPolicy switch
