@@ -133,6 +133,158 @@ bus, err := flux.Connect(ctx, flux.ConnectOptions{
 Para que el clasificador reconozca un status HTTP, envuelve el fallo con
 `flux.NewHTTPError(status, msg, retryAfter)` o implementa `flux.HTTPStatusError`.
 
+> ⚠️ `RetryAfter` es una **sugerencia para el primer reintento**, no un control del
+> calendario. Con `backoff` configurado —y flux lo configura siempre— JetStream honra el
+> delay de un `nak` solo en la primera reentrega; a partir de la segunda manda el array
+> `backoff` y el delay **se ignora sin ningún aviso**:
+>
+> ```
+> SIN backoff:  0ms → 300ms → 600ms → 900ms      ← el delay se honra siempre
+> CON backoff:  0ms → 300ms → 5300ms → 15300ms   ← solo la primera vez
+> ```
+>
+> Medido contra NATS 2.14.5 ([03-delivery.md §2.2](../specification/03-delivery.md)). Un
+> `Retry-After: 5` de un proveedor acorta el primer reintento y nada más; los siguientes
+> siguen el backoff canónico. No construyas lógica que dependa de otra cosa.
+
+---
+
+## Aislamiento entre tenants
+
+```go
+bus, err := flux.Connect(ctx, flux.ConnectOptions{
+    // ...
+    TenantID:        "acme",
+    TenantIsolation: flux.TenantIsolationStrict, // toda suscripción filtra; olvidarlo falla
+})
+```
+
+- `TenantIsolationOff` (el cero del tipo): se filtra si hay `TenantID`, pero olvidarlo no
+  rompe nada.
+- `TenantIsolationStrict`: `Subscribe` devuelve `*flux.TenantIsolationError` **antes de
+  tocar el broker**, para no dejar a medias un durable en el servidor.
+
+El filtrado ocurre **antes** del handler: un evento de otro tenant se `Ack`ea y se descarta
+— no es un fallo, no es para nosotros
+([09-multitenancy.md §3](../specification/09-multitenancy.md)).
+
+El modo estricto es el punto que importa. Un filtro que hay que acordarse de poner es un
+filtro que alguien olvidará, y el fallo —ver los datos de otro tenant— **no produce ningún
+error**: produce un incidente de privacidad que se descubre semanas después.
+
+`"system"` **no cuenta** como filtro: es la ausencia de tenant, no un tenant
+([§5](../specification/09-multitenancy.md)). Aceptarlo dejaría fuera todos los eventos de
+negocio y daría por satisfecho el modo estricto sin filtrar nada.
+
+Lo que este modelo **no** cubre: un servicio legítimo comprometido puede publicar con el
+`tenantid` de otro, y un consumidor comprometido puede leer el subject entero. El filtro
+del SDK evita errores, no adversarios; para eso está el Modelo B (una account de NATS por
+tenant).
+
+## Firma de eventos — extensión opcional
+
+Traslada la autenticidad **del canal al evento**: un evento firmado sigue siendo
+verificable dentro de un fichero, un backup o un correo, donde ya no hay ninguna ACL que lo
+respalde ([07-signing.md](../specification/07-signing.md)).
+
+Usa `crypto/ed25519` de la stdlib: **cero dependencias nuevas**.
+
+```go
+par, _ := flux.GenerateKeyPair()   // PEM: PKCS#8 la privada, SPKI la pública
+
+bus, err := flux.Connect(ctx, flux.ConnectOptions{
+    // ...
+    Signing: flux.SigningOptions{
+        PrivateKeyPEM: par.PrivateKeyPEM,   // firmar al publicar
+        KeyID:         "pedidos-api-3",
+        PublicKeys:    map[string]string{"pedidos-api-3": par.PublicKeyPEM},
+        Verify:        flux.VerifyRequire,  // VerifyOff (default) | VerifyWarn | VerifyRequire
+    },
+})
+```
+
+- Ed25519, sin negociación de algoritmo. Los formatos con algoritmo negociable acumulan una
+  familia de vulnerabilidades —de `alg: none` a la confusión HMAC/RSA— que solo existe
+  porque hay algo que negociar.
+- Se firma `Serialize(evento sin Signature y sin las extensiones dlq*)`. **No hay
+  canonicalización aparte**: es el mismo `Serialize` del productor, y funciona porque
+  [01-envelope.md](../specification/01-envelope.md) §1.1, §2.2 y §6 fijan una única
+  representación en bytes.
+- `SignKeyID` va **dentro** de lo firmado. Si quedara fuera, un atacante lo cambiaría para
+  que la verificación buscara otra clave.
+- Un evento que pasa por la DLQ **sigue verificando**: las `dlq*` se añaden después de
+  firmar y la verificación las ignora. El replay redistribuye un hecho ya emitido.
+
+| Modo | Evento sin firma | Firma inválida |
+|---|---|---|
+| `VerifyOff` (default) | Se acepta | Se acepta (no se mira) |
+| `VerifyWarn` | Se registra y se acepta | Se registra y se acepta |
+| `VerifyRequire` | POISON `MISSING_SIGNATURE` | POISON `INVALID_SIGNATURE` / `UNKNOWN_SIGNING_KEY` |
+
+`VerifyWarn` existe porque adoptar la firma en un ecosistema en marcha exige un periodo en
+el que unos productores firman y otros no. Pasar directo a `VerifyRequire` convierte en
+POISON todo evento de un servicio aún no migrado. Registra en el `Logger` de
+`ConnectOptions`; sin logger, acepta en silencio.
+
+> **Conserva las claves públicas retiradas** mientras exista algún evento firmado con ellas
+> — mínimo 90 días, la retención de la DLQ. Retirar una clave impide **emitir** con ella, no
+> **verificar** lo ya emitido; tratarla como inválida convierte una rotación rutinaria en la
+> invalidación retroactiva de todo el historial
+> ([§6](../specification/07-signing.md)).
+
+⚠️ El orden de los campos `SignKeyID` y `Signature` en el struct `Event` es **normativo**:
+`encoding/json` emite en orden de declaración, las `dlq*` se añaden después de firmar y el
+orden de claves es parte del contrato. Moverlos bajo `DLQTime` haría que el mismo evento
+firmado produjera bytes distintos en Go y en Node, y una firma de un SDK dejaría de
+verificar en el otro. Hay un test que lo vigila.
+
+## Métricas
+
+Siete métricas con nombres y etiquetas fijados por el protocolo
+([08-observability.md](../specification/08-observability.md)). No son una decisión del SDK:
+si Go y Node nombraran distinto la tasa de DLQ, un panel del ecosistema sería imposible.
+
+```go
+metrics := flux.NewInMemoryMetrics()
+bus, err := flux.Connect(ctx, flux.ConnectOptions{ /* ... */ Metrics: metrics })
+
+http.HandleFunc("/metrics", func(w http.ResponseWriter, _ *http.Request) {
+    w.Header().Set("Content-Type", "text/plain; version=0.0.4")
+    _, _ = io.WriteString(w, metrics.Render())
+})
+```
+
+| Métrica | Tipo | Etiquetas |
+|---|---|---|
+| `flux_events_published_total` | Counter | `subject`, `outcome` |
+| `flux_events_consumed_total` | Counter | `subject`, `consumer`, `outcome` |
+| `flux_event_handler_duration_seconds` | Histogram | `subject`, `consumer` |
+| `flux_events_dlq_total` | Counter | `subject`, `consumer`, `reason`, `code` |
+| `flux_events_retried_total` | Counter | `subject`, `consumer`, `attempt` |
+| `flux_consumer_pending` | Gauge | `subject`, `consumer` |
+| `flux_connection_state` | Gauge | — |
+
+- El default es `NoMetrics{}`: un SDK no debe imponer un backend. `InMemoryMetrics` es una
+  comodidad sin dependencias y segura desde varios goroutines; si ya usas
+  `prometheus/client_golang`, implementa `MetricsSink` contra él y conserva los nombres.
+- **Nunca** se etiqueta por `tenantid`, `id` ni `correlationid`. Por eso `MetricsSink` tiene
+  parámetros nombrados y no un `map[string]string`: un mapa genérico es exactamente por
+  donde se cuela el `tenantid` que multiplica las series temporales. La cardinalidad no
+  avisa — funciona con tres tenants en desarrollo y muere con diez mil en producción.
+- El último bucket del histograma es `30` **porque es el `ack_wait`**: un handler que cae
+  ahí está a punto de que su mensaje se reentregue mientras aún se ejecuta. Hay un test que
+  falla si alguien cambia `DefaultAckWait` y olvida el bucket.
+
+- `flux_connection_state` (`1` conectado, `0` desconectado, `2` reconectando) va enganchado
+  a `DisconnectErrHandler` / `ReconnectHandler` / `ClosedHandler`: sin eso valdría `1` hasta
+  el `Close()` y no diría nada.
+
+⚠️ `flux_consumer_pending` no lo alimenta el SDK todavía: sale de `ConsumerInfo.NumPending`
+y hace falta un sondeo periódico contra el broker que este SDK aún no hace. El método está
+en la interfaz para que quien lo sondee use el nombre correcto — es la métrica de la cuarta
+alerta mínima, y la que delata a un consumidor cuyo bucle murió mientras la conexión sigue
+reportándose sana.
+
 ---
 
 ## Diferencias con el SDK de referencia (Node)
@@ -199,6 +351,24 @@ vecino `RetryAfter` ya usa ese mismo convenio. Un puntero añadiría una asignac
 alias mutable a un struct que se copia por valor en cada despacho, a cambio de distinguir
 un caso que no existe. Los valores cero de `ClassifierOptions` siguen significando el
 default de la spec: `retryable-bounded` con presupuesto 2.
+
+### 6. La firma va sin dependencias, y el modo `warn` necesita un logger
+
+Node usa `node:crypto`; aquí `crypto/ed25519` de la stdlib. Ninguno de los dos añade una
+dependencia — el SDK de Python sí la necesita, porque su stdlib no trae Ed25519.
+
+Donde Node escribe el aviso del modo `warn` con `console.warn`, aquí va al `*slog.Logger`
+de `ConnectOptions` (nil = silencio, como el resto del SDK). `NewVerifier` lo recibe como
+segundo parámetro para que un verificador construido a mano en un test sea observable sin
+tocar variables globales.
+
+### 7. Valores de etiqueta escapados, no sustituidos
+
+Node sustituye `"`, `\` y los saltos de línea de un valor de etiqueta por `_`. Aquí se
+**escapan** según el formato de exposición de Prometheus. El objetivo compartido es el
+mismo —un `code` con comillas no puede partir la línea y tumbar el scrape entero— pero
+escapar conserva el valor, que es lo que un operador quiere leer cuando el `code` viene de
+un error mal formado.
 
 ---
 
@@ -294,15 +464,25 @@ servidor**, no solo sobre la solicitada.
 | `errors.go` | `ErrorClass`, `RetryableError`, `PermanentError`, `PoisonError`, `Classification` |
 | `classify.go` | `NewClassifier`, `HTTPStatusError`, políticas configurables |
 | `context.go` | Propagación explícita vía `context.Context` |
+| `signing.go` | `NewSigner`, `NewVerifier`, `GenerateKeyPair`, `SigningOptions` (extensión opcional) |
+| `metrics.go` | `MetricsSink`, `NoMetrics`, `InMemoryMetrics`, `DurationBuckets` |
+| `tenant.go` | `TenantIsolation`, `TenantIsolationError`, resolución del filtro de tenant |
 | `client.go` | `Connect`, `Bus.Publish`, `Bus.Subscribe`, `Bus.Close` |
 
 ## Desarrollo
 
 ```bash
 go vet ./...
-go test ./...
+go test -race ./...
+gofmt -l .          # sin salida
 ```
 
-Los tests no requieren un broker: cubren naming, envelope y clasificación, que es
-donde vive la semántica del protocolo. La conformidad contra un NATS real se verifica
-con [`conformance/`](../conformance/).
+Los tests no requieren un broker: cubren naming, envelope, clasificación, firma, métricas
+y aislamiento de tenant, que es donde vive la semántica del protocolo. Los de métricas
+leen `../protocol.json` para que una divergencia entre el SDK y el contrato —un nombre de
+métrica renombrado, un bucket movido— falle en CI en vez de dejar un panel vacío.
+
+`-race` no es decorativo: `InMemoryMetrics` se renderiza desde el handler HTTP mientras el
+bucle de consumo sigue registrando, y hay un test que ejerce exactamente eso.
+
+La conformidad contra un NATS real se verifica con [`conformance/`](../conformance/).

@@ -42,9 +42,21 @@ type Classification struct {
 	// "PEDIDO_YA_CANCELADO"). El mensaje del error cambia; el código no debería.
 	Code string
 
-	// RetryAfter solo aplica a ClassRetryable y sobrescribe el backoff canónico
-	// para ese intento. Úsalo cuando la dependencia dice explícitamente cuánto
-	// esperar (cabecera Retry-After). Cero significa "usa el backoff canónico".
+	// RetryAfter solo aplica a ClassRetryable: es una SUGERENCIA PARA EL PRIMER
+	// REINTENTO, no un control del calendario completo. Cero significa "usa el
+	// backoff canónico".
+	//
+	// ⚠️ Con backoff configurado —y flux lo configura siempre— JetStream honra el
+	// delay de un nak ÚNICAMENTE en la primera reentrega; a partir de la segunda
+	// manda el array backoff y el delay se ignora SIN NINGÚN AVISO. Medido contra
+	// NATS 2.14.5, ver 03-delivery.md §2.2:
+	//
+	//	SIN backoff:  0ms → 300ms → 600ms → 900ms      ← el delay se honra siempre
+	//	CON backoff:  0ms → 300ms → 5300ms → 15300ms   ← solo la primera vez
+	//
+	// Consecuencia práctica: un `Retry-After: 5` de un proveedor acorta el primer
+	// reintento y nada más; los siguientes siguen el backoff canónico (1m, 5m, 15m,
+	// 30m). No construyas lógica que dependa de que se respete después.
 	RetryAfter time.Duration
 
 	// MaxAttempts solo aplica a ClassRetryable: entregas máximas para ESTE error,
@@ -95,8 +107,11 @@ func WithCode(code string) ErrorOption {
 	return func(o *errorOptions) { o.code = code }
 }
 
-// WithRetryAfter fija el retraso explícito del siguiente intento. Solo tiene efecto
-// sobre un RetryableError; en las otras clases se ignora, igual que en Node.
+// WithRetryAfter sugiere el retraso del PRIMER reintento. Solo tiene efecto sobre un
+// RetryableError; en las otras clases se ignora, igual que en Node.
+//
+// No sobrescribe el calendario de reintentos: con backoff configurado, JetStream ignora
+// el delay a partir de la segunda reentrega. Ver Classification.RetryAfter.
 func WithRetryAfter(d time.Duration) ErrorOption {
 	return func(o *errorOptions) { o.retryAfter = d }
 }
@@ -121,7 +136,8 @@ func applyOptions(opts []ErrorOption) errorOptions {
 type RetryableError struct {
 	Message string
 	Code    string
-	// RetryAfter sobrescribe el backoff canónico para este intento.
+	// RetryAfter sugiere el retraso del PRIMER reintento. Ver Classification.RetryAfter:
+	// a partir de la segunda reentrega manda el backoff del consumidor.
 	RetryAfter time.Duration
 	Cause      error
 }

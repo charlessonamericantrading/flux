@@ -42,6 +42,16 @@ from .errors import (
     RetryableError,
     is_classified_error,
 )
+from .metrics import (
+    DURATION_BUCKETS,
+    NO_METRICS,
+    ConnectionState,
+    ConsumeOutcome,
+    InMemoryMetrics,
+    MetricsSink,
+    NoMetrics,
+    PublishOutcome,
+)
 from .protocol import (
     CONSUMER_DEFAULTS,
     MAX_MESSAGE_BYTES,
@@ -59,6 +69,22 @@ from .protocol import (
     stream_name,
     subject_to_type,
     uuid7,
+)
+
+# La firma es una extensión OPCIONAL y `cryptography` una dependencia opcional: el módulo
+# se importa siempre —es barato— pero no toca `cryptography` hasta que alguien firma o
+# verifica de verdad. Ver flux/signing.py.
+from .tenant import TenantIsolation, TenantIsolationError, resolve_tenant_filter
+from .signing import (
+    KeyPair,
+    Signer,
+    SigningKeyError,
+    SigningOptions,
+    Verifier,
+    VerificationMode,
+    create_signer,
+    create_verifier,
+    generate_key_pair,
 )
 
 if TYPE_CHECKING:  # pragma: no cover - solo para los type checkers
@@ -99,6 +125,9 @@ __all__ = [
     "ConnectOptions",
     "Credentials",
     "ConsumerConfigMismatchError",
+    "TenantIsolationError",
+    "TenantIsolation",
+    "resolve_tenant_filter",
     "HandlerContext",
     "Handler",
     "Subscription",
@@ -146,6 +175,29 @@ __all__ = [
     "is_dlq_subject",
     "source_uri",
     "uuid7",
+    # multi-tenant (09-multitenancy.md)
+    "TenantIsolation",
+    "TenantIsolationError",
+    "resolve_tenant_filter",
+    # firma (extensión opcional — 07-signing.md)
+    "SigningOptions",
+    "SigningKeyError",
+    "VerificationMode",
+    "Signer",
+    "Verifier",
+    "KeyPair",
+    "create_signer",
+    "create_verifier",
+    "generate_key_pair",
+    # métricas (08-observability.md)
+    "MetricsSink",
+    "NoMetrics",
+    "NO_METRICS",
+    "InMemoryMetrics",
+    "DURATION_BUCKETS",
+    "ConnectionState",
+    "PublishOutcome",
+    "ConsumeOutcome",
     # contexto
     "current_context",
     "use_context",

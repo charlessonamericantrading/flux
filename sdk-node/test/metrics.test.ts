@@ -85,7 +85,29 @@ describe("recolector", () => {
     }
   });
 
-  test("escapa las comillas de los valores de etiqueta", () => {
+  test("escapa las comillas CONSERVANDO el valor", () => {
+    // Se escapa, no se sustituye: reemplazar por `_` no rompería el scrape pero
+    // dejaría dos errores distintos bajo la misma etiqueta. Python y Go hacen lo
+    // mismo; una divergencia aquí partiría la agregación entre SDKs.
+    const m = new InMemoryMetrics();
+    m.eventDlq("s", "c", "permanent", 'dice "hola"');
+    const salida = m.render();
+    assert.match(salida, /code="dice \\"hola\\""/);
+  });
+
+  test("escapa la barra invertida ANTES que las comillas", () => {
+    // Al revés, se escaparían las barras recién introducidas y una `"` acabaría como
+    // `\\\\"` — el valor saldría corrupto sin que nada fallara.
+    const m = new InMemoryMetrics();
+    m.eventDlq("s", "c", "permanent", 'ruta C:\\tmp');
+    const linea = m
+      .render()
+      .split("\n")
+      .find((l) => l.startsWith("flux_events_dlq_total"))!;
+    assert.ok(linea.includes("C:\\\\tmp"), `barra mal escapada: ${linea}`);
+  });
+
+  test("comillas desbalanceadas nunca rompen el scrape", () => {
     // Un `code` con comillas rompería el formato de exposición y Prometheus
     // descartaría el scrape entero, no solo esa línea.
     const m = new InMemoryMetrics();

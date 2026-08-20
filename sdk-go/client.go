@@ -46,10 +46,37 @@ type ConnectOptions struct {
 	// Version es el SemVer del servicio. Va en `producerversion`.
 	Version string
 
-	// TenantID por defecto de los eventos publicados. Vacío significa "system".
+	// TenantID por defecto de los eventos publicados, y filtro por defecto al consumir.
+	// Vacío significa "system".
 	TenantID string
+
+	// TenantIsolation gobierna qué pasa al suscribirse sin filtro de tenant
+	// — 09-multitenancy.md §3.
+	//
+	// Con TenantIsolationStrict, Subscribe devuelve *TenantIsolationError si no hay
+	// tenant configurado. Un filtro que hay que acordarse de poner es un filtro que
+	// alguien olvidará, y el fallo —ver los datos de otro tenant— no produce ningún
+	// error: produce un incidente de privacidad que se descubre semanas después.
+	//
+	// El cero del tipo es TenantIsolationOff, que es el default del protocolo.
+	TenantIsolation TenantIsolation
+
 	// Classification por defecto. Vacío significa "internal" — 06-security.md §5.
 	Classification DataClassification
+
+	// Signing configura la firma Ed25519. Extensión OPCIONAL — 07-signing.md.
+	//
+	// Traslada la autenticidad DEL CANAL AL EVENTO: un evento firmado sigue siendo
+	// verificable dentro de un fichero, un backup o un correo, donde ya no hay ACL. El
+	// cero del struct no firma ni verifica, que es el default del protocolo.
+	Signing SigningOptions
+
+	// Metrics es el destino de las métricas. Nil significa NoMetrics{}.
+	//
+	// Los nombres y las etiquetas los fija el protocolo (08-observability.md), no la
+	// aplicación: si cada SDK nombrara a su manera, un panel del ecosistema sería
+	// imposible.
+	Metrics MetricsSink
 
 	// Schemas es el mapa exacto subject → URI de `dataschema`. Gana sobre SchemaBaseURL.
 	Schemas map[string]string
@@ -264,6 +291,12 @@ type Bus struct {
 	classify Classifier
 	source   string
 
+	// Se construyen UNA vez en Connect y no por evento: parsear un PEM en la ruta
+	// caliente sería tirar el throughput por comodidad de escritura.
+	signer   *Signer
+	verifier *Verifier
+	metrics  MetricsSink
+
 	mu            sync.Mutex
 	subscriptions map[*Subscription]struct{}
 	ensured       map[string]struct{}
@@ -280,6 +313,22 @@ func Connect(ctx context.Context, opts ConnectOptions) (*Bus, error) {
 			"alimentan `source` y `producerversion`, que son atributos obligatorios del envelope")
 	}
 
+	// Las claves se validan ANTES de abrir la conexión: una clave mal formada es un
+	// fallo de configuración y debe romper el arranque, no la primera publicación.
+	signer, err := NewSigner(opts.Signing)
+	if err != nil {
+		return nil, err
+	}
+	verifier, err := NewVerifier(opts.Signing, opts.Logger)
+	if err != nil {
+		return nil, err
+	}
+
+	metrics := opts.Metrics
+	if metrics == nil {
+		metrics = NoMetrics{}
+	}
+
 	natsOpts := []nats.Option{
 		nats.Name(opts.Service + "@" + opts.Environment),
 		nats.MaxReconnects(-1),
@@ -288,6 +337,16 @@ func Connect(ctx context.Context, opts ConnectOptions) (*Bus, error) {
 		// RetryOnFailedConnect equivale al waitOnFirstConnect de Node: un servicio que
 		// arranca antes que el broker no debe morir en el primer intento.
 		nats.RetryOnFailedConnect(true),
+
+		// flux_connection_state: 1 conectado, 0 desconectado, 2 reconectando
+		// — 08-observability.md §2.1. Sin estos callbacks el gauge valdría 1 hasta
+		// Close() y no diría nada, que es peor que no publicarlo.
+		nats.DisconnectErrHandler(func(*nats.Conn, error) {
+			// Con MaxReconnects(-1) una caída SIEMPRE es "reconectando".
+			metrics.ConnectionState(StateReconnecting)
+		}),
+		nats.ReconnectHandler(func(*nats.Conn) { metrics.ConnectionState(StateConnected) }),
+		nats.ClosedHandler(func(*nats.Conn) { metrics.ConnectionState(StateDisconnected) }),
 	}
 	switch {
 	case opts.Credentials.CredsFile != "":
@@ -309,12 +368,16 @@ func Connect(ctx context.Context, opts ConnectOptions) (*Bus, error) {
 		return nil, fmt.Errorf("flux: no se pudo inicializar JetStream: %w", err)
 	}
 
+	metrics.ConnectionState(StateConnected)
 	return &Bus{
 		nc:            nc,
 		js:            js,
 		opts:          opts,
 		classify:      NewClassifier(opts.Classifier),
 		source:        SourceURI(opts.Environment, opts.Service),
+		signer:        signer,
+		verifier:      verifier,
+		metrics:       metrics,
 		subscriptions: make(map[*Subscription]struct{}),
 		ensured:       make(map[string]struct{}),
 	}, nil
@@ -338,6 +401,7 @@ func (b *Bus) Close() error {
 	for _, s := range subs {
 		s.Unsubscribe()
 	}
+	b.metrics.ConnectionState(StateDisconnected)
 	// Drain y no Close: los acks pendientes no se pierden en silencio.
 	return b.nc.Drain()
 }
@@ -445,6 +509,14 @@ func (b *Bus) Publish(ctx context.Context, subject string, data any, opts ...Pub
 		return Event{}, err
 	}
 
+	// Firmar es LO ÚLTIMO antes de serializar: la firma cubre el envelope completo, así
+	// que cualquier atributo añadido después la invalidaría — 07-signing.md §5.
+	if b.signer != nil {
+		if event, err = b.signer.Sign(event); err != nil {
+			return Event{}, err
+		}
+	}
+
 	payload, err := Serialize(event)
 	if err != nil {
 		return Event{}, err
@@ -458,8 +530,10 @@ func (b *Bus) Publish(ctx context.Context, subject string, data any, opts ...Pub
 	// mismo Nats-Msg-Id y eso es correcto y deseado. Nunca sustituye a la
 	// idempotencia del consumidor — 03-delivery.md §3.
 	if _, err := b.js.Publish(ctx, subject, payload, jetstream.WithMsgID(event.ID)); err != nil {
+		b.metrics.EventPublished(subject, PublishError)
 		return Event{}, fmt.Errorf("flux: fallo al publicar en %q: %w", subject, err)
 	}
+	b.metrics.EventPublished(subject, PublishOK)
 	return event, nil
 }
 
@@ -495,6 +569,14 @@ func (b *Bus) Subscribe(ctx context.Context, subject string, handler Handler, op
 	for _, o := range opts {
 		o(&cfg)
 	}
+
+	// ANTES de tocar el broker: un error de configuración debe romper el arranque, no
+	// dejar a medias un consumidor durable en el servidor — 09-multitenancy.md §3.
+	tenantFilter, err := resolveTenantFilter(subject, b.opts.TenantID, cfg.tenantID, b.opts.TenantIsolation)
+	if err != nil {
+		return nil, err
+	}
+	cfg.tenantID = tenantFilter
 
 	if err := b.ensureStream(ctx, parsed.Domain); err != nil {
 		return nil, err
@@ -631,8 +713,10 @@ func (b *Bus) dispatch(msg jetstream.Msg, subject, durable string, handler Handl
 		return
 	}
 
+	// Filtrar ANTES del handler: un evento de otro tenant no es un fallo, no es para
+	// nosotros. Se confirma y se descarta — 09-multitenancy.md §3.
 	if cfg.tenantID != "" && event.TenantID != cfg.tenantID {
-		_ = msg.Ack() // no es para nosotros
+		_ = msg.Ack()
 		return
 	}
 
@@ -667,9 +751,18 @@ func (b *Bus) dispatch(msg jetstream.Msg, subject, durable string, handler Handl
 		Durable:     durable,
 	}
 
-	handlerErr := b.invoke(ctx, handler, event, delivery)
+	// La firma se comprueba ANTES de invocar al handler: si el evento fue manipulado, su
+	// payload puede ser perfectamente válido y aun así no venir del productor que dice
+	// — 07-signing.md §5.1. En modo warn, Check registra y devuelve nil.
+	inicio := time.Now()
+	handlerErr := b.verify(event)
+	if handlerErr == nil {
+		handlerErr = b.invoke(ctx, handler, event, delivery)
+	}
 	if handlerErr == nil {
 		_ = msg.Ack()
+		b.metrics.EventConsumed(subject, durable, ConsumeOK)
+		b.metrics.HandlerDuration(subject, durable, time.Since(inicio).Seconds())
 		return
 	}
 
@@ -698,6 +791,10 @@ func (b *Bus) dispatch(msg jetstream.Msg, subject, durable string, handler Handl
 		}
 		b.logf(slog.LevelWarn, "RETRYABLE en %s: %s (intento %d/%d), reintento en %s",
 			subject, c.Code, attempt, budget, delay)
+		b.metrics.EventRetried(subject, durable, attempt)
+		// ⚠️ El delay solo se honra en la PRIMERA reentrega: con backoff configurado —y
+		// flux lo configura siempre— JetStream manda el array a partir de la segunda y
+		// lo ignora sin avisar (03-delivery.md §2.2).
 		_ = msg.NakWithDelay(delay)
 		return
 	}
@@ -718,12 +815,45 @@ func (b *Bus) dispatch(msg jetstream.Msg, subject, durable string, handler Handl
 		return
 	}
 
+	b.metrics.EventConsumed(subject, durable, outcomeFor(reason, c.Code))
+	b.metrics.EventDLQ(subject, durable, reason, c.Code)
+	b.metrics.HandlerDuration(subject, durable, time.Since(inicio).Seconds())
+
 	if b.opts.OnDLQ != nil {
 		b.opts.OnDLQ(DLQEventInfo{Subject: subject, Event: event, Classification: c})
 	}
 	b.logf(slog.LevelError, "DLQ (%s) %s en %s tras %d intento(s): %v",
 		reason, c.Code, subject, attempt, handlerErr)
 	_ = msg.Term()
+}
+
+// verify aplica la política de firma, o nil si la extensión está apagada.
+func (b *Bus) verify(event Event) error {
+	if b.verifier == nil {
+		return nil
+	}
+	return b.verifier.Check(event)
+}
+
+// outcomeFor traduce el motivo de DLQ al valor de la etiqueta `outcome`.
+//
+// La firma inválida se separa del POISON común porque son dos incidentes distintos
+// —basura frente a suplantación— con dos respuestas distintas, y la etiqueta existe para
+// eso (08-observability.md §2.1). El `reason` de la DLQ sigue siendo `poison`, que es el
+// enum cerrado de 04-errors.md §1.
+func outcomeFor(reason DLQReason, code string) ConsumeOutcome {
+	switch code {
+	case "MISSING_SIGNATURE", "INVALID_SIGNATURE", "UNKNOWN_SIGNING_KEY":
+		return ConsumeInvalidSignature
+	}
+	switch reason {
+	case DLQReasonRetryable:
+		return ConsumeRetryable
+	case DLQReasonPoison:
+		return ConsumePoison
+	default:
+		return ConsumePermanent
+	}
 }
 
 // invoke aísla el pánico del handler.
@@ -746,6 +876,13 @@ func (b *Bus) handlePoison(subject, durable string, msg jetstream.Msg, err error
 	if b.opts.OnPoison != nil {
 		b.opts.OnPoison(PoisonInfo{Subject: subject, Err: err, Raw: msg.Data()})
 	}
+	code := "POISON"
+	var pe *PoisonError
+	if errors.As(err, &pe) && pe.Code != "" {
+		code = pe.Code
+	}
+	b.metrics.EventConsumed(subject, durable, ConsumePoison)
+	b.metrics.EventDLQ(subject, durable, DLQReasonPoison, code)
 	b.logf(slog.LevelError, "POISON en %s: %v", subject, err)
 	if dlqErr := b.sendRawToDLQ(subject, msg.Data(), durable, err.Error()); dlqErr != nil {
 		b.logf(slog.LevelError, "no se pudo enrutar el POISON a la DLQ: %v", dlqErr)

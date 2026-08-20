@@ -93,6 +93,16 @@ class FluxEvent(Generic[T]):
     traceparent: str | None = None
     tracestate: str | None = None
 
+    #: Firma Ed25519 — extensión OPCIONAL, 07-signing.md §4. Un evento sin ellas sigue
+    #: siendo válido: el default de la verificación es `off`.
+    #:
+    #: `signkeyid` va DENTRO de lo firmado y `signature` no (no puede firmarse a sí
+    #: misma). Van declaradas ANTES de las `dlq*` porque las `dlq*` se añaden después de
+    #: firmar, y el orden de claves es normativo (01-envelope.md §6): así el mismo evento
+    #: firmado produce los mismos bytes en Node, Python y Go.
+    signkeyid: str | None = None
+    signature: str | None = None
+
     dlqreason: DlqReason | None = None
     dlqattempts: int | None = None
     dlqconsumer: str | None = None
@@ -128,6 +138,8 @@ class FluxEvent(Generic[T]):
             "partitionkey",
             "traceparent",
             "tracestate",
+            "signkeyid",
+            "signature",
             "dlqreason",
             "dlqattempts",
             "dlqconsumer",
@@ -160,6 +172,8 @@ ALLOWED_ROOT_ATTRIBUTES: Final[frozenset[str]] = frozenset(
         "partitionkey",
         "traceparent",
         "tracestate",
+        "signkeyid",
+        "signature",
         "dlqreason",
         "dlqattempts",
         "dlqconsumer",

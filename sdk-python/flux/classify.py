@@ -75,7 +75,13 @@ def extract_http_status(e: object) -> int | None:
 
 
 def extract_retry_after_ms(e: object) -> float | None:
-    """Lee `Retry-After` (segundos) si la dependencia lo expone."""
+    """
+    Lee `Retry-After` (segundos) si la dependencia lo expone.
+
+    Lo que se obtiene es una sugerencia para el PRIMER reintento: con `backoff`
+    configurado, JetStream ignora el delay del `nak` a partir de la segunda reentrega
+    (03-delivery.md §2.2). Ver `Classification.retry_after_ms`.
+    """
     headers = getattr(getattr(e, "response", None), "headers", None)
     if headers is None:
         headers = getattr(e, "headers", None)

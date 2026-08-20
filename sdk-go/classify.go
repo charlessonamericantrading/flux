@@ -34,6 +34,10 @@ type HTTPStatusError interface {
 
 // RetryAfterError es un error que sabe cuánto pide esperar la dependencia
 // (la cabecera Retry-After de una respuesta 429 o 503).
+//
+// Lo que aporta es una sugerencia para el PRIMER reintento: con backoff configurado,
+// JetStream ignora el delay del nak a partir de la segunda reentrega (03-delivery.md
+// §2.2). Ver Classification.RetryAfter.
 type RetryAfterError interface {
 	error
 	RetryAfter() time.Duration

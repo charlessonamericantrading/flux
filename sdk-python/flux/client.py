@@ -17,9 +17,10 @@ import json
 import logging
 import math
 import random
+import time
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any, Awaitable, Callable, Mapping, Sequence
+from typing import Any, Awaitable, Callable, Final, Mapping, Sequence
 
 import nats
 import nats.errors
@@ -50,6 +51,7 @@ from .envelope import (
     to_dlq_event,
 )
 from .errors import Classification, ErrorClass, PoisonError
+from .metrics import NO_METRICS, ConnectionState, ConsumeOutcome, MetricsSink
 from .protocol import (
     CONSUMER_DEFAULTS,
     STREAM_DEFAULTS,
@@ -62,6 +64,8 @@ from .protocol import (
     stream_name,
     uuid7,
 )
+from .signing import Signer, SigningOptions, Verifier, create_signer, create_verifier
+from .tenant import TenantIsolation, TenantIsolationError, resolve_tenant_filter
 
 __all__ = [
     "Credentials",
@@ -72,9 +76,23 @@ __all__ = [
     "PoisonInfo",
     "DlqInfo",
     "ConsumerConfigMismatchError",
+    # Se reexportan desde flux.tenant: viven fuera de aquí para poder probarse sin
+    # `nats-py` instalado, pero la API pública del SDK es la misma.
+    "TenantIsolationError",
+    "TenantIsolation",
+    "resolve_tenant_filter",
     "FluxBus",
     "connect",
 ]
+
+#: Códigos POISON que produce la verificación de firma — 07-signing.md §7.
+#:
+#: Se distinguen del resto de POISON solo para las métricas: `outcome="invalid_signature"`
+#: separa "un productor está publicando basura" de "un productor está publicando eventos
+#: que no son suyos", que son dos incidentes distintos con dos respuestas distintas.
+_SIGNING_CODES: Final[frozenset[str]] = frozenset(
+    {"MISSING_SIGNATURE", "INVALID_SIGNATURE", "UNKNOWN_SIGNING_KEY"}
+)
 
 
 # ─── Opciones ────────────────────────────────────────────────────────────────
@@ -116,10 +134,29 @@ class ConnectOptions:
     environment: str
     #: SemVer del servicio. Va en `producerversion`.
     version: str
-    #: Tenant por defecto de los eventos publicados.
+    #: Tenant por defecto de los eventos publicados, y filtro por defecto al consumir.
     tenant_id: str = "system"
+    #: Aislamiento entre tenants — 09-multitenancy.md §3.
+    #:
+    #: `"strict"`: toda suscripción filtra por tenant, y suscribirse sin tenant
+    #: configurado es un **error de configuración**. Un filtro que hay que acordarse de
+    #: poner es un filtro que alguien olvidará, y el fallo —ver los datos de otro tenant—
+    #: no produce ningún error: produce un incidente de privacidad que se descubre
+    #: semanas después.
+    #:
+    #: `"off"` (default): el filtrado sigue ocurriendo si hay `tenant_id`, pero olvidarlo
+    #: no rompe nada.
+    tenant_isolation: TenantIsolation = "off"
     #: Clasificación por defecto. Ver 06-security.md §5.
     classification: DataClassification = "internal"
+    #: Firma Ed25519 de eventos. Extensión OPCIONAL — 07-signing.md. Traslada la
+    #: autenticidad del canal al evento: un evento firmado sigue siendo verificable
+    #: dentro de un fichero, un backup o un correo, donde ya no hay ACL.
+    signing: SigningOptions | None = None
+    #: Destino de métricas. Los nombres y etiquetas los fija el protocolo
+    #: (08-observability.md), no la aplicación: si cada SDK nombrara a su manera, un panel
+    #: del ecosistema sería imposible. El default no registra nada.
+    metrics: MetricsSink = NO_METRICS
     #: Mapa exacto subject → URI de `dataschema`. Gana sobre `schema_base_url`.
     schemas: Mapping[str, str] = field(default_factory=dict)
     #: Base para derivar `dataschema` cuando no está en `schemas`.
@@ -218,6 +255,13 @@ class FluxBus:
         self._source = source_uri(options.environment, options.service)
         self._pumps: set[asyncio.Task[None]] = set()
         self._ensured: set[str] = set()
+        self._metrics = options.metrics
+        # Se construyen aquí y no por evento: parsear un PEM en la ruta caliente sería
+        # tirar el throughput por comodidad de escritura.
+        signing = options.signing or SigningOptions()
+        self._signer: Signer | None = create_signer(signing)
+        self._verifier: Verifier | None = create_verifier(signing, options.logger)
+        self._metrics.connection_state(ConnectionState.CONNECTED)
 
     # ─── publish ──────────────────────────────────────────────────────────────
 
@@ -276,10 +320,21 @@ class FluxBus:
             tracestate=inherited.tracestate if inherited is not None else None,
         )
 
+        # Firmar es LO ÚLTIMO antes de serializar: la firma cubre el envelope completo,
+        # así que cualquier atributo añadido después la invalidaría — 07-signing.md §5.
+        publicado = self._signer.sign(event) if self._signer is not None else event
+
         # La cabecera Nats-Msg-Id deduplica reintentos de PUBLICACIÓN dentro de
         # duplicate_window. NO deduplica reentregas de consumo — 03-delivery.md §3.
-        await self._js.publish(subject, serialize(event), headers={"Nats-Msg-Id": event.id})
-        return event
+        try:
+            await self._js.publish(
+                subject, serialize(publicado), headers={"Nats-Msg-Id": publicado.id}
+            )
+        except Exception:
+            self._metrics.event_published(subject, "error")
+            raise
+        self._metrics.event_published(subject, "ok")
+        return publicado
 
     def _schema_for(self, subject: str) -> str:
         explicit = self._opts.schemas.get(subject)
@@ -313,8 +368,16 @@ class FluxBus:
 
         El handler puede ser síncrono o `async`. Devolver normalmente = ack; lanzar =
         clasificar y decidir entre nak, DLQ o alerta (04-errors.md).
+
+        Con `tenant_isolation="strict"`, suscribirse sin tenant configurado lanza
+        `TenantIsolationError` — 09-multitenancy.md §3.
         """
         parsed = parse_subject(subject)
+        # ANTES de tocar el broker: un error de configuración debe romper el arranque,
+        # no dejar un consumidor a medio crear.
+        tenant_filter = resolve_tenant_filter(
+            subject, self._opts.tenant_id, tenant_id, self._opts.tenant_isolation
+        )
         await self._ensure_stream(parsed.domain)
         await self._ensure_dlq_stream(parsed.domain)
 
@@ -350,7 +413,7 @@ class FluxBus:
 
         stopped = asyncio.Event()
         task = asyncio.create_task(
-            self._pump(psub, stopped, subject, durable, handler, tenant_id),
+            self._pump(psub, stopped, subject, durable, handler, tenant_filter),
             name=f"flux-pump:{durable}",
         )
         self._pumps.add(task)
@@ -409,7 +472,7 @@ class FluxBus:
         subject: str,
         durable: str,
         handler: Handler,
-        tenant_id: str | None,
+        tenant_filter: str | None,
     ) -> None:
         while not stopped.is_set():
             try:
@@ -434,7 +497,7 @@ class FluxBus:
                 if stopped.is_set():
                     break
                 try:
-                    await self._dispatch(m, subject, durable, handler, tenant_id)
+                    await self._dispatch(m, subject, durable, handler, tenant_filter)
                 except asyncio.CancelledError:
                     raise
                 except Exception as e:
@@ -450,7 +513,7 @@ class FluxBus:
         subject: str,
         durable: str,
         handler: Handler,
-        tenant_id: str | None,
+        tenant_filter: str | None,
     ) -> None:
         attempt = self._attempt_of(m)
         max_attempts = CONSUMER_DEFAULTS.max_deliver
@@ -463,24 +526,36 @@ class FluxBus:
             err = e if isinstance(e, PoisonError) else PoisonError(str(e), cause=e)
             if self._opts.on_poison is not None:
                 self._opts.on_poison(PoisonInfo(subject=subject, error=err, raw=m.data))
+            self._metrics.event_consumed(subject, durable, "poison")
+            self._metrics.event_dlq(subject, durable, "poison", err.code or "POISON")
             self._log("error", "[flux] POISON en %s: %s", subject, err)
             if await self._safely_send_raw_to_dlq(subject, m.data, durable, str(err)):
                 await m.term()
             return
 
-        if tenant_id is not None and event.tenantid != tenant_id:
-            await m.ack()  # no es para nosotros
+        # Filtrar ANTES del handler: un evento de otro tenant no es un fallo, no es para
+        # nosotros. Se confirma y se descarta — 09-multitenancy.md §3.
+        if tenant_filter is not None and event.tenantid != tenant_filter:
+            await m.ack()
             return
 
         # WIP mientras el handler vive: extiende ack_wait y evita que el mismo evento se
         # ejecute en concurrencia consigo mismo — 03-delivery.md §2.1.
         wip = asyncio.create_task(self._keep_alive(m))
+        inicio = time.monotonic()
         try:
+            # La firma se comprueba ANTES de invocar al handler: si el evento fue
+            # manipulado, su payload puede ser perfectamente válido y aun así no venir
+            # del productor que dice — 07-signing.md §5.1.
+            if self._verifier is not None:
+                self._verifier.check(event)
             with use_context(context_from_event(event)):
                 result = handler(event, HandlerContext(attempt, max_attempts, subject))
                 if inspect.isawaitable(result):
                     await result
             await m.ack()
+            self._metrics.event_consumed(subject, durable, "ok")
+            self._metrics.handler_duration(subject, durable, time.monotonic() - inicio)
         except asyncio.CancelledError:
             # El SDK se está cerrando: ni ack ni term. El mensaje se reentregará, que es
             # exactamente el caso que cubre la idempotencia del consumidor.
@@ -511,6 +586,10 @@ class FluxBus:
                     budget,
                     delay_ms,
                 )
+                self._metrics.event_retried(subject, durable, attempt)
+                # ⚠️ El delay solo se honra en la PRIMERA reentrega: con `backoff`
+                # configurado —y flux lo configura siempre— JetStream manda el array a
+                # partir de la segunda y lo ignora sin avisar (03-delivery.md §2.2).
                 await m.nak(delay=delay_ms / 1000)
                 return
 
@@ -539,6 +618,17 @@ class FluxBus:
                     dlq_error,
                 )
                 return
+
+            # `outcome` distingue la firma inválida del POISON común: son dos incidentes
+            # distintos —basura frente a suplantación— y la etiqueta existe para eso
+            # (08-observability.md §2.1). El `reason` de la DLQ sigue siendo `poison`,
+            # que es el enum de 04-errors.md §1.
+            outcome: ConsumeOutcome = (
+                "invalid_signature" if c.code in _SIGNING_CODES else reason
+            )
+            self._metrics.event_consumed(subject, durable, outcome)
+            self._metrics.event_dlq(subject, durable, reason, c.code)
+            self._metrics.handler_duration(subject, durable, time.monotonic() - inicio)
 
             if self._opts.on_dlq is not None:
                 self._opts.on_dlq(DlqInfo(subject=subject, event=event, classification=c))
@@ -705,6 +795,7 @@ class FluxBus:
             except Exception as e:
                 self._log("warning", "[flux] error al parar un consumidor: %s", e)
         self._pumps.clear()
+        self._metrics.connection_state(ConnectionState.DISCONNECTED)
         # drain, no close: vacía lo pendiente antes de cortar. Los acks que no lleguen
         # provocan reentrega, y eso es correcto — 03-delivery.md §6.
         await self._nc.drain()
@@ -729,10 +820,13 @@ async def connect(
     environment: str,
     version: str,
     tenant_id: str = "system",
+    tenant_isolation: TenantIsolation = "off",
     classification: DataClassification = "internal",
     schemas: Mapping[str, str] | None = None,
     schema_base_url: str | None = None,
     classifier: ClassifierOptions | None = None,
+    signing: SigningOptions | None = None,
+    metrics: MetricsSink | None = None,
     credentials: Credentials | None = None,
     on_poison: Callable[[PoisonInfo], None] | None = None,
     on_dlq: Callable[[DlqInfo], None] | None = None,
@@ -754,15 +848,33 @@ async def connect(
         environment=environment,
         version=version,
         tenant_id=tenant_id,
+        tenant_isolation=tenant_isolation,
         classification=classification,
         schemas=dict(schemas or {}),
         schema_base_url=schema_base_url,
         classifier=classifier,
+        signing=signing,
+        metrics=metrics if metrics is not None else NO_METRICS,
         credentials=credentials,
         on_poison=on_poison,
         on_dlq=on_dlq,
         logger=logger,
     )
+
+    sink = options.metrics
+
+    # flux_connection_state: 1 conectado, 0 desconectado, 2 reconectando
+    # — 08-observability.md §2.1. Sin estos callbacks el gauge valdría 1 hasta close() y
+    # no diría nada, que es peor que no publicarlo.
+    async def _reconectando() -> None:
+        # Con max_reconnect_attempts=-1 una caída SIEMPRE es "reconectando".
+        sink.connection_state(ConnectionState.RECONNECTING)
+
+    async def _reconectado() -> None:
+        sink.connection_state(ConnectionState.CONNECTED)
+
+    async def _cerrada() -> None:
+        sink.connection_state(ConnectionState.DISCONNECTED)
 
     creds = credentials or Credentials()
     auth: dict[str, Any] = {}
@@ -781,6 +893,9 @@ async def connect(
         max_reconnect_attempts=-1,
         reconnect_time_wait=1.0 + random.random() * 0.5,
         allow_reconnect=True,
+        disconnected_cb=_reconectando,
+        reconnected_cb=_reconectado,
+        closed_cb=_cerrada,
         **auth,
     )
     return FluxBus(nc, nc.jetstream(), options)

@@ -64,10 +64,21 @@ export const NO_METRICS: MetricsSink = {
 
 type Labels = Record<string, string | number>;
 
+/**
+ * Escapa un valor de etiqueta según el formato de exposición de Prometheus.
+ *
+ * Se ESCAPA, no se sustituye: un `code` con comillas rompería el scrape entero, pero
+ * reemplazarlas por `_` perdería el valor y dejaría dos errores distintos con la misma
+ * etiqueta. El orden importa — la barra invertida primero, o se escaparían las que
+ * acabamos de introducir.
+ */
+const escaparEtiqueta = (v: string): string =>
+  v.replace(/\\/g, "\\\\").replace(/"/g, '\\"').replace(/\n/g, "\\n");
+
 const clave = (name: string, labels: Labels) =>
   `${name}{${Object.entries(labels)
     .sort(([a], [b]) => a.localeCompare(b))
-    .map(([k, v]) => `${k}="${String(v).replace(/["\\\n]/g, "_")}"`)
+    .map(([k, v]) => `${k}="${escaparEtiqueta(String(v))}"`)
     .join(",")}}`;
 
 /**

@@ -1961,6 +1961,25 @@ attempt  = 1..max_deliver
 
 `flux_connection_state`: `1` conectado, `0` desconectado, `2` reconectando.
 
+### 2.3 `flux_consumer_pending` se sondea, no se observa
+
+Es la única de las siete que **no sale del flujo de eventos**: hay que preguntarle al
+servidor por `num_pending` del consumidor. Un SDK L2 **DEBE** sondearlo
+periódicamente (~15 s por defecto), y un fallo del sondeo **NO DEBE** afectar al
+consumo: es telemetría.
+
+Sin ese sondeo la métrica nunca se emite, y un panel que muestra "sin datos" es
+**indistinguible de un consumidor sano** — que es exactamente el fallo que esta
+métrica existe para detectar.
+
+**Qué mide, con precisión:** `num_pending` son los mensajes del stream **aún no
+entregados** a ese consumidor. No son los entregados y sin confirmar.
+
+- Un handler **lento** no la hace crecer: sus mensajes ya se entregaron y están
+  esperando ack. Se ve en `flux_event_handler_duration_seconds`.
+- Un consumidor **muerto** sí: deja de recoger mensajes y `num_pending` sube sin
+  techo. Es la señal, y la conexión sigue reportándose sana mientras tanto.
+
 ### 2.2 ⚠️ Cardinalidad
 
 - `subject` es **acotado** —hay tantos como eventos declarados— así que sirve como

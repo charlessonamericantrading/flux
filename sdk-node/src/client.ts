@@ -139,6 +139,17 @@ export interface ConnectOptions {
   onPoison?: (info: { subject: string; error: Error; raw: Uint8Array }) => void;
   /** Se invoca al enrutar cualquier evento a la DLQ. */
   onDlq?: (info: { subject: string; event: FluxEvent; classification: Classification }) => void;
+  /**
+   * Cada cuánto sondear `num_pending` de cada consumidor, en ms. `0` lo desactiva.
+   *
+   * No es opcional por capricho: `flux_consumer_pending` es la ÚNICA señal que delata
+   * a un consumidor cuyo bucle murió, porque la conexión sigue reportándose sana y el
+   * healthcheck dice que todo va bien (08-observability.md §4). Pero el dato solo se
+   * obtiene preguntándole al servidor, así que hace falta un sondeo.
+   *
+   * @default 15000
+   */
+  pendingPollMs?: number;
   /** Logger opcional. Por defecto, silencio. */
   logger?: Pick<Console, "warn" | "error">;
 }
@@ -386,10 +397,26 @@ export class FluxBus {
     const consumer = await this.#js.consumers.get(stream, durable);
     const messages = await consumer.consume();
 
+    // Sondeo de num_pending. Sin esto, `flux_consumer_pending` nunca se emite y el
+    // panel muestra "sin datos", que es indistinguible de "consumidor sano" — 08 §4.
+    const pollMs = this.#opts.pendingPollMs ?? 15_000;
+    const poll =
+      pollMs > 0 && this.#opts.metrics
+        ? setInterval(() => {
+            void this.#jsm.consumers
+              .info(stream, durable)
+              .then((i) => this.#metrics.consumerPending(subject, durable, i.num_pending))
+              // Un fallo del sondeo NO debe afectar al consumo: es telemetría.
+              .catch(() => {});
+          }, pollMs)
+        : null;
+    if (poll?.unref) poll.unref();
+
     let stopped = false;
     const entry = {
       stop: () => {
         stopped = true;
+        if (poll) clearInterval(poll);
         messages.stop();
       },
     };

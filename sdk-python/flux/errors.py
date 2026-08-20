@@ -48,8 +48,20 @@ class Classification:
     error_class: ErrorClass
     #: Código estable para métricas y alertas. Ej. "HTTP_503", "PEDIDO_YA_CANCELADO".
     code: str
-    #: Solo para RETRYABLE: sobrescribe el backoff canónico para este intento.
-    #: Úsalo cuando la dependencia dice explícitamente cuánto esperar (Retry-After).
+    #: Solo para RETRYABLE: **sugerencia para el PRIMER reintento**, no un control del
+    #: calendario completo.
+    #:
+    #: ⚠️ Con `backoff` configurado —y flux lo configura siempre— JetStream honra el delay
+    #: de un `nak` únicamente en la primera reentrega; a partir de la segunda manda el
+    #: array `backoff` y el delay se ignora **sin ningún aviso**. Medido contra NATS
+    #: 2.14.5, ver 03-delivery.md §2.2::
+    #:
+    #:     SIN backoff:  0ms → 300ms → 600ms → 900ms      ← el delay se honra siempre
+    #:     CON backoff:  0ms → 300ms → 5300ms → 15300ms   ← solo la primera vez
+    #:
+    #: Consecuencia práctica: un `Retry-After: 5` de un proveedor acorta el primer
+    #: reintento y nada más; los siguientes siguen el backoff canónico (1 m, 5 m, 15 m,
+    #: 30 m). No construyas lógica que dependa de que se respete después.
     retry_after_ms: float | None = None
     #: Solo para RETRYABLE: número máximo de entregas para ESTE error, por debajo del
     #: `max_deliver` del consumidor. `None` = sin tope propio, manda el del consumidor.
@@ -89,6 +101,9 @@ class RetryableError(FluxError):
     """
     La aplicación lanza esto para forzar reintento.
     Úsalo cuando SABES que el fallo es transitorio.
+
+    `retry_after_ms` es una **sugerencia para el primer reintento**: a partir de la
+    segunda reentrega manda el backoff del consumidor. Ver `Classification.retry_after_ms`.
     """
 
     flux_class = ErrorClass.RETRYABLE

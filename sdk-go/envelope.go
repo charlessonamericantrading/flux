@@ -116,6 +116,20 @@ type Event struct {
 	TraceParent  string `json:"traceparent,omitempty"`
 	TraceState   string `json:"tracestate,omitempty"`
 
+	// ── Firma Ed25519 — extensión OPCIONAL — 07-signing.md §4 ──
+	//
+	// Un evento sin estos dos atributos sigue siendo válido: el default de la
+	// verificación es `off`. SignKeyID va DENTRO de lo firmado; Signature no puede
+	// firmarse a sí misma.
+	//
+	// ⚠️ Van declarados ANTES de las dlq* y eso es normativo, no estético: encoding/json
+	// emite los campos en orden de declaración, las dlq* se añaden DESPUÉS de firmar, y
+	// el orden de claves es parte del contrato (01-envelope.md §6). Moverlos aquí abajo
+	// haría que el mismo evento firmado produjera bytes distintos en Go y en Node, y una
+	// firma de un SDK dejaría de verificar en el otro.
+	SignKeyID string `json:"signkeyid,omitempty"`
+	Signature string `json:"signature,omitempty"`
+
 	// ── Extensiones de DLQ — solo presentes en dlq.<subject> — 04-errors.md §3 ──
 
 	DLQReason DLQReason `json:"dlqreason,omitempty"`
@@ -172,6 +186,8 @@ func (e Event) Equal(other Event) bool {
 		e.PartitionKey == other.PartitionKey &&
 		e.TraceParent == other.TraceParent &&
 		e.TraceState == other.TraceState &&
+		e.SignKeyID == other.SignKeyID &&
+		e.Signature == other.Signature &&
 		e.DLQReason == other.DLQReason &&
 		e.DLQAttempts == other.DLQAttempts &&
 		e.DLQConsumer == other.DLQConsumer &&
@@ -206,6 +222,7 @@ var AllowedRootAttributes = map[string]struct{}{
 	"datacontenttype": {}, "dataschema": {}, "subject": {},
 	"correlationid": {}, "tenantid": {}, "producerversion": {}, "dataclassification": {},
 	"causationid": {}, "partitionkey": {}, "traceparent": {}, "tracestate": {},
+	"signkeyid": {}, "signature": {},
 	"dlqreason": {}, "dlqattempts": {}, "dlqconsumer": {}, "dlqerror": {}, "dlqtime": {},
 	"data": {},
 }

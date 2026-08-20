@@ -19,8 +19,16 @@ dependencies = [
 # `uuid7` no aparece aquí a propósito: el SDK genera UUIDv7 con la stdlib
 # (flux/protocol.py). Python <3.14 no trae `uuid.uuid7()` y no compensa una dependencia
 # por 15 líneas que además hay que auditar por generar identidad de eventos.
-dev = ["pytest>=8"]
+dev = ["pytest>=8", "cryptography>=42"]
 otel = ["opentelemetry-api>=1.20"]
+# Firma Ed25519 — extensión OPCIONAL de v1 (07-signing.md), de ahí el extra.
+#
+# La stdlib de Python no trae Ed25519: es la única pieza de la extensión que no sale
+# gratis. El SDK de Node la implementa con `node:crypto` y el de Go con `crypto/ed25519`,
+# ambos sin dependencias. `flux/signing.py` no importa `cryptography` hasta que alguien
+# firma o verifica de verdad, así que un servicio que no usa la extensión no la necesita
+# instalada ni auditada.
+signing = ["cryptography>=42"]
 
 [tool.hatch.build.targets.wheel]
 packages = ["flux"]
