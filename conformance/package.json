@@ -1,0 +1,17 @@
+{
+  "name": "@flux/conformance",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Suite de conformidad del Event Protocol v1. Habla NATS directamente, sin pasar por ningún SDK de flux: un runner construido sobre un SDK heredaría las suposiciones que debe verificar.",
+  "scripts": {
+    "test": "node run.mjs"
+  },
+  "dependencies": {
+    "@nats-io/jetstream": "^3.4.0",
+    "@nats-io/transport-node": "^3.4.0"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

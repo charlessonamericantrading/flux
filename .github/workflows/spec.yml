@@ -68,3 +68,50 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: jq empty protocol.json && echo "✓ protocol.json válido"
+
+  sdk-node:
+    name: SDK Node — typecheck y tests
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: sdk-node
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm install --no-audit --no-fund
+      - run: npm run typecheck
+      - run: npm test
+      - run: npm run build
+
+  conformance:
+    name: Conformidad contra NATS real
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      # Contra un NATS de verdad, no un mock: la suite existe precisamente porque
+      # las suposiciones sobre el broker resultaron falsas al comprobarlas.
+      # Se levanta con `docker run` y no con `services:` porque la imagen oficial no
+      # arranca JetStream por defecto y `services:` no permite sobrescribir el command.
+      - name: Levantar NATS con JetStream
+        run: |
+          docker run -d --name flux-nats -p 4222:4222 -p 8222:8222 \
+            nats:2.14-alpine --jetstream --http_port=8222
+          for i in $(seq 1 30); do
+            if curl -sf http://127.0.0.1:8222/healthz >/dev/null; then
+              echo "✓ NATS listo"; exit 0
+            fi
+            sleep 1
+          done
+          echo "✗ NATS no arrancó"; docker logs flux-nats; exit 1
+
+      - name: Ejecutar suite de conformidad
+        working-directory: conformance
+        run: |
+          npm install --no-audit --no-fund
+          npm test

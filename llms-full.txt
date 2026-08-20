@@ -557,8 +557,17 @@ logistica.envio.v1.entrega-fallida
 
 - **DEBE** tener exactamente 4 tokens. Ni más, ni menos.
 - **DEBE** ir todo en minúsculas. NATS distingue mayúsculas y `Pedidos.` ≠ `pedidos.`
-  — un solo despiste crea un subject fantasma al que nadie está suscrito y que no
-  produce ningún error.
+  — un solo despiste crea un subject fantasma al que nadie está suscrito.
+
+  > **Requisito derivado — publicar siempre por JetStream, nunca por core NATS.**
+  > Verificado contra NATS 2.14.5: un `publish` de **core** a un subject que ningún
+  > stream captura **no da ningún error** y el evento se evapora sin rastro. El mismo
+  > `publish` por **JetStream** sí falla, porque espera el acuse del stream.
+  >
+  > Esa es la única red de seguridad automática contra una errata de subject. Un SDK
+  > **NO DEBE** exponer publicación por core NATS para eventos de dominio.
+  > Ver [`conformance/run.mjs`](../conformance/run.mjs), casos
+  > `core-publish-to-wrong-case-is-silent` y `jetstream-publish-to-wrong-case-errors`.
 - **NO DEBE** contener `_`, espacios, `*` ni `>`. Solo `[a-z0-9-]` dentro de cada token.
 - El plural del dominio y el singular del agregado son deliberados: leído en voz alta,
   `pedidos.pedido` es "el agregado *pedido*, del dominio *pedidos*".
