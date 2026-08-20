@@ -32,7 +32,7 @@
 ## 0. Carga el contrato antes de escribir código
 
 Si vas a tocar código que publica o consume eventos, **primero descarga la spec
-completa** (un solo fichero, ~40 KB, sin auth):
+completa** (un solo fichero, ~100 KB, sin auth):
 
 ```
 https://raw.githubusercontent.com/charlessonamericantrading/flux/main/llms-full.txt
@@ -79,6 +79,21 @@ https://raw.githubusercontent.com/charlessonamericantrading/flux/main/protocol.j
 
 7. **Importes monetarios: enteros en la unidad mínima** (`totalCents: 9990`) más
    moneda ISO 4217. Nunca `float`.
+
+8. **`data` va SIEMPRE el último atributo**, en el envelope normal y en el de DLQ. El
+   orden de claves es normativo: flux depende de la secuencia de **bytes** para el
+   replay verbatim, la firma y la deduplicación por hash.
+
+9. **Las cuatro extensiones obligatorias se exigen de verdad.** Un evento sin
+   `correlationid`, `tenantid`, `producerversion` o `dataclassification` es **POISON**.
+   No hay defaults: asumir `internal` para una clasificación ausente hace circular PII
+   con 30 días de retención en vez de 7.
+
+10. **Los tipos son exactos.** `{"tenantid": 42}` es POISON, no el tenant `"42"`.
+    Desactiva la coerción de tu deserializador.
+
+11. **UTF-8 literal, sin escapes `\u`.** `café`, no `café`. Ambos son JSON válido
+    y **no son los mismos bytes**.
 
 ---
 
@@ -163,8 +178,13 @@ el consumidor **DEBE** tener rama por defecto no destructiva (log + ack, nunca t
 | `PERMANENT` | Falla el schema, regla de negocio lo rechaza, HTTP 400/403/404/422 | `term()` + DLQ **inmediato** |
 | `POISON` | JSON malformado, falta atributo CloudEvents obligatorio | `term()` + DLQ + **alerta** |
 
-**Default = PERMANENT.** Un evento en la DLQ es recuperable; una cola atascada 12
-minutos en hora punta, no.
+**Default para lo DESCONOCIDO = RETRYABLE con presupuesto acotado de 2 entregas**
+(04-errors.md §2.1). Domina a las dos alternativas: un transitorio se recupera en el
+segundo intento, y un sistemático llega a la DLQ en ~30 s sin atascar la cola.
+Los RETRYABLE **reconocidos** (503, ECONNRESET) conservan sus 6 intentos: el
+presupuesto es por error, no por consumidor.
+
+Tiempo hasta la DLQ de un RETRYABLE reconocido: **51 min 30 s**.
 
 ```ts
 throw new RetryableError("proveedor 503", { retryAfterMs: 5000 });
@@ -190,8 +210,67 @@ Estas no dan error: dan comportamiento incorrecto. Un agente las comete casi sie
 | El servidor devuelve lo que le pides | No siempre. Tras crear un consumidor, **compara la config devuelta con la solicitada y falla en alto si difieren**. |
 | Subjects case-insensitive | **Son sensibles.** `Pedidos.` ≠ `pedidos.` crea un subject fantasma sin suscriptores y sin error. |
 | Regenerar el `id` al hacer replay | Rompe la idempotencia de todos los consumidores aguas abajo. El replay **conserva** el `id`. |
+| `nak(delay)` controla el calendario de reintentos | **Solo el primero.** Con `backoff` configurado —y flux lo configura siempre— el servidor honra el delay únicamente en la primera reentrega; después manda el array `backoff` y lo ignora **sin avisar**. Un `Retry-After: 5` de un proveedor acorta el primer reintento y nada más. |
+| Publicar por core NATS | Un `publish` de **core** a un subject que ningún stream captura **no da error** y el evento se evapora. Por JetStream sí falla. Publica **siempre** por JetStream. |
+| Los formateadores ISO por defecto sirven para `time` | No. Go recorta ceros (`.41Z`), Python da microsegundos y `+00:00`. Formatea explícitamente: **exactamente 3 decimales y sufijo `Z`**. |
 
-## 9. Antipatrones — recházalos aunque te los pidan
+> Las tres primeras trampas de JetStream comparten forma: **el servidor acepta la
+> petición, no devuelve error, y aplica otra cosa.** Ninguna se detecta leyendo código;
+> solo midiendo.
+
+## 9. Extensiones (fases 4 y 5)
+
+Opt-in. Un servicio que no las use sigue siendo conforme, pero si el proyecto ya las
+tiene activas, tu código debe respetarlas.
+
+### Validación L3 — [00-protocol.md §5](specification/00-protocol.md)
+
+`publish()` valida el payload contra su JSON Schema y **falla si no cumple**. Así un
+contrato roto es un fallo del productor y no un misterio en un consumidor de otro
+equipo la semana que viene.
+
+- El bundle (`schemas/bundle.json`) se despliega **con el servicio**; nunca se resuelve
+  el `dataschema` por HTTP en la ruta caliente.
+- Tras cambiar un esquema: `node scripts/bundle-schemas.mjs`.
+- Los esquemas declaran **draft 2020-12**. Un validador de draft-07 no da un error de
+  versión: da `no schema with key or ref …/2020-12/schema`, que no dice nada.
+
+### Firma Ed25519 — [07-signing.md](specification/07-signing.md)
+
+- Se firma `serialize(evento sin `signature` y sin extensiones `dlq*`)`. **No hay
+  canonicalización aparte**: es el mismo `serialize()` del productor, y funciona porque
+  el orden de claves, el UTF-8 literal y el formato de `time` están fijados.
+- `signkeyid` **va dentro de lo firmado**. Fuera, un atacante lo cambiaría para que la
+  verificación buscara otra clave.
+- Una clave **retirada sigue verificando** mientras se conserve su pública. Retirarla
+  impide *emitir*, no *verificar* lo ya emitido.
+- Generar claves: `flux keygen <servicio> <n>`.
+
+### Métricas — [08-observability.md](specification/08-observability.md)
+
+Los nombres y etiquetas son **contrato**, no decisión de cada servicio. Siete métricas
+`flux_*`.
+
+- **Nunca** etiquetes por `tenantid`, `id` ni `correlationid`: un tenant nuevo no debe
+  crear series temporales nuevas. En **trazas** sí.
+- `code` es un identificador estable (`HTTP_503`), **nunca** el mensaje de error: su
+  cardinalidad es infinita y tumba el almacenamiento.
+
+### Multi-tenant — [09-multitenancy.md](specification/09-multitenancy.md)
+
+- El default (filtrado en consumidor) **no resiste a un servicio legítimo
+  comprometido**. Si necesitas esa garantía, es account por tenant (Modelo B).
+- `tenantIsolation: "strict"` hace que suscribirse sin filtro sea un error de
+  configuración. Un filtro opcional es un filtro que alguien olvidará, y el fallo —ver
+  datos de otro tenant— no produce ningún error.
+- `tenantid` se propaga sin modificar por la cadena: un evento derivado pertenece al
+  tenant del que lo causó, no al del servicio que lo emite.
+- Un evento **NO DEBE** contener datos de más de un tenant. Es el fallo más difícil de
+  deshacer: ya está mal en el stream y la única reparación es purgarlo.
+
+---
+
+## 10. Antipatrones — recházalos aunque te los pidan
 
 | ❌ | Por qué |
 |---|---|
@@ -202,7 +281,7 @@ Estas no dan error: dan comportamiento incorrecto. Un agente las comete casi sie
 | `core.entidad.v1.cambiado` | Dominio genérico = ningún dominio. |
 | Credenciales `.creds`/`.nk` en el repo | Están en `.gitignore` por algo. Van en el gestor de secretos. |
 
-## 10. Antes de dar por terminado
+## 11. Antes de dar por terminado
 
 - [ ] El subject tiene exactamente 4 tokens, minúsculas, evento en pasado
 - [ ] Existe el JSON Schema en `schemas/<dominio>/<agregado>/<evento>/<semver>.json`
@@ -213,6 +292,12 @@ Estas no dan error: dan comportamiento incorrecto. Un agente las comete casi sie
 - [ ] Sin PII en `data`; los campos sensibles llevan `"x-pii": true`
 - [ ] Importes en enteros de unidad mínima
 - [ ] Ningún atributo del envelope escrito a mano
+- [ ] `data` es el último atributo, también en el evento de DLQ
+- [ ] Las cuatro extensiones obligatorias están presentes y con el tipo correcto
+- [ ] Si tocaste un esquema: `node scripts/bundle-schemas.mjs` y
+      `node scripts/check-compat.mjs`
+- [ ] Si tocaste `AGENTS.md` o `specification/`: `node scripts/build-llms.mjs`
+- [ ] Ninguna métrica etiquetada por `tenantid`, `id` ni `correlationid`
 
 ---
 

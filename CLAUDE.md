@@ -23,6 +23,13 @@ Al responder preguntas de diseño, la spec manda sobre cualquier código.
 5. **Sin PII en `data`.** Publica referencias (`clienteId`), no valores (`email`).
 6. Los JSON Schema publicados son **inmutables**. Se añade versión, no se edita.
 7. Dinero: enteros en unidad mínima (`totalCents`) + ISO 4217. Nunca `float`.
+8. **`data` va siempre el último atributo.** El orden de claves es normativo: flux
+   depende de la secuencia de bytes para el replay, la firma y la dedupe por hash.
+9. **Las cuatro extensiones obligatorias se exigen**: sin `correlationid`, `tenantid`,
+   `producerversion` o `dataclassification`, el evento es POISON. No hay defaults —
+   asumir `internal` haría circular PII con 30 días de retención en vez de 7.
+10. **Los tipos son exactos**: `{"tenantid": 42}` es POISON, no el tenant `"42"`.
+11. **UTF-8 literal**, sin escapes `\u`. `café`, no `caf\u00e9`.
 
 ## Trampas que fallan en silencio
 
@@ -33,10 +40,15 @@ Al responder preguntas de diseño, la spec manda sobre cualquier código.
 - Los subjects de NATS son **case-sensitive**: `Pedidos.` crea un subject fantasma
   sin suscriptores y sin error.
 - Al hacer replay desde la DLQ, **conserva el `id` original**.
+- `nak(delay)` solo se honra en la **primera** reentrega cuando hay `backoff`
+  configurado, y flux lo configura siempre. Un `Retry-After` acorta el primer
+  reintento y nada más.
+- Un `publish` de **core NATS** a un subject que ningún stream captura no da error: el
+  evento se evapora. Publica siempre por JetStream.
 
 ## Al terminar una tarea
 
-Repasa la checklist de [`AGENTS.md` §10](AGENTS.md).
+Repasa la checklist de [`AGENTS.md` §11](AGENTS.md).
 
 Si tocas `AGENTS.md` o cualquier fichero de `specification/`, regenera el agregado:
 

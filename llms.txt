@@ -22,9 +22,12 @@ Si solo vas a cargar un fichero, carga
 - [01-envelope.md](https://raw.githubusercontent.com/charlessonamericantrading/flux/main/specification/01-envelope.md): Atributos CloudEvents, las 4 extensiones obligatorias, reglas de `data`, claim-check por encima de 1 MiB. Incluye el aviso de que `subject` de CloudEvents no es el subject de NATS.
 - [02-naming.md](https://raw.githubusercontent.com/charlessonamericantrading/flux/main/specification/02-naming.md): `<dominio>.<agregado>.v<major>.<evento>`, derivación del `type`, streams, durable consumers, por qué la DLQ va prefijada, 6 antipatrones.
 - [03-delivery.md](https://raw.githubusercontent.com/charlessonamericantrading/flux/main/specification/03-delivery.md): at-least-once, configuración canónica de consumidor, qué protege y qué no protege `duplicate_window`, las 3 estrategias de idempotencia, por qué no hay garantía de orden y cómo prescindir de ella.
-- [04-errors.md](https://raw.githubusercontent.com/charlessonamericantrading/flux/main/specification/04-errors.md): Taxonomía RETRYABLE / PERMANENT / POISON, por qué el default es PERMANENT, formato del mensaje en DLQ, procedimiento de replay.
+- [04-errors.md](https://raw.githubusercontent.com/charlessonamericantrading/flux/main/specification/04-errors.md): Taxonomía RETRYABLE / PERMANENT / POISON, por qué el default de lo desconocido es RETRYABLE con presupuesto acotado, formato del mensaje en DLQ, procedimiento de replay.
 - [05-compatibility.md](https://raw.githubusercontent.com/charlessonamericantrading/flux/main/specification/05-compatibility.md): Qué sube MINOR y qué obliga a MAYOR, la trampa de los enums, migración con doble publicación, verificaciones de CI.
 - [06-security.md](https://raw.githubusercontent.com/charlessonamericantrading/flux/main/specification/06-security.md): Accounts por entorno, ACLs por dominio, clasificación de datos, RGPD y derecho de supresión.
+- [07-signing.md](https://raw.githubusercontent.com/charlessonamericantrading/flux/main/specification/07-signing.md): Firma Ed25519, extensión opcional. Qué resuelve que las ACLs no cubren, por qué sin negociación de algoritmo, rotación de claves, y qué NO resuelve.
+- [08-observability.md](https://raw.githubusercontent.com/charlessonamericantrading/flux/main/specification/08-observability.md): Siete métricas obligatorias con nombres y etiquetas fijados, buckets del histograma atados al ack_wait, cuatro alertas mínimas, y por qué nunca se etiqueta por tenant.
+- [09-multitenancy.md](https://raw.githubusercontent.com/charlessonamericantrading/flux/main/specification/09-multitenancy.md): Tres modelos de aislamiento con su coste real, la tabla de amenazas que cada uno cubre, y las dos que el modelo por defecto NO cubre.
 
 ## Ejemplos
 
