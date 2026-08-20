@@ -139,13 +139,24 @@ Rule = Callable[[BaseException], Classification | None]
 class ClassifierOptions:
     #: Qué hacer con un error que no encaja en ninguna regla conocida.
     #:
-    #: `"permanent"` (default de la spec) — va a la DLQ sin gastar reintentos. La cola
-    #: sigue fluyendo y el evento se puede reproducir cuando se entienda qué pasó.
+    #: `"retryable-bounded"` (default de la spec) — reintenta, pero con un presupuesto
+    #: reducido (`unknown_retry_budget`, 2 entregas) en vez de los 6 intentos completos.
+    #: Un transitorio se recupera en el segundo intento; un sistemático llega a la DLQ
+    #: en ~30 s sin atascar la cola. Ver 04-errors.md §2.1.
     #:
-    #: `"retryable"` — reintenta con el backoff completo. Elegir esto solo si vuestras
-    #: dependencias internas tienen hipos frecuentes; el coste es que un modo de fallo
-    #: nuevo atasca la cola 51 minutos y se amplifica con cada mensaje siguiente.
-    unknown_error_policy: Literal["permanent", "retryable"] = "permanent"
+    #: `"permanent"` — va a la DLQ sin gastar reintentos. Falla rápido, pero un hipo de
+    #: red manda a la DLQ un evento perfectamente válido y alguien lo reproduce a mano.
+    #:
+    #: `"retryable"` — reintenta con el backoff completo, 51 minutos. Elegir esto solo si
+    #: vuestras dependencias internas tienen hipos frecuentes y podéis asumir que un modo
+    #: de fallo nuevo atasque la cola y se amplifique con cada mensaje siguiente.
+    unknown_error_policy: Literal["permanent", "retryable", "retryable-bounded"] = (
+        "retryable-bounded"
+    )
+
+    #: Entregas máximas para un error desconocido cuando la política es
+    #: `"retryable-bounded"`. Incluye la primera entrega, así que 2 = un reintento.
+    unknown_retry_budget: int = 2
 
     #: Un timeout, ¿es "el mundo va lento" o "esta operación no cabe en la ventana"?
     #:
@@ -172,9 +183,11 @@ def create_classifier(
     final. Esa última línea es la decisión de política de verdad.
     """
     opts = options or ClassifierOptions()
-    unknown_class = (
-        ErrorClass.RETRYABLE if opts.unknown_error_policy == "retryable" else ErrorClass.PERMANENT
-    )
+    unknown_policy = opts.unknown_error_policy
+    unknown_class = ErrorClass.PERMANENT if unknown_policy == "permanent" else ErrorClass.RETRYABLE
+    # Solo la política acotada impone un tope propio; las otras dos dejan mandar al
+    # `max_deliver` del consumidor.
+    unknown_budget = opts.unknown_retry_budget if unknown_policy == "retryable-bounded" else None
     timeout_class = (
         ErrorClass.PERMANENT if opts.timeout_policy == "permanent" else ErrorClass.RETRYABLE
     )
@@ -215,9 +228,15 @@ def create_classifier(
             return Classification(error_class=timeout_class, code="TIMEOUT")
 
         # 6. Lo desconocido. Aquí es donde se decide el comportamiento del ecosistema
-        #    ante lo que nadie previó. El default de la spec es PERMANENT porque un
-        #    evento en la DLQ es recuperable y una cola atascada en hora punta no lo es.
-        return Classification(error_class=unknown_class, code=syscall or "UNKNOWN")
+        #    ante lo que nadie previó. El default acotado da al transitorio una segunda
+        #    oportunidad sin regalarle 51 minutos de cola al sistemático — y el tope va
+        #    en la clasificación, no en `max_deliver`, para no recortar los reintentos
+        #    de los RETRYABLE reconocidos — 04-errors.md §2.1.
+        return Classification(
+            error_class=unknown_class,
+            code=syscall or "UNKNOWN",
+            max_attempts=unknown_budget,
+        )
 
     return classify
 

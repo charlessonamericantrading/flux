@@ -170,7 +170,10 @@ type Delivery struct {
 	// Attempt es el número de entrega, empezando en 1. Si es > 1, este evento YA se
 	// intentó procesar antes: la idempotencia no es opcional — 03-delivery.md §4.
 	Attempt int
-	// MaxAttempts es DefaultMaxDeliver. Al alcanzarlo, el SDK enruta a la DLQ.
+	// MaxAttempts es DefaultMaxDeliver, el techo del consumidor. Al alcanzarlo, el
+	// SDK enruta a la DLQ — antes si la clasificación del error impone un presupuesto
+	// menor, cosa que aquí todavía no se sabe porque el handler aún no ha fallado
+	// — 04-errors.md §2.1.
 	MaxAttempts int
 	// Subject es el subject de NATS por el que llegó el evento.
 	Subject string
@@ -672,7 +675,16 @@ func (b *Bus) dispatch(msg jetstream.Msg, subject, durable string, handler Handl
 
 	c := b.classify(handlerErr)
 
-	if c.Class == ClassRetryable && attempt < DefaultMaxDeliver {
+	// El presupuesto efectivo es el menor entre el del consumidor y el que la
+	// clasificación imponga para ESTE error. Así un error desconocido agota su
+	// presupuesto acotado sin recortar los 6 intentos de un ECONNRESET reconocido
+	// — 04-errors.md §2.1.
+	budget := DefaultMaxDeliver
+	if c.MaxAttempts > 0 && c.MaxAttempts < budget {
+		budget = c.MaxAttempts
+	}
+
+	if c.Class == ClassRetryable && attempt < budget {
 		// Retraso explícito según el backoff canónico en vez de dejar expirar
 		// ack_wait: no retiene la ranura de max_ack_pending 30 s de más.
 		delay := c.RetryAfter
@@ -685,7 +697,7 @@ func (b *Bus) dispatch(msg jetstream.Msg, subject, durable string, handler Handl
 			delay = backoff[idx]
 		}
 		b.logf(slog.LevelWarn, "RETRYABLE en %s: %s (intento %d/%d), reintento en %s",
-			subject, c.Code, attempt, DefaultMaxDeliver, delay)
+			subject, c.Code, attempt, budget, delay)
 		_ = msg.NakWithDelay(delay)
 		return
 	}

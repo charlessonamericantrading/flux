@@ -489,7 +489,13 @@ class FluxBus:
             c = self._classify(e)
             message = str(e) or type(e).__name__
 
-            if c.error_class is ErrorClass.RETRYABLE and attempt < max_attempts:
+            # El presupuesto efectivo es el menor entre el del consumidor y el que la
+            # clasificación imponga para ESTE error. Así un error desconocido agota su
+            # presupuesto acotado sin recortar los 6 intentos de un ECONNRESET
+            # reconocido — 04-errors.md §2.1.
+            budget = min(max_attempts, c.max_attempts or max_attempts)
+
+            if c.error_class is ErrorClass.RETRYABLE and attempt < budget:
                 # Retraso explícito según el backoff canónico, en vez de dejar expirar
                 # ack_wait: no retiene la ranura de ack_pending 30 s de más.
                 delay_ms = c.retry_after_ms
@@ -502,7 +508,7 @@ class FluxBus:
                     c.code,
                     subject,
                     attempt,
-                    max_attempts,
+                    budget,
                     delay_ms,
                 )
                 await m.nak(delay=delay_ms / 1000)

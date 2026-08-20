@@ -130,20 +130,68 @@ func TestClassifyTimeoutsSegunPolitica(t *testing.T) {
 	}
 }
 
-func TestClassifyDefaultDeLoDesconocidoEsPermanent(t *testing.T) {
-	// LA decisión de política del protocolo: un evento en la DLQ es recuperable, una
-	// cola atascada 51 minutos en hora punta no lo es — 04-errors.md §2.
+func TestClassifyDefaultDeLoDesconocidoEsRetryableAcotado(t *testing.T) {
+	// LA decisión de política del protocolo. Domina a las dos alternativas: el
+	// transitorio se recupera en el 2º intento, el sistemático llega a la DLQ en ~30 s
+	// sin atascar la cola — 04-errors.md §2.1.
 	desconocido := errors.New("algo que nadie previó")
 
 	got := Classify(desconocido)
-	if got.Class != ClassPermanent || got.Code != "UNKNOWN" {
-		t.Errorf("el default debe ser PERMANENT/UNKNOWN, se obtuvo %+v", got)
+	if got.Class != ClassRetryable || got.Code != "UNKNOWN" {
+		t.Errorf("el default debe ser RETRYABLE/UNKNOWN, se obtuvo %+v", got)
+	}
+	if DefaultUnknownRetryBudget != 2 {
+		t.Errorf("el presupuesto de la spec es 2 entregas, no %d", DefaultUnknownRetryBudget)
+	}
+	if got.MaxAttempts != DefaultUnknownRetryBudget {
+		t.Errorf("MaxAttempts = %d, se esperaba %d", got.MaxAttempts, DefaultUnknownRetryBudget)
+	}
+}
+
+func TestElPresupuestoAcotadoNoRecortaLosRetryableReconocidos(t *testing.T) {
+	// Un ECONNRESET o un 503 conservan sus 6 intentos: el presupuesto es por error, no
+	// por consumidor. Bajarlo en max_deliver los habría recortado a todos.
+	reconocidos := []error{
+		NewHTTPError(503, "dependencia", 0),
+		&net.OpError{Op: "read", Err: syscall.ECONNRESET},
+		NewRetryableError("proveedor caído", WithCode("PROVEEDOR_CAIDO")),
+	}
+	for _, err := range reconocidos {
+		if got := Classify(err); got.MaxAttempts != 0 {
+			t.Errorf("Classify(%v).MaxAttempts = %d, se esperaba 0 (sin tope propio)",
+				err, got.MaxAttempts)
+		}
+	}
+}
+
+func TestClassifyPresupuestoDeLoDesconocidoConfigurable(t *testing.T) {
+	generoso := NewClassifier(ClassifierOptions{UnknownRetryBudget: 3})
+	if got := generoso(errors.New("x")); got.MaxAttempts != 3 {
+		t.Errorf("MaxAttempts = %d, se esperaba 3", got.MaxAttempts)
+	}
+}
+
+func TestClassifyPoliticasDeLoDesconocido(t *testing.T) {
+	// Configurable, porque es política y no infraestructura: el equilibrio correcto
+	// depende de cómo fallen las dependencias de cada ecosistema — 04-errors.md §2.1.
+	desconocido := errors.New("algo que nadie previó")
+
+	// permanent: a la DLQ sin gastar ningún reintento.
+	estricto := NewClassifier(ClassifierOptions{UnknownErrorPolicy: UnknownPermanent})
+	if got := estricto(desconocido); got.Class != ClassPermanent || got.MaxAttempts != 0 {
+		t.Errorf("con UnknownPermanent se esperaba PERMANENT sin tope, se obtuvo %+v", got)
 	}
 
-	// Configurable, porque es política y no infraestructura.
-	tolerante := NewClassifier(ClassifierOptions{UnknownErrorPolicy: ClassRetryable})
-	if got := tolerante(desconocido); got.Class != ClassRetryable {
-		t.Errorf("con UnknownErrorPolicy=retryable se esperaba RETRYABLE, se obtuvo %q", got.Class)
+	// retryable: backoff completo, sin tope propio — manda el max_deliver del consumidor.
+	tolerante := NewClassifier(ClassifierOptions{UnknownErrorPolicy: UnknownRetryable})
+	if got := tolerante(desconocido); got.Class != ClassRetryable || got.MaxAttempts != 0 {
+		t.Errorf("con UnknownRetryable se esperaba RETRYABLE sin tope, se obtuvo %+v", got)
+	}
+
+	// retryable-bounded explícito == el default.
+	acotado := NewClassifier(ClassifierOptions{UnknownErrorPolicy: UnknownRetryableBounded})
+	if got := acotado(desconocido); got.Class != ClassRetryable || got.MaxAttempts != 2 {
+		t.Errorf("con UnknownRetryableBounded se esperaba RETRYABLE/2, se obtuvo %+v", got)
 	}
 }
 

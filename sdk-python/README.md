@@ -84,19 +84,42 @@ raise PermanentError("pedido ya cancelado", code="PEDIDO_YA_CANCELADO")  # term 
 | `PERMANENT` | Falla el schema, regla de negocio, HTTP 400/403/404/422 | `term()` + DLQ inmediato |
 | `POISON` | JSON malformado, falta un atributo CloudEvents | `term()` + DLQ + alerta |
 
-**Lo desconocido es PERMANENT por defecto**, y es configurable:
+**Lo desconocido es RETRYABLE con presupuesto acotado: 2 entregas, no 6**
+([04-errors.md §2.1](../specification/04-errors.md)).
+
+```
+Error reconocido como transitorio (ECONNRESET, 503) → 6 entregas, hasta 51 min
+Error desconocido                                   → 2 entregas, ~30 s
+Error reconocido como permanente (400, 422)         → 1 entrega, sin espera
+```
+
+Las dos opciones obvias fallan cada una en un extremo: `permanent` manda a la DLQ un
+evento válido por un hipo de red y alguien lo reproduce a mano; `retryable` completo
+atasca la cola 51 minutos y el modo de fallo se amplifica con cada mensaje siguiente. El
+acotado cuesta 30 segundos de latencia sobre los permanentes genuinos y elimina ambos
+problemas — no es un punto medio, es estrictamente mejor.
+
+El presupuesto **no** se configura en `max_deliver` del consumidor: `max_deliver` es por
+consumidor, no por mensaje, y bajarlo a 2 recortaría también los reintentos de los
+RETRYABLE reconocidos. El clasificador rellena `Classification.max_attempts` solo para
+los errores desconocidos y el runtime aplica
+`min(max_deliver, max_attempts)` a ese error concreto.
+
+Todo ello es configurable, porque el equilibrio correcto depende de cómo fallen vuestras
+dependencias:
 
 ```python
 from flux import ClassifierOptions
 
 bus = await flux.connect(
     ...,
-    classifier=ClassifierOptions(unknown_error_policy="retryable", timeout_policy="permanent"),
+    classifier=ClassifierOptions(
+        unknown_error_policy="retryable-bounded",  # o "permanent" / "retryable"
+        unknown_retry_budget=2,
+        timeout_policy="permanent",
+    ),
 )
 ```
-
-Un evento en la DLQ es recuperable; una cola atascada 51 minutos en hora punta, no. Esa
-asimetría es la que decide el default.
 
 ## Propagación de contexto
 

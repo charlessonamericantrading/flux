@@ -46,6 +46,22 @@ type Classification struct {
 	// para ese intento. Úsalo cuando la dependencia dice explícitamente cuánto
 	// esperar (cabecera Retry-After). Cero significa "usa el backoff canónico".
 	RetryAfter time.Duration
+
+	// MaxAttempts solo aplica a ClassRetryable: entregas máximas para ESTE error,
+	// por debajo del max_deliver del consumidor. Cero significa "sin tope propio",
+	// es decir, manda el del consumidor.
+	//
+	// Existe porque max_deliver es por consumidor, no por mensaje: bajarlo a 2 para
+	// acotar los errores desconocidos recortaría también los reintentos de los que sí
+	// sabemos transitorios (ECONNRESET, HTTP 503), que deben conservar sus 6 intentos
+	// — 04-errors.md §2.1.
+	//
+	// Es int y no *int a propósito: cero no es un presupuesto válido —un mensaje se
+	// entrega al menos una vez, así que el mínimo con sentido es 1— y el campo de al
+	// lado, RetryAfter, ya usa el mismo convenio de "cero = sin especificar". Un
+	// puntero añadiría una asignación y un alias mutable a un struct que se copia por
+	// valor en cada despacho, a cambio de distinguir un caso que no existe.
+	MaxAttempts int
 }
 
 // ClassifiedError es un error que ya declara su propia clase de flux. La aplicación

@@ -51,6 +51,14 @@ class Classification:
     #: Solo para RETRYABLE: sobrescribe el backoff canónico para este intento.
     #: Úsalo cuando la dependencia dice explícitamente cuánto esperar (Retry-After).
     retry_after_ms: float | None = None
+    #: Solo para RETRYABLE: número máximo de entregas para ESTE error, por debajo del
+    #: `max_deliver` del consumidor. `None` = sin tope propio, manda el del consumidor.
+    #:
+    #: Existe porque `max_deliver` es por consumidor, no por mensaje: bajarlo a 2 para
+    #: acotar los errores desconocidos recortaría también los reintentos de los que sí
+    #: sabemos transitorios (ECONNRESET, HTTP 503), que deben conservar sus 6 intentos.
+    #: Ver 04-errors.md §2.1.
+    max_attempts: int | None = None
 
 
 class FluxError(Exception):

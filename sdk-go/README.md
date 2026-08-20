@@ -88,9 +88,36 @@ return flux.NewPermanentError("pedido ya cancelado", flux.WithCode("PEDIDO_YA_CA
 | `ClassPermanent` | Falla el schema, regla de negocio, HTTP 400/403/404/422 | `term` + DLQ inmediato |
 | `ClassPoison` | JSON malformado, falta atributo CloudEvents | `term` + DLQ + alerta |
 
-**Default de lo desconocido: `PERMANENT`**, configurable vía
-`ClassifierOptions.UnknownErrorPolicy`. Un evento en la DLQ es recuperable; una cola
-atascada 51 minutos en hora punta, no.
+**Default de lo desconocido: `RETRYABLE` con presupuesto acotado de 2 entregas**
+([04-errors.md §2.1](../specification/04-errors.md)).
+
+```
+Error reconocido como transitorio (ECONNRESET, 503) → 6 entregas, hasta 51 min
+Error desconocido                                   → 2 entregas, ~30 s
+Error reconocido como permanente (400, 422)         → 1 entrega, sin espera
+```
+
+Las dos opciones obvias fallan cada una en un extremo: `UnknownPermanent` manda a la DLQ
+un evento válido por un hipo de red y alguien lo reproduce a mano; `UnknownRetryable`
+completo atasca la cola 51 minutos y el modo de fallo se amplifica con cada mensaje
+siguiente. El acotado cuesta 30 segundos de latencia sobre los permanentes genuinos y
+elimina ambos problemas — no es un punto medio, es estrictamente mejor.
+
+El presupuesto **no** se configura en `max_deliver`: eso es por consumidor, no por
+mensaje, y bajarlo a 2 recortaría también los reintentos de los `RETRYABLE` reconocidos.
+El clasificador rellena `Classification.MaxAttempts` solo para los errores desconocidos
+y el runtime aplica `min(max_deliver, MaxAttempts)` a ese error concreto. `MaxAttempts`
+es un `int` con cero = "sin tope propio", igual convenio que `RetryAfter`.
+
+```go
+bus, err := flux.Connect(ctx, flux.ConnectOptions{
+    // ...
+    Classifier: flux.ClassifierOptions{
+        UnknownErrorPolicy: flux.UnknownRetryableBounded, // o UnknownPermanent / UnknownRetryable
+        UnknownRetryBudget: 2,
+    },
+})
+```
 
 Para que el clasificador reconozca un status HTTP, envuelve el fallo con
 `flux.NewHTTPError(status, msg, retryAfter)` o implementa `flux.HTTPStatusError`.
@@ -100,7 +127,7 @@ Para que el clasificador reconozca un status HTTP, envuelve el fallo con
 ## Diferencias con el SDK de referencia (Node)
 
 El envelope, el naming, la taxonomía de errores y la config de consumidor son
-**idénticos byte a byte**. Estas cuatro divergencias son de lenguaje, no de contrato.
+**idénticos byte a byte**. Estas cinco divergencias son de lenguaje, no de contrato.
 
 ### 1. Contexto explícito en vez de `AsyncLocalStorage`
 
@@ -147,6 +174,20 @@ cumple igual: el SDK jamás confirma antes de que el handler termine.
 
 Extra de Go: un pánico en el handler se convierte en `PERMANENT` en vez de matar el
 proceso y con él las demás suscripciones.
+
+### 5. Política de lo desconocido: tipo propio y cero como "sin tope"
+
+Node usa una unión de literales (`"permanent" | "retryable" | "retryable-bounded"`) y un
+`maxAttempts?: number` opcional. En Go la política es el tipo `UnknownPolicy` —no un
+`ErrorClass`— porque "retryable acotado" no es una clase del protocolo y meterlo en
+`ErrorClass` contaminaría el valor que acaba escrito en `dlqreason`.
+
+`Classification.MaxAttempts` es un `int` y no un `*int`: cero no es un presupuesto válido
+—un mensaje se entrega al menos una vez, así que el mínimo con sentido es 1— y el campo
+vecino `RetryAfter` ya usa ese mismo convenio. Un puntero añadiría una asignación y un
+alias mutable a un struct que se copia por valor en cada despacho, a cambio de distinguir
+un caso que no existe. Los valores cero de `ClassifierOptions` siguen significando el
+default de la spec: `retryable-bounded` con presupuesto 2.
 
 ---
 

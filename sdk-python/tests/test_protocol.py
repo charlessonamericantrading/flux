@@ -450,16 +450,41 @@ class TestClassify:
         assert c.error_class is ErrorClass.RETRYABLE
         assert c.code in PROTOCOL["errors"]["classes"]["retryable"]["syscallCodes"]
 
-    def test_default_de_lo_desconocido_es_permanent(self):
-        # Un evento en la DLQ es recuperable; una cola atascada en hora punta, no.
-        assert PROTOCOL["errors"]["default"] == "permanent"
+    def test_default_de_lo_desconocido_es_retryable_acotado(self):
+        # Domina a las dos alternativas: el transitorio se recupera en el 2º intento,
+        # el sistemático llega a la DLQ en ~30 s sin atascar la cola — 04-errors.md §2.1.
+        assert PROTOCOL["errors"]["default"] == "retryable-bounded"
         c = classify(ValueError("algo que nadie previó"))
-        assert c.error_class is ErrorClass.PERMANENT
+        assert c.error_class is ErrorClass.RETRYABLE
         assert c.code == "UNKNOWN"
+        assert c.max_attempts == PROTOCOL["errors"]["unknownRetryBudget"] == 2
 
-    def test_la_politica_de_lo_desconocido_es_configurable(self):
+    def test_el_presupuesto_acotado_no_recorta_los_retryable_reconocidos(self):
+        # Un ECONNRESET o un 503 conservan sus 6 intentos: el presupuesto es por error,
+        # no por consumidor. Bajarlo en `max_deliver` los habría recortado a todos.
+        import errno
+
+        e = RuntimeError("dependencia caída")
+        e.status = 503  # type: ignore[attr-defined]
+        assert classify(e).max_attempts is None
+        assert classify(ConnectionResetError(errno.ECONNRESET, "red")).max_attempts is None
+        assert PROTOCOL["errors"]["budgets"]["recognizedRetryable"] == CONSUMER_DEFAULTS.max_deliver
+
+    def test_el_presupuesto_de_lo_desconocido_es_configurable(self):
+        generoso = create_classifier(ClassifierOptions(unknown_retry_budget=3))
+        assert generoso(ValueError("x")).max_attempts == 3
+
+    def test_politica_permanent_no_gasta_ningun_reintento(self):
+        estricto = create_classifier(ClassifierOptions(unknown_error_policy="permanent"))
+        c = estricto(ValueError("x"))
+        assert c.error_class is ErrorClass.PERMANENT
+        assert c.max_attempts is None
+
+    def test_politica_retryable_da_el_backoff_completo(self):
         agresivo = create_classifier(ClassifierOptions(unknown_error_policy="retryable"))
-        assert agresivo(ValueError("x")).error_class is ErrorClass.RETRYABLE
+        c = agresivo(ValueError("x"))
+        assert c.error_class is ErrorClass.RETRYABLE
+        assert c.max_attempts is None  # sin tope propio = manda el del consumidor
 
     def test_timeout_por_defecto_retryable(self):
         assert classify(TimeoutError()).error_class is ErrorClass.RETRYABLE

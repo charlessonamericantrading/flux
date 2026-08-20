@@ -136,21 +136,55 @@ func isTimeout(err error) bool {
 // declaran su clase.
 type Rule func(err error) (Classification, bool)
 
+// UnknownPolicy es qué hacer con un error que no encaja en ninguna regla conocida
+// — 04-errors.md §2.1.
+//
+// Es un tipo propio y no un ErrorClass porque "retryable acotado" no es una clase del
+// protocolo: son dos clases (RETRYABLE) con presupuestos distintos. Meterlo en
+// ErrorClass contaminaría el valor que acaba escrito en `dlqreason`.
+type UnknownPolicy string
+
+const (
+	// UnknownRetryableBounded es el default de la spec: RETRYABLE con presupuesto
+	// reducido (UnknownRetryBudget, 2 entregas) en vez de los 6 completos. Un
+	// transitorio se recupera en el segundo intento; un sistemático llega a la DLQ en
+	// ~30 s sin atascar la cola.
+	UnknownRetryableBounded UnknownPolicy = "retryable-bounded"
+
+	// UnknownPermanent va a la DLQ sin gastar reintentos. Falla rápido, pero un hipo
+	// de red manda a la DLQ un evento perfectamente válido y alguien lo reproduce a
+	// mano cada mañana.
+	UnknownPermanent UnknownPolicy = "permanent"
+
+	// UnknownRetryable reintenta con el backoff completo, 51 minutos. Elígelo solo si
+	// vuestras dependencias internas tienen hipos frecuentes y podéis asumir que un
+	// modo de fallo nuevo atasque la cola y se amplifique con cada mensaje que falle
+	// igual.
+	UnknownRetryable UnknownPolicy = "retryable"
+)
+
+// DefaultUnknownRetryBudget son las entregas que gasta un error desconocido bajo la
+// política acotada. Incluye la primera entrega, así que 2 = un reintento.
+const DefaultUnknownRetryBudget = 2
+
 // ClassifierOptions es la política de clasificación del consumidor.
 type ClassifierOptions struct {
 	// UnknownErrorPolicy decide qué hacer con un error que no encaja en ninguna
-	// regla conocida.
+	// regla conocida. Ver las constantes UnknownPolicy.
 	//
-	// ClassPermanent (default de la spec) — va a la DLQ sin gastar reintentos. La
-	// cola sigue fluyendo y el evento se puede reproducir cuando se entienda qué pasó.
+	// El cero del campo ("") significa el default de la spec:
+	// UnknownRetryableBounded.
+	UnknownErrorPolicy UnknownPolicy
+
+	// UnknownRetryBudget son las entregas máximas de un error desconocido cuando la
+	// política es UnknownRetryableBounded. El cero significa el default de la spec:
+	// DefaultUnknownRetryBudget (2).
 	//
-	// ClassRetryable — reintenta con el backoff completo. Elígelo solo si vuestras
-	// dependencias internas tienen hipos frecuentes; el coste es que un modo de
-	// fallo nuevo atasca la cola 51 minutos y se amplifica con cada mensaje que falle
-	// igual.
-	//
-	// El cero del campo ("") significa el default de la spec: ClassPermanent.
-	UnknownErrorPolicy ErrorClass
+	// NO se traduce a max_deliver del consumidor: eso es por consumidor, no por
+	// mensaje, y recortaría también los reintentos de los RETRYABLE reconocidos. Viaja
+	// en Classification.MaxAttempts y lo aplica el runtime a ese error concreto
+	// — 04-errors.md §2.1.
+	UnknownRetryBudget int
 
 	// TimeoutPolicy responde a: un timeout, ¿es "el mundo va lento" o "esta
 	// operación no cabe en la ventana"?
@@ -179,9 +213,18 @@ type Classifier func(err error) Classification
 // El orden de evaluación es deliberado: lo más específico primero y el default al
 // final. Esa última línea es la decisión de política de verdad.
 func NewClassifier(opts ClassifierOptions) Classifier {
-	unknownClass := ClassPermanent
-	if opts.UnknownErrorPolicy == ClassRetryable {
-		unknownClass = ClassRetryable
+	unknownClass := ClassRetryable
+	if opts.UnknownErrorPolicy == UnknownPermanent {
+		unknownClass = ClassPermanent
+	}
+	// Solo la política acotada impone un tope propio; las otras dos dejan mandar al
+	// max_deliver del consumidor.
+	unknownBudget := 0
+	if opts.UnknownErrorPolicy == "" || opts.UnknownErrorPolicy == UnknownRetryableBounded {
+		unknownBudget = DefaultUnknownRetryBudget
+		if opts.UnknownRetryBudget > 0 {
+			unknownBudget = opts.UnknownRetryBudget
+		}
 	}
 	timeoutClass := ClassRetryable
 	if opts.TimeoutPolicy == ClassPermanent {
@@ -239,13 +282,14 @@ func NewClassifier(opts ClassifierOptions) Classifier {
 		}
 
 		// 6. Lo desconocido. Aquí se decide el comportamiento del ecosistema ante lo
-		//    que nadie previó. El default de la spec es PERMANENT porque un evento en
-		//    la DLQ es recuperable y una cola atascada en hora punta no lo es
-		//    — 04-errors.md §2.
-		return Classification{Class: unknownClass, Code: "UNKNOWN"}
+		//    que nadie previó. El default acotado da al transitorio una segunda
+		//    oportunidad sin regalarle 51 minutos de cola al sistemático — y el tope
+		//    viaja en la clasificación, no en max_deliver, para no recortar los
+		//    reintentos de los RETRYABLE reconocidos — 04-errors.md §2.1.
+		return Classification{Class: unknownClass, Code: "UNKNOWN", MaxAttempts: unknownBudget}
 	}
 }
 
-// Classify es el clasificador con los defaults de la spec: desconocido → PERMANENT,
-// timeout → RETRYABLE.
+// Classify es el clasificador con los defaults de la spec: desconocido → RETRYABLE
+// acotado a 2 entregas, timeout → RETRYABLE.
 var Classify = NewClassifier(ClassifierOptions{})
