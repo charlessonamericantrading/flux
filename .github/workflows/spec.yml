@@ -144,11 +144,6 @@ jobs:
   sdk-dotnet:
     name: SDK .NET — build y tests
     runs-on: ubuntu-latest
-    # ⚠️ Este SDK nunca se compiló en la máquina donde se escribió (no había .NET).
-    # continue-on-error mientras no esté verificado: el trabajo REPORTA el estado real
-    # sin bloquear el resto del CI. Quitar este flag es el paso que lo promueve a
-    # ciudadano de primera clase — ver sdk-dotnet/README.md.
-    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-dotnet@v4

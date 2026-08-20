@@ -1,28 +1,5 @@
 # flux SDK para .NET
 
-> ## ⚠️ SIN VERIFICAR — no lo uses en producción todavía
->
-> Este SDK **nunca se ha compilado ni ejecutado**: no había .NET instalado en la
-> máquina donde se escribió. Su corrección se aseguró por revisión, no por ejecución,
-> y este proyecto ha demostrado repetidamente que la revisión no basta — cada uno de
-> los otros cuatro SDKs encontró bugs que ninguna lectura había visto.
->
-> **Riesgo acotado a un fichero.** La única superficie no verificable por lectura es
-> el binding a `NATS.Net` 2.5 (firmas exactas de `NatsOpts`, `ConsumerConfigAckPolicy`,
-> `PubAckResponse.EnsureSuccess()`, `NatsJSMsg<T>.AckProgressAsync`), y está todo en
-> `src/Flux/FluxBus.cs`. Los otros 8 ficheros solo usan la BCL y los 5 de test no tocan
-> NATS.
->
-> **Para desbloquearlo:**
-> ```bash
-> cd sdk-dotnet
-> dotnet build          # aquí aparecerán los desajustes de firma, si los hay
-> dotnet test
-> ```
-> Además, este SDK todavía **no implementa** las tres reglas de envelope añadidas
-> después de escribirlo (01-envelope.md §1.1, §2.4 y §3.1: UTF-8 literal, tipos sin
-> coerción y extensiones obligatorias exigidas).
-
 Cliente del **flux Event Protocol v1** — CloudEvents 1.0 sobre NATS JetStream.
 Nivel de conformidad objetivo: **L2**.
 
