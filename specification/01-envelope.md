@@ -96,7 +96,32 @@ exactamente el mismo fantasma que [02-naming.md §1.1](02-naming.md) combate en 
 subjects. La regla de atributos raíz cerrados lo tapa por accidente; esta sección lo
 hace explícito para que ningún SDK dependa de esa casualidad.
 
-### 2.4 Unicidad
+### 2.4 Los tipos son exactos: nada de coerción
+
+Un atributo declarado `String` **DEBE** llegar como cadena JSON. `{"tenantid": 42}` es
+**POISON**, no el tenant `"42"`.
+
+No es pedantería: los deserializadores discrepan por defecto. Jackson convierte `42` en
+`"42"` sin avisar; Go lo rechaza; Node lo acepta como número y lo propaga. El mismo
+mensaje produce tres comportamientos distintos, y el que "funciona" es el peor —
+propaga un tipo inesperado hasta que alguien compara `tenantid` con `===`.
+
+Un SDK **DEBE** desactivar la coerción de tipos de su deserializador.
+
+### 2.5 Fidelidad numérica del payload
+
+Un SDK **NO DEBE** reescribir los números de `data` al deserializar y volver a
+serializar. `4995.00` **DEBE** volver a salir como `4995.00`.
+
+Go y Python lo cumplen por accidente —guardan el payload como bytes crudos— pero
+Jackson lo normaliza a `4995.0` salvo que se le pida lo contrario
+(`USE_BIG_DECIMAL_FOR_FLOATS` sin recorte de ceros). El replay verbatim depende de
+esto tanto como del orden de claves (§6).
+
+> La forma más simple de no tener este problema: **no metas decimales en `data`.** Los
+> importes van como entero en la unidad mínima (§4), y ahí no hay nada que normalizar.
+
+### 2.6 Unicidad
 
 `id` + `source` **DEBEN** ser únicos en su conjunto. Esa pareja es la clave de
 deduplicación del ecosistema entero. Como `id` es UUIDv7 (monotónico en el tiempo),
@@ -220,7 +245,29 @@ Un SDK L1 **DEBE** rellenar sin intervención del desarrollador:
 Todo lo demás es responsabilidad del SDK. Si un desarrollador tiene que rellenar
 `correlationid` a mano, el SDK ha fallado en su único trabajo.
 
-## 6. Límite de tamaño
+## 6. Orden de los atributos — normativo
+
+JSON no define orden de claves, pero flux sí lo necesita: **`data` va siempre el
+último.** Los demás atributos van en el orden en que se declaran en §2 y §3.
+
+Un objeto JSON con las mismas claves en otro orden es equivalente como dato y
+**distinto como bytes**, y flux depende de la secuencia de bytes en cuatro sitios:
+
+- El **replay verbatim** desde la DLQ deja de producir el mismo mensaje.
+- Una **firma criptográfica** sobre el evento serializado (fase 4) no verifica.
+- La **deduplicación por hash de contenido** ve dos eventos donde hay uno.
+- Los **fixtures compartidos** entre SDKs dejan de comparar.
+
+> Esta regla nació de una divergencia real. El SDK de Node construía el evento de DLQ
+> con `{...event, dlq*}`, dejando las extensiones **después** de `data`; Python, Go y
+> Java las ponían **antes**. El mismo evento, dos secuencias de bytes. La suite de
+> conformidad no lo veía porque su fixture solo cubría el envelope normal — donde los
+> cuatro SDKs sí coincidían.
+>
+> Poner `data` al final es además lo natural: los metadatos primero y el payload
+> después, que es como se lee un mensaje.
+
+## 7. Límite de tamaño
 
 - El mensaje serializado **NO DEBE** superar **1 MiB**.
 - Un SDK L2 **DEBE** fallar en `publish()` al superarlo, con un error accionable.

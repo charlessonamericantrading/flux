@@ -126,6 +126,23 @@ describe("DLQ", () => {
     assert.deepEqual(stripDlqExtensions(d), e as FluxEvent);
   });
 
+  test("`data` va el último — el orden de claves es normativo", () => {
+    // JSON no define orden, pero flux depende de la secuencia de BYTES para el replay
+    // verbatim y la firma futura. Node construía esto con {...event, dlq*}, dejando
+    // las extensiones después de `data`, mientras Python/Go/Java las ponían antes:
+    // mismo evento, dos secuencias distintas. Ver 01-envelope.md §6.
+    const e = buildEvent({ ...base, data: { pedidoId: "ped-1" } });
+    const d = toDlqEvent(e, { reason: "permanent", attempts: 1, consumer: "c", error: "X" });
+    const keys = Object.keys(d);
+
+    assert.equal(keys.at(-1), "data", "`data` debe ser el último atributo");
+    assert.ok(
+      keys.indexOf("dlqreason") < keys.indexOf("data"),
+      "las extensiones dlq* van ANTES de data",
+    );
+    assert.equal(Object.keys(e).at(-1), "data", "también en el envelope normal");
+  });
+
   test("dlqattempts distingue un PERMANENT de un RETRYABLE agotado", () => {
     const e = buildEvent({ ...base, data: {} });
     assert.equal(toDlqEvent(e, { reason: "permanent", attempts: 1, consumer: "c", error: "" }).dlqattempts, 1);

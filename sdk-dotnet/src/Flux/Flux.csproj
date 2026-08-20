@@ -1,0 +1,55 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <!--
+      net8.0 y no net9.0: es la LTS vigente. La única concesión que obliga es implementar
+      el UUIDv7 a mano (Guid.CreateVersion7() llega en .NET 9) — ver Protocol.NewEventId.
+    -->
+    <TargetFramework>net8.0</TargetFramework>
+    <LangVersion>12.0</LangVersion>
+    <ImplicitUsings>enable</ImplicitUsings>
+
+    <!--
+      Nullable activado. No es cosmético en este SDK: "ausente != vacio"
+      (01-envelope.md §3.3) solo se puede expresar si el compilador distingue un opcional
+      ausente de una cadena vacía.
+    -->
+    <Nullable>enable</Nullable>
+
+    <RootNamespace>Flux</RootNamespace>
+    <AssemblyName>Flux</AssemblyName>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <EnforceCodeStyleInBuild>false</EnforceCodeStyleInBuild>
+
+    <PackageId>Flux</PackageId>
+    <Version>1.0.0</Version>
+    <Description>Cliente del flux Event Protocol v1 (CloudEvents 1.0 sobre NATS JetStream). Nivel de conformidad L2.</Description>
+    <PackageTags>cloudevents;nats;jetstream;eventos;flux</PackageTags>
+    <Authors>flux</Authors>
+    <NeutralLanguage>es</NeutralLanguage>
+
+    <!--
+      El XML doc va en español, igual que el resto de SDKs del repo. CS1591 (miembro
+      público sin documentar) queda ACTIVO a propósito: es el guardia de que ningún
+      miembro nuevo se cuele sin explicar por qué existe.
+    -->
+    <TreatWarningsAsErrors>false</TreatWarningsAsErrors>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!--
+      NATS.Net es el cliente oficial de segunda generación (namespaces NATS.Client.Core /
+      NATS.Client.JetStream). El paquete antiguo `NATS.Client` está en mantenimiento y un
+      SDK nuevo no debería nacer sobre él, igual que el SDK de Node usa @nats-io/* y no el
+      paquete monolítico `nats`.
+    -->
+    <PackageReference Include="NATS.Net" Version="2.5.*" />
+
+    <!--
+      System.Text.Json viene en el framework compartido de .NET 8; se referencia explícito
+      para poder subir de parche sin cambiar de TFM.
+    -->
+    <PackageReference Include="System.Text.Json" Version="8.0.5" />
+  </ItemGroup>
+
+</Project>

@@ -70,11 +70,16 @@ jobs:
       - run: node scripts/gen-acl.mjs examples/services.json --check
 
   protocol-json-valid:
-    name: protocol.json parseable
+    name: protocol.json coherente
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - run: jq empty protocol.json && echo "✓ protocol.json válido"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      # No basta con que sea JSON válido: un patrón con las barras invertidas comidas
+      # sigue compilando y rechaza TODO lo que debería aceptar. Pasó de verdad.
+      - run: node scripts/check-protocol-json.mjs
 
   sdk-node:
     name: SDK Node — typecheck y tests

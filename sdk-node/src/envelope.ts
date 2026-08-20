@@ -212,13 +212,21 @@ export function toDlqEvent(
     error: string;
   },
 ): FluxEvent {
+  // `data` va SIEMPRE al final, también aquí — 01-envelope.md §7.
+  //
+  // Un `{...event, dlq*}` deja las extensiones DESPUÉS de `data`, y entonces el mismo
+  // evento serializado por Node y por Python produce secuencias de bytes distintas.
+  // Ninguna es incorrecta como JSON, pero rompe el replay verbatim y cualquier firma
+  // futura sobre el evento serializado.
+  const { data, ...rest } = event;
   return {
-    ...event,
+    ...rest,
     dlqreason: info.reason,
     dlqattempts: info.attempts,
     dlqconsumer: info.consumer,
     dlqerror: info.error.slice(0, 1024),
     dlqtime: new Date().toISOString(),
+    data,
   };
 }
 

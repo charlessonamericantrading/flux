@@ -1,0 +1,74 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+
+  <groupId>com.flux</groupId>
+  <artifactId>flux-sdk</artifactId>
+  <version>1.0.0</version>
+  <packaging>jar</packaging>
+
+  <name>flux SDK para Java</name>
+  <description>
+    Cliente del flux Event Protocol v1 — CloudEvents 1.0 sobre NATS JetStream.
+    Nivel de conformidad objetivo: L2.
+  </description>
+
+  <properties>
+    <maven.compiler.release>17</maven.compiler.release>
+    <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+
+    <!--
+      jnats 2.20+ por la API de contextos simplificada (StreamContext / ConsumerContext /
+      MessageConsumer). La API antigua (`JetStream.subscribe` con PushSubscribeOptions)
+      no permite verificar la config efectiva del consumidor sin una llamada aparte, y esa
+      verificacion es requisito L2 — 03-delivery.md §2.1.
+    -->
+    <jnats.version>2.20.5</jnats.version>
+    <!--
+      jackson-databind y nada mas. El envelope es JSON plano con nombres de atributo fijos:
+      no hace falta jackson-datatype-jsr310 porque `time` viaja como String formateado a
+      mano (01-envelope.md §2.2), ni jackson-module-parameter-names porque cada componente
+      del record lleva su @JsonProperty explicito.
+    -->
+    <jackson.version>2.15.4</jackson.version>
+    <junit.version>5.10.2</junit.version>
+  </properties>
+
+  <dependencies>
+    <dependency>
+      <groupId>io.nats</groupId>
+      <artifactId>jnats</artifactId>
+      <version>${jnats.version}</version>
+    </dependency>
+
+    <dependency>
+      <groupId>com.fasterxml.jackson.core</groupId>
+      <artifactId>jackson-databind</artifactId>
+      <version>${jackson.version}</version>
+    </dependency>
+
+    <dependency>
+      <groupId>org.junit.jupiter</groupId>
+      <artifactId>junit-jupiter</artifactId>
+      <version>${junit.version}</version>
+      <scope>test</scope>
+    </dependency>
+  </dependencies>
+
+  <build>
+    <plugins>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-compiler-plugin</artifactId>
+        <version>3.13.0</version>
+      </plugin>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-surefire-plugin</artifactId>
+        <version>3.2.5</version>
+      </plugin>
+    </plugins>
+  </build>
+</project>

@@ -110,7 +110,7 @@
         "type": "string",
         "format": "date-time",
         "timezone": "UTC",
-        "pattern": "^d{4}-d{2}-d{2}Td{2}:d{2}:d{2}.d{3}Z$",
+        "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}\\.\\d{3}Z$",
         "precision": "exactly-3-decimals",
         "generatedBy": "sdk",
         "$comment": "Instante en que OCURRIO el hecho, no el de publicacion. EXACTAMENTE 3 decimales y sufijo Z: los formateadores ISO por defecto divergen (Go RFC3339Nano recorta ceros -> .41Z; Python isoformat da microsegundos y +00:00). Un SDK DEBE formatear explicitamente."

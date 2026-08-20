@@ -29,7 +29,7 @@ La clasificación se define por **semántica**, no por una lista de códigos:
 | Categoría | Qué significa |
 |---|---|
 | Red no disponible o interrumpida | Conexión rechazada, reseteada, ruta inalcanzable, tubería rota |
-| Resolución de nombres temporal | El resolutor dice explícitamente "reinténtalo", no "no existe" |
+| Resolución de nombres temporal | El resolutor dice explícitamente "reinténtalo", no "no existe". **Si la plataforma no distingue** (Java y .NET usan `UnknownHostException` tanto para NXDOMAIN como para SERVFAIL), trátalo como RETRYABLE: un dominio que de verdad no existe agotará su presupuesto y acabará en la DLQ igualmente |
 | Rechazo por carga | HTTP 429, 502, 503, 504 |
 | Contención en base de datos | Deadlock, lock timeout, pool agotado |
 | Dependencia arrancando o desplegándose | Aún no acepta tráfico |

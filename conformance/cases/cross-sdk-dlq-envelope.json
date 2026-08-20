@@ -1,0 +1,81 @@
+{
+  "case": "cross-sdk-dlq-envelope",
+  "title": "El evento de DLQ es byte a byte idéntico entre SDKs",
+  "spec": "specification/01-envelope.md §6, specification/04-errors.md §3",
+  "verifiedAgainst": "sdk-node, sdk-python, sdk-go, sdk-java",
+  "verifiedOn": "2026-08-20",
+  "rationale": "cross-sdk-envelope.json solo cubría el envelope NORMAL, donde los cuatro SDKs ya coincidían. El de DLQ no estaba cubierto y divergía: Node construía el evento con {...event, dlq*}, dejando las extensiones DESPUÉS de data, mientras Python, Go y Java las ponían ANTES. Mismo evento, dos secuencias de bytes. Lo encontró el port a Java, no la suite.",
+  "divergenceFound": {
+    "id": "dlq-extensions-key-order",
+    "observed": {
+      "node_antes_del_arreglo": "…, dataclassification, data, dlqreason, dlqattempts, dlqconsumer, dlqerror, dlqtime",
+      "python_go_java": "…, dataclassification, dlqreason, dlqattempts, dlqconsumer, dlqerror, dlqtime, data"
+    },
+    "impact": "Rompe el replay verbatim desde la DLQ, la firma criptográfica del evento (fase 4), la deduplicación por hash de contenido y los fixtures compartidos entre SDKs.",
+    "rule": "`data` va SIEMPRE el último atributo, en el envelope normal y en el de DLQ. Los demás van en el orden declarado en 01-envelope.md §2 y §3.",
+    "afterFix": {
+      "identical": true
+    }
+  },
+  "fixture": {
+    "input": {
+      "subject": "pedidos.pedido.v1.creado",
+      "id": "01924f8e-7c3a-7b2d-9e14-3f8a1c9d0e55",
+      "source": "/produccion/pedidos-api",
+      "time": "2025-08-20T10:25:39.410Z",
+      "dataschema": "https://schemas.internal/pedidos/pedido/creado/1.0.0.json",
+      "correlationid": "01924f8e-7c3a-7b2d-9e14-3f8a1c9d0e55",
+      "tenantid": "acme",
+      "producerversion": "3.4.1",
+      "dataclassification": "internal",
+      "data": {
+        "pedidoId": "ped-123"
+      },
+      "dlq": {
+        "reason": "permanent",
+        "attempts": 1,
+        "consumer": "facturacion-api__pedidos_pedido_v1_creado",
+        "error": "PEDIDO_YA_CANCELADO"
+      }
+    },
+    "expectedKeyOrder": [
+      "specversion",
+      "id",
+      "source",
+      "type",
+      "time",
+      "datacontenttype",
+      "dataschema",
+      "correlationid",
+      "tenantid",
+      "producerversion",
+      "dataclassification",
+      "dlqreason",
+      "dlqattempts",
+      "dlqconsumer",
+      "dlqerror",
+      "dlqtime",
+      "data"
+    ],
+    "assertions": [
+      {
+        "id": "data-is-last",
+        "expr": "keys[keys.length-1] == 'data'"
+      },
+      {
+        "id": "dlq-extensions-before-data",
+        "expr": "keys.indexOf('dlqreason') < keys.indexOf('data')"
+      },
+      {
+        "id": "id-preserved",
+        "expr": "dlqEvent.id == originalEvent.id",
+        "reason": "El replay conserva el id; regenerarlo rompería la idempotencia aguas abajo — 04-errors.md §4.1"
+      },
+      {
+        "id": "strip-yields-original",
+        "expr": "stripDlqExtensions(dlqEvent) deepEquals originalEvent",
+        "reason": "El replay es del(.dlq*) + republicar. Si no vuelve al original exacto, el replay no es verbatim."
+      }
+    ]
+  }
+}

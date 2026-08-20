@@ -54,7 +54,7 @@ dato.**
 - **Comando disfrazado.** `pedidos.pedido.v1.crear` no es un evento. Si necesitas
   request/reply, usa NATS Core request/reply — está fuera del alcance de v1.
 - **Transporte de blobs.** Si el payload supera **1 MiB**, publica una referencia
-  (URI + checksum), no el contenido. Ver [01-envelope.md §6](01-envelope.md).
+  (URI + checksum), no el contenido. Ver [01-envelope.md §7](01-envelope.md).
 - **Sustituto de una tabla.** Un evento no es una fila. Un evento es un cambio.
 
 ## 5. Niveles de conformidad
