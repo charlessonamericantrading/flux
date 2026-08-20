@@ -40,8 +40,3 @@ dist-test/
 # Rust
 target/
 Cargo.lock
-
-# PHP
-vendor/
-composer.lock
-.phpunit.result.cache

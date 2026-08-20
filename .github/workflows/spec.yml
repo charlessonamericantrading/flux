@@ -152,6 +152,76 @@ jobs:
       - run: dotnet build sdk-dotnet/Flux.sln
       - run: dotnet test sdk-dotnet/Flux.sln
 
+  sdk-php:
+    name: SDK PHP — lint y tests
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: sdk-php
+    steps:
+      - uses: actions/checkout@v4
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.2'
+          extensions: json, sockets
+          coverage: none
+      - run: composer validate --no-check-lock
+      - run: composer install --no-interaction --prefer-dist
+      # `php -l` sobre todo el árbol antes de PHPUnit: un error de sintaxis debe reportarse
+      # como tal y no como una suite entera que no arranca.
+      - run: find src tests -name '*.php' -print0 | xargs -0 -n1 php -l
+      # `sockets` va en las extensiones del job para que NO se salte el test que traduce
+      # SOCKET_ECONNRESET a "ECONNRESET" por nombre de constante — es justo el mecanismo
+      # que evita que el mismo corte de red se clasifique distinto en Linux y en Windows.
+      - run: vendor/bin/phpunit
+
+  sdk-rust:
+    name: SDK Rust — fmt, clippy y tests
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: sdk-rust
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets -- -D warnings
+      # Los tests de integración necesitan un NATS con JetStream.
+      - name: Levantar NATS con JetStream
+        run: |
+          docker run -d --name flux-nats-rust -p 4222:4222 -p 8222:8222             nats:2.14-alpine --jetstream --http_port=8222
+          for i in $(seq 1 30); do
+            curl -sf http://127.0.0.1:8222/healthz >/dev/null && exit 0
+            sleep 1
+          done
+          echo "NATS no arrancó"; docker logs flux-nats-rust; exit 1
+      - run: cargo test
+
+  sdk-php:
+    name: SDK PHP — tests
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: sdk-php
+    steps:
+      - uses: actions/checkout@v4
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.2'
+          # `sockets` no es opcional: sin ella se salta el test que traduce
+          # SOCKET_ECONNRESET por NOMBRE de constante, y ese es justo el que evita que
+          # el mismo corte de red se clasifique distinto en Windows (10054) y Linux (104).
+          extensions: json, sockets
+          coverage: none
+      - run: composer validate --no-check-lock
+      - run: composer install --no-interaction --prefer-dist
+      # `php -l` sobre todo el árbol antes de phpunit: un error de sintaxis debe
+      # reportarse como tal y no como 201 tests que no arrancan.
+      - run: find src tests -name '*.php' -print0 | xargs -0 -n1 php -l
+      - run: vendor/bin/phpunit
+
   conformance:
     name: Conformidad contra NATS real
     runs-on: ubuntu-latest

@@ -2,7 +2,10 @@
 name = "flux"
 version = "1.0.0"
 edition = "2021"
-rust-version = "1.75"
+# 1.83 es el mínimo real: `io::ErrorKind::{HostUnreachable, NetworkUnreachable}` —que
+# `classify.rs` usa para reconocer lo transitorio por SEMÁNTICA y no por substring— se
+# estabilizaron ahí (`io_error_more`).
+rust-version = "1.83"
 description = "Cliente Rust del flux Event Protocol v1 — CloudEvents 1.0 sobre NATS JetStream (L2)"
 license = "MIT"
 repository = "https://github.com/charlessonamericantrading/flux"
@@ -38,3 +41,6 @@ async-nats = "0.50"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+# Los tests de integración leen la DLQ con la API CRUDA de NATS a propósito: comprueban
+# los BYTES que el SDK escribió, no su propia interpretación de ellos.
+async-nats = "0.50"

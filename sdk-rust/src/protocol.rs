@@ -363,7 +363,10 @@ mod tests {
     /// Los ejemplos son literalmente los de `protocol.json` → `naming.subject`.
     #[test]
     fn subjects_validos_de_protocol_json() {
-        for s in ["pedidos.pedido.v1.creado", "logistica.envio.v1.entrega-fallida"] {
+        for s in [
+            "pedidos.pedido.v1.creado",
+            "logistica.envio.v1.entrega-fallida",
+        ] {
             assert!(is_valid_subject(s), "{s} debería ser válido");
         }
     }
@@ -458,6 +461,9 @@ mod tests {
 
     #[test]
     fn source_uri_formato() {
-        assert_eq!(source_uri("produccion", "pedidos-api"), "/produccion/pedidos-api");
+        assert_eq!(
+            source_uri("produccion", "pedidos-api"),
+            "/produccion/pedidos-api"
+        );
     }
 }

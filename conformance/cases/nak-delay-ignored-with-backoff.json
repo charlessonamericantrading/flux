@@ -1,0 +1,53 @@
+{
+  "case": "nak-delay-ignored-with-backoff",
+  "title": "Con backoff configurado, el delay de un nak solo cuenta en la primera reentrega",
+  "spec": "specification/03-delivery.md §2.2",
+  "verifiedAgainst": "nats-server 2.14.5",
+  "verifiedOn": "2026-08-20",
+  "rationale": "Tercera trampa silenciosa de JetStream que el protocolo ha tenido que documentar. Las tres comparten forma: el servidor acepta la peticion, no devuelve error, y aplica otra cosa. Lo encontro el port a Rust midiendo, no leyendo.",
+  "measurement": {
+    "method": "publicar 1 mensaje, hacer nak(300ms) en TODAS las reentregas, medir los instantes de entrega",
+    "withoutBackoff": {
+      "config": {
+        "ack_wait": "30s",
+        "max_deliver": 4
+      },
+      "deliveries": [
+        "0ms",
+        "300ms",
+        "600ms",
+        "900ms"
+      ],
+      "conclusion": "el delay del nak se honra en todas"
+    },
+    "withBackoff": {
+      "config": {
+        "backoff": [
+          "300ms",
+          "5s",
+          "10s"
+        ],
+        "max_deliver": 4
+      },
+      "deliveries": [
+        "0ms",
+        "300ms",
+        "5300ms",
+        "15300ms"
+      ],
+      "conclusion": "solo la primera reentrega usa el delay; el resto sigue backoff[1], backoff[2]"
+    }
+  },
+  "consequence": "flux configura backoff SIEMPRE, asi que un Retry-After de un proveedor acorta el primer reintento y nada mas. Los siguientes siguen el backoff canonico (1m, 5m, 15m, 30m).",
+  "rule": "Classification.retryAfterMs es una SUGERENCIA para el primer reintento, no un control del calendario. Un SDK NO DEBE documentarla como si sobrescribiera el backoff ni construir logica que dependa de que se respete despues de la primera vez.",
+  "relatedTraps": [
+    {
+      "spec": "03-delivery.md §2.1",
+      "trap": "ack_wait se reemplaza por backoff[0] sin aviso"
+    },
+    {
+      "spec": "02-naming.md §1.1",
+      "trap": "un publish de core NATS a un subject sin stream se evapora sin error"
+    }
+  ]
+}

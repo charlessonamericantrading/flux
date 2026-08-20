@@ -19,8 +19,16 @@ export interface Classification {
   /** Código estable para métricas y alertas. Ej. "HTTP_503", "PEDIDO_YA_CANCELADO". */
   readonly code: string;
   /**
-   * Solo para RETRYABLE: sobrescribe el backoff canónico para este intento.
-   * Úsalo cuando la dependencia dice explícitamente cuánto esperar (Retry-After).
+   * Solo para RETRYABLE: **sugerencia para el PRIMER reintento**, no un control del
+   * calendario completo.
+   *
+   * ⚠️ Con `backoff` configurado —y flux lo configura siempre— JetStream honra el
+   * delay de un `nak` únicamente en la primera reentrega; a partir de la segunda
+   * manda el array `backoff` y el delay se ignora **sin ningún aviso**. Medido contra
+   * NATS 2.14.5, ver 03-delivery.md §2.2.
+   *
+   * Consecuencia práctica: un `Retry-After: 5` de un proveedor acorta el primer
+   * reintento y nada más. No construyas lógica que dependa de que se respete después.
    */
   readonly retryAfterMs?: number;
   /**

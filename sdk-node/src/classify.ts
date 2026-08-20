@@ -41,7 +41,12 @@ export function extractHttpStatus(e: unknown): number | undefined {
   return typeof candidate === "number" ? candidate : undefined;
 }
 
-/** Lee `Retry-After` (segundos) si la dependencia lo expone. */
+/**
+ * Lee `Retry-After` (segundos) si la dependencia lo expone.
+ *
+ * Solo afecta al PRIMER reintento: JetStream ignora el delay del `nak` a partir de la
+ * segunda reentrega cuando hay `backoff` configurado — 03-delivery.md §2.2.
+ */
 export function extractRetryAfterMs(e: unknown): number | undefined {
   if (typeof e !== "object" || e === null) return undefined;
   const headers = (e as { response?: { headers?: unknown } })?.response?.headers as

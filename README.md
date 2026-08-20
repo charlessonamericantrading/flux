@@ -133,17 +133,18 @@ protocolo a v2.
 | [Go](sdk-go/) | L2 | 75 | ✅ (también con `-race`) |
 | [Java](sdk-java/) | L2 | 75 | ✅ (Maven en el runner) |
 | [.NET](sdk-dotnet/) | L2 | — | ✅ |
-| [PHP](sdk-php/) | L2 | 133 | ⚠️ solo en CI — ver abajo |
+| [Rust](sdk-rust/) | L2 | 105 | ✅ (incl. 7 contra NATS real) |
+| [PHP](sdk-php/) | L2 | 201 | ⚠️ el adaptador NATS no se ha probado contra un broker real |
+| [PHP](sdk-php/) | L2 | 201 | ✅ (transporte no — ver abajo) |
 
 Los cinco primeros se compilan y ejecutan en CI en cada push. La suite de conformidad corre
 aparte, contra un NATS real: **14/14**.
 
-> **PHP.** Se escribió en una máquina sin `php` ni `composer`, así que el job de CI es la
-> primera ejecución real de su suite. Además, su adaptador de transporte sobre
-> `basis-company/nats` **no está verificado contra un broker real**: el ecosistema PHP de
-> NATS no está consolidado y el SDK aísla esa incertidumbre tras un puerto
-> (`Flux\Transport\NatsTransport`). Todo lo demás —envelope, naming, clasificación y el
-> runtime del consumidor— se prueba sin broker. Ver [`sdk-php/README.md`](sdk-php/).
+> **PHP.** Su adaptador de transporte sobre `basis-company/nats` **no está verificado
+> contra un broker real**: el ecosistema PHP de NATS no está consolidado y el SDK aísla esa
+> incertidumbre tras un puerto (`Flux\Transport\NatsTransport`), probado con un cliente
+> falso. Todo lo demás —envelope, naming, clasificación y el runtime del consumidor— se
+> prueba sin broker y está en verde. Ver [`sdk-php/README.md`](sdk-php/).
 
 ---
 
@@ -185,7 +186,7 @@ propaga `correlationid` / `traceparent`. El desarrollador nunca los escribe a ma
 | Fase | Alcance | Estado |
 |---|---|---|
 | **1 — Core** | Especificación v1, JetStream, SDK Node/Python/Go a nivel L2 | ✅ |
-| **2 — Cobertura** | SDK Java ✅ · .NET ✅ · Rust, PHP ⏳ | 🚧 |
+| **2 — Cobertura** | Java · .NET · Rust · PHP | ✅ |
 | **3 — Operación** | CLI `flux`: doctor, tail, triaje y replay de DLQ | ✅ |
 | **4 — Gobierno** | Validación L3, verificador de compatibilidad, generador de ACLs | ✅ |
 | **5 — Confianza** | Firma Ed25519 ✅ · observabilidad ✅ · multi-tenant ✅ | ✅ |

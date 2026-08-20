@@ -987,6 +987,36 @@ Un SDK L2 **DEBE**:
 - Documentar que un handler que supere los 30 s sin emitir WIP es un bug de la
   aplicación.
 
+### 2.2 ⚠️ Con `backoff` configurado, el delay de un `nak` solo cuenta la primera vez
+
+La segunda trampa de la misma familia, y también silenciosa. Medido contra NATS 2.14.5
+pidiendo `nak(300ms)` en **todas** las reentregas:
+
+```
+SIN backoff:  0ms → 300ms → 600ms → 900ms          ← el delay se honra siempre
+CON backoff:  0ms → 300ms → 5300ms → 15300ms       ← solo la primera vez
+              (backoff configurado: 300ms, 5s, 10s)
+```
+
+A partir de la segunda reentrega el servidor manda el array `backoff` y **el delay
+solicitado se ignora sin ningún aviso**.
+
+**Y flux configura `backoff` siempre**, así que la consecuencia es directa: un
+`Retry-After: 5` de un proveedor **acorta el primer reintento y nada más**. Los
+siguientes seguirán el backoff canónico (1 m, 5 m, 15 m, 30 m).
+
+Por eso `Classification.retryAfterMs` es una **sugerencia para el primer reintento**,
+no un control del calendario de reintentos. Un SDK **NO DEBE** documentarla como si
+sobrescribiera el backoff, ni construir lógica que dependa de que se respete más allá
+de la primera vez.
+
+> Las tres trampas de JetStream que el protocolo ha tenido que documentar comparten
+> forma: **el servidor acepta la petición, no devuelve error, y aplica otra cosa.**
+> `ack_wait` reemplazado por `backoff[0]` (§2.1), el delay del `nak` ignorado (§2.2), y
+> un `publish` de core a un subject sin stream que se evapora
+> ([02-naming.md §1.1](02-naming.md)). Ninguna se detecta leyendo código: solo
+> midiendo.
+
 > **Nota no verificada:** un mensaje en espera de reintento consume una ranura de
 > `max_ack_pending`. Con backoffs largos y muchos fallos simultáneos, el consumidor
 > podría llenar la ventana de 256 y dejar de recibir mensajes nuevos. Monitorizad
