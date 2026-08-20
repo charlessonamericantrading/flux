@@ -132,3 +132,4 @@ Declarado explícitamente para evitar scope creep:
 | [06-security.md](06-security.md) | Accounts, ACLs, clasificación de datos |
 | [07-signing.md](07-signing.md) | Firma Ed25519 — extensión **opcional** |
 | [08-observability.md](08-observability.md) | Métricas, trazas y alertas — normativo para L2 |
+| [09-multitenancy.md](09-multitenancy.md) | Modelos de aislamiento entre tenants |

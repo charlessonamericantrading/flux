@@ -105,7 +105,8 @@ protocolo a v2.
 │   ├── 05-compatibility.md ← reglas de evolución de esquemas
 │   ├── 06-security.md      ← accounts, ACLs, clasificación de datos
 │   ├── 07-signing.md       ← firma Ed25519 (extensión opcional)
-│   └── 08-observability.md ← métricas, trazas y alertas
+│   ├── 08-observability.md ← métricas, trazas y alertas
+│   └── 09-multitenancy.md  ← modelos de aislamiento entre tenants
 ├── schemas/                ← JSON Schemas versionados por evento
 │   └── <dominio>/<agregado>/<evento>/<semver>.json
 ├── cli/                    ← flux doctor · tail · dlq · validate
@@ -117,7 +118,8 @@ protocolo a v2.
 ├── sdk-python/             ← fase 1
 ├── sdk-go/                 ← fase 1
 ├── sdk-java/               ← fase 2
-└── sdk-dotnet/             ← fase 2
+├── sdk-dotnet/             ← fase 2
+└── sdk-php/                ← fase 2
 ```
 
 ---
@@ -126,14 +128,22 @@ protocolo a v2.
 
 | SDK | Nivel | Tests | Verificado |
 |---|---|---|---|
-| [Node / TypeScript](sdk-node/) | **L3** | 100 | ✅ |
+| [Node / TypeScript](sdk-node/) | **L3** | 103 | ✅ |
 | [Python](sdk-python/) | L2 | 104 | ✅ |
 | [Go](sdk-go/) | L2 | 75 | ✅ (también con `-race`) |
 | [Java](sdk-java/) | L2 | 75 | ✅ (Maven en el runner) |
 | [.NET](sdk-dotnet/) | L2 | — | ✅ |
+| [PHP](sdk-php/) | L2 | 133 | ⚠️ solo en CI — ver abajo |
 
-Los cinco se compilan y ejecutan en CI en cada push. La suite de conformidad corre
+Los cinco primeros se compilan y ejecutan en CI en cada push. La suite de conformidad corre
 aparte, contra un NATS real: **14/14**.
+
+> **PHP.** Se escribió en una máquina sin `php` ni `composer`, así que el job de CI es la
+> primera ejecución real de su suite. Además, su adaptador de transporte sobre
+> `basis-company/nats` **no está verificado contra un broker real**: el ecosistema PHP de
+> NATS no está consolidado y el SDK aísla esa incertidumbre tras un puerto
+> (`Flux\Transport\NatsTransport`). Todo lo demás —envelope, naming, clasificación y el
+> runtime del consumidor— se prueba sin broker. Ver [`sdk-php/README.md`](sdk-php/).
 
 ---
 
@@ -178,4 +188,4 @@ propaga `correlationid` / `traceparent`. El desarrollador nunca los escribe a ma
 | **2 — Cobertura** | SDK Java ✅ · .NET ✅ · Rust, PHP ⏳ | 🚧 |
 | **3 — Operación** | CLI `flux`: doctor, tail, triaje y replay de DLQ | ✅ |
 | **4 — Gobierno** | Validación L3, verificador de compatibilidad, generador de ACLs | ✅ |
-| **5 — Confianza** | Firma Ed25519 ✅ · observabilidad ✅ · aislamiento de tenant ⏳ | 🚧 |
+| **5 — Confianza** | Firma Ed25519 ✅ · observabilidad ✅ · multi-tenant ✅ | ✅ |

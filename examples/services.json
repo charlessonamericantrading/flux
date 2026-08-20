@@ -4,23 +4,45 @@
   "services": [
     {
       "name": "pedidos-api",
-      "owns": ["pedidos"],
-      "consumes": ["inventario.stock.v1.>"]
+      "owns": [
+        "pedidos"
+      ],
+      "consumes": [
+        "inventario.stock.v1.>"
+      ]
     },
     {
       "name": "facturacion-api",
-      "owns": ["facturacion"],
-      "consumes": ["pedidos.pedido.v1.>"]
+      "owns": [
+        "facturacion"
+      ],
+      "consumes": [
+        "pedidos.pedido.v1.>"
+      ]
     },
     {
       "name": "inventario-api",
-      "owns": ["inventario"],
-      "consumes": ["pedidos.pedido.v1.>"]
+      "owns": [
+        "inventario"
+      ],
+      "consumes": [
+        "pedidos.pedido.v1.>"
+      ]
     },
     {
       "name": "logistica-api",
-      "owns": ["logistica"],
-      "consumes": ["pedidos.pedido.v1.>", "facturacion.factura.v2.>"]
+      "owns": [
+        "logistica"
+      ],
+      "consumes": [
+        "pedidos.pedido.v1.>",
+        "facturacion.factura.v2.>"
+      ]
     }
-  ]
+  ],
+  "tenants": [
+    "acme",
+    "globex"
+  ],
+  "$commentTenants": "Solo se usa con --tenants (Modelo B de 09-multitenancy.md). El Modelo A, que es el default de v1, no necesita esta lista: los tenants se filtran en el consumidor."
 }

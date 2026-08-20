@@ -85,6 +85,18 @@ export interface ConnectOptions {
   version: string;
   /** Tenant por defecto de los eventos publicados. */
   tenantId?: string;
+  /**
+   * Aislamiento entre tenants — 09-multitenancy.md §3.
+   *
+   * `"strict"`: toda suscripción filtra por `tenantId`, y suscribirse sin tenant
+   * configurado es un error de configuración. Un filtro que hay que acordarse de
+   * poner es un filtro que alguien olvidará, y el fallo —ver los datos de otro
+   * tenant— no produce ningún error: produce un incidente de privacidad que se
+   * descubre semanas después.
+   *
+   * `"off"` (default): el filtrado es opcional por suscripción.
+   */
+  tenantIsolation?: "off" | "strict";
   /** Clasificación por defecto. Ver 06-security.md §5. */
   classification?: DataClassification;
   /** Mapa exacto subject → URI de `dataschema`. Gana sobre `schemaBaseUrl`. */
@@ -187,6 +199,17 @@ export class ConsumerConfigMismatchError extends Error {
   }
 }
 
+export class TenantIsolationError extends Error {
+  constructor(subject: string, motivo: string) {
+    super(
+      `tenantIsolation="strict" pero ${motivo} al suscribirse a "${subject}". ` +
+        `Sin filtro de tenant, este consumidor vería los eventos de TODOS los tenants ` +
+        `y eso no produce ningún error visible (09-multitenancy.md §3).`,
+    );
+    this.name = "TenantIsolationError";
+  }
+}
+
 // ─── Cliente ─────────────────────────────────────────────────────────────────
 
 export class FluxBus {
@@ -280,6 +303,12 @@ export class FluxBus {
     return tp ? { traceparent: tp } : {};
   }
 
+  /** El tenant de la conexión, salvo "system", que no es un tenant sino su ausencia. */
+  #tenantFilter(): string | undefined {
+    const t = this.#opts.tenantId;
+    return t && t !== "system" ? t : undefined;
+  }
+
   #schemaFor(subject: string): string {
     const explicit = this.#opts.schemas?.[subject];
     if (explicit) return explicit;
@@ -312,6 +341,15 @@ export class FluxBus {
     options: SubscribeOptions = {},
   ): Promise<Subscription> {
     const { domain } = parseSubject(subject);
+
+    // El filtro efectivo: el de la suscripción gana sobre el de la conexión.
+    const tenantFilter = options.tenantId ?? this.#tenantFilter();
+    if (this.#opts.tenantIsolation === "strict" && !tenantFilter) {
+      throw new TenantIsolationError(
+        subject,
+        "no hay tenantId ni en connect() ni en subscribe()",
+      );
+    }
     await this.#ensureStream(domain);
     await this.#ensureDlqStream(domain);
 
@@ -361,7 +399,7 @@ export class FluxBus {
       for await (const m of messages) {
         if (stopped) break;
         try {
-          await this.#dispatch(m, subject, durable, handler as Handler, options);
+          await this.#dispatch(m, subject, durable, handler as Handler, tenantFilter);
         } catch (e) {
           // Sin este catch, un fallo inesperado de #dispatch —por ejemplo que la
           // publicación en la DLQ falle— rompe el `for await` y el consumidor deja
@@ -416,7 +454,7 @@ export class FluxBus {
     subject: string,
     durable: string,
     handler: Handler,
-    options: SubscribeOptions,
+    tenantFilter: string | undefined,
   ): Promise<void> {
     // `deliveryCount` empieza en 1 en la primera entrega, no en 0.
     const attempt = m.info.deliveryCount;
@@ -446,8 +484,10 @@ export class FluxBus {
       return;
     }
 
-    if (options.tenantId && event.tenantid !== options.tenantId) {
-      m.ack(); // no es para nosotros
+    // Filtrar ANTES del handler: un evento de otro tenant no es un fallo, no es para
+    // nosotros. Se confirma y se descarta — 09-multitenancy.md §3.
+    if (tenantFilter && event.tenantid !== tenantFilter) {
+      m.ack();
       return;
     }
 

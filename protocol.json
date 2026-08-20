@@ -457,7 +457,6 @@
     "protobuf",
     "avro",
     "field-level encryption",
-    "real tenant isolation",
     "multi-cluster federation"
   ],
   "signing": {
@@ -586,5 +585,48 @@
       "correlationid"
     ],
     "$commentCardinality": "Un tenant nuevo no debe crear series temporales nuevas; para eso estan las trazas, donde la cardinalidad no es problema. El fallo no avisa: funciona en desarrollo con tres tenants y muere en produccion con diez mil, y se manifiesta como \"Prometheus se ha quedado sin memoria\", no como \"alguien etiqueto por tenant\". `code` DEBE ser un identificador estable, nunca el mensaje de error."
+  },
+  "multitenancy": {
+    "spec": "specification/09-multitenancy.md",
+    "defaultModel": "A",
+    "models": {
+      "A": {
+        "name": "filtrado en consumidor",
+        "default": true,
+        "isolation": "convencion del SDK, no frontera del broker",
+        "notCovered": [
+          "servicio legitimo comprometido que publica con el tenantid de otro",
+          "consumidor comprometido que lee todos los tenants"
+        ]
+      },
+      "B": {
+        "name": "account de NATS por tenant",
+        "isolation": "aplicado por el broker",
+        "cost": [
+          "streams x numero de tenants",
+          "N conexiones por servicio multi-tenant",
+          "export/import para eventos de plataforma"
+        ],
+        "generator": "node scripts/gen-acl.mjs services.json --tenants"
+      },
+      "C": {
+        "name": "tenant en el subject",
+        "status": "RECHAZADO en v1",
+        "reason": "rompe la regla de 4 tokens de 02-naming.md 1.1, de la que dependen los wildcards, los nombres de stream y durable y la derivacion del type. El Modelo B da el mismo aislamiento sin tocar el formato."
+      }
+    },
+    "sdkRequirements": [
+      "tenantId a nivel de conexion",
+      "filtrar ANTES del handler",
+      "modo strict donde suscribirse sin filtro es error de configuracion"
+    ],
+    "$commentStrict": "Un filtro que hay que acordarse de poner es un filtro que alguien olvidara, y el fallo -ver los datos de otro tenant- no produce ningun error: produce un incidente de privacidad que se descubre semanas despues.",
+    "signingBinding": "Con la firma activa, tenantid queda ligado criptograficamente a la clave del productor: alterarlo en transito o en reposo invalida la firma. Lo que NO cambia: un productor legitimo comprometido firma lo que quiera. La firma responde quien lo escribio, no si tenia derecho a escribirlo.",
+    "rules": [
+      "tenantid se propaga sin modificar por la cadena de eventos",
+      "\"system\" es para eventos de plataforma, nunca un comodin ni un default",
+      "nunca etiquetar metricas por tenantid (si en trazas)",
+      "un evento NO DEBE contener datos de mas de un tenant"
+    ]
   }
 }

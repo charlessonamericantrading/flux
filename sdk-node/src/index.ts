@@ -4,7 +4,12 @@
  * Especificación: https://github.com/charlessonamericantrading/flux
  */
 
-export { connect, FluxBus, ConsumerConfigMismatchError } from "./client.js";
+export {
+  connect,
+  FluxBus,
+  ConsumerConfigMismatchError,
+  TenantIsolationError,
+} from "./client.js";
 export type {
   ConnectOptions,
   PublishOptions,

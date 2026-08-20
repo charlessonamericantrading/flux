@@ -156,7 +156,7 @@ rediseñarse. La alternativa —cripto-borrado con clave por sujeto— queda fue
 |---|---|---|
 | Firma de eventos | ✅ **Implementada** | Ed25519, extensión opcional — ver [07-signing.md](07-signing.md). Traslada la autenticidad del canal al evento. |
 | Cifrado a nivel de campo | Fase 4 | Hoy: no metas ahí lo que no puedas guardar en claro. |
-| Aislamiento real de tenant | Fase 4 | Ver §4. |
+| Aislamiento real de tenant | ✅ **Documentado** | Tres modelos con su coste real — ver [09-multitenancy.md](09-multitenancy.md). El default de v1 (filtrado en consumidor) NO resiste a un servicio legítimo comprometido; el Modelo B sí. |
 | Auditoría inmutable de acceso | Fase 4 | Hoy: logs del servidor NATS. |
 
 Esta tabla existe para que nadie confunda "no está en el documento" con "está

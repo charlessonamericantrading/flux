@@ -5,6 +5,8 @@
  *
  *   node scripts/gen-acl.mjs services.json            → imprime la config
  *   node scripts/gen-acl.mjs services.json --check    → valida el manifiesto
+ *   node scripts/gen-acl.mjs services.json --tenants  → Modelo B: una account por
+ *                                                       tenant (09-multitenancy.md §2)
  *
  * §3 dice: "un servicio solo publica en el dominio del que es dueño; solo se suscribe
  * a lo que se le ha concedido explícitamente". Eso es una regla derivable: si sabes
@@ -91,6 +93,31 @@ if (problemas.length) {
   process.exit(1);
 }
 
+// Modelo B — aislamiento duro por account de tenant. 09-multitenancy.md §2.
+if (flags.includes("--tenants")) {
+  const tenants = manifest.tenants ?? [];
+  if (tenants.length === 0) {
+    console.error(
+      `
+✗ --tenants requiere una lista \`tenants\` en el manifiesto.
+` +
+        `  Ej.: "tenants": ["acme", "globex"]
+`,
+    );
+    process.exit(1);
+  }
+  for (const t of tenants) {
+    if (!DOMAIN_RE.test(t)) {
+      console.error(`
+✗ tenant inválido "${t}": kebab-case en minúsculas
+`);
+      process.exit(1);
+    }
+  }
+  console.log(renderTenantAccounts(manifest, tenants));
+  process.exit(0);
+}
+
 if (flags.includes("--check")) {
   console.log(
     `✓ manifiesto válido: ${manifest.services.length} servicio(s), ${dueñoDe.size} dominio(s)`,
@@ -153,3 +180,68 @@ p(`# Las credenciales NUNCA se versionan (06-security.md §2): sustituye cada`);
 p(`# <NKEY_DE_*> desde el gestor de secretos al desplegar.`);
 
 console.log(lines.join("\n"));
+
+// ─── Modelo B: una account por tenant ────────────────────────────────────────
+
+function renderTenantAccounts(manifest, tenants) {
+  const env = (manifest.environment ?? "produccion").toUpperCase();
+  const out = [];
+  const w = (x = "") => out.push(x);
+  const up = (x) => x.toUpperCase().replace(/-/g, "_");
+
+  w(`# GENERADO por scripts/gen-acl.mjs --tenants — no editar a mano.`);
+  w(`# Modelo B de 09-multitenancy.md §2: una account de NATS POR TENANT.`);
+  w(`#`);
+  w(`# Las accounts de NATS son un límite de aislamiento REAL: los subjects de una son`);
+  w(`# invisibles desde otra salvo export/import explícito. Un servicio con credenciales`);
+  w(`# de un tenant no puede leer los datos de otro aunque su código lo intente.`);
+  w(`#`);
+  w(`# COSTE, para que nadie lo descubra en producción:`);
+  w(`#   · ${tenants.length} tenant(s) × los streams de cada dominio = ${tenants.length}× streams.`);
+  w(`#     JetStream tiene límites de recursos por servidor.`);
+  w(`#   · Un servicio que atiende a N tenants necesita N CONEXIONES, una por account.`);
+  w(`#   · Los eventos de plataforma (tenantid "system") requieren export/import entre`);
+  w(`#     accounts: fontanería que hay que mantener y que este generador no cubre.`);
+  w(`#`);
+  w(`# Si esto parece caro, probablemente el Modelo A (filtrado en consumidor + firma)`);
+  w(`# baste para vuestro modelo de amenaza. Ver 09-multitenancy.md §1.`);
+  w();
+  w(`accounts {`);
+
+  for (const t of tenants) {
+    w();
+    w(`  # ─── tenant: ${t} ───`);
+    w(`  ${env}_${up(t)}: {`);
+    w(`    jetstream: enabled`);
+    w(`    users: [`);
+    for (const svc of manifest.services) {
+      const pub = [
+        ...(svc.owns ?? []).map((d) => `${d}.>`),
+        ...(svc.consumes ?? []).map((c) => `dlq.${c}`),
+      ];
+      const sub = [
+        ...(svc.consumes ?? []),
+        ...(svc.owns ?? []).map((d) => `dlq.${d}.>`),
+        "_INBOX.>",
+      ];
+      w(`      # ${svc.name} @ ${t}`);
+      w(`      {`);
+      w(`        nkey: "<NKEY_DE_${up(svc.name)}_${up(t)}>"`);
+      w(`        permissions: {`);
+      w(`          publish:   { allow: [${pub.map((x) => `"${x}"`).join(", ")}] }`);
+      w(`          subscribe: { allow: [${sub.map((x) => `"${x}"`).join(", ")}] }`);
+      w(`        }`);
+      w(`      },`);
+    }
+    w(`    ]`);
+    w(`  }`);
+  }
+
+  w(`}`);
+  w();
+  w(`# Los subjects son IDÉNTICOS en todas las accounts, y eso es correcto: cada account`);
+  w(`# es un universo aparte, así que "pedidos.pedido.v1.creado" de acme y el de globex`);
+  w(`# no colisionan. El aislamiento lo da la account, no el nombre.`);
+
+  return out.join("\n");
+}
