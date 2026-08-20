@@ -77,12 +77,38 @@ L1, más:
 
 ### L3 — Gobernado
 L2, más:
-- **DEBE** resolver y validar `dataschema` contra el Schema Registry antes de
-  publicar, y fallar el `publish()` si el payload no valida.
-- **DEBE** exponer las reglas de compatibilidad de
-  [05-compatibility.md](05-compatibility.md) como error en tiempo de publicación.
+- **DEBE** resolver y validar `dataschema` antes de publicar, y **fallar el
+  `publish()`** si el payload no cumple su esquema.
+- **DEBE** reportar TODOS los errores de validación, no solo el primero: de uno en
+  uno, arreglar un payload con tres campos mal cuesta tres despliegues.
+- **DEBERÍA** ofrecer un modo `warn` para introducir validación en un ecosistema en
+  marcha sin romper nada el primer día.
+- **PUEDE** validar también al consumir. Un fallo ahí se clasifica **PERMANENT**: el
+  evento es sintácticamente correcto pero incumple su contrato, y reintentarlo dará
+  exactamente el mismo resultado.
 
-Los SDKs de fase 1 apuntan a **L2**.
+#### Resolución de esquemas: bundle, no HTTP
+
+El `dataschema` es una URI, pero un SDK L3 **NO DEBE** resolverla por red en
+`publish()`. Validar está en la ruta caliente: una petición por evento es
+inaceptable, y una caché con TTL abre una ventana en la que dos servicios validan
+contra versiones distintas del mismo esquema.
+
+En su lugar, los esquemas se empaquetan y se despliegan **con el servicio**
+([`scripts/bundle-schemas.mjs`](../scripts/bundle-schemas.mjs)). Así la versión del
+esquema queda clavada a la versión del servicio — que es justo lo que
+`producerversion` promete poder acotar.
+
+El bundle resuelve además el `dataschema` exacto: dentro de un mayor todo es
+BACKWARD-compatible, así que el MINOR más alto acepta todo lo que aceptan los
+anteriores.
+
+> **Nota de implementación.** Los esquemas de flux declaran `$schema: draft/2020-12`.
+> Un validador configurado para draft-07 no falla con un error de versión: falla con
+> `no schema with key or ref ".../draft/2020-12/schema"`, que no dice nada útil.
+> En `ajv` hay que usar `ajv/dist/2020`, no el export por defecto.
+
+Los SDKs de fase 1 apuntan a **L2**; el de Node implementa ya **L3** de forma opt-in.
 
 ## 6. Fuera del alcance de v1
 

@@ -41,6 +41,12 @@ import {
 import { ErrorClass, PoisonError, type Classification } from "./errors.js";
 import { createClassifier, type ClassifierOptions } from "./classify.js";
 import {
+  createValidator,
+  schemaUriFor,
+  SchemaValidationError,
+  type ValidationOptions,
+} from "./validation.js";
+import {
   contextFromEvent,
   currentContext,
   runWithContext,
@@ -79,6 +85,12 @@ export interface ConnectOptions {
   schemaBaseUrl?: string;
   /** Política de clasificación de errores. Ver classify.ts. */
   classifier?: ClassifierOptions;
+  /**
+   * Validación L3 contra el JSON Schema del evento. Ver validation.ts.
+   * Con `mode: "strict"`, publicar un payload que viola su contrato falla en el
+   * productor en vez de aparecer como un misterio en un consumidor de otro equipo.
+   */
+  validation?: ValidationOptions;
   /**
    * Réplicas de los streams que el SDK crea si no existen.
    *
@@ -166,6 +178,7 @@ export class FluxBus {
   readonly #source: string;
   readonly #subscriptions = new Set<{ stop: () => void }>();
   readonly #ensured = new Set<string>();
+  #validate: ((e: FluxEvent, subject: string) => void) | null = null;
 
   constructor(
     nc: NatsConnection,
@@ -221,6 +234,11 @@ export class FluxBus {
       ...(inherited?.tracestate !== undefined && { tracestate: inherited.tracestate }),
     });
 
+    // L3: validar ANTES de publicar. Un payload que viola su contrato debe fallar
+    // aquí, en el servicio que lo generó, y no aparecer como un misterio en un
+    // consumidor de otro equipo la semana que viene — 00-protocol.md §5.
+    this.#validate?.(event, subject);
+
     // msgID pone la cabecera Nats-Msg-Id: deduplica reintentos de PUBLICACIÓN dentro
     // de duplicate_window. NO deduplica reentregas de consumo — 03-delivery.md §3.
     await this.#js.publish(subject, serialize(event), { msgID: event.id });
@@ -235,15 +253,24 @@ export class FluxBus {
   #schemaFor(subject: string): string {
     const explicit = this.#opts.schemas?.[subject];
     if (explicit) return explicit;
+
+    // El bundle L3 conoce el MINOR real de cada subject: dentro de un mayor todo es
+    // BACKWARD-compatible, así que el más alto acepta lo que aceptan los anteriores.
+    const fromBundle = this.#opts.validation?.bundle
+      ? schemaUriFor(this.#opts.validation.bundle, subject)
+      : undefined;
+    if (fromBundle) return fromBundle;
+
     const base = this.#opts.schemaBaseUrl;
     if (!base) {
       throw new Error(
-        `no hay dataschema para "${subject}". Declara \`schemas["${subject}"]\` o \`schemaBaseUrl\` en connect().`,
+        `no hay dataschema para "${subject}". Declara \`schemas["${subject}"]\`, ` +
+          `\`schemaBaseUrl\`, o pasa un bundle en \`validation.bundle\` (connect()).`,
       );
     }
     const { domain, aggregate, event, major } = parseSubject(subject);
-    // Sin registro exacto solo se puede asumir el .0.0 del mayor. Un SDK L3 resolverá
-    // el minor real contra el Schema Registry — 00-protocol.md §5.
+    // Sin bundle ni mapa explícito solo se puede asumir el .0.0 del mayor. Es
+    // suficiente para L2 —el atributo es informativo— pero no para L3.
     return `${base.replace(/\/$/, "")}/${domain}/${aggregate}/${event}/${major}.0.0.json`;
   }
 
@@ -403,6 +430,10 @@ export class FluxBus {
     }, CONSUMER_DEFAULTS.ackWaitMs / 2);
 
     try {
+      // L3 en consumo: el evento es sintácticamente válido pero incumple su
+      // contrato. Reintentarlo dará exactamente el mismo resultado, así que la
+      // clasificación correcta es PERMANENT — 04-errors.md §1.2.
+      if (this.#opts.validation?.onConsume) this.#validate?.(event, subject);
       await runWithContext(contextFromEvent(event), async () =>
         handler(event, {
           ack: () => {},
@@ -561,6 +592,11 @@ export class FluxBus {
     }
   }
 
+  /** Lo llama connect(). Público solo porque connect() vive fuera de la clase. */
+  async initValidation(): Promise<void> {
+    this.#validate = await createValidator(this.#opts.validation ?? {});
+  }
+
   // ─── ciclo de vida ─────────────────────────────────────────────────────────
 
   get connected(): boolean {
@@ -594,5 +630,9 @@ export async function connect(options: ConnectOptions): Promise<FluxBus> {
   const nc = await natsConnect(natsOptions);
   const jsm = await jetstreamManager(nc);
   const js = jetstream(nc);
-  return new FluxBus(nc, js, jsm, options);
+  const bus = new FluxBus(nc, js, jsm, options);
+  // Compilar los esquemas UNA vez en connect(), no por evento: ajv compila a
+  // función y hacerlo en la ruta caliente tiraría el throughput.
+  await bus.initValidation();
+  return bus;
 }

@@ -62,5 +62,13 @@ export {
 } from "./protocol.js";
 export type { ParsedSubject } from "./protocol.js";
 
+export {
+  createValidator,
+  schemaUriFor,
+  SchemaValidationError,
+  SchemaNotFoundError,
+} from "./validation.js";
+export type { ValidationOptions, ValidationMode, SchemaBundle } from "./validation.js";
+
 export { currentContext } from "./context.js";
 export type { EventContext } from "./context.js";

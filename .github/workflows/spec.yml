@@ -37,6 +37,11 @@ jobs:
       - name: Esquemas conformes y BACKWARD-compatibles
         run: node scripts/check-compat.mjs -v
 
+      # El bundle es lo que los servicios L3 despliegan: si diverge de schemas/,
+      # un servicio valida contra un contrato que ya no existe.
+      - name: bundle.json al día
+        run: node scripts/bundle-schemas.mjs --check
+
       # 05-compatibility.md §4: los esquemas publicados son inmutables.
       # Editar 1.0.0 in situ invalida todos los eventos ya emitidos que lo referencian.
       - name: Ningún schema existente modificado

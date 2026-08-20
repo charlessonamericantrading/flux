@@ -421,10 +421,15 @@
     ],
     "L3": [
       "L2",
-      "schema registry validation on publish",
-      "compatibility rules enforced at publish time"
+      "schema validation on publish (fail publish if invalid)",
+      "report ALL validation errors, not just the first",
+      "warn mode for gradual adoption",
+      "optional validation on consume, classified PERMANENT"
     ],
-    "phase1Target": "L2"
+    "phase1Target": "L2",
+    "schemaResolution": "bundle-deployed-with-service",
+    "$commentL3": "El dataschema NO se resuelve por red en publish(): esta en la ruta caliente y una cache con TTL abre una ventana en la que dos servicios validan contra versiones distintas. El bundle se despliega con el servicio, asi que la version del esquema queda clavada a producerversion. Los esquemas declaran draft/2020-12: un validador de draft-07 falla con \"no schema with key or ref\", que no dice nada util.",
+    "nodeImplements": "L3"
   },
   "outOfScopeV1": [
     "request/reply",

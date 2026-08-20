@@ -28,7 +28,8 @@ async function walk(dir) {
   for (const e of await readdir(dir, { withFileTypes: true })) {
     const p = join(dir, e.name);
     if (e.isDirectory()) out.push(...(await walk(p)));
-    else if (e.name.endsWith(".json")) out.push(p);
+    // bundle.json es generado por scripts/bundle-schemas.mjs, no un esquema.
+    else if (e.name.endsWith(".json") && e.name !== "bundle.json") out.push(p);
   }
   return out;
 }
