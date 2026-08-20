@@ -501,7 +501,22 @@
       "proteccion contra replay legitimo",
       "autenticacion del broker",
       "sustituto de las ACLs"
-    ]
+    ],
+    "availability": {
+      "node": "stdlib (node:crypto)",
+      "go": "stdlib (crypto/ed25519)",
+      "java": "stdlib (java.security, JDK 15+)",
+      "php": "stdlib (ext-sodium, PHP 7.2+)",
+      "python": "dependencia: cryptography",
+      "rust": "dependencia: ed25519-dalek",
+      "dotnet": "NO esta en la BCL de .NET 8 — dependencia: BouncyCastle o NSec"
+    },
+    "$commentAvailability": "Ed25519 NO esta en la biblioteca estandar de todos los lenguajes, y decirlo importa: el argumento de \"sin negociacion de algoritmo\" se sostiene por la ausencia de parametros, no por la ubicuidad de la primitiva. En .NET se elige BouncyCastle sobre NSec porque NSec envuelve libsodium nativo y falla con DllNotFoundException EN EJECUCION si el RID no trae el binario: el mismo modo de fallo que este protocolo lleva tres documentos evitando.",
+    "warnModeMustEmitMetric": "flux_events_consumed_total{outcome=\"invalid_signature\"}",
+    "$commentWarnMode": "Sin esa metrica, el modo warn es inutil para lo unico que existe: pilotar la migracion. La pregunta \"cuantos eventos siguen sin firma y de que productores\" no se contesta buscando en siete logs.",
+    "metricOutcome": "invalid_signature",
+    "dlqReason": "poison",
+    "$commentOutcome": "El outcome de la metrica y el dlqreason del evento NO son lo mismo. outcome=poison responde \"un productor publica basura\"; outcome=invalid_signature responde \"alguien publica eventos que no son suyos\". Mezclarlas hace que rate(...{outcome=\"poison\"}) mida cosas distintas segun el lenguaje del consumidor."
   },
   "observability": {
     "status": "normative-for-L2",

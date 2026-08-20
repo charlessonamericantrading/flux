@@ -66,6 +66,13 @@ import java.time.Instant;
  * @param partitionkey      clave de ordenacion. Por convencion, igual al aggregateId.
  * @param traceparent       W3C Trace Context.
  * @param tracestate        W3C Trace Context.
+ * @param signkeyid         identifica la clave publica con la que verificar. Formato
+ *                          {@code <servicio>-<n>}. <b>Va DENTRO de lo firmado</b>: si
+ *                          quedara fuera, un atacante podria cambiarlo para que la
+ *                          verificacion buscara otra clave — 07-signing.md §5.
+ * @param signature         firma Ed25519 en base64url SIN padding. Es el unico atributo
+ *                          que NO va firmado, porque no puede firmarse a si mismo
+ *                          — 07-signing.md §4.
  * @param dlqreason         solo presente en {@code dlq.<subject>}.
  * @param dlqattempts       numero de entrega en la que el evento murio, NO una propiedad
  *                          de su clase. Un PERMANENT suele registrar 1; un RETRYABLE
@@ -85,6 +92,13 @@ import java.time.Instant;
         "specversion", "id", "source", "type", "time", "datacontenttype", "dataschema", "subject",
         "correlationid", "tenantid", "producerversion", "dataclassification",
         "causationid", "partitionkey", "traceparent", "tracestate",
+        // `signkeyid` y `signature` van entre las extensiones y ANTES de `data`
+        // (07-signing.md §4). Van tambien antes de las `dlq*` porque el orden no es
+        // decorativo: se firma sobre el evento serializado, y aunque las `dlq*` se
+        // eliminen antes de verificar, un evento de DLQ firmado tiene que producir la
+        // MISMA secuencia de bytes en Java que en Node — que es donde este orden se fijo
+        // primero (01-envelope.md §6).
+        "signkeyid", "signature",
         "dlqreason", "dlqattempts", "dlqconsumer", "dlqerror", "dlqtime",
         "data"
 })
@@ -111,6 +125,10 @@ public record FluxEvent(
         @JsonProperty("partitionkey") String partitionkey,
         @JsonProperty("traceparent") String traceparent,
         @JsonProperty("tracestate") String tracestate,
+
+        // ── Firma Ed25519 — extension OPCIONAL — 07-signing.md §4 ──
+        @JsonProperty("signkeyid") String signkeyid,
+        @JsonProperty("signature") String signature,
 
         // ── Extensiones de DLQ — solo en dlq.<subject> — 04-errors.md §3 ──
         @JsonProperty("dlqreason") DlqReason dlqreason,
@@ -227,11 +245,37 @@ public record FluxEvent(
         return new FluxEvent(specversion, id, source, type, time, datacontenttype, dataschema,
                 aggregateId, correlationid, tenantid, producerversion, dataclassification,
                 causationid, partitionkey, traceparent, tracestate,
+                signkeyid, signature,
                 reason, attempts, consumer, error, when, data);
     }
 
     /** Copia sin las extensiones {@code dlq*}. El {@code id} original se CONSERVA. */
     FluxEvent withoutDlq() {
         return withDlq(null, null, null, null, null);
+    }
+
+    /**
+     * Copia con los atributos de firma puestos. Lo usa {@link Signing}.
+     *
+     * <p>Existe aqui por el mismo motivo que {@link #withDlq}: la unica invocacion del
+     * constructor canonico de 24 componentes vive junto a la definicion del record.
+     */
+    FluxEvent withSigning(String keyId, String sig) {
+        return new FluxEvent(specversion, id, source, type, time, datacontenttype, dataschema,
+                aggregateId, correlationid, tenantid, producerversion, dataclassification,
+                causationid, partitionkey, traceparent, tracestate,
+                keyId, sig,
+                dlqreason, dlqattempts, dlqconsumer, dlqerror, dlqtime, data);
+    }
+
+    /**
+     * Copia sin {@code signature}, conservando {@code signkeyid}.
+     *
+     * <p>Es el paso 3 de la verificacion (07-signing.md §5.1): una firma no puede cubrirse
+     * a si misma, pero {@code signkeyid} SI va firmado y quitarlo aqui invalidaria toda
+     * firma valida.
+     */
+    FluxEvent withoutSignature() {
+        return withSigning(signkeyid, null);
     }
 }

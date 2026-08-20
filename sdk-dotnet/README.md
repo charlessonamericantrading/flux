@@ -8,11 +8,17 @@ README diverge de la spec, manda la spec.
 
 ```bash
 dotnet add package Flux
+dotnet add package Flux.Signing   # solo si vas a firmar o verificar eventos
 ```
 
 Requiere **.NET 8** o superior, `NATS.Net` 2.5+ (el cliente oficial de segunda
 generación: namespaces `NATS.Client.Core` / `NATS.Client.JetStream`, no el paquete
 `NATS.Client` en mantenimiento) y `System.Text.Json`.
+
+> **`Flux.Signing` es un paquete aparte, y es opt-in.** Ed25519 **no existe en la BCL de
+> .NET 8**, así que la firma —una extensión *opcional* del protocolo cuyo default es
+> `off`— necesita una librería de criptografía. Meterla en el paquete base castigaría a
+> todo servicio que solo quiere publicar un evento sin firmar. Ver §"Firma de eventos".
 
 ---
 
@@ -142,6 +148,193 @@ Para que el clasificador reconozca un status HTTP no hace falta hacer nada: lee
 fallos de tu cliente en un tipo propio, implementa `IHttpStatusError` (o usa
 `HttpStatusException`).
 
+> ⚠️ **`RetryAfter` es una sugerencia para el PRIMER reintento, y solo para él.** Con
+> `backoff` configurado —y flux lo configura siempre— JetStream honra el delay del `nak` en
+> la primera reentrega y a partir de la segunda impone el array `backoff`, **sin devolver
+> error ni avisar** ([03-delivery.md §2.2](../specification/03-delivery.md), medido contra
+> NATS 2.14.5):
+>
+> ```
+> SIN backoff:  0ms → 300ms → 600ms  → 900ms     ← el delay se honra siempre
+> CON backoff:  0ms → 300ms → 5300ms → 15300ms   ← solo la primera vez
+> ```
+>
+> Un `Retry-After: 5` de un proveedor acorta el primer reintento y nada más: los siguientes
+> seguirán 1 m, 5 m, 15 m, 30 m. No construyas lógica que dependa de que se respete más
+> allá de la primera vez.
+
+## Firma de eventos (paquete `Flux.Signing`, opcional)
+
+Extensión **opcional** de v1 — [07-signing.md](../specification/07-signing.md). El default
+es `off` y **un evento sin firma sigue siendo válido**.
+
+```csharp
+using Flux;
+
+var par = Ed25519Signing.GenerateKeyPair();   // PKCS#8 + SPKI en PEM
+
+var (signer, verifier) = Ed25519Signing.Create(new SigningOptions
+{
+    PrivateKeyPem = par.PrivateKeyPem,        // omitir para solo verificar
+    KeyId         = "pedidos-api-1",
+    PublicKeys    = new Dictionary<string, string> { ["pedidos-api-1"] = par.PublicKeyPem },
+    Verify        = VerificationMode.Require,
+});
+
+await using var bus = await FluxBus.ConnectAsync(new ConnectOptions
+{
+    // …
+    Signer   = signer,
+    Verifier = verifier,
+});
+```
+
+### Por qué es un paquete aparte, y qué librería
+
+**Ed25519 no está en la BCL de .NET 8.** `System.Security.Cryptography` trae `RSA`,
+`ECDsa` y `ECDiffieHellman`, pero no EdDSA; `ECCurve` modela curvas de Weierstrass y
+Ed25519 es de Edwards retorcida, así que ni siquiera cabe como "una curva más". Es la única
+diferencia de plataforma real de esta fase: en Node está en `node:crypto`, en Java en
+`java.security` desde el JDK 15, en Go en `crypto/ed25519`, y **aquí hace falta un
+paquete**.
+
+De los dos candidatos serios se elige **`BouncyCastle.Cryptography` 2.4.0** sobre
+`NSec.Cryptography`, y la razón es operativa, no de API:
+
+| | BouncyCastle | NSec |
+|---|---|---|
+| Implementación | 100 % código gestionado | envoltorio de **libsodium** (nativo) |
+| RIDs exóticos (Alpine/musl, ARM64, distroless) | funciona | depende de que el RID traiga la libsodium correcta |
+| Single-file / AOT | sin colocar binarios a mano | hay que gestionar el asset nativo |
+| Modo de fallo si falta el binario | no aplica | **`DllNotFoundException` en EJECUCIÓN**, la primera vez que alguien firma |
+| Rendimiento | menor | mayor (C) |
+
+NSec es más rápido. Da igual: se firma una vez por evento sobre unos cientos de bytes, y
+eso no es la ruta caliente de nada. Lo que sí importa es el modo de fallo — un
+`DllNotFoundException` en el primer `publish()` de producción es exactamente la forma de
+error que este protocolo lleva tres documentos evitando: el servicio arranca, el
+healthcheck dice que todo va bien, y se rompe cuando importa.
+
+La versión está **fijada** (`2.4.0`, no un rango): una librería de criptografía que se
+actualiza sola en un `restore` es un cambio de comportamiento que nadie ha revisado.
+
+### Cómo queda repartido
+
+| Paquete | Qué lleva | Dependencias |
+|---|---|---|
+| `Flux` | `IEventSigner`, `IEventVerifier`, `VerificationMode`, `EventSigning.SignablePayload`, los códigos POISON | NATS.Net, System.Text.Json |
+| `Flux.Signing` | `Ed25519Signing`, `SigningOptions` — la única criptografía del SDK | `Flux` + BouncyCastle |
+
+Es decir: el paquete base define **el contrato y la política**; el de firma aporta **solo la
+primitiva**. Un servicio que no firma no instala BouncyCastle, y aun así puede *leer* un
+evento firmado: `signkeyid` y `signature` son atributos raíz válidos con la verificación
+apagada. Si no lo fueran, adoptar la firma de forma gradual convertiría en POISON los
+eventos de los productores ya migrados.
+
+### Política
+
+| Modo | Evento sin firma | Firma inválida |
+|---|---|---|
+| `Off` (default) | se acepta | se acepta (no se mira) |
+| `Warn` | se registra y se acepta | se registra y se acepta |
+| `Require` | **POISON** `MISSING_SIGNATURE` | **POISON** `INVALID_SIGNATURE` / `UNKNOWN_SIGNING_KEY` |
+
+`Warn` existe porque adoptar la firma en un ecosistema en marcha exige un periodo en el que
+unos productores firman y otros no. Pasar directo a `Require` convierte en POISON todo
+evento de un servicio aún no migrado.
+
+Tres cosas que conviene tener claras:
+
+- **`signkeyid` va dentro de lo firmado.** Si quedara fuera, un atacante lo cambiaría por el
+  id de una clave suya y la firma seguiría "verificando".
+- **Una clave RETIRADA sigue verificando** mientras se conserve su pública. Retirarla impide
+  *emitir* con ella, no *verificar* lo ya emitido; tratarla como inválida convierte una
+  rotación rutinaria en la invalidación retroactiva de todo el historial. Mínimo de
+  retención: **90 días**, la de la DLQ.
+- **La firma sobrevive a la DLQ y al replay.** Las extensiones `dlq*` se añaden después de
+  firmar y se quitan antes de verificar, así que un evento reproducido conserva su firma
+  válida — que es lo correcto: el replay redistribuye un hecho ya emitido.
+
+Lo que **no** resuelve: confidencialidad, replay legítimo, autenticación del broker, ni las
+ACLs. La ACL controla **quién puede escribir**; la firma, **quién lo escribió**.
+
+## Métricas
+
+Normativo para L2 — [08-observability.md](../specification/08-observability.md). Los
+nombres y las etiquetas son **contrato entre SDKs**: si .NET y Go nombran distinto la tasa
+de DLQ, no se pueden sumar y un panel del ecosistema es imposible.
+
+```csharp
+var metrics = new InMemoryMetrics();
+await using var bus = await FluxBus.ConnectAsync(new ConnectOptions { /* … */ Metrics = metrics });
+
+app.MapGet("/metrics", () => Results.Text(metrics.Render(), "text/plain; version=0.0.4"));
+```
+
+El default es `NoMetrics.Instance` (no-op): un SDK de protocolo no impone un backend de
+métricas. Para enchufar `System.Diagnostics.Metrics`, prometheus-net u OpenTelemetry,
+implementa `IMetricsSink`.
+
+| Métrica | Tipo | Etiquetas |
+|---|---|---|
+| `flux_events_published_total` | Counter | `subject`, `outcome` |
+| `flux_events_consumed_total` | Counter | `subject`, `consumer`, `outcome` |
+| `flux_event_handler_duration_seconds` | Histogram | `subject`, `consumer` |
+| `flux_events_dlq_total` | Counter | `subject`, `consumer`, `reason`, `code` |
+| `flux_events_retried_total` | Counter | `subject`, `consumer`, `attempt` |
+| `flux_consumer_pending` | Gauge | `subject`, `consumer` |
+| `flux_connection_state` | Gauge | — |
+
+- **`IMetricsSink` tiene un método por métrica con parámetros nombrados, no un
+  `IDictionary<string,string>` genérico.** Es deliberado: un diccionario de etiquetas es
+  justo por donde se cuela un `tenantid` que multiplica las series temporales. La
+  cardinalidad no avisa — funciona con tres tenants en desarrollo y mata a Prometheus con
+  diez mil en producción. Etiquetar por `tenantid`, `id` o `correlationid` está
+  **prohibido**; para eso están las trazas
+  ([§2.2](../specification/08-observability.md)).
+- **El último bucket del histograma es `30` porque *es* el `ack_wait`.** Un handler que cae
+  ahí está a punto de que su mensaje se reentregue mientras aún se ejecuta. Hay un test que
+  lo ata a `Protocol.DefaultAckWait`: cambiar uno sin el otro rompe la suite.
+- **`flux_consumer_pending` se alimenta en cada entrega**, con el `NumPending` que ya viene
+  en los metadatos del mensaje de JetStream: no hace falta sondear al servidor. Es la única
+  señal que delata a un consumidor cuyo bucle murió, porque la conexión sigue reportándose
+  sana y el healthcheck dice que todo va bien
+  ([§4](../specification/08-observability.md)).
+- **Un fallo de firma se contabiliza como `outcome="invalid_signature"`**, aunque el
+  `dlqreason` del evento siga siendo `poison`. Son dos incidentes distintos —basura frente
+  a suplantación— con dos respuestas distintas. La traducción vive en
+  `MetricLabels.ConsumeOutcomeFor` y es el mismo criterio que Go, Rust y PHP.
+
+## Aislamiento entre tenants
+
+[09-multitenancy.md §3](../specification/09-multitenancy.md). flux v1 usa el **Modelo A**:
+un stream por dominio con todos los tenants mezclados, y el SDK filtra antes del handler.
+
+```csharp
+new ConnectOptions
+{
+    // …
+    TenantId        = "acme",
+    TenantIsolation = TenantIsolation.Strict,   // olvidar el filtro LANZA
+}
+```
+
+- En `Strict`, suscribirse sin tenant configurado lanza `TenantIsolationException` **antes
+  de crear el durable consumer**. No es celo: el fallo que previene —ver los datos de otro
+  tenant— no produce ninguna señal. No hay excepción, no hay log, no hay métrica; hay un
+  incidente de privacidad que se descubre semanas después.
+- **`"system"` no cuenta como filtro.** Es la ausencia de tenant, no un tenant: se reserva
+  para eventos de plataforma y no debe usarse como comodín ni como valor por defecto.
+- El evento de otro tenant se **`Ack`ea y se descarta**. Nakearlo lo reentregaría seis veces
+  y acabaría en la DLQ, convirtiendo el aislamiento en una fábrica de ruido.
+
+La política vive en `TenantFilterPolicy`, fuera de `FluxBus` y sin tipos de NATS —igual que
+`ConsumerConfigVerifier`— para poder probarla entera sin broker.
+
+Lo que el Modelo A **no** da: todo servicio con acceso al dominio sigue pudiendo leer los
+datos de todos los tenants. El aislamiento duro exige una account de NATS por tenant
+(Modelo B), y eso es topología, no SDK.
+
 ## Contexto
 
 `correlationid`, `causationid`, `tenantid` y `traceparent` se propagan solos a través de
@@ -237,7 +430,8 @@ tests unitarios que corren sin Docker.
 ## Fricciones: dónde el protocolo no encaja limpio en C#/.NET
 
 Esto es señal **sobre la spec**, no sobre .NET. Las letras A–G se corresponden con las del
-README de Go, para poder leerlas en paralelo; H–K son nuevas y específicas de este port.
+README de Go, para poder leerlas en paralelo; H–K son nuevas y específicas de este port, y
+L–P salieron al portar la fase 5 (firma, métricas y multi-tenant).
 
 ### A. "Ausente ≠ vacío" obliga a anulables — y la spec cita a System.Text.Json por su nombre
 
@@ -391,6 +585,103 @@ el `Guid` se construye por componentes para evitarlo.
 Cuando el consumidor mueva el TFM a `net9.0` puede sustituirse por la API del framework sin
 cambiar un byte del formato.
 
+### L. 🔴 Ed25519 no existe en la BCL — y la spec da por hecho que sí
+
+[07-signing.md §3](../specification/07-signing.md) justifica la elección del algoritmo
+diciendo que está "disponible en la biblioteca estándar o equivalente de todos los lenguajes
+del ecosistema", y lista `System.Security.Cryptography` entre ellos. **No es cierto para
+.NET 8**, que es la LTS vigente: el namespace trae `RSA`, `ECDsa` y `ECDiffieHellman`, y
+EdDSA no aparece por ninguna parte. Ni siquiera cabe como "una curva más" en `ECCurve`, que
+modela curvas de Weierstrass mientras que Ed25519 es de Edwards retorcida.
+
+Es el único lenguaje del ecosistema donde la extensión de firma **no es gratis**: obliga a
+un paquete de terceros y, por tanto, a una decisión de empaquetado que los otros cinco SDKs
+no tienen que tomar. Aquí se resuelve partiendo el SDK en dos (`Flux` + `Flux.Signing`), de
+modo que quien no firma no paga la dependencia; ver §"Firma de eventos".
+
+**Sugerencia para la spec:** corregir esa lista. La frase importa más de lo que parece
+porque es la que sostiene "sin negociación de algoritmo": si Ed25519 costara una dependencia
+pesada en algún lenguaje, la presión por admitir un segundo algoritmo volvería — y esa
+presión es exactamente lo que §3 existe para eliminar. Con un paquete gestionado de 3 MB el
+argumento se sostiene, pero conviene decirlo en vez de dar por hecho lo contrario.
+
+### M. `warn` no define dónde se registra, y aquí no hay un `console.warn`
+
+[§7](../specification/07-signing.md) exige tres modos y dice que `warn` "se registra y se
+acepta". No dice **dónde**. El SDK de Node usa `console.warn`; en .NET no existe un canal
+equivalente que no imponga `Microsoft.Extensions.Logging` a toda aplicación que use el SDK.
+
+`SigningOptions.OnWarn` acepta un `Action<string>` y cae a `Console.Error` si no se pasa.
+Es lo razonable, pero significa que el mismo evento no firmado produce salidas distintas en
+cada SDK, y una alerta sobre "cuántos productores faltan por migrar" no se puede escribir
+contra los logs.
+
+**Sugerencia:** que `warn` incremente además una métrica. El valor de etiqueta ya existe
+—`flux_events_consumed_total{outcome="invalid_signature"}`,
+[08-observability.md §2.1](../specification/08-observability.md)— pero hoy **solo se emite
+cuando el evento muere en modo `Require`**, que es justo el escenario en el que ya no hay
+migración que pilotar (ver §N). Un log es para leer; una migración se pilota con una
+métrica.
+
+### N. 🔴 Node es el único SDK que NO emite `outcome="invalid_signature"`
+
+§2.1 lista `invalid_signature` entre los valores de `outcome`, y hay dos lecturas de cómo
+contabilizar un fallo de firma en modo `Require`:
+
+| SDK | `outcome` de un fallo de firma |
+|---|---|
+| Go, Rust, PHP, Java, **.NET** | `invalid_signature` (con `dlqreason` = `poison`) |
+| **Node** (la referencia) | `poison` |
+
+Este SDK sigue a la mayoría (`MetricLabels.ConsumeOutcomeFor`): la firma inválida se separa
+del POISON común porque son dos incidentes distintos —basura frente a suplantación— con dos
+respuestas distintas. Un pico de firmas rotas apunta a un productor con la clave equivocada
+o a alguien reinyectando eventos; un pico de JSON corrupto, a un productor roto.
+Confundirlos hace que la alerta no diga qué hacer. El `dlqreason` del evento **no** cambia,
+porque ése sí es el enum cerrado de [04-errors.md §1](../specification/04-errors.md).
+
+Pero mientras Node emita `poison`, `rate(flux_events_consumed_total{outcome="poison"})` mide
+cosas distintas según el lenguaje del servicio — que es exactamente lo que
+08-observability.md existe para evitar.
+
+**Sugerencia:** que §2.1 diga explícitamente **cuándo** se emite `invalid_signature`, en vez
+de limitarse a listarlo entre los valores posibles. Con eso, corregir `sdk-node` es una
+línea; sin eso, cada SDK seguirá eligiendo, que es como se llegó aquí.
+
+### O. La firma es la única parte del protocolo con **una sola** implementación correcta
+
+Todo lo demás tolera divergencias menores: dos SDKs pueden ordenar las claves de `data` de
+forma distinta y el ecosistema sigue funcionando, porque nadie compara bytes. La firma no.
+Un byte de diferencia en `Serialize()` y la firma de .NET no verifica en Node — y el fallo
+no aparece como "los SDKs divergen", aparece como **`INVALID_SIGNATURE` en producción**,
+indistinguible de un ataque.
+
+Eso convierte en requisitos de seguridad tres reglas que parecían de estilo, y en .NET las
+tres estaban a una línea de romperse: el encoder por defecto escapa los no-ASCII (§J),
+`ToString("O")` emite siete decimales (§C), y el orden de serialización no está garantizado
+por contrato (de ahí los `[JsonPropertyOrder]` explícitos). Cualquiera de las tres, sola,
+invalida todas las firmas del servicio.
+
+**Sugerencia:** que la suite de conformidad incluya un caso de **firma cruzada** —una clave
+fija, un evento fijo y la firma esperada en base64url— y no solo el envelope. Hoy cada SDK
+comprueba que su propia firma verifica con su propia verificación, que es exactamente la
+prueba que no demuestra nada.
+
+### P. `Classification.RetryAfter` prometía más de lo que JetStream cumple
+
+No es una fricción de .NET —afecta a los seis SDKs— pero se corrigió aquí al portar la
+fase 5. La documentación decía "sobrescribe el backoff canónico para este intento", lo que
+invita a construir lógica de reintentos sobre él. Y
+[03-delivery.md §2.2](../specification/03-delivery.md) mide lo contrario: con `backoff`
+configurado —y flux lo configura siempre— el delay del `nak` se honra **solo en la primera
+reentrega**, y a partir de la segunda el servidor impone el array `backoff` sin devolver
+error.
+
+Ahora se documenta como **sugerencia para el primer reintento**. Es la tercera trampa de
+JetStream de la misma familia (`ack_wait` sobrescrito por `backoff[0]`, el delay del `nak`
+ignorado, y el publish de core que se evapora): **el servidor acepta la petición, no
+devuelve error, y aplica otra cosa.** Ninguna se detecta leyendo código; solo midiendo.
+
 ---
 
 ## Ficheros
@@ -405,18 +696,36 @@ cambiar un byte del formato.
 | `Classifier.cs` | Políticas configurables, transitorios por semántica, `EffectiveBudget` |
 | `EventContext.cs` | Propagación implícita vía `AsyncLocal<T>` y `Activity.Current` |
 | `ConsumerConfigMismatchException.cs` | Verificación L2 de la config efectiva, sin tipos de NATS |
+| `Signing.cs` | Contrato y política de firma: `IEventSigner`, `IEventVerifier`, `VerificationMode`, `EventSigning.SignablePayload`, códigos POISON. **Sin criptografía** |
+| `Metrics.cs` | `IMetricsSink`, `NoMetrics`, `InMemoryMetrics` y los enums de etiquetas |
+| `TenantIsolation.cs` | `TenantIsolation`, `TenantFilterPolicy`, `TenantIsolationException` |
 | `FluxBus.cs` | `ConnectAsync`, `PublishAsync`, `SubscribeAsync`, `DisposeAsync`. **Único fichero que conoce NATS** |
+
+Y en el paquete aparte `Flux.Signing`:
+
+| Fichero | Contenido |
+|---|---|
+| `Ed25519Signing.cs` | `SigningOptions`, `CreateSigner`, `CreateVerifier`, `GenerateKeyPair`. **Único fichero que conoce criptografía** |
 
 ## Desarrollo
 
 ```bash
-dotnet build
-dotnet test
+dotnet build sdk-dotnet/Flux.sln
+dotnet test sdk-dotnet/Flux.sln
 ```
 
-Los tests no requieren un broker: cubren naming, envelope, clasificación, contexto y la
-verificación de config de consumidor, que es donde vive la semántica del protocolo. La
-conformidad contra un NATS real se verifica con [`conformance/`](../conformance/).
+Los tests no requieren un broker: cubren naming, envelope, clasificación, contexto, la
+verificación de config de consumidor, la firma, las métricas y el aislamiento de tenant —
+que es donde vive la semántica del protocolo. La conformidad contra un NATS real se
+verifica con [`conformance/`](../conformance/).
+
+> **Nota de procedencia.** Este SDK se escribió en una máquina **sin `dotnet` instalado**,
+> así que la suite la ejecuta el CI (`.github/workflows/spec.yml`, job *SDK .NET*). Las
+> partes que sí se pudieron verificar localmente fueron las que se comparten con el SDK de
+> Java, que sí se compiló y ejecutó: el orden de los atributos del envelope firmado, el
+> DER de las claves PKCS#8/SPKI —comprobado byte a byte contra el que emite
+> `KeyPairGenerator` de Java, que a su vez verifica contra Node— y el formato de exposición
+> de Prometheus.
 
 ## Robustez del bucle de consumo
 

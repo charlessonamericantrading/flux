@@ -180,11 +180,45 @@ public sealed record FluxEvent
     [JsonPropertyOrder(15)]
     public string? TraceState { get; init; }
 
+    // ── Firma Ed25519 — extensión OPCIONAL — 07-signing.md §4 ──
+
+    /// <summary>
+    /// Identifica la clave pública con la que verificar. Formato
+    /// <c>&lt;servicio&gt;-&lt;n&gt;</c>, p. ej. <c>pedidos-api-3</c>.
+    /// </summary>
+    /// <remarks>
+    /// <b>Va DENTRO de lo firmado.</b> Si quedara fuera, un atacante podría cambiarlo por
+    /// el id de una clave suya y la firma "verificaría" — 07-signing.md §5.
+    /// <para>
+    /// DEBE cambiar en cada rotación: reutilizar un id con una clave distinta convierte la
+    /// verificación de eventos históricos en un juego de azar (§6).
+    /// </para>
+    /// </remarks>
+    [JsonPropertyName("signkeyid")]
+    [JsonPropertyOrder(16)]
+    public string? SignKeyId { get; init; }
+
+    /// <summary>Firma Ed25519 en base64url SIN padding — 07-signing.md §4.</summary>
+    /// <remarks>
+    /// Es el único atributo que NO va firmado: no puede firmarse a sí mismo. Todo lo demás
+    /// —incluidos <c>data</c> y <see cref="SignKeyId"/>— sí está cubierto; firmar solo unos
+    /// atributos elegidos dejaría el resto manipulable.
+    /// <para>
+    /// Va antes que las extensiones <c>dlq*</c> en el orden de serialización, igual que en
+    /// Node: las <c>dlq*</c> se añaden DESPUÉS de firmar, y aunque la verificación las
+    /// ignore, el evento de DLQ tiene que producir la misma secuencia de bytes en los dos
+    /// SDKs o el replay verbatim deja de serlo — 01-envelope.md §6.
+    /// </para>
+    /// </remarks>
+    [JsonPropertyName("signature")]
+    [JsonPropertyOrder(17)]
+    public string? Signature { get; init; }
+
     // ── Extensiones de DLQ — solo en dlq.<subject> — 04-errors.md §3 ──
 
     /// <summary>Por qué acabó en la DLQ. Solo presente en <c>dlq.&lt;subject&gt;</c>.</summary>
     [JsonPropertyName("dlqreason")]
-    [JsonPropertyOrder(16)]
+    [JsonPropertyOrder(18)]
     public DlqReason? DlqReason { get; init; }
 
     /// <summary>
@@ -204,22 +238,22 @@ public sealed record FluxEvent
     /// </para>
     /// </remarks>
     [JsonPropertyName("dlqattempts")]
-    [JsonPropertyOrder(17)]
+    [JsonPropertyOrder(19)]
     public int? DlqAttempts { get; init; }
 
     /// <summary>Durable del consumidor que lo enrutó.</summary>
     [JsonPropertyName("dlqconsumer")]
-    [JsonPropertyOrder(18)]
+    [JsonPropertyOrder(20)]
     public string? DlqConsumer { get; init; }
 
     /// <summary>Mensaje del error, recortado a 1024 caracteres.</summary>
     [JsonPropertyName("dlqerror")]
-    [JsonPropertyOrder(19)]
+    [JsonPropertyOrder(21)]
     public string? DlqError { get; init; }
 
     /// <summary>Instante del enrutado a la DLQ, en el formato de <see cref="Time"/>.</summary>
     [JsonPropertyName("dlqtime")]
-    [JsonPropertyOrder(20)]
+    [JsonPropertyOrder(22)]
     public string? DlqTime { get; init; }
 
     // ── Payload — 01-envelope.md §4 ──
@@ -242,7 +276,7 @@ public sealed record FluxEvent
     /// </para>
     /// </remarks>
     [JsonPropertyName("data")]
-    [JsonPropertyOrder(21)]
+    [JsonPropertyOrder(23)]
     public required JsonElement Data { get; init; }
 
     // ── Utilidades ──
@@ -311,6 +345,8 @@ public sealed record FluxEvent
             && string.Equals(PartitionKey, other.PartitionKey, StringComparison.Ordinal)
             && string.Equals(TraceParent, other.TraceParent, StringComparison.Ordinal)
             && string.Equals(TraceState, other.TraceState, StringComparison.Ordinal)
+            && string.Equals(SignKeyId, other.SignKeyId, StringComparison.Ordinal)
+            && string.Equals(Signature, other.Signature, StringComparison.Ordinal)
             && DlqReason == other.DlqReason
             && DlqAttempts == other.DlqAttempts
             && string.Equals(DlqConsumer, other.DlqConsumer, StringComparison.Ordinal)

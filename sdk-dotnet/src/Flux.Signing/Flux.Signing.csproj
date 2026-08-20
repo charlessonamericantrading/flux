@@ -1,0 +1,54 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <LangVersion>12.0</LangVersion>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+
+    <RootNamespace>Flux</RootNamespace>
+    <AssemblyName>Flux.Signing</AssemblyName>
+    <GenerateDocumentationFile>true</GenerateDocumentationFile>
+    <EnforceCodeStyleInBuild>false</EnforceCodeStyleInBuild>
+
+    <PackageId>Flux.Signing</PackageId>
+    <Version>1.0.0</Version>
+    <Description>Firma Ed25519 de eventos de flux (extensión opcional de v1, specification/07-signing.md). Paquete aparte porque Ed25519 no existe en la BCL de .NET 8 y la firma es opcional: quien no la usa no debe pagar la dependencia de criptografía.</Description>
+    <PackageTags>cloudevents;nats;jetstream;ed25519;firma;flux</PackageTags>
+    <Authors>flux</Authors>
+    <NeutralLanguage>es</NeutralLanguage>
+    <TreatWarningsAsErrors>false</TreatWarningsAsErrors>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\Flux\Flux.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!--
+      ⚠️ Ed25519 NO está en la BCL de .NET 8: System.Security.Cryptography trae RSA, ECDsa y
+      ECDiffieHellman, pero no EdDSA, y `ECCurve` modela curvas de Weierstrass mientras que
+      Ed25519 es de Edwards retorcida. Hace falta un paquete, y hay dos candidatos serios.
+
+      Se elige BouncyCastle.Cryptography sobre NSec.Cryptography por una razón operativa, no
+      de API:
+
+      · BouncyCastle es 100 % código gestionado. Funciona en cualquier RID —Alpine/musl,
+        ARM64, contenedores distroless— y en publicación single-file o AOT sin colocar
+        binarios nativos a mano.
+      · NSec envuelve libsodium, que es nativo. Si el RID de destino no trae la libsodium
+        correcta, el fallo NO es de compilación: es un DllNotFoundException EN EJECUCIÓN, la
+        primera vez que alguien firma un evento. Es exactamente la forma de fallo que este
+        protocolo lleva tres documentos evitando: el sistema arranca, el healthcheck dice
+        que todo va bien, y se rompe cuando importa.
+
+      NSec es más rápido (libsodium en C). Da igual: se firma una vez por evento sobre unos
+      cientos de bytes, y eso no es la ruta caliente de nada.
+
+      Versión CONCRETA y no un rango: una librería de criptografía que se actualiza sola en
+      un `restore` es un cambio de comportamiento que nadie ha revisado.
+    -->
+    <PackageReference Include="BouncyCastle.Cryptography" Version="2.4.0" />
+  </ItemGroup>
+
+</Project>

@@ -26,6 +26,13 @@
 
   <ItemGroup>
     <ProjectReference Include="..\..\src\Flux\Flux.csproj" />
+    <!--
+      Flux.Signing NO es una dependencia de Flux: la firma es una extensión opcional del
+      protocolo (07-signing.md) y Ed25519 no existe en la BCL de .NET 8, así que arrastrar
+      BouncyCastle al paquete base castigaría a todo servicio que solo publica eventos sin
+      firmar. Los tests sí lo referencian, porque tienen que ejercerlo.
+    -->
+    <ProjectReference Include="..\..\src\Flux.Signing\Flux.Signing.csproj" />
   </ItemGroup>
 
 </Project>

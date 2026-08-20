@@ -118,6 +118,132 @@ Para que el clasificador reconozca un status HTTP, lanza
 `new Classifier.HttpException(status, msg, retryAfter)` o implementa
 `Classifier.HttpStatusAware`.
 
+> ⚠️ **`retryAfter` es una sugerencia para el PRIMER reintento, y solo para él.** Con
+> `backoff` configurado —y flux lo configura siempre— JetStream honra el delay del `nak`
+> en la primera reentrega y a partir de la segunda impone el array `backoff`, **sin
+> devolver error ni avisar** ([03-delivery.md §2.2](../specification/03-delivery.md),
+> medido contra NATS 2.14.5). Un `Retry-After: 5` de un proveedor acorta el primer
+> reintento y nada más: los siguientes seguirán 1 m, 5 m, 15 m, 30 m. No construyas lógica
+> que dependa de que se respete más allá de la primera vez.
+
+---
+
+## Firma de eventos (opcional)
+
+Extensión **opcional** de v1 — [07-signing.md](../specification/07-signing.md). El default
+es `off` y **un evento sin firma sigue siendo válido**.
+
+```java
+Signing.KeyPairPem par = Signing.generateKeyPair();   // PKCS#8 + SPKI en PEM
+
+FluxBus bus = FluxBus.connect(new FluxBus.ConnectOptions()
+        // …
+        .signing(new Signing.SigningOptions()
+                .privateKeyPem(par.privateKeyPem())        // firmar al publicar
+                .keyId("pedidos-api-1")
+                .publicKey("pedidos-api-1", par.publicKeyPem())
+                .verify(Signing.VerificationMode.REQUIRE)));
+```
+
+**Sin dependencias nuevas.** `java.security` trae `Ed25519` desde el JDK 15 (JEP 339) y
+este SDK compila con `release 17`, así que no hace falta BouncyCastle. Es la diferencia
+con el SDK de .NET, donde Ed25519 **no** está en la BCL y la firma vive en un paquete
+aparte.
+
+| Modo | Evento sin firma | Firma inválida |
+|---|---|---|
+| `OFF` (default) | se acepta | se acepta (no se mira) |
+| `WARN` | se registra y se acepta | se registra y se acepta |
+| `REQUIRE` | **POISON** `MISSING_SIGNATURE` | **POISON** `INVALID_SIGNATURE` / `UNKNOWN_SIGNING_KEY` |
+
+`WARN` existe porque adoptar la firma en un ecosistema en marcha exige un periodo en el
+que unos productores firman y otros no. Pasar directo a `REQUIRE` convierte en POISON todo
+evento de un servicio aún no migrado.
+
+Tres cosas que conviene tener claras:
+
+- **`signkeyid` va dentro de lo firmado.** Si quedara fuera, un atacante lo cambiaría por
+  el id de una clave suya y la firma seguiría "verificando".
+- **Una clave RETIRADA sigue verificando** mientras se conserve su pública. Retirarla
+  impide *emitir* con ella, no *verificar* lo ya emitido; tratarla como inválida convierte
+  una rotación rutinaria en la invalidación retroactiva de todo el historial. Mínimo de
+  retención: **90 días**, la de la DLQ.
+- **La firma sobrevive a la DLQ y al replay.** Las extensiones `dlq*` se añaden después de
+  firmar y se quitan antes de verificar, así que un evento reproducido conserva su firma
+  válida — que es lo correcto: el replay redistribuye un hecho ya emitido.
+
+Lo que **no** resuelve: confidencialidad, replay legítimo, autenticación del broker, ni las
+ACLs. La ACL controla **quién puede escribir**; la firma, **quién lo escribió**.
+
+## Métricas
+
+Normativo para L2 — [08-observability.md](../specification/08-observability.md). Los
+nombres y las etiquetas son **contrato entre SDKs**: si Java y Go nombran distinto la tasa
+de DLQ, no se pueden sumar y un panel del ecosistema es imposible.
+
+```java
+InMemoryMetrics metrics = new InMemoryMetrics();
+FluxBus bus = FluxBus.connect(new FluxBus.ConnectOptions()./* … */.metrics(metrics));
+
+// en tu servidor HTTP:
+responder(metrics.render());   // formato de exposición de Prometheus, sin dependencias
+```
+
+El default es `MetricsSink.NONE` (no-op): un SDK de protocolo no impone un backend de
+métricas. Para enchufar Micrometer u OpenTelemetry, implementa `MetricsSink`.
+
+| Métrica | Tipo | Etiquetas |
+|---|---|---|
+| `flux_events_published_total` | Counter | `subject`, `outcome` |
+| `flux_events_consumed_total` | Counter | `subject`, `consumer`, `outcome` |
+| `flux_event_handler_duration_seconds` | Histogram | `subject`, `consumer` |
+| `flux_events_dlq_total` | Counter | `subject`, `consumer`, `reason`, `code` |
+| `flux_events_retried_total` | Counter | `subject`, `consumer`, `attempt` |
+| `flux_consumer_pending` | Gauge | `subject`, `consumer` |
+| `flux_connection_state` | Gauge | — |
+
+- **`MetricsSink` tiene un método por métrica con parámetros nombrados, no un
+  `Map<String,String>` genérico.** Es deliberado: un mapa de etiquetas es justo por donde
+  se cuela un `tenantid` que multiplica las series temporales. La cardinalidad no avisa —
+  funciona con tres tenants en desarrollo y mata a Prometheus con diez mil en producción.
+  Etiquetar por `tenantid`, `id` o `correlationid` está **prohibido**; para eso están las
+  trazas ([§2.2](../specification/08-observability.md)).
+- **El último bucket del histograma es `30` porque *es* el `ack_wait`.** Un handler que cae
+  ahí está a punto de que su mensaje se reentregue mientras aún se ejecuta. Hay un test que
+  lo ata a `Protocol.DEFAULT_ACK_WAIT`: cambiar uno sin el otro rompe la suite.
+- **`flux_consumer_pending` se alimenta en cada entrega**, con el `pendingCount()` que ya
+  viene en los metadatos del mensaje de JetStream: no hace falta sondear al servidor. Es la
+  única señal que delata a un consumidor cuyo bucle murió, porque la conexión sigue
+  reportándose sana y el healthcheck dice que todo va bien
+  ([§4](../specification/08-observability.md)).
+- **Un fallo de firma se contabiliza como `outcome="invalid_signature"`**, aunque el
+  `dlqreason` del evento siga siendo `poison`. Son dos incidentes distintos —basura frente
+  a suplantación— con dos respuestas distintas. Es el mismo criterio que Go, Rust y PHP.
+
+## Aislamiento entre tenants
+
+[09-multitenancy.md §3](../specification/09-multitenancy.md). flux v1 usa el **Modelo A**:
+un stream por dominio con todos los tenants mezclados, y el SDK filtra antes del handler.
+
+```java
+FluxBus.connect(new FluxBus.ConnectOptions()
+        .tenantId("acme")
+        .tenantIsolation(FluxBus.TenantIsolation.STRICT));   // olvidar el filtro LANZA
+```
+
+- En `STRICT`, suscribirse sin tenant configurado lanza `TenantIsolationException`
+  **antes de crear el durable consumer**. No es celo: el fallo que previene —ver los datos
+  de otro tenant— no produce ninguna señal. No hay excepción, no hay log, no hay métrica;
+  hay un incidente de privacidad que se descubre semanas después.
+- **`"system"` no cuenta como filtro.** Es la ausencia de tenant, no un tenant: se reserva
+  para eventos de plataforma y no debe usarse como comodín ni como valor por defecto.
+- El evento de otro tenant se **`ack`ea y se descarta**. Nakearlo lo reentregaría seis
+  veces y acabaría en la DLQ, convirtiendo el aislamiento en una fábrica de ruido.
+
+Lo que el Modelo A **no** da: todo servicio con acceso al dominio sigue pudiendo leer los
+datos de todos los tenants. El aislamiento duro exige una account de NATS por tenant
+(Modelo B), y eso es topología, no SDK.
+
 ---
 
 ## Diferencias con los SDKs de referencia (Node y Go)
@@ -310,7 +436,7 @@ marcan su captura como sospechosa.
 `PERMANENT`, `POISON`) y deje el nombre del tipo a cada lenguaje. Su prosa ya lo hace; los
 bloques de código, no.
 
-### I. 🔴 Los eventos de DLQ **no** son byte a byte iguales entre los SDKs existentes
+### I. ✅ RESUELTO — los eventos de DLQ ya son byte a byte iguales
 
 No es una fricción de Java: es una divergencia real entre los SDKs ya escritos, encontrada
 al decidir el orden de serialización de este.
@@ -319,19 +445,23 @@ al decidir el orden de serialización de este.
 |---|---|
 | Go (`ToDLQEvent`) | los campos `DLQ*` están declarados antes de `Data` en el struct → `dlq*`, luego `data` |
 | Python (`to_dict`) | emite `dlq*` en el bucle de opcionales y `data` al final → `dlq*`, luego `data` |
-| **Node** (`toDlqEvent`) | `{...event, dlqreason, …}` → **`data` primero y `dlq*` después** |
-
-El fixture `conformance/cases/cross-sdk-envelope.json` solo cubre el envelope normal, así
-que la suite no lo detecta. Consecuencias: un replay verbatim desde la DLQ no es idéntico
-según qué SDK escribió el mensaje, y cualquier hash o firma sobre el evento de DLQ
-diverge.
+| **Node** (`toDlqEvent`) | emitía `{...event, dlqreason, …}` → **`data` primero y `dlq*` después** |
 
 Este SDK **sigue el orden de Go y Python** (`dlq*` antes de `data`): es la mayoría, agrupa
 las extensiones con el resto de atributos de contexto y deja el payload al final, igual que
 el envelope normal.
 
-**Sugerencia:** fijar el orden de los atributos del evento de DLQ en 04-errors.md §3,
-corregir `sdk-node`, y añadir un caso de conformidad `cross-sdk-dlq-envelope`.
+**Estado actual: resuelto.** `sdk-node` ya destructura `data` y lo reemite al final, y
+[01-envelope.md §6](../specification/01-envelope.md) recoge la regla como normativa citando
+esta divergencia por su nombre. Comprobado al portar la fase 5: un evento **firmado** que
+pasa por la DLQ produce exactamente los mismos bytes en Java y en Node, incluida la
+posición de `signkeyid` y `signature` (después de `tracestate`, antes de las `dlq*`).
+
+**Lo que sigue faltando:** el caso de conformidad `cross-sdk-dlq-envelope`. El fixture
+`cross-sdk-envelope.json` solo cubre el envelope normal, así que la regla está escrita y
+comprobada a mano, pero la suite no la vigila. Y ahora importa el doble: con la firma
+activa, un SDK que reordene las `dlq*` no solo rompe el replay verbatim — invalida la firma
+de todo lo que pase por su DLQ.
 
 ### J. Un método de conveniencia se convirtió en un atributo del envelope
 
@@ -378,6 +508,84 @@ tiene `MaxAttempts` y su README dice "Default de lo desconocido: `PERMANENT`". L
 `retryable-bounded` con presupuesto 2. Este SDK sigue la spec, así que **hoy Java y Node
 reintentan un error desconocido y Go lo manda directo a la DLQ**.
 
+### N. La firma es la única parte del protocolo con **una sola** implementación correcta
+
+Todo lo demás tolera divergencias menores: dos SDKs pueden ordenar las claves de `data` de
+forma distinta y el ecosistema sigue funcionando, porque nadie compara bytes. La firma no.
+Un byte de diferencia en `serialize()` y la firma de Java no verifica en Node — y el fallo
+no aparece como "los SDKs divergen", aparece como **`INVALID_SIGNATURE` en producción**,
+indistinguible de un ataque.
+
+Eso convierte tres reglas que parecían de estilo en requisitos de seguridad:
+[§1.1](../specification/01-envelope.md) (UTF-8 literal), [§2.2](../specification/01-envelope.md)
+(exactamente 3 decimales) y [§6](../specification/01-envelope.md) (orden de claves). La spec
+ya lo dice ([07-signing.md §2](../specification/07-signing.md)); lo que falta es la
+consecuencia operativa.
+
+**Sugerencia:** que la suite de conformidad incluya un caso de **firma cruzada** —una clave
+fija, un evento fijo y la firma esperada en base64url— y no solo el envelope. Hoy cada SDK
+comprueba que su propia firma verifica con su propia verificación, que es exactamente la
+prueba que no demuestra nada. Al portar este SDK hubo que montar el cruce contra Node a
+mano; debería ser un fixture.
+
+### O. `warn` necesita un canal de log que el protocolo no define
+
+[07-signing.md §7](../specification/07-signing.md) exige tres modos y dice que `warn` "se
+registra y se acepta". No dice **dónde**. El SDK de Node usa `console.warn` directamente,
+que es una decisión que ningún SDK de Java tomaría: aquí no hay un logger universal, y
+elegir SLF4J impondría una fachada a toda aplicación que use el SDK.
+
+Este SDK acepta un `Consumer<String>` en `SigningOptions.onWarn` y cae a
+`System.Logger("flux.signing")` si no se pasa. Es lo razonable, pero significa que **el
+mismo evento no firmado produce salidas distintas en cada SDK**, y una alerta sobre "cuántos
+productores faltan por migrar" no se puede escribir contra los logs.
+
+**Sugerencia:** que el modo `warn` incremente además una métrica. El valor de etiqueta ya
+existe —`flux_events_consumed_total{outcome="invalid_signature"}`,
+[08-observability.md §2.1](../specification/08-observability.md)— pero hoy **solo se emite
+cuando el evento muere en modo `require`**, que es justo el escenario en el que ya no hay
+migración que pilotar. Un log es para leer; una migración se pilota con una métrica.
+
+### P. 🔴 Node es el único SDK que NO emite `outcome="invalid_signature"`
+
+§2.1 lista `invalid_signature` entre los valores de `outcome`, y hay dos lecturas de cómo
+contabilizar un fallo de firma en modo `require`:
+
+| SDK | `outcome` de un fallo de firma |
+|---|---|
+| Go, Rust, PHP, **Java**, **.NET** | `invalid_signature` (con `dlqreason` = `poison`) |
+| **Node** (la referencia) | `poison` |
+
+Este SDK sigue a la mayoría: la firma inválida se separa del POISON común porque son dos
+incidentes distintos —basura frente a suplantación— con dos respuestas distintas. Un pico
+de firmas rotas apunta a un productor con la clave equivocada o a alguien reinyectando
+eventos; un pico de JSON corrupto, a un productor roto. Confundirlos hace que la alerta no
+diga qué hacer. El `dlqreason` del evento **no** cambia, porque ése sí es el enum cerrado de
+[04-errors.md §1](../specification/04-errors.md).
+
+Pero mientras Node emita `poison`, `rate(flux_events_consumed_total{outcome="poison"})`
+mide cosas distintas según el lenguaje del servicio — que es exactamente lo que
+08-observability.md existe para evitar.
+
+**Sugerencia:** que §2.1 diga explícitamente **cuándo** se emite `invalid_signature`, en vez
+de limitarse a listarlo entre los valores posibles. Con eso, corregir `sdk-node` es una
+línea; sin eso, cada SDK seguirá eligiendo, que es como se llegó aquí.
+
+### Q. `Classification.retryAfter` prometía más de lo que JetStream cumple
+
+No es una fricción de Java —afecta a los seis SDKs— pero se corrigió aquí al portar la
+fase 5. El javadoc decía "sobrescribe el backoff canónico para ESTE intento", lo que invita
+a construir lógica de reintentos sobre él. Y
+[03-delivery.md §2.2](../specification/03-delivery.md) mide lo contrario: con `backoff`
+configurado —y flux lo configura siempre— el delay del `nak` se honra **solo en la primera
+reentrega** y a partir de la segunda el servidor impone el array `backoff`, sin devolver
+error.
+
+Ahora se documenta como **sugerencia para el primer reintento**. Es la tercera trampa de
+JetStream de la misma familia (`ack_wait` sobrescrito por `backoff[0]`, el delay del `nak`
+ignorado, y el publish de core que se evapora): **el servidor acepta la petición, no
+devuelve error, y aplica otra cosa.** Ninguna se detecta leyendo código.
+
 ---
 
 ## Ficheros
@@ -391,8 +599,12 @@ reintentan un error desconocido y Go lo manda directo a la DLQ**.
 | `FluxErrors.java` | `RetryableException`, `PermanentException`, `PoisonException`, `Classification`, `asClassified` |
 | `Classifier.java` | `ClassifierOptions`, políticas configurables, `HttpStatusAware` |
 | `EventContext.java` | Propagación explícita de `correlationid` / `causationid` / `traceparent` |
-| `FluxBus.java` | `connect`, `publish`, `subscribe`, `close`, despacho, WIP, DLQ |
+| `FluxBus.java` | `connect`, `publish`, `subscribe`, `close`, despacho, WIP, DLQ, firma, métricas, aislamiento de tenant |
 | `ConsumerConfigMismatchException.java` | Requisito L2: el servidor no honró la config |
+| `Signing.java` | Ed25519 sobre `java.security`: `SigningOptions`, `Signer`, `Verifier`, `generateKeyPair`, códigos POISON |
+| `MetricsSink.java` | El contrato de métricas: siete métodos con parámetros nombrados, buckets y `NONE` |
+| `InMemoryMetrics.java` | Recolector sin dependencias con salida en formato Prometheus |
+| `TenantIsolationException.java` | Suscripción sin filtro de tenant con el aislamiento en estricto |
 
 ## Desarrollo
 
@@ -414,4 +626,20 @@ Los tests no requieren un broker. Cubren:
   [`conformance/cases/consumer-config.json`](../conformance/cases/consumer-config.json), y
   la aritmética del presupuesto de reintentos;
 - **UUIDv7** — versión, variante, timestamp embebido y monotonía dentro del mismo
-  milisegundo.
+  milisegundo;
+- **firma** — orden de los atributos, determinismo, round-trip de serialización,
+  supervivencia a la DLQ y al replay, detección de manipulación de `data`, `tenantid` y
+  `signkeyid`, los tres modos y la clave retirada;
+- **métricas** — el último bucket contra `Protocol.DEFAULT_ACK_WAIT`, los siete nombres con
+  sus etiquetas exactas, ausencia de etiquetas de alta cardinalidad, formato de exposición
+  línea a línea, escapado de comillas, y que un fallo de firma dé
+  `outcome="invalid_signature"` sin tocar el `dlqreason`;
+- **aislamiento de tenant** — `STRICT` sin tenant lanza, `"system"` no cuenta como filtro,
+  precedencia suscripción → conexión.
+
+> Estos tres bloques se verificaron además **contra el SDK de Node**, que es la referencia:
+> un evento firmado en Java lo verifica el verificador de Node, la firma de los dos es el
+> mismo string, el envelope firmado es idéntico byte a byte, y el volcado de
+> `InMemoryMetrics.render()` coincide byte a byte con el de Node para el mismo conjunto de
+> observaciones. Sin esa comprobación, "las dos suites pasan" solo demuestra que cada SDK
+> es coherente consigo mismo.

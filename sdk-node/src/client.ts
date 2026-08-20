@@ -236,6 +236,8 @@ export class FluxBus {
   #validate: ((e: FluxEvent, subject: string) => void) | null = null;
   #signer: Signer | null = null;
   #verifier: Verifier | null = null;
+  /** Código del último fallo de firma, para que #dispatch sepa clasificar. */
+  #pendingSignatureFailure: string | null = null;
 
   constructor(
     nc: NatsConnection,
@@ -535,7 +537,13 @@ export class FluxBus {
       // clasificación correcta es PERMANENT — 04-errors.md §1.2.
       // La firma se comprueba ANTES que el esquema: si el evento fue manipulado, su
       // payload puede validar perfectamente y aun así no ser del productor que dice.
+      this.#pendingSignatureFailure = null;
       this.#verifier?.check(event);
+      if (this.#pendingSignatureFailure) {
+        // Modo `warn`: check() no lanzó, pero el evento habría muerto en `require`.
+        this.#metrics.eventConsumed(subject, durable, "invalid_signature");
+        this.#pendingSignatureFailure = null;
+      }
       if (this.#opts.validation?.onConsume) this.#validate?.(event, subject);
       await runWithContext(contextFromEvent(event), async () =>
         handler(event, {
@@ -580,6 +588,14 @@ export class FluxBus {
             ? "retryable" // agotó los reintentos
             : "permanent";
 
+      // El `outcome` de la métrica y el `dlqreason` del evento NO son lo mismo cuando
+      // muere por firma: en la DLQ es `poison` (el evento no es interpretable como
+      // legítimo), pero la métrica debe decir `invalid_signature`. "Un productor
+      // publica basura" y "alguien publica eventos que no son suyos" son dos
+      // preguntas distintas — 07-signing.md §7.2.
+      const outcome = this.#pendingSignatureFailure ? "invalid_signature" : reason;
+      this.#pendingSignatureFailure = null;
+
       try {
         await this.#sendToDlq(subject, event, durable, attempt, reason, `${c.code}: ${message}`);
       } catch (dlqError) {
@@ -594,7 +610,7 @@ export class FluxBus {
         return;
       }
 
-      this.#metrics.eventConsumed(subject, durable, reason);
+      this.#metrics.eventConsumed(subject, durable, outcome);
       this.#metrics.eventDlq(subject, durable, reason, c.code);
       this.#metrics.handlerDuration(subject, durable, (Date.now() - inicio) / 1000);
       this.#opts.onDlq?.({ subject, event, classification: c });
@@ -705,7 +721,17 @@ export class FluxBus {
   async initValidation(): Promise<void> {
     this.#validate = await createValidator(this.#opts.validation ?? {});
     this.#signer = createSigner(this.#opts.signing ?? {});
-    this.#verifier = createVerifier(this.#opts.signing ?? {});
+    // Se envuelve para que el fallo de firma cuente como `invalid_signature` y no
+    // como `poison`: son dos preguntas distintas —"un productor publica basura" vs
+    // "alguien publica eventos que no son suyos"— y mezclarlas hace que la misma
+    // consulta mida cosas distintas según el lenguaje. Ver 07-signing.md §7.2.
+    this.#verifier = createVerifier({
+      ...(this.#opts.signing ?? {}),
+      onFailure: (info) => {
+        this.#pendingSignatureFailure = info.code;
+        this.#opts.signing?.onFailure?.(info);
+      },
+    });
   }
 
   // ─── ciclo de vida ─────────────────────────────────────────────────────────

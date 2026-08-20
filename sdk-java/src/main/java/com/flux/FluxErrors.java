@@ -100,10 +100,17 @@ public final class FluxErrors {
         }
 
         /**
-         * @param retryAfter sobrescribe el backoff canonico para ESTE intento. Usalo
-         *                   cuando la dependencia dice explicitamente cuanto esperar
-         *                   (cabecera {@code Retry-After}). {@code null} significa "usa el
-         *                   backoff canonico".
+         * @param retryAfter <b>sugerencia para el PRIMER reintento</b>, no un control del
+         *                   calendario de reintentos. Usalo cuando la dependencia dice
+         *                   explicitamente cuanto esperar (cabecera {@code Retry-After}).
+         *                   {@code null} significa "usa el backoff canonico".
+         *                   <p>⚠️ Con {@code backoff} configurado —y flux lo configura
+         *                   SIEMPRE— JetStream honra el delay del {@code nak} solo en la
+         *                   primera reentrega; a partir de la segunda manda el array
+         *                   {@code backoff} y el delay solicitado <b>se ignora sin ningun
+         *                   aviso</b>. Medido contra NATS 2.14.5 — 03-delivery.md §2.2.
+         *                   Un {@code Retry-After: 5} acorta el primer reintento y nada
+         *                   mas: los siguientes seguiran 1 m, 5 m, 15 m, 30 m.
          */
         public RetryableException(String message, String code, Duration retryAfter, Throwable cause) {
             super(message, code, cause);
@@ -187,8 +194,15 @@ public final class FluxErrors {
      *
      * @param errorClass  determina la accion sobre el mensaje.
      * @param code        codigo estable para metricas y alertas.
-     * @param retryAfter  solo para RETRYABLE: sobrescribe el backoff canonico para este
-     *                    intento. {@code null} = usa el backoff canonico.
+     * @param retryAfter  solo para RETRYABLE: <b>sugerencia para el PRIMER reintento</b>.
+     *                    {@code null} = usa el backoff canonico.
+     *                    <p>⚠️ NO sobrescribe el calendario de reintentos, aunque lo
+     *                    parezca. Con {@code backoff} configurado —y flux lo configura
+     *                    siempre— JetStream aplica el delay del {@code nak} solo en la
+     *                    primera reentrega y a partir de la segunda impone el array
+     *                    {@code backoff}, sin devolver error ni avisar de nada. Verificado
+     *                    contra NATS 2.14.5 — 03-delivery.md §2.2. No construyas logica que
+     *                    dependa de que se respete mas alla de la primera vez.
      * @param maxAttempts solo para RETRYABLE: numero maximo de entregas para ESTE error,
      *                    por debajo del {@code max_deliver} del consumidor. Existe porque
      *                    {@code max_deliver} es por consumidor, no por mensaje: bajarlo a

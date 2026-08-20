@@ -65,9 +65,13 @@ public sealed class RetryableException : ClassifiedException, IRetryAfterError
     /// <param name="message">Mensaje para el operador.</param>
     /// <param name="code">Código estable para métricas y alertas.</param>
     /// <param name="retryAfter">
-    /// Retraso explícito del siguiente intento; sobrescribe el backoff canónico para ESE
-    /// intento. Úsalo cuando la dependencia dice cuánto esperar (cabecera
+    /// <b>Sugerencia para el PRIMER reintento</b>, no un control del calendario de
+    /// reintentos. Úsalo cuando la dependencia dice cuánto esperar (cabecera
     /// <c>Retry-After</c>). <see langword="null"/> significa "usa el backoff canónico".
+    /// ⚠️ Con <c>backoff</c> configurado —y flux lo configura SIEMPRE— JetStream honra el
+    /// delay del <c>nak</c> solo en la primera reentrega; a partir de la segunda manda el
+    /// array <c>backoff</c> y el delay solicitado se ignora sin ningún aviso. Medido contra
+    /// NATS 2.14.5 — 03-delivery.md §2.2.
     /// </param>
     /// <param name="innerException">Error subyacente, si lo hay.</param>
     public RetryableException(
@@ -230,15 +234,29 @@ public sealed class HttpStatusException : Exception, IHttpStatusError, IRetryAft
 public sealed record Classification(ErrorClass Class, string Code)
 {
     /// <summary>
-    /// Solo aplica a <see cref="ErrorClass.Retryable"/>: sobrescribe el backoff canónico
-    /// para este intento. <see langword="null"/> significa "usa el backoff canónico".
+    /// Solo aplica a <see cref="ErrorClass.Retryable"/>: <b>sugerencia para el PRIMER
+    /// reintento</b>. <see langword="null"/> significa "usa el backoff canónico".
     /// </summary>
     /// <remarks>
+    /// ⚠️ <b>NO sobrescribe el calendario de reintentos, aunque lo parezca.</b> Con
+    /// <c>backoff</c> configurado —y flux lo configura siempre— JetStream aplica el delay
+    /// del <c>nak</c> solo en la primera reentrega, y a partir de la segunda impone el array
+    /// <c>backoff</c> sin devolver error ni avisar de nada. Medido contra NATS 2.14.5
+    /// pidiendo <c>nak(300ms)</c> en todas las reentregas — 03-delivery.md §2.2:
+    /// <code>
+    /// SIN backoff:  0ms → 300ms → 600ms  → 900ms     ← el delay se honra siempre
+    /// CON backoff:  0ms → 300ms → 5300ms → 15300ms   ← solo la primera vez
+    /// </code>
+    /// Es decir: un <c>Retry-After: 5</c> de un proveedor acorta el primer reintento y nada
+    /// más; los siguientes seguirán el backoff canónico (1 m, 5 m, 15 m, 30 m). No
+    /// construyas lógica que dependa de que se respete más allá de la primera vez.
+    /// <para>
     /// Divergencia deliberada con Go, donde este campo es un <c>time.Duration</c> y el cero
     /// significa "sin especificar". En C# <c>TimeSpan?</c> distingue "no me han dicho
     /// cuánto esperar" de "reintenta ya mismo", y AMBOS son valores con sentido: un
     /// <c>nak</c> con retraso cero es una petición legítima. Go paga el colapso porque no
     /// tiene opcionales baratos; aquí no hay motivo para pagarlo.
+    /// </para>
     /// </remarks>
     public TimeSpan? RetryAfter { get; init; }
 

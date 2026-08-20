@@ -122,6 +122,11 @@ public static class Envelope
         "specversion", "id", "source", "type", "time", "datacontenttype", "dataschema",
         "subject", "correlationid", "tenantid", "producerversion", "dataclassification",
         "causationid", "partitionkey", "traceparent", "tracestate",
+        // Extensión OPCIONAL de firma — 07-signing.md §4. Se admiten SIEMPRE, con la
+        // verificación encendida o apagada: un consumidor que no verifica tiene que poder
+        // LEER un evento firmado, o adoptar la firma de forma gradual convertiría en POISON
+        // los eventos de los productores ya migrados.
+        "signkeyid", "signature",
         "dlqreason", "dlqattempts", "dlqconsumer", "dlqerror", "dlqtime", "data",
     };
 

@@ -170,6 +170,11 @@ public final class Envelope {
             "specversion", "id", "source", "type", "time", "datacontenttype", "dataschema", "subject",
             "correlationid", "tenantid", "producerversion", "dataclassification",
             "causationid", "partitionkey", "traceparent", "tracestate",
+            // Extension OPCIONAL de firma — 07-signing.md §4. Van en la lista aunque el
+            // SDK tenga la verificacion en `off`: un consumidor que no verifica DEBE aun
+            // asi poder LEER un evento firmado, o la adopcion gradual de la firma
+            // convertiria en POISON todo evento de un productor ya migrado.
+            "signkeyid", "signature",
             "dlqreason", "dlqattempts", "dlqconsumer", "dlqerror", "dlqtime",
             "data");
 
@@ -398,6 +403,9 @@ public final class Envelope {
                 partitionKey,
                 in.traceparent,
                 in.tracestate,
+                // signkeyid + signature: los pone {@link Signing} DESPUES de construir el
+                // evento, porque la firma cubre el envelope completo — 07-signing.md §5.
+                null, null,
                 null, null, null, null, null,
                 data);
     }

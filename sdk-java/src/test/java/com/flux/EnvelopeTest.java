@@ -643,6 +643,11 @@ class EnvelopeTest {
                 "specversion", "id", "source", "type", "time", "datacontenttype", "dataschema",
                 "subject", "correlationid", "tenantid", "producerversion", "dataclassification",
                 "causationid", "partitionkey", "traceparent", "tracestate",
+                // Extension OPCIONAL de firma — 07-signing.md §4. Se admiten SIEMPRE, con
+                // la verificacion encendida o apagada: un consumidor que no verifica tiene
+                // que poder leer un evento firmado, o adoptar la firma de forma gradual
+                // convertiria en POISON los eventos de los productores ya migrados.
+                "signkeyid", "signature",
                 "dlqreason", "dlqattempts", "dlqconsumer", "dlqerror", "dlqtime", "data"));
         assertEquals(esperados.size(), Envelope.ALLOWED_ROOT_ATTRIBUTES.size());
         assertTrue(Envelope.ALLOWED_ROOT_ATTRIBUTES.containsAll(esperados));

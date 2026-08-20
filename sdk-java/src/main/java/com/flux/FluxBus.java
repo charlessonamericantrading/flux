@@ -132,6 +132,30 @@ public final class FluxBus implements AutoCloseable {
     public record DlqEventInfo(String subject, FluxEvent event, Classification classification) {
     }
 
+    /**
+     * Aislamiento entre tenants — 09-multitenancy.md §3.
+     *
+     * <p>flux v1 implementa el <b>Modelo A</b>: un stream por dominio con todos los tenants
+     * mezclados, y el SDK filtra antes del handler. Eso protege contra el consumidor que
+     * olvida filtrar, no contra un adversario: todo servicio con acceso al dominio SIGUE
+     * pudiendo leer los datos de todos los tenants. El aislamiento duro exige una account
+     * de NATS por tenant (Modelo B), y eso es topologia, no SDK.
+     */
+    public enum TenantIsolation {
+        /** Default. El filtrado es opcional y se decide por suscripcion. */
+        OFF,
+        /**
+         * Toda suscripcion filtra, y suscribirse sin tenant configurado es un ERROR de
+         * configuracion.
+         *
+         * <p>Es el punto que importa de §3. Un filtro que hay que acordarse de poner es un
+         * filtro que alguien olvidara, y el fallo —ver los datos de otro tenant— <b>no
+         * produce ningun error</b>: produce un incidente de privacidad que se descubre
+         * semanas despues.
+         */
+        STRICT
+    }
+
     /** Configuracion de la conexion al bus. */
     public static final class ConnectOptions {
         private String servers = "nats://localhost:4222";
@@ -139,6 +163,9 @@ public final class FluxBus implements AutoCloseable {
         private String environment;
         private String version;
         private String tenantId;
+        private TenantIsolation tenantIsolation = TenantIsolation.OFF;
+        private Signing.SigningOptions signing;
+        private MetricsSink metrics = MetricsSink.NONE;
         private FluxEvent.DataClassification classification;
         private final Map<String, String> schemas = new HashMap<>();
         private String schemaBaseUrl;
@@ -177,6 +204,39 @@ public final class FluxBus implements AutoCloseable {
         /** Tenant por defecto de los eventos publicados. Vacio significa {@code "system"}. */
         public ConnectOptions tenantId(String v) {
             this.tenantId = v;
+            return this;
+        }
+
+        /**
+         * Aislamiento entre tenants. Default {@link TenantIsolation#OFF}
+         * — 09-multitenancy.md §3.
+         */
+        public ConnectOptions tenantIsolation(TenantIsolation v) {
+            this.tenantIsolation = v != null ? v : TenantIsolation.OFF;
+            return this;
+        }
+
+        /**
+         * Firma Ed25519 de eventos. Extension OPCIONAL — 07-signing.md.
+         *
+         * <p>Traslada la autenticidad del canal al evento: hoy la garantiza la ACL del
+         * broker, que deja de aplicar en cuanto el evento sale del stream. Un evento
+         * firmado sigue siendo verificable dentro de un fichero, un backup o un correo.
+         */
+        public ConnectOptions signing(Signing.SigningOptions v) {
+            this.signing = v;
+            return this;
+        }
+
+        /**
+         * Destino de las metricas. Default {@link MetricsSink#NONE}.
+         *
+         * <p>Los nombres y las etiquetas los fija el protocolo (08-observability.md), no la
+         * aplicacion: si cada SDK nombrara a su manera, un panel del ecosistema seria
+         * imposible.
+         */
+        public ConnectOptions metrics(MetricsSink v) {
+            this.metrics = v != null ? v : MetricsSink.NONE;
             return this;
         }
 
@@ -414,6 +474,9 @@ public final class FluxBus implements AutoCloseable {
     private final JetStreamManagement jsm;
     private final ConnectOptions options;
     private final Classifier classifier;
+    private final MetricsSink metrics;
+    private final Signing.Signer signer;
+    private final Signing.Verifier verifier;
     private final String source;
     private final Set<Subscription> subscriptions =
             Collections.newSetFromMap(new ConcurrentHashMap<>());
@@ -441,7 +504,13 @@ public final class FluxBus implements AutoCloseable {
         this.jsm = jsm;
         this.options = options;
         this.classifier = new Classifier(options.classifierOptions);
+        this.metrics = options.metrics;
+        // Las claves se decodifican UNA vez, en connect(): un PEM mal escrito debe romper
+        // el arranque del servicio y no la primera publicacion a las 3 de la manana.
+        this.signer = Signing.createSigner(options.signing);
+        this.verifier = Signing.createVerifier(options.signing);
         this.source = Protocol.sourceUri(options.environment, options.service);
+        this.metrics.connectionState(MetricsSink.ConnectionState.CONNECTED);
     }
 
     // ─── connect ─────────────────────────────────────────────────────────────
@@ -513,6 +582,7 @@ public final class FluxBus implements AutoCloseable {
         }
         subscriptions.clear();
         wipScheduler.shutdownNow();
+        metrics.connectionState(MetricsSink.ConnectionState.DISCONNECTED);
         try {
             // drain y no close: los acks pendientes no se pierden en silencio.
             connection.drain(Duration.ofSeconds(10)).get(10, TimeUnit.SECONDS);
@@ -603,7 +673,12 @@ public final class FluxBus implements AutoCloseable {
             input.traceparent(emptyToNull(options.traceparentSupplier.get()));
         }
 
+        // Firmar es lo ULTIMO antes de serializar: la firma cubre el envelope COMPLETO, asi
+        // que cualquier atributo anadido despues la invalidaria — 07-signing.md §5.
         FluxEvent event = Envelope.buildEvent(input);
+        if (signer != null) {
+            event = signer.sign(event);
+        }
         byte[] payload = Envelope.serialize(event);
 
         try {
@@ -617,8 +692,10 @@ public final class FluxBus implements AutoCloseable {
             jetStream.publish(subject, payload,
                     io.nats.client.PublishOptions.builder().messageId(event.id()).build());
         } catch (IOException | JetStreamApiException e) {
+            metrics.eventPublished(subject, MetricsSink.PublishOutcome.ERROR);
             throw new FluxBusException("flux: fallo al publicar en \"" + subject + "\"", e);
         }
+        metrics.eventPublished(subject, MetricsSink.PublishOutcome.OK);
         return event;
     }
 
@@ -658,6 +735,11 @@ public final class FluxBus implements AutoCloseable {
         Protocol.ParsedSubject parsed = Protocol.parseSubject(subject);
         SubscribeOptions so = subscribeOptions != null ? subscribeOptions : new SubscribeOptions();
 
+        // El filtro efectivo se resuelve ANTES de tocar el broker: si el aislamiento es
+        // estricto y falta el tenant, la suscripcion no debe llegar ni a crear el durable.
+        String tenantFilter = requiredTenantFilter(
+                subject, options.tenantIsolation, so.tenantId, options.tenantId);
+
         ensureStream(parsed.domain());
         ensureDlqStream(parsed.domain());
 
@@ -691,7 +773,7 @@ public final class FluxBus implements AutoCloseable {
 
             MessageConsumer consumer = consumerContext.consume(msg -> {
                 try {
-                    dispatch(msg, subject, durable, handler, so);
+                    dispatch(msg, subject, durable, handler, tenantFilter);
                 } catch (Throwable t) {
                     // Sin este catch, un fallo inesperado del despacho —por ejemplo que la
                     // publicacion en la DLQ falle— sube a la libreria y puede detener la
@@ -770,15 +852,56 @@ public final class FluxBus implements AutoCloseable {
 
     // ─── despacho ────────────────────────────────────────────────────────────
 
+    /**
+     * El tenant por el que hay que filtrar, o {@code null} si no hay ninguno.
+     *
+     * <p>El de la suscripcion gana sobre el de la conexion.
+     *
+     * <p>{@code "system"} NO cuenta: se reserva para eventos de plataforma sin tenant y
+     * <b>no debe usarse como comodin ni como valor por defecto</b> cuando el tenant real se
+     * desconoce. Un consumidor configurado con {@code tenantId="system"} no esta aislado de
+     * nadie, asi que devolver aqui {@code "system"} haria que el modo estricto diese por
+     * bueno justo el caso que existe para cazar — 09-multitenancy.md §5.
+     *
+     * <p>Package-private para poder testear la politica sin broker, igual que
+     * {@link #assertConfigHonored} y {@link #effectiveBudget}.
+     */
+    static String tenantFilter(String subscriptionTenantId, String connectionTenantId) {
+        String candidate = firstNonEmpty(subscriptionTenantId, connectionTenantId);
+        return candidate == null || "system".equals(candidate) ? null : candidate;
+    }
+
+    /**
+     * Igual que {@link #tenantFilter}, pero en {@link TenantIsolation#STRICT} exige que
+     * haya filtro.
+     *
+     * @throws TenantIsolationException si el aislamiento es estricto y no hay tenant.
+     */
+    static String requiredTenantFilter(String subject, TenantIsolation isolation,
+                                       String subscriptionTenantId, String connectionTenantId) {
+        String filter = tenantFilter(subscriptionTenantId, connectionTenantId);
+        if (isolation == TenantIsolation.STRICT && filter == null) {
+            throw new TenantIsolationException(subject, subscriptionTenantId, connectionTenantId);
+        }
+        return filter;
+    }
+
     private void dispatch(io.nats.client.Message msg, String subject, String durable,
-                          Handler handler, SubscribeOptions so) {
+                          Handler handler, String tenantFilter) {
         // deliveredCount empieza en 1 en la primera entrega, no en 0.
         int attempt = 1;
         try {
-            long delivered = msg.metaData().deliveredCount();
+            io.nats.client.impl.NatsJetStreamMetaData meta = msg.metaData();
+            long delivered = meta.deliveredCount();
             if (delivered > 0) {
                 attempt = (int) delivered;
             }
+            // `pending` viene en los metadatos del propio mensaje: no hace falta sondear al
+            // servidor. Es la UNICA senal que delata a un consumidor cuyo bucle murio — la
+            // conexion sigue reportandose sana y el healthcheck dice que todo va bien, asi
+            // que solo el crecimiento de pending lo evidencia (08-observability.md §4). Es
+            // el bug que aparecio de verdad en el SDK de Node.
+            metrics.consumerPending(subject, durable, meta.pendingCount());
         } catch (RuntimeException e) {
             // Un mensaje sin metadatos de JetStream no deberia llegar aqui; si llega, se
             // trata como primera entrega en vez de tirar el despacho.
@@ -795,8 +918,11 @@ public final class FluxBus implements AutoCloseable {
             return;
         }
 
-        if (so.tenantId != null && !so.tenantId.equals(event.tenantid())) {
-            msg.ack(); // no es para nosotros
+        // Filtrar ANTES del handler: un evento de otro tenant no es un fallo y no es para
+        // nosotros. Se confirma y se descarta — 09-multitenancy.md §3, punto 2. Tampoco se
+        // contabiliza como consumido: no lo hemos consumido, lo hemos ignorado.
+        if (tenantFilter != null && !tenantFilter.equals(event.tenantid())) {
+            msg.ack();
             return;
         }
 
@@ -814,11 +940,22 @@ public final class FluxBus implements AutoCloseable {
         }, wipPeriodMillis, wipPeriodMillis, TimeUnit.MILLISECONDS);
 
         Delivery delivery = new Delivery(attempt, Protocol.DEFAULT_MAX_DELIVER, subject, durable);
+        long inicio = System.nanoTime();
 
         try {
-            Throwable handlerError = invoke(handler, event, delivery);
+            // La firma se comprueba ANTES que nada: si el evento fue manipulado, su payload
+            // puede validar perfectamente y aun asi no ser del productor que dice ser. En
+            // modo `require` esto lanza una PoisonException y cae por la rama de error de
+            // abajo, que la clasifica como POISON y la enruta a la DLQ con alerta
+            // — 07-signing.md §7.
+            Throwable handlerError = verifierError(event);
+            if (handlerError == null) {
+                handlerError = invoke(handler, event, delivery);
+            }
             if (handlerError == null) {
                 msg.ack();
+                metrics.eventConsumed(subject, durable, MetricsSink.ConsumeOutcome.OK);
+                metrics.handlerDuration(subject, durable, elapsedSeconds(inicio));
                 return;
             }
 
@@ -838,6 +975,7 @@ public final class FluxBus implements AutoCloseable {
                         : backoffFor(attempt);
                 log(System.Logger.Level.WARNING, "RETRYABLE " + classification.code() + " en " + subject
                         + " (intento " + attempt + "/" + budget + "), reintento en " + delay);
+                metrics.eventRetried(subject, durable, attempt);
                 msg.nakWithDelay(delay);
                 return;
             }
@@ -860,6 +998,9 @@ public final class FluxBus implements AutoCloseable {
                 return;
             }
 
+            metrics.eventConsumed(subject, durable, consumeOutcome(reason, classification.code()));
+            metrics.eventDlq(subject, durable, reason, classification.code());
+            metrics.handlerDuration(subject, durable, elapsedSeconds(inicio));
             if (options.onDlq != null) {
                 options.onDlq.onDlq(new DlqEventInfo(subject, event, classification));
             }
@@ -927,11 +1068,69 @@ public final class FluxBus implements AutoCloseable {
         return message != null ? message : t.getClass().getName();
     }
 
+    /**
+     * Comprueba la firma, o {@code null} si no hay verificador o el evento pasa.
+     *
+     * <p>Devuelve el error en vez de lanzarlo para que recorra exactamente la misma ruta
+     * que un fallo del handler: clasificacion, DLQ, metricas y {@code term}. Un camino
+     * aparte seria un segundo sitio donde arreglar el enrutado a la DLQ.
+     */
+    private Throwable verifierError(FluxEvent event) {
+        if (verifier == null) {
+            return null;
+        }
+        try {
+            verifier.check(event);
+            return null;
+        } catch (RuntimeException e) {
+            return e;
+        }
+    }
+
+    private static double elapsedSeconds(long startNanos) {
+        return (System.nanoTime() - startNanos) / 1_000_000_000.0;
+    }
+
+    /**
+     * La etiqueta {@code outcome} de un evento que muere.
+     *
+     * <p><b>La firma invalida se separa del POISON comun</b> aunque su {@code reason} siga
+     * siendo {@code poison}: son dos incidentes distintos —basura frente a suplantacion— con
+     * dos respuestas distintas, y la etiqueta existe para eso (08-observability.md §2.1). El
+     * {@code reason} de la DLQ no cambia porque ese si es el enum cerrado de 04-errors.md
+     * §1.
+     *
+     * <p>Package-private para poder testear la traduccion sin broker.
+     */
+    static MetricsSink.ConsumeOutcome consumeOutcome(FluxEvent.DlqReason reason, String code) {
+        if (isSignatureCode(code)) {
+            return MetricsSink.ConsumeOutcome.INVALID_SIGNATURE;
+        }
+        return switch (reason) {
+            case RETRYABLE -> MetricsSink.ConsumeOutcome.RETRYABLE;
+            case PERMANENT -> MetricsSink.ConsumeOutcome.PERMANENT;
+            case POISON -> MetricsSink.ConsumeOutcome.POISON;
+        };
+    }
+
+    /** Los tres codigos POISON de la extension de firma — 07-signing.md §7. */
+    private static boolean isSignatureCode(String code) {
+        return Signing.CODE_MISSING_SIGNATURE.equals(code)
+                || Signing.CODE_INVALID_SIGNATURE.equals(code)
+                || Signing.CODE_UNKNOWN_SIGNING_KEY.equals(code);
+    }
+
     private void handlePoison(String subject, String durable, io.nats.client.Message msg,
                               RuntimeException error) {
         if (options.onPoison != null) {
             options.onPoison.onPoison(new PoisonInfo(subject, error, msg.getData()));
         }
+        // El `code` es el estable de la clasificacion (MALFORMED_JSON, WRONG_ATTRIBUTE_TYPE…),
+        // nunca el mensaje: un mensaje lleva ids y timestamps y su cardinalidad infinita
+        // tumba el almacenamiento de metricas — 08-observability.md §2.2.
+        String code = error instanceof FluxErrors.PoisonException poison ? poison.code() : "POISON";
+        metrics.eventConsumed(subject, durable, consumeOutcome(FluxEvent.DlqReason.POISON, code));
+        metrics.eventDlq(subject, durable, FluxEvent.DlqReason.POISON, code);
         log(System.Logger.Level.ERROR, "POISON en " + subject + ": " + error.getMessage());
         try {
             sendRawToDlq(subject, msg.getData(), durable, messageOf(error));

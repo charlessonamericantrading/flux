@@ -1823,9 +1823,30 @@ algoritmo negociable acumulan una familia de vulnerabilidades bien conocida —d
 negociar. Aquí no lo hay.
 
 - Firma de 64 bytes, clave pública de 32.
-- Disponible en la biblioteca estándar o equivalente de todos los lenguajes del
-  ecosistema (`node:crypto`, `cryptography`, `crypto/ed25519`, `java.security`,
-  `System.Security.Cryptography`, `ring`/`ed25519-dalek`, `sodium`).
+
+**Disponibilidad real por lenguaje.** No está en la biblioteca estándar de todos, y
+decirlo importa: el argumento de "sin negociación" se sostiene por la ausencia de
+parámetros, no por la ubicuidad de la primitiva.
+
+| Lenguaje | Dónde | ¿Dependencia? |
+|---|---|---|
+| Node | `node:crypto` | No |
+| Go | `crypto/ed25519` | No |
+| Java | `java.security`, algoritmo `Ed25519` | No (**JDK 15+**) |
+| PHP | `sodium_crypto_sign_*` | No (ext-sodium, PHP 7.2+) |
+| Python | `cryptography` | **Sí** |
+| Rust | `ed25519-dalek` | **Sí** |
+| .NET | **No está en la BCL de .NET 8** | **Sí** — BouncyCastle o NSec |
+
+Donde haga falta dependencia, un SDK **DEBERÍA** hacerla opcional: la firma es una
+extensión, y un servicio que no la use no debe pagarla.
+
+> **Nota sobre .NET.** Entre `NSec.Cryptography` y `BouncyCastle.Cryptography`, el SDK
+> elige BouncyCastle por una razón operativa: NSec envuelve libsodium nativo y falla
+> con `DllNotFoundException` **en ejecución** si el RID no trae el binario. Es
+> exactamente el modo de fallo que este protocolo lleva tres documentos evitando —
+> algo que no avisa al compilar y revienta en producción. BouncyCastle es 100 %
+> gestionado.
 
 ## 4. Atributos
 
@@ -1898,6 +1919,37 @@ Códigos POISON:
 | Falta `signature` en modo `require` | `MISSING_SIGNATURE` |
 | La firma no verifica | `INVALID_SIGNATURE` |
 | `signkeyid` desconocido | `UNKNOWN_SIGNING_KEY` |
+
+### 7.1 `warn` DEBE ser observable
+
+Un SDK en modo `warn` **DEBE** emitir
+`flux_events_consumed_total{outcome="invalid_signature"}` para cada evento que habría
+rechazado en `require`. **NO DEBE** limitarse a escribir en el log.
+
+Sin esa métrica, `warn` es inútil para lo único que existe: **pilotar la migración**.
+La pregunta que hay que poder responder antes de pasar a `require` es "¿cuántos
+eventos siguen sin firma y de qué productores?", y un log no la contesta — hay que
+buscarla a mano en siete servicios.
+
+Dónde se registra el aviso lo decide cada SDK con el mecanismo idiomático de su
+plataforma, y **NO DEBE** imponer una fachada de logging. La métrica es la parte
+normativa; el log, un extra.
+
+### 7.2 `outcome` en las métricas
+
+Un evento que muere por firma **DEBE** contarse como
+`flux_events_consumed_total{outcome="invalid_signature"}`, no como `poison` — aunque
+su `dlqreason` en la DLQ **sí** sea `poison`.
+
+Son dos preguntas distintas y las dos importan:
+
+- `outcome="poison"` — *"un productor publica basura"*. Un bug de serialización.
+- `outcome="invalid_signature"` — *"alguien publica eventos que no son suyos"*. Un
+  incidente de seguridad, o una migración a medias.
+
+Mezclarlas hace que `rate(...{outcome="poison"})` mida cosas distintas según el
+lenguaje del consumidor, que es justo lo que
+[08-observability.md §1](08-observability.md) existe para impedir.
 
 ## 8. Lo que la firma NO resuelve
 

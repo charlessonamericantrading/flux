@@ -7,6 +7,7 @@
 // existe para evitar (00-protocol.md §3).
 
 using System.Collections.Concurrent;
+using System.Diagnostics;
 using System.Globalization;
 using System.Text.Json;
 using NATS.Client.Core;
@@ -83,6 +84,56 @@ public sealed record ConnectOptions
 
     /// <summary>Tenant por defecto de los eventos publicados. Vacío significa <c>"system"</c>.</summary>
     public string? TenantId { get; init; }
+
+    /// <summary>
+    /// Aislamiento entre tenants. Default <see cref="Flux.TenantIsolation.Off"/>
+    /// — 09-multitenancy.md §3.
+    /// </summary>
+    /// <remarks>
+    /// Con <see cref="Flux.TenantIsolation.Strict"/>, toda suscripción filtra por tenant y
+    /// suscribirse sin ninguno lanza <see cref="TenantIsolationException"/> antes de crear
+    /// el consumidor.
+    /// </remarks>
+    // El nombre de la propiedad coincide con el de su tipo (el caso "Color Color" que el
+    // lenguaje permite). Se cualifica el valor por defecto para que no dependa de esa regla:
+    // es gratis y se lee sin tener que recordarla.
+    public TenantIsolation TenantIsolation { get; init; } = Flux.TenantIsolation.Off;
+
+    /// <summary>
+    /// Firma los eventos al publicar. <see langword="null"/> (default) no firma.
+    /// </summary>
+    /// <remarks>
+    /// La implementación Ed25519 está en el paquete <c>Flux.Signing</c>, que no es una
+    /// dependencia de éste: Ed25519 no existe en la BCL de .NET 8 y una extensión OPCIONAL
+    /// del protocolo no debe añadir una librería de criptografía a todo servicio que solo
+    /// quiera publicar un evento sin firmar. Ver README §"Firma".
+    /// <code>
+    /// var (signer, verifier) = Ed25519Signing.Create(new SigningOptions
+    /// {
+    ///     PrivateKeyPem = File.ReadAllText("pedidos-api-1.key"),
+    ///     KeyId         = "pedidos-api-1",
+    ///     PublicKeys    = clavesConocidas,
+    ///     Verify        = VerificationMode.Require,
+    /// });
+    /// </code>
+    /// </remarks>
+    public IEventSigner? Signer { get; init; }
+
+    /// <summary>
+    /// Verifica la firma de los eventos entrantes. <see langword="null"/> (default) no
+    /// verifica, que es el modo <see cref="VerificationMode.Off"/> de 07-signing.md §7.
+    /// </summary>
+    public IEventVerifier? Verifier { get; init; }
+
+    /// <summary>
+    /// Destino de las métricas. <see langword="null"/> usa <see cref="NoMetrics.Instance"/>.
+    /// </summary>
+    /// <remarks>
+    /// Los nombres y las etiquetas los fija el protocolo (08-observability.md), no la
+    /// aplicación: si cada SDK nombrara a su manera, un panel del ecosistema sería
+    /// imposible.
+    /// </remarks>
+    public IMetricsSink? Metrics { get; init; }
 
     /// <summary>Clasificación por defecto. <see langword="null"/> significa <c>internal</c> — 06-security.md §5.</summary>
     public DataClassification? Classification { get; init; }
@@ -169,8 +220,18 @@ public sealed record SubscribeOptions
 
     /// <summary>
     /// Descarta —con ack— los eventos de otros tenants antes de invocar al handler
-    /// — 06-security.md §4.
+    /// — 06-security.md §4 y 09-multitenancy.md §3.
     /// </summary>
+    /// <remarks>
+    /// Gana sobre <see cref="ConnectOptions.TenantId"/>. Si ninguno de los dos está puesto
+    /// no se filtra nada, salvo que <see cref="ConnectOptions.TenantIsolation"/> sea
+    /// <see cref="TenantIsolation.Strict"/>, en cuyo caso suscribirse es un error.
+    /// <para>
+    /// El evento descartado se ACK-ea: no es un fallo, no es para nosotros. Nakearlo lo
+    /// reentregaría seis veces y acabaría en la DLQ, convirtiendo el aislamiento en una
+    /// fábrica de ruido.
+    /// </para>
+    /// </remarks>
     public string? TenantId { get; init; }
 }
 
@@ -246,6 +307,7 @@ public sealed class FluxBus : IAsyncDisposable
     private readonly NatsJSContext _jetStream;
     private readonly ConnectOptions _options;
     private readonly Classifier _classifier;
+    private readonly IMetricsSink _metrics;
     private readonly string _source;
     private readonly ConcurrentDictionary<Subscription, byte> _subscriptions = new();
     private readonly ConcurrentDictionary<string, byte> _ensuredStreams = new(StringComparer.Ordinal);
@@ -256,7 +318,9 @@ public sealed class FluxBus : IAsyncDisposable
         _jetStream = jetStream;
         _options = options;
         _classifier = new Classifier(options.Classifier);
+        _metrics = options.Metrics ?? NoMetrics.Instance;
         _source = Protocol.SourceUri(options.Environment, options.Service);
+        _metrics.ConnectionState(Flux.ConnectionState.Connected);
     }
 
     /// <summary>
@@ -404,6 +468,13 @@ public sealed class FluxBus : IAsyncDisposable
             TraceState = inherited?.TraceState ?? FluxContext.ActiveTracestate(),
         });
 
+        // Firmar es lo ÚLTIMO antes de serializar: la firma cubre el envelope COMPLETO, así
+        // que cualquier atributo añadido después la invalidaría — 07-signing.md §5.
+        if (_options.Signer is not null)
+        {
+            evento = _options.Signer.Sign(evento);
+        }
+
         var payload = Envelope.Serialize(evento);
 
         // MsgId pone la cabecera Nats-Msg-Id. Deduplica reintentos de PUBLICACIÓN dentro de
@@ -413,13 +484,26 @@ public sealed class FluxBus : IAsyncDisposable
         // NO deduplica reentregas de consumo. Un nak reentrega el mismo mensaje con el
         // mismo Nats-Msg-Id y eso es correcto y deseado. Nunca sustituye a la idempotencia
         // del consumidor — 03-delivery.md §3.
-        var ack = await _jetStream.PublishAsync(
-            subject: subject,
-            data: payload,
-            opts: new NatsJSPubOpts { MsgId = evento.Id },
-            cancellationToken: cancellationToken).ConfigureAwait(false);
+        try
+        {
+            var ack = await _jetStream.PublishAsync(
+                subject: subject,
+                data: payload,
+                opts: new NatsJSPubOpts { MsgId = evento.Id },
+                cancellationToken: cancellationToken).ConfigureAwait(false);
 
-        ack.EnsureSuccess();
+            ack.EnsureSuccess();
+        }
+        catch
+        {
+            // `throw;` a secas y no `throw e;`: conserva la pila original. El llamante
+            // sigue recibiendo exactamente la excepción del cliente de NATS; lo único que
+            // añade este catch es la anotación de la métrica.
+            _metrics.EventPublished(subject, PublishOutcome.Error);
+            throw;
+        }
+
+        _metrics.EventPublished(subject, PublishOutcome.Ok);
         return evento;
     }
 
@@ -472,6 +556,11 @@ public sealed class FluxBus : IAsyncDisposable
         var parsed = Protocol.ParseSubject(subject);
         var subscribeOptions = options ?? new SubscribeOptions();
 
+        // El filtro efectivo se resuelve ANTES de tocar el broker: si el aislamiento es
+        // estricto y falta el tenant, la suscripción no debe llegar ni a crear el durable.
+        var tenantFilter = TenantFilterPolicy.Require(
+            subject, _options.TenantIsolation, subscribeOptions.TenantId, _options.TenantId);
+
         await EnsureStreamAsync(parsed.Domain, cancellationToken).ConfigureAwait(false);
         await EnsureDlqStreamAsync(parsed.Domain, cancellationToken).ConfigureAwait(false);
 
@@ -508,9 +597,10 @@ public sealed class FluxBus : IAsyncDisposable
 
         var subscription = new Subscription(this, subject, durable);
         _subscriptions[subscription] = 0;
-        subscription.Start(consumer, handler, subscribeOptions);
+        subscription.Start(consumer, handler, tenantFilter);
         return subscription;
     }
+
 
     /// <summary>
     /// Traduce la config que devuelve el servidor al snapshot que sabe verificar
@@ -555,13 +645,23 @@ public sealed class FluxBus : IAsyncDisposable
         string subject,
         string durable,
         FluxHandler handler,
-        SubscribeOptions options,
+        string? tenantFilter,
         CancellationToken cancellationToken)
     {
         // NumDelivered empieza en 1 en la primera entrega, no en 0.
         var delivered = message.Metadata?.NumDelivered ?? 1;
         var attempt = delivered < 1 ? 1 : (int)delivered;
         var raw = message.Data ?? Array.Empty<byte>();
+
+        // `NumPending` viene en los metadatos del propio mensaje: no hace falta sondear al
+        // servidor. Es la ÚNICA señal que delata a un consumidor cuyo bucle murió —la
+        // conexión sigue reportándose sana y el healthcheck dice que todo va bien, así que
+        // solo el crecimiento de pending lo evidencia (08-observability.md §4). Es el bug
+        // que apareció de verdad en el SDK de Node.
+        if (message.Metadata is { } metadata)
+        {
+            _metrics.ConsumerPending(subject, durable, (long)metadata.NumPending);
+        }
 
         // POISON se detecta ANTES del handler: el mensaje no es interpretable, así que el
         // handler nunca llega a verlo — 04-errors.md §1.3.
@@ -578,10 +678,13 @@ public sealed class FluxBus : IAsyncDisposable
             return;
         }
 
-        if (!string.IsNullOrEmpty(options.TenantId) &&
-            !string.Equals(evento.TenantId, options.TenantId, StringComparison.Ordinal))
+        // Filtrar ANTES del handler: un evento de otro tenant no es un fallo y no es para
+        // nosotros. Se confirma y se descarta — 09-multitenancy.md §3, punto 2. Tampoco se
+        // contabiliza como consumido: no lo hemos consumido, lo hemos ignorado.
+        if (tenantFilter is not null &&
+            !string.Equals(evento.TenantId, tenantFilter, StringComparison.Ordinal))
         {
-            await message.AckAsync(cancellationToken: cancellationToken).ConfigureAwait(false); // no es para nosotros
+            await message.AckAsync(cancellationToken: cancellationToken).ConfigureAwait(false);
             return;
         }
 
@@ -591,10 +694,19 @@ public sealed class FluxBus : IAsyncDisposable
         using var wipCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
         var wip = KeepAliveAsync(message, wipCts.Token);
 
+        var comienzo = Stopwatch.GetTimestamp();
         Exception? handlerError = null;
         try
         {
             var delivery = new Delivery(attempt, Protocol.DefaultMaxDeliver, subject, durable);
+
+            // La firma se comprueba ANTES que nada: si el evento fue manipulado, su payload
+            // puede validar perfectamente y aun así no ser del productor que dice ser. En
+            // modo Require esto lanza una PoisonException que recorre exactamente la misma
+            // ruta que un fallo del handler —clasificación, DLQ, métricas y term— porque un
+            // camino aparte sería un segundo sitio donde arreglar el enrutado a la DLQ
+            // — 07-signing.md §7.
+            _options.Verifier?.Check(evento);
 
             // El contexto del evento entrante se instala aquí. En Go esto obliga a pasar el
             // ctx a mano hasta el Publish; AsyncLocal lo propaga solo, igual que el
@@ -621,12 +733,20 @@ public sealed class FluxBus : IAsyncDisposable
         if (handlerError is null)
         {
             await message.AckAsync(cancellationToken: cancellationToken).ConfigureAwait(false);
+            _metrics.EventConsumed(subject, durable, ConsumeOutcome.Ok);
+            _metrics.HandlerDuration(subject, durable, Elapsed(comienzo));
             return;
         }
 
         await ResolveFailureAsync(
-            message, subject, durable, evento, attempt, handlerError, cancellationToken).ConfigureAwait(false);
+            message, subject, durable, evento, attempt, handlerError, comienzo, cancellationToken)
+            .ConfigureAwait(false);
     }
+
+    /// <summary>Segundos transcurridos desde una marca de <see cref="Stopwatch.GetTimestamp"/>.</summary>
+    private static double Elapsed(long since) =>
+        Stopwatch.GetElapsedTime(since).TotalSeconds;
+
 
     private async Task ResolveFailureAsync(
         NatsJSMsg<byte[]> message,
@@ -635,6 +755,7 @@ public sealed class FluxBus : IAsyncDisposable
         FluxEvent evento,
         int attempt,
         Exception handlerError,
+        long comienzo,
         CancellationToken cancellationToken)
     {
         var classification = _classifier.Classify(handlerError);
@@ -658,6 +779,7 @@ public sealed class FluxBus : IAsyncDisposable
                 budget.ToString(CultureInfo.InvariantCulture) + "), reintento en " +
                 delay.ToString(null, CultureInfo.InvariantCulture));
 
+            _metrics.EventRetried(subject, durable, attempt);
             await message.NakAsync(delay: delay, cancellationToken: cancellationToken).ConfigureAwait(false);
             return;
         }
@@ -682,6 +804,9 @@ public sealed class FluxBus : IAsyncDisposable
             return;
         }
 
+        _metrics.EventConsumed(subject, durable, MetricLabels.ConsumeOutcomeFor(reason, classification.Code));
+        _metrics.EventDlq(subject, durable, reason, classification.Code);
+        _metrics.HandlerDuration(subject, durable, Elapsed(comienzo));
         _options.OnDlq?.Invoke(new DlqEventInfo(subject, dlqEvent, classification));
         _options.Logger?.Error(
             "[flux] DLQ (" + reason.ToString().ToLowerInvariant() + ") " + classification.Code +
@@ -729,6 +854,13 @@ public sealed class FluxBus : IAsyncDisposable
         CancellationToken cancellationToken)
     {
         _options.OnPoison?.Invoke(new PoisonInfo(subject, error, raw));
+
+        // El `code` es el estable de la clasificación (MALFORMED_JSON, WRONG_ATTRIBUTE_TYPE,
+        // INVALID_SIGNATURE…), nunca el mensaje: un mensaje lleva ids y timestamps y su
+        // cardinalidad infinita tumba el almacenamiento de métricas — 08-observability.md §2.2.
+        var code = error is ClassifiedException classified ? classified.FluxCode : "POISON";
+        _metrics.EventConsumed(subject, durable, MetricLabels.ConsumeOutcomeFor(DlqReason.Poison, code));
+        _metrics.EventDlq(subject, durable, DlqReason.Poison, code);
         _options.Logger?.Error($"[flux] POISON en {subject}: {error.Message}");
 
         try
@@ -918,6 +1050,7 @@ public sealed class FluxBus : IAsyncDisposable
         }
 
         _subscriptions.Clear();
+        _metrics.ConnectionState(Flux.ConnectionState.Disconnected);
         await _connection.DisposeAsync().ConfigureAwait(false);
     }
 
@@ -942,12 +1075,12 @@ public sealed class FluxBus : IAsyncDisposable
         /// <inheritdoc />
         public string Durable { get; }
 
-        internal void Start(INatsJSConsumer consumer, FluxHandler handler, SubscribeOptions options)
+        internal void Start(INatsJSConsumer consumer, FluxHandler handler, string? tenantFilter)
         {
-            _loop = Task.Run(() => ConsumeAsync(consumer, handler, options), CancellationToken.None);
+            _loop = Task.Run(() => ConsumeAsync(consumer, handler, tenantFilter), CancellationToken.None);
         }
 
-        private async Task ConsumeAsync(INatsJSConsumer consumer, FluxHandler handler, SubscribeOptions options)
+        private async Task ConsumeAsync(INatsJSConsumer consumer, FluxHandler handler, string? tenantFilter)
         {
             try
             {
@@ -957,7 +1090,7 @@ public sealed class FluxBus : IAsyncDisposable
                 {
                     try
                     {
-                        await _bus.DispatchAsync(message, Subject, Durable, handler, options, _cts.Token)
+                        await _bus.DispatchAsync(message, Subject, Durable, handler, tenantFilter, _cts.Token)
                             .ConfigureAwait(false);
                     }
                     catch (Exception e)

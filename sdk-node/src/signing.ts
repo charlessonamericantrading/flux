@@ -38,6 +38,15 @@ export interface SigningOptions {
   publicKeys?: Record<string, string>;
   /** @default "off" */
   verify?: VerificationMode;
+  /**
+   * Se invoca en CADA fallo de firma, también en modo `warn`.
+   *
+   * El cliente lo usa para emitir `flux_events_consumed_total{outcome=
+   * "invalid_signature"}`. Sin esa métrica, `warn` es inútil para lo único que existe
+   * —pilotar la migración—: la pregunta "¿cuántos eventos siguen sin firma y de qué
+   * productores?" no se contesta buscando en siete logs. Ver 07-signing.md §7.1.
+   */
+  onFailure?: (info: { code: string; message: string; eventId: string }) => void;
 }
 
 export class SigningKeyError extends Error {
@@ -145,7 +154,10 @@ export function createVerifier(options: SigningOptions): Verifier | null {
     );
   }
 
-  const fallar = (code: string, message: string) => {
+  const fallar = (code: string, message: string, eventId: string) => {
+    // Se informa SIEMPRE, en los dos modos: `require` para contarlo antes de lanzar,
+    // `warn` porque es su única salida observable — 07-signing.md §7.1.
+    options.onFailure?.({ code, message, eventId });
     const err = new PoisonError(message, { code });
     if (mode === "require") throw err;
     console.warn(`[flux] ${message}`);
@@ -155,7 +167,7 @@ export function createVerifier(options: SigningOptions): Verifier | null {
     check(event) {
       const firma = (event as FluxEvent & { signature?: string }).signature;
       if (firma === undefined) {
-        fallar("MISSING_SIGNATURE", `evento ${event.id} sin firma`);
+        fallar("MISSING_SIGNATURE", `evento ${event.id} sin firma`, event.id);
         return;
       }
       const keyId = (event as FluxEvent & { signkeyid?: string }).signkeyid;
@@ -167,6 +179,7 @@ export function createVerifier(options: SigningOptions): Verifier | null {
           "UNKNOWN_SIGNING_KEY",
           `evento ${event.id} firmado con signkeyid=${JSON.stringify(keyId)}, que no ` +
             `está entre las claves conocidas. ¿Se retiró sin conservar la pública?`,
+          event.id,
         );
         return;
       }
@@ -177,7 +190,7 @@ export function createVerifier(options: SigningOptions): Verifier | null {
         ok = false;
       }
       if (!ok) {
-        fallar("INVALID_SIGNATURE", `la firma del evento ${event.id} no verifica`);
+        fallar("INVALID_SIGNATURE", `la firma del evento ${event.id} no verifica`, event.id);
       }
     },
   };
