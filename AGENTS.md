@@ -165,7 +165,9 @@ Estas no dan error: dan comportamiento incorrecto. Un agente las comete casi sie
 | `subject` de CloudEvents ≠ subject de NATS | El primero es el **id del agregado** (`"ped-123"`), el segundo la **dirección de enrutado**. En la API del SDK se llaman `aggregateId` y `subject`. |
 | Puntos en nombres de stream o durable | NATS **no los admite**. `EVT_PEDIDOS`, no `EVT.PEDIDOS`. `facturacion-api__pedidos_pedido_v1_creado`, no con puntos. |
 | `duplicate_window` deduplica reintentos | **No.** Solo deduplica publicaciones dentro de 2 min. Nunca sustituye a la idempotencia. |
+| `ack_wait` y `backoff` son independientes | **No: el servidor sobrescribe `ack_wait` con `backoff[0]` sin avisar.** Verificado en NATS 2.14.5: pides `ack_wait: 30s` + `backoff: [1s, …]` y obtienes `ack_wait: 1s`, sin error. Cualquier handler de más de un segundo se ejecuta en concurrencia consigo mismo. **`backoff[0]` DEBE ser el presupuesto de duración del handler** — por eso el backoff canónico empieza en `30s`, no en `1s`. |
 | `max_deliver` y `backoff` descuadrados | `max_deliver: 6` con 5 entradas de backoff = 1 entrega + 5 reintentos. Si `max_deliver` fuese 5, la última entrada nunca se aplica. |
+| El servidor devuelve lo que le pides | No siempre. Tras crear un consumidor, **compara la config devuelta con la solicitada y falla en alto si difieren**. |
 | Subjects case-insensitive | **Son sensibles.** `Pedidos.` ≠ `pedidos.` crea un subject fantasma sin suscriptores y sin error. |
 | Regenerar el `id` al hacer replay | Rompe la idempotencia de todos los consumidores aguas abajo. El replay **conserva** el `id`. |
 

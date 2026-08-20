@@ -26,30 +26,65 @@ de negocio para decidir qué significa "el mismo evento".
 ack_policy:       explicit
 ack_wait:         30s
 max_deliver:      6
-backoff:          [1s, 5s, 30s, 2m, 10m]
+backoff:          [30s, 1m, 5m, 15m, 30m]
 max_ack_pending:  256
 deliver_policy:   all
 replay_policy:    instant
 ```
 
+> ✅ Verificado contra NATS Server 2.14.5. Ver
+> [`conformance/cases/consumer-config.json`](../conformance/cases/consumer-config.json).
+
 `max_deliver: 6` con 5 entradas de backoff = **1 entrega inicial + 5 reintentos**.
 Los dos números tienen que cuadrar: si `max_deliver` fuese 5, la última entrada del
-backoff (`10m`) no se aplicaría nunca y la configuración mentiría sobre su propio
+backoff (`30m`) no se aplicaría nunca y la configuración mentiría sobre su propio
 comportamiento.
 
-**Tiempo total hasta la DLQ ≈ 12 min 36 s.** Ese número es una decisión de producto,
-no un detalle técnico: es cuánto tiempo estás dispuesto a que un evento se quede
-atascado antes de que un humano se entere.
+**Tiempo total hasta la DLQ ≈ 51 min 30 s.** Ese número es una decisión de producto,
+no un detalle técnico: es cuánto tiempo estás dispuesto a que un evento transitorio
+siga reintentando antes de que un humano se entere. Es largo a propósito — los
+errores que llegan aquí son **solo** los RETRYABLE, y la mayoría de fallos
+transitorios se resuelven solos. Un PERMANENT no gasta ni un reintento: va a la DLQ
+en la primera entrega ([04-errors.md](04-errors.md)).
 
-### 2.1 `ack_wait` y handlers lentos
+### 2.1 ⚠️ `backoff[0]` **es** `ack_wait` — el servidor lo sobrescribe en silencio
 
-Si un handler tarda más de `ack_wait` (30 s), JetStream **reentrega el mensaje
-mientras el original sigue procesándose**. Eso produce ejecución concurrente del
-mismo evento — el peor escenario para efectos secundarios.
+Esta es la trampa más cara de JetStream y no aparece en ningún error:
 
-Un SDK L2 **DEBE** enviar `WPI` (work-in-progress / `AckWait` extension) de forma
-automática cada `ack_wait / 2` mientras el handler siga vivo, y **DEBE** documentar
-que un handler que supere los 30 s sin ceder control es un bug de la aplicación.
+```
+Solicitado:  ack_wait = 30s,  backoff = [1s, 5s, 30s, 2m, 10m]
+Efectivo:    ack_wait = 1s    ← el servidor lo reemplaza por backoff[0]
+```
+
+**El servidor acepta la petición, no avisa, y devuelve una configuración distinta de
+la enviada.** Comprobado contra NATS 2.14.5 vía `$JS.API.CONSUMER.DURABLE.CREATE`.
+
+La consecuencia es grave. Con `ack_wait` efectivo de 1 s, cualquier handler que tarde
+más de un segundo —es decir, cualquier handler que escriba en una base de datos y
+llame a una API— recibe **el mismo mensaje reentregado mientras aún se está
+ejecutando**. Ejecución concurrente del mismo evento, en cada mensaje, bajo carga.
+
+**Regla derivada:** `backoff[0]` **DEBE** ser el presupuesto de duración del handler,
+porque es literalmente el `ack_wait`. De ahí que la config canónica empiece en `30s` y
+no en `1s`. Un primer reintento rápido es imposible por construcción, y buscarlo es lo
+que rompe la configuración.
+
+Un SDK L2 **DEBE**:
+- Establecer `ack_wait == backoff[0]` explícitamente, para que la config declarada
+  coincida con la efectiva.
+- **Verificar la config devuelta por el servidor** tras crear el consumidor y fallar
+  en alto si difiere de la solicitada. Es la única defensa contra este tipo de
+  sobrescritura silenciosa.
+- Enviar `WIP` (work-in-progress) automáticamente cada `ack_wait / 2` mientras el
+  handler siga vivo — esto sí extiende el plazo.
+- Documentar que un handler que supere los 30 s sin emitir WIP es un bug de la
+  aplicación.
+
+> **Nota no verificada:** un mensaje en espera de reintento consume una ranura de
+> `max_ack_pending`. Con backoffs largos y muchos fallos simultáneos, el consumidor
+> podría llenar la ventana de 256 y dejar de recibir mensajes nuevos. Monitorizad
+> `num_ack_pending`; si se acerca al límite de forma sostenida, el problema no es la
+> ventana sino la tasa de fallo.
 
 ## 3. Deduplicación de productor
 

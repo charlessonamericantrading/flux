@@ -1,7 +1,7 @@
 # 04 — Errores y DLQ
 
 El error más caro de un sistema de eventos no es perder un mensaje. Es **reintentar
-durante 12 minutos algo que nunca va a funcionar**, mientras el consumidor se atasca
+durante 51 minutos algo que nunca va a funcionar**, mientras el consumidor se atasca
 y los eventos sanos se acumulan detrás.
 
 Por eso flux no tiene "una política de reintentos". Tiene una **taxonomía**.
@@ -44,7 +44,7 @@ El evento es sintácticamente correcto, pero este consumidor no puede actuar sob
 - HTTP 400, 403, 404, 422 de una dependencia
 - Versión de contrato no soportada por este consumidor
 
-→ `term()` **inmediato** y publicación en la DLQ. Reintentar es puro desperdicio: 12
+→ `term()` **inmediato** y publicación en la DLQ. Reintentar es puro desperdicio: 51
 minutos de cola bloqueada para llegar al mismo sitio.
 
 ### 1.3 POISON
@@ -71,7 +71,7 @@ Un SDK L2 **DEBE**:
 
 El default de flux es **PERMANENT salvo que se demuestre lo contrario**:
 
-> Un fallo desconocido tratado como RETRYABLE bloquea la cola durante 12 minutos y se
+> Un fallo desconocido tratado como RETRYABLE bloquea la cola durante 51 minutos y se
 > repite con cada mensaje siguiente que falle igual — el modo de fallo se amplifica.
 > Tratado como PERMANENT, va a la DLQ, la cola sigue fluyendo y el evento se puede
 > reproducir cuando se entienda qué pasó. **Un evento en la DLQ es recuperable; una

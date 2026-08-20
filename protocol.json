@@ -110,13 +110,14 @@
   "consumer": {
     "ackPolicy": "explicit",
     "ackWaitSeconds": 30,
+    "ackWaitEqualsBackoffZero": true,
     "maxDeliver": 6,
-    "backoffMs": [1000, 5000, 30000, 120000, 600000],
+    "backoffMs": [30000, 60000, 300000, 900000, 1800000],
     "maxAckPending": 256,
     "deliverPolicy": "all",
     "replayPolicy": "instant",
-    "totalTimeToDlqSeconds": 756,
-    "$comment": "maxDeliver 6 = 1 entrega inicial + 5 reintentos, uno por entrada de backoffMs. Los dos numeros DEBEN cuadrar: con maxDeliver 5 la ultima entrada nunca se aplicaria."
+    "totalTimeToDlqSeconds": 3090,
+    "$comment": "maxDeliver 6 = 1 entrega inicial + 5 reintentos, uno por entrada de backoffMs. TRAMPA VERIFICADA contra NATS 2.14.5: el servidor SOBRESCRIBE ack_wait con backoff[0] sin avisar y devuelve una config distinta de la enviada. Por eso backoffMs[0] == ackWaitSeconds == 30s: backoff[0] ES el presupuesto de duracion del handler. Un backoff[0] de 1s daria ack_wait de 1s y reentrega concurrente en cualquier handler que toque una BD. El SDK DEBE verificar la config devuelta por el servidor y fallar si difiere."
   },
 
   "stream": {
@@ -132,7 +133,7 @@
 
   "errors": {
     "default": "permanent",
-    "$comment": "Un evento en la DLQ es recuperable; una cola atascada 12 minutos en hora punta no lo es. La asimetria del coste decide el default.",
+    "$comment": "Un evento en la DLQ es recuperable; una cola atascada 51 minutos en hora punta no lo es. La asimetria del coste decide el default.",
     "classes": {
       "retryable": {
         "action": "nak",

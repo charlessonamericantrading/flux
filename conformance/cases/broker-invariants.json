@@ -1,0 +1,75 @@
+{
+  "case": "broker-invariants",
+  "title": "Invariantes del broker de las que depende el protocolo",
+  "spec": "specification/02-naming.md, specification/03-delivery.md",
+  "verifiedAgainst": "nats-server 2.14.5",
+  "verifiedOn": "2026-08-20",
+
+  "rationale": "Varias reglas de la spec se justifican por comportamientos concretos de NATS. Si una versión futura del servidor los cambia, la regla deja de tener sentido y hay que revisarla. Estos casos convierten esa dependencia en algo que el CI detecta en vez de descubrirse en producción.",
+
+  "invariants": [
+    {
+      "id": "stream-name-rejects-dots",
+      "spec": "02-naming.md §3",
+      "justifies": "Por qué los streams se llaman EVT_PEDIDOS y no EVT.PEDIDOS.",
+      "action": "create_stream",
+      "input": { "name": "EVT.PEDIDOS", "subjects": ["conftest.>"] },
+      "expect": "error",
+      "observed": { "result": "error", "message": "\"EVT.PEDIDOS\" is not a valid stream name" }
+    },
+    {
+      "id": "durable-name-rejects-dots",
+      "spec": "02-naming.md §4",
+      "justifies": "Por qué el durable es facturacion-api__pedidos_pedido_v1_creado y no lleva puntos.",
+      "action": "create_durable_consumer",
+      "input": { "durable_name": "facturacion-api.pedidos" },
+      "expect": "error",
+      "observed": { "result": "error", "message": "durable name can not contain '.', '*', '>'" }
+    },
+    {
+      "id": "durable-name-accepts-underscores",
+      "spec": "02-naming.md §4",
+      "justifies": "Que el esquema de naming propuesto es realmente construible.",
+      "action": "create_durable_consumer",
+      "input": { "durable_name": "facturacion-api__pedidos_pedido_v1_creado" },
+      "expect": "ok",
+      "observed": { "result": "ok" }
+    },
+    {
+      "id": "dlq-suffix-captured-by-main-stream",
+      "spec": "02-naming.md §3.1",
+      "justifies": "Por qué la DLQ va PREFIJADA (dlq.<subject>) y no sufijada. Este es el caso negativo: demuestra el problema que el prefijo evita.",
+      "action": "publish_and_count",
+      "input": { "stream": { "name": "EVT_CONFTEST", "subjects": ["conftest.>"] }, "publishTo": "conftest.pedido.v1.creado.dlq" },
+      "expect": "captured_by_main_stream",
+      "observed": { "result": "captured_by_main_stream", "messagesInMainStream": 1, "note": "El stream principal se traga sus propios muertos: cuentan contra su retención y los consumidores con wildcard los reciben." }
+    },
+    {
+      "id": "dlq-prefix-disjoint",
+      "spec": "02-naming.md §3.1",
+      "justifies": "Que el prefijo dlq. produce espacios de nombres disjuntos por construcción.",
+      "action": "publish_and_count",
+      "input": { "streams": [{ "name": "EVT_CONFTEST", "subjects": ["conftest.>"] }, { "name": "DLQ_CONFTEST", "subjects": ["dlq.conftest.>"] }], "publishTo": "dlq.conftest.pedido.v1.creado" },
+      "expect": "captured_by_dlq_stream_only",
+      "observed": { "result": "captured_by_dlq_stream_only", "messagesInDlqStream": 1, "messagesAddedToMainStream": 0 }
+    },
+    {
+      "id": "nats-msg-id-dedupes-publishes",
+      "spec": "03-delivery.md §3",
+      "justifies": "Que la deduplicación de productor funciona como se describe.",
+      "action": "publish_same_msg_id_n_times",
+      "input": { "times": 3, "header": "Nats-Msg-Id", "duplicate_window": 120000000000 },
+      "expect": { "messagesAdded": 1 },
+      "observed": { "messagesAdded": 1 }
+    },
+    {
+      "id": "subjects-are-case-sensitive-and-silent",
+      "spec": "02-naming.md §1.1",
+      "justifies": "Por qué la spec obliga a minúsculas: un error de mayúsculas NO produce ningún error, solo un subject fantasma sin suscriptores.",
+      "action": "publish_and_count",
+      "input": { "stream": { "name": "EVT_CONFTEST", "subjects": ["conftest.>"] }, "publishTo": "Conftest.pedido.v1.creado" },
+      "expect": { "publishSucceeds": true, "messagesAdded": 0 },
+      "observed": { "publishSucceeds": true, "messagesAdded": 0, "note": "Exit code 0. Ningún error en cliente ni servidor. El evento simplemente no existe para nadie." }
+    }
+  ]
+}

@@ -1,0 +1,47 @@
+# Entorno local de desarrollo y conformidad.
+#
+#   docker compose up -d
+#   docker compose exec nats-box nats stream ls
+#
+# Un solo nodo, sin réplicas: es para desarrollo y para la suite de conformidad.
+# La configuración de producción (replicas: 3) está en specification/02-naming.md §3.2.
+
+services:
+  nats:
+    image: nats:2.14-alpine
+    container_name: flux-nats
+    command:
+      - "--jetstream"
+      - "--store_dir=/data"
+      - "--http_port=8222"
+      - "--name=flux-dev"
+    ports:
+      - "4222:4222"   # cliente
+      - "8222:8222"   # monitorización — NUNCA expuesto fuera de la red de gestión
+                      # en producción (specification/06-security.md §6)
+    volumes:
+      - nats-data:/data
+    healthcheck:
+      # /healthz espera a que JetStream esté listo, no solo a que el puerto abra.
+      test: ["CMD", "wget", "-q", "-O-", "http://localhost:8222/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+
+  # CLI de NATS preinstalado. Evita que cada dev instale binarios a mano.
+  nats-box:
+    image: natsio/nats-box:latest
+    container_name: flux-nats-box
+    depends_on:
+      nats:
+        condition: service_healthy
+    environment:
+      NATS_URL: "nats://nats:4222"
+    volumes:
+      - ./conformance:/conformance:ro
+      - ./schemas:/schemas:ro
+    entrypoint: ["/bin/sh", "-c", "trap : TERM INT; sleep infinity & wait"]
+
+volumes:
+  nats-data:

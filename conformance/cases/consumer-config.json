@@ -1,0 +1,62 @@
+{
+  "case": "consumer-config",
+  "title": "La configuración canónica de consumidor sobrevive al servidor sin alteraciones",
+  "spec": "specification/03-delivery.md §2, §2.1",
+  "verifiedAgainst": "nats-server 2.14.5",
+  "verifiedOn": "2026-08-20",
+
+  "rationale": "JetStream sobrescribe ack_wait con backoff[0] SIN devolver error. Una config que pide ack_wait:30s con backoff[0]:1s se acepta y se aplica como ack_wait:1s, lo que provoca reentrega concurrente en cualquier handler que tarde más de un segundo. Este caso existe para que ninguna implementación pueda reintroducir esa combinación.",
+
+  "given": {
+    "stream": {
+      "name": "EVT_CONFTEST",
+      "subjects": ["conftest.>"],
+      "storage": "file",
+      "retention": "limits",
+      "discard": "old",
+      "duplicate_window": 120000000000
+    }
+  },
+
+  "when": {
+    "action": "create_durable_consumer",
+    "requestedConfig": {
+      "durable_name": "conf__consumer_config",
+      "ack_policy": "explicit",
+      "ack_wait": 30000000000,
+      "max_deliver": 6,
+      "max_ack_pending": 256,
+      "backoff": [30000000000, 60000000000, 300000000000, 900000000000, 1800000000000],
+      "deliver_policy": "all",
+      "replay_policy": "instant"
+    }
+  },
+
+  "then": {
+    "serverEffectiveConfig": {
+      "ack_wait": 30000000000,
+      "max_deliver": 6,
+      "backoff": [30000000000, 60000000000, 300000000000, 900000000000, 1800000000000]
+    },
+    "assertions": [
+      { "id": "ack-wait-preserved", "expr": "effective.ack_wait == requested.ack_wait", "reason": "Si falla, el servidor ha alterado la config y el SDK DEBE fallar en alto." },
+      { "id": "ack-wait-equals-backoff-zero", "expr": "effective.ack_wait == effective.backoff[0]", "reason": "Invariante del protocolo: backoff[0] ES ack_wait. No son independientes." },
+      { "id": "backoff-count-matches-retries", "expr": "effective.backoff.length == effective.max_deliver - 1", "reason": "1 entrega inicial + N reintentos. Si no cuadran, la última entrada de backoff nunca se aplica." },
+      { "id": "handler-budget-sane", "expr": "effective.backoff[0] >= 30000000000", "reason": "backoff[0] es el presupuesto de duración del handler. Menos de 30s provoca ejecución concurrente del mismo evento." }
+    ]
+  },
+
+  "counterExample": {
+    "description": "La configuración que la spec tenía ANTES de verificarse contra un servidor real. Toda implementación DEBE rechazarla.",
+    "requestedConfig": {
+      "ack_wait": 30000000000,
+      "max_deliver": 6,
+      "backoff": [1000000000, 5000000000, 30000000000, 120000000000, 600000000000]
+    },
+    "observedEffectiveConfig": {
+      "ack_wait": 1000000000,
+      "backoff": [1000000000, 5000000000, 30000000000, 120000000000, 600000000000]
+    },
+    "consequence": "ack_wait efectivo de 1s. Un handler que escribe en BD y llama a una API tarda más que eso, así que el mensaje se reentrega mientras la primera ejecución sigue viva. Ejecución concurrente del mismo evento en cada mensaje, bajo carga, sin ningún error visible."
+  }
+}

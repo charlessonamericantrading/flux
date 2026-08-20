@@ -28,7 +28,7 @@ export const TRANSIENT_SYSCALL_CODES = new Set([
 
 /**
  * Códigos HTTP que merecen reintento. Nótese qué NO está aquui:
- * 400, 403, 404, 422 son PERMANENT — reintentarlos es gastar 12 minutos
+ * 400, 403, 404, 422 son PERMANENT — reintentarlos es gastar 51 minutos
  * para obtener exactamente la misma respuesta.
  */
 export const RETRYABLE_HTTP_STATUS = new Set([429, 502, 503, 504]);
@@ -81,7 +81,7 @@ export function extractSyscallCode(e: unknown): string | undefined {
  *     válidos, y alguien tendrá que reproducirlos a mano cada mañana.
  *
  *   · Si vuestras dependencias fallan de forma limpia y determinista, ser
- *     generoso con RETRYABLE solo sirve para retrasar 12 minutos el momento en
+ *     generoso con RETRYABLE solo sirve para retrasar 51 minutos el momento en
  *     que alguien se entera de que algo está roto.
  *
  * Y hay una tercera opción que la spec no impone: tratar los errores DESCONOCIDOS
