@@ -487,6 +487,14 @@ export class FluxBus {
   ): Promise<void> {
     // `deliveryCount` empieza en 1 en la primera entrega, no en 0.
     const attempt = m.info.deliveryCount;
+
+    // Los metadatos traen `pending` gratis en cada entrega: más fresco que el sondeo y
+    // sin coste. Pero NO sustituye al sondeo — si el bucle muere, dejan de llegar
+    // mensajes y el gauge se quedaría plano en vez de crecer, que es exactamente lo
+    // contrario de la señal que hace falta (08-observability.md §2.3).
+    if (typeof m.info.pending === "number") {
+      this.#metrics.consumerPending(subject, durable, m.info.pending);
+    }
     const maxAttempts = CONSUMER_DEFAULTS.maxDeliver;
 
     // POISON se detecta antes del handler: el mensaje no es interpretable, así que

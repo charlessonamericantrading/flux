@@ -1,0 +1,32 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <!-- El mismo TFM que el SDK: el arnés tiene que ejercitar lo que se publica. -->
+    <TargetFramework>net8.0</TargetFramework>
+    <LangVersion>12.0</LangVersion>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+
+    <OutputType>Exe</OutputType>
+    <RootNamespace>Flux.Conformance</RootNamespace>
+    <AssemblyName>Flux.ConformanceHarness</AssemblyName>
+
+    <!--
+      No se publica en NuGet: es utillaje del repositorio, no parte del SDK. Va en la
+      solución igualmente para que `dotnet build Flux.sln` lo compile en CI y el arnés no
+      pueda pudrirse en silencio mientras el SDK evoluciona.
+    -->
+    <IsPackable>false</IsPackable>
+    <GenerateDocumentationFile>false</GenerateDocumentationFile>
+    <EnforceCodeStyleInBuild>false</EnforceCodeStyleInBuild>
+
+    <TreatWarningsAsErrors>false</TreatWarningsAsErrors>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\Flux\Flux.csproj" />
+    <!-- `sign` y `verify` son parte del contrato del arnés, y Ed25519 vive aquí. -->
+    <ProjectReference Include="..\..\src\Flux.Signing\Flux.Signing.csproj" />
+  </ItemGroup>
+
+</Project>

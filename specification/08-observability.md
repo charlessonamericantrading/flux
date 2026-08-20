@@ -42,12 +42,28 @@ attempt  = 1..max_deliver
 
 `flux_connection_state`: `1` conectado, `0` desconectado, `2` reconectando.
 
-### 2.3 `flux_consumer_pending` se sondea, no se observa
+### 2.3 `flux_consumer_pending`: metadatos **y** sondeo
 
-Es la única de las siete que **no sale del flujo de eventos**: hay que preguntarle al
-servidor por `num_pending` del consumidor. Un SDK L2 **DEBE** sondearlo
-periódicamente (~15 s por defecto), y un fallo del sondeo **NO DEBE** afectar al
-consumo: es telemetría.
+Es la única de las siete que no sale limpiamente del flujo de eventos, y tiene dos
+fuentes posibles. **Un SDK L2 DEBE usar las dos**, porque cada una falla justo donde
+la otra sirve:
+
+| Fuente | Coste | Falla cuando… |
+|---|---|---|
+| Metadatos del mensaje entregado | Gratis, fresco en cada evento | **No llegan mensajes** — y ese es el caso que importa |
+| Sondeo de `num_pending` al servidor | Una petición cada ~15 s | Nunca, mientras haya conexión |
+
+El razonamiento es el que decide la regla: **si el bucle del consumidor muere, dejan
+de entregarse mensajes**, así que una métrica alimentada solo desde los metadatos se
+queda **plana en su último valor** en vez de crecer. Un panel mostraría una línea
+horizontal, que es indistinguible de "no pasa nada".
+
+El sondeo sigue corriendo y reporta el `num_pending` creciente. Es la señal.
+
+- El SDK **DEBE** actualizar el gauge desde los metadatos de cada mensaje entregado.
+- El SDK **DEBE** además sondear periódicamente (~15 s por defecto, configurable, `0`
+  lo desactiva).
+- Un fallo del sondeo **NO DEBE** afectar al consumo: es telemetría.
 
 Sin ese sondeo la métrica nunca se emite, y un panel que muestra "sin datos" es
 **indistinguible de un consumidor sano** — que es exactamente el fallo que esta

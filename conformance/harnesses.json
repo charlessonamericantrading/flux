@@ -61,9 +61,20 @@
         "com.flux.ConformanceHarness"
       ],
       "cwd": "sdk-java"
+    },
+    {
+      "sdk": "dotnet",
+      "$comment": "`-v quiet` porque MSBuild escribe en STDOUT y el contrato dice que ahí solo va el JSON. `dotnet run` compila si hace falta; en CI se hace antes un `dotnet build` de la solución para que ni el restore ni el saludo de primera ejecución del CLI caigan en medio de una operación.",
+      "cmd": "dotnet",
+      "args": [
+        "run",
+        "-v",
+        "quiet",
+        "--project",
+        "tools/Flux.ConformanceHarness/Flux.ConformanceHarness.csproj"
+      ],
+      "cwd": "sdk-dotnet"
     }
   ],
-  "pending": [
-    "dotnet"
-  ]
+  "pending": []
 }

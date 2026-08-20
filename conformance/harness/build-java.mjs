@@ -39,10 +39,13 @@ const DESTINO = join(SDK, "target", "harness");
 const CLASES = join(DESTINO, "classes");
 const JAR_ARNES = join(DESTINO, "flux-conformance.jar");
 
-/** Corre un comando y aborta con su salida si falla. `null` si el binario no existe. */
+/** Corre un comando y aborta con su salida si falla. */
 function correr(cmd, args, opciones = {}) {
   const r = spawnSync(cmd, args, { cwd: RAIZ, stdio: "inherit", ...opciones });
-  if (r.error?.code === "ENOENT") return null;
+  if (r.error?.code === "ENOENT") {
+    console.error(`✗ no se encontró \`${cmd}\` en el PATH`);
+    process.exit(1);
+  }
   if (r.status !== 0) {
     console.error(`✗ ${cmd} ${args.join(" ")} → exit ${r.status}`);
     process.exit(1);
@@ -75,15 +78,22 @@ if (artefactos.every((a) => existsSync(a.origen))) {
   console.log(`✓ jackson ${jackson} desde ~/.m2`);
 } else {
   console.log(`· jackson ${jackson} no está en ~/.m2; pidiéndoselo a Maven`);
-  const mvn = correr(process.platform === "win32" ? "mvn.cmd" : "mvn", [
-    "-B", "-q", "-f", "sdk-java/pom.xml",
-    "dependency:copy-dependencies",
-    "-DincludeScope=compile",
-    "-DoutputDirectory=target/harness",
-  ]);
-  if (mvn === null) {
+  // `outputDirectory` ABSOLUTO: el plugin resuelve las rutas relativas contra el
+  // directorio de trabajo, no contra el pom, y acabarían en la raíz del repositorio.
+  // `shell` en Windows porque ahí `mvn` es un .cmd y Node se niega a lanzarlo sin shell.
+  const mvn = spawnSync(
+    "mvn",
+    [
+      "-B", "-q", "-f", "sdk-java/pom.xml",
+      "dependency:copy-dependencies",
+      "-DincludeScope=compile",
+      `-DoutputDirectory=${DESTINO}`,
+    ],
+    { cwd: RAIZ, stdio: "inherit", shell: process.platform === "win32" },
+  );
+  if (mvn.error?.code === "ENOENT" || mvn.status !== 0) {
     console.error(
-      "✗ faltan las dependencias de Jackson y no hay Maven para descargarlas.\n" +
+      "✗ faltan las dependencias de Jackson y Maven no pudo descargarlas.\n" +
         "  Instala Maven, o compila el SDK una vez para poblar ~/.m2/repository.",
     );
     process.exit(1);

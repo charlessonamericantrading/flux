@@ -252,6 +252,14 @@ jobs:
           (cd sdk-node && npm install --no-audit --no-fund && npm run build)
           pip install cryptography
           (cd sdk-php && composer install --no-interaction --prefer-dist)
+          # javac + jar en sdk-java/target/harness. Se reconstruye SIEMPRE y no se versiona:
+          # un jar versionado se quedaría atrás respecto al SDK y el runner compararía bytes
+          # de un código que ya no existe.
+          node conformance/harness/build-java.mjs
+          # `dotnet run` compilaría igualmente en la primera operación, pero el restore y el
+          # saludo de primera ejecución del CLI van a STDOUT, donde el contrato dice que solo
+          # va el JSON del arnés. Se sacan de en medio aquí.
+          dotnet build sdk-dotnet/Flux.sln -v quiet
 
       # No necesita broker: esto ejercita envelope, firma y parseo, no NATS. Compara
       # las salidas de los siete SDKs BYTE A BYTE con los mismos vectores.

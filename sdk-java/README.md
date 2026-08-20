@@ -586,6 +586,27 @@ JetStream de la misma familia (`ack_wait` sobrescrito por `backoff[0]`, el delay
 ignorado, y el publish de core que se evapora): **el servidor acepta la petición, no
 devuelve error, y aplica otra cosa.** Ninguna se detecta leyendo código.
 
+### R. 🐛 RESUELTO — Jackson escapaba los caracteres fuera del BMP al escribir bytes
+
+`Envelope.serialize` usaba `writeValueAsBytes`, y el generador UTF-8 de Jackson
+(`UTF8JsonGenerator._outputMultiByteChar`) escapa **todo carácter fuera del BMP** como la
+pareja `\uXXXX\uXXXX` de sus suplentes, sin que el mapper se lo pida y sin forma de
+desactivarlo. Un `"🚀"` (U+1F680) salía como los doce caracteres ASCII de una pareja de
+escapes `\uXXXX\uXXXX` en vez de como sus cuatro octetos `F0 9F 9A 80`.
+
+El JSON es equivalente al parsearlo, así que ningún test de round-trip lo veía. Pero
+[01-envelope.md §1.1](../specification/01-envelope.md) prohíbe los escapes `\uXXXX`
+precisamente porque de los BYTES dependen el replay verbatim desde la DLQ y la firma:
+**un evento con un emoji firmado en Java no verificaba en Node, Go, Python ni PHP**, y al
+revés tampoco.
+
+Lo cazó el vector `utf8-literal` del [arnés de conformidad
+cruzada](../conformance/harness/README.md) — el primer mecanismo del repositorio que
+compara los bytes de los siete SDKs entre sí. El test de UTF-8 de este SDK existía desde el
+principio y pasaba: solo cubría el BMP (`café ñandú 東京 €`), que es justo el rango que
+Jackson emite bien. Ahora `serialize` escribe vía `writeValueAsString(...).getBytes(UTF_8)`
+—el generador sobre `Writer` no tiene esa rama— y el test lleva un carácter fuera del BMP.
+
 ---
 
 ## Ficheros
@@ -605,11 +626,17 @@ devuelve error, y aplica otra cosa.** Ninguna se detecta leyendo código.
 | `MetricsSink.java` | El contrato de métricas: siete métodos con parámetros nombrados, buckets y `NONE` |
 | `InMemoryMetrics.java` | Recolector sin dependencias con salida en formato Prometheus |
 | `TenantIsolationException.java` | Suscripción sin filtro de tenant con el aislamiento en estricto |
+| `ConformanceHarness.java` | Arnés de [conformidad cruzada](../conformance/harness/README.md): una operación por stdin, un resultado por stdout, exit 0 siempre. Vive en `com.flux` porque fijar el `dlqtime` del vector necesita `FluxEvent.withDlq`, que es package-private |
 
 ## Desarrollo
 
 ```bash
 mvn -q -f sdk-java/pom.xml test
+
+# El arnés cross-SDK: compara los bytes de este SDK con los de los otros seis.
+# javac + jar, sin Maven si Jackson ya está en ~/.m2; deja sdk-java/target/harness/*.jar
+node conformance/harness/build-java.mjs
+node conformance/cross-sdk.mjs --only node,java --verbose
 ```
 
 Los tests no requieren un broker. Cubren:
