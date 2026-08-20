@@ -1,0 +1,22 @@
+node_modules/
+dist/
+build/
+*.tsbuildinfo
+
+# Credenciales NATS — nunca versionadas (06-security.md §2)
+*.creds
+*.nk
+*.jwt
+.env
+.env.*
+!.env.example
+
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

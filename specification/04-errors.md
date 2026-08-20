@@ -1,0 +1,165 @@
+# 04 — Errores y DLQ
+
+El error más caro de un sistema de eventos no es perder un mensaje. Es **reintentar
+durante 12 minutos algo que nunca va a funcionar**, mientras el consumidor se atasca
+y los eventos sanos se acumulan detrás.
+
+Por eso flux no tiene "una política de reintentos". Tiene una **taxonomía**.
+
+---
+
+## 1. Las tres clases
+
+| Clase | Significado | Acción NATS | ¿Reintenta? |
+|---|---|---|---|
+| **RETRYABLE** | El fallo es del entorno y podría desaparecer solo. | `nak(delay)` | Sí, con backoff |
+| **PERMANENT** | El evento es válido pero este consumidor nunca podrá procesarlo. | `term()` + DLQ | **No** |
+| **POISON** | El mensaje ni siquiera es interpretable. | `term()` + DLQ + alerta | **No** |
+
+La distinción entre RETRYABLE y PERMANENT es **la decisión de diseño más importante
+de un consumidor**. Equivocarla en un sentido atasca la cola; equivocarla en el otro
+tira eventos buenos a la basura por un hipo de red.
+
+### 1.1 RETRYABLE
+
+El fallo no dice nada sobre el evento — dice algo sobre el mundo en este instante.
+
+- Timeout de red, DNS, conexión rechazada
+- HTTP 429, 502, 503, 504
+- Deadlock o lock timeout de base de datos
+- Pool de conexiones agotado
+- Dependencia en arranque o en despliegue
+
+→ `nak` con el backoff de [03-delivery.md §2](03-delivery.md). Tras agotar
+`max_deliver`, JetStream deja de entregar y el SDK enruta a la DLQ.
+
+### 1.2 PERMANENT
+
+El evento es sintácticamente correcto, pero este consumidor no puede actuar sobre él
+**por mucho que espere**.
+
+- Falla la validación contra `dataschema`
+- Regla de negocio que rechaza el hecho (`el pedido ya estaba cancelado`)
+- Referencia a una entidad que no existe y no va a existir
+- HTTP 400, 403, 404, 422 de una dependencia
+- Versión de contrato no soportada por este consumidor
+
+→ `term()` **inmediato** y publicación en la DLQ. Reintentar es puro desperdicio: 12
+minutos de cola bloqueada para llegar al mismo sitio.
+
+### 1.3 POISON
+
+El SDK no logra siquiera construir un evento a partir del mensaje.
+
+- JSON malformado
+- Falta un atributo obligatorio de CloudEvents
+- `specversion` desconocida
+- `datacontenttype` no soportado
+
+→ `term()` + DLQ + **alerta inmediata**. Un POISON casi siempre significa que un
+productor está roto o que alguien publicó a mano en el subject equivocado. Es el único
+caso que **DEBE** despertar a alguien.
+
+## 2. Cómo se clasifica un error
+
+Un SDK L2 **DEBE**:
+
+1. Clasificar POISON él mismo, antes de invocar al handler.
+2. Ofrecer un default razonable para errores del handler.
+3. **Permitir que la aplicación anule la clasificación**, porque solo ella conoce sus
+   dependencias.
+
+El default de flux es **PERMANENT salvo que se demuestre lo contrario**:
+
+> Un fallo desconocido tratado como RETRYABLE bloquea la cola durante 12 minutos y se
+> repite con cada mensaje siguiente que falle igual — el modo de fallo se amplifica.
+> Tratado como PERMANENT, va a la DLQ, la cola sigue fluyendo y el evento se puede
+> reproducir cuando se entienda qué pasó. **Un evento en la DLQ es recuperable; una
+> cola atascada durante una hora punta, no.**
+
+Un SDK L2 **DEBE** exponer errores tipados para que la aplicación señale la clase:
+
+```
+throw new RetryableError("proveedor de pagos 503", { retryAfterMs: 5000 })
+throw new PermanentError("pedido ya cancelado", { code: "PEDIDO_YA_CANCELADO" })
+```
+
+> 🔨 **La función que traduce un error cualquiera a una de estas tres clases se
+> implementa en `sdk-node/src/classify.ts`.** Es una decisión de política, no de
+> infraestructura — ver la nota al final de ese fichero.
+
+## 3. Formato del mensaje en DLQ
+
+El mensaje de DLQ es **el CloudEvent original, íntegro**, con extensiones añadidas.
+No se envuelve en otro sobre.
+
+```json
+{
+  "specversion": "1.0",
+  "id": "01924f8e-7c3a-7b2d-9e14-3f8a1c9d0e55",
+  "source": "/produccion/pedidos-api",
+  "type": "com.flux.pedidos.pedido.creado.v1",
+  "time": "2026-08-20T10:25:39.412Z",
+  "dataschema": "https://schemas.internal/pedidos/pedido/creado/1.2.0.json",
+  "correlationid": "01924f8e-7c3a-7b2d-9e14-3f8a1c9d0e55",
+  "tenantid": "acme",
+  "producerversion": "3.4.1",
+  "dataclassification": "confidential",
+  "data": { "pedidoId": "ped-123", "totalCents": 9990 },
+
+  "dlqreason": "permanent",
+  "dlqattempts": 1,
+  "dlqconsumer": "facturacion-api__pedidos_pedido_v1_creado",
+  "dlqerror": "PEDIDO_YA_CANCELADO: el pedido ped-123 estaba cancelado",
+  "dlqtime": "2026-08-20T10:25:40.117Z"
+}
+```
+
+**Por qué el original íntegro y no un wrapper:** para reproducir un mensaje de la DLQ
+solo hay que borrar las extensiones `dlq*` y republicar en el subject original. Con
+un wrapper habría que desenvolver, y cada consumidor de la DLQ tendría que conocer dos
+formatos. El replay se convierte en `jq 'del(.dlq*)'`.
+
+`dlqattempts` distingue de un vistazo un PERMANENT (`1`) de un RETRYABLE agotado (`6`).
+
+Subject de destino: `dlq.<subject original>` — ver
+[02-naming.md §3.1](02-naming.md).
+
+```
+pedidos.pedido.v1.creado  →  dlq.pedidos.pedido.v1.creado
+```
+
+## 4. La DLQ no es un cementerio
+
+Una DLQ que nadie mira es una pérdida de datos con pasos extra. El protocolo exige:
+
+- **DEBE** existir una alerta sobre `dlq.>` con umbral distinto por razón:
+  `poison` → inmediata; `permanent` → agregada; `retryable` → por tasa.
+- **DEBERÍA** revisarse la DLQ en cada ciclo operativo, no cuando algo se rompe.
+- `max_age: 90d` en el stream de DLQ da margen forense, pero **es un límite real**: a
+  los 90 días el evento desaparece.
+
+### 4.1 Replay
+
+```bash
+# Inspeccionar sin consumir
+nats stream view DLQ_PEDIDOS --subject 'dlq.pedidos.pedido.v1.creado'
+
+# Reproducir: quitar extensiones dlq* y republicar en el subject original
+nats stream get DLQ_PEDIDOS --last-for 'dlq.pedidos.pedido.v1.creado' --json \
+  | jq '.data | @base64d | fromjson | del(.dlqreason, .dlqattempts, .dlqconsumer, .dlqerror, .dlqtime)' \
+  | nats pub 'pedidos.pedido.v1.creado' --force-stdin
+```
+
+**Antes de reproducir, dos comprobaciones obligatorias:**
+
+1. **¿Se ha arreglado la causa?** Reproducir contra el mismo bug devuelve el evento a
+   la DLQ y ensucia el rastro.
+2. **¿Sigue siendo idempotente el consumidor para este `id`?** El replay conserva el
+   `id` original, así que si el consumidor llegó a aplicar un efecto parcial antes de
+   fallar, la tabla de eventos procesados **DEBE** ser lo que impida duplicarlo. Si el
+   handler no es idempotente, el replay es más peligroso que el fallo original.
+
+> El replay **DEBE** conservar el `id` original. Regenerarlo rompe la idempotencia de
+> todos los consumidores aguas abajo y convierte una recuperación en un incidente
+> nuevo.
