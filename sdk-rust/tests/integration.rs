@@ -94,7 +94,7 @@ async fn publicar_y_consumir_con_ack_explicito() {
 
     assert_eq!(ev.id, publicado.id, "el id no se regenera");
     assert_eq!(ev.specversion, "1.0");
-    assert_eq!(ev.event_type, format!("com.flux.itrust1.pedido.creado.v1"));
+    assert_eq!(ev.event_type, "com.flux.itrust1.pedido.creado.v1");
     assert_eq!(ev.source, "/test/pedidos-api");
     assert_eq!(ev.tenantid, "acme");
     assert_eq!(ev.producerversion, "1.0.0");
