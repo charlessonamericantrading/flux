@@ -1,0 +1,40 @@
+[package]
+name = "flux"
+version = "1.0.0"
+edition = "2021"
+rust-version = "1.75"
+description = "Cliente Rust del flux Event Protocol v1 — CloudEvents 1.0 sobre NATS JetStream (L2)"
+license = "MIT"
+repository = "https://github.com/charlessonamericantrading/flux"
+readme = "README.md"
+keywords = ["cloudevents", "nats", "jetstream", "eventos", "flux"]
+categories = ["network-programming", "asynchronous"]
+
+[dependencies]
+# `preserve_order` mantiene el orden de inserción de las claves de un serde_json::Map.
+# Sin él, un `data` construido con json!({...}) se reordenaría alfabéticamente al
+# serializar y dejaría de ser byte a byte el mismo — 01-envelope.md §6.
+#
+# `raw_value` habilita Box<RawValue>, el equivalente de json.RawMessage de Go: el
+# payload viaja sin interpretar, así que un evento parseado y vuelto a serializar
+# conserva orden de claves Y fidelidad numérica (4995.00 no se convierte en 4995.0)
+# — 01-envelope.md §2.5.
+serde_json = { version = "1.0", features = ["preserve_order", "raw_value"] }
+serde = { version = "1.0", features = ["derive"] }
+
+# UUIDv7: monotónico en el tiempo — 01-envelope.md §2.6.
+uuid = { version = "1", features = ["v7"] }
+
+# chrono y no std::time: `time` exige EXACTAMENTE 3 decimales y sufijo Z, y eso hay
+# que formatearlo explícitamente — 01-envelope.md §2.2.
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+
+thiserror = "2"
+
+tokio = { version = "1", features = ["rt", "time", "macros", "sync"] }
+futures = "0.3"
+
+async-nats = "0.50"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }

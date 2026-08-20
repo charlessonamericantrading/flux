@@ -41,6 +41,13 @@ import {
 import { ErrorClass, PoisonError, type Classification } from "./errors.js";
 import { createClassifier, type ClassifierOptions } from "./classify.js";
 import {
+  createSigner,
+  createVerifier,
+  type Signer,
+  type Verifier,
+  type SigningOptions,
+} from "./signing.js";
+import {
   createValidator,
   schemaUriFor,
   SchemaValidationError,
@@ -91,6 +98,12 @@ export interface ConnectOptions {
    * productor en vez de aparecer como un misterio en un consumidor de otro equipo.
    */
   validation?: ValidationOptions;
+  /**
+   * Firma Ed25519 de eventos. Extensión OPCIONAL — ver specification/07-signing.md.
+   * Traslada la autenticidad del canal al evento: un evento firmado sigue siendo
+   * verificable dentro de un fichero, un backup o un correo, donde ya no hay ACL.
+   */
+  signing?: SigningOptions;
   /**
    * Réplicas de los streams que el SDK crea si no existen.
    *
@@ -179,6 +192,8 @@ export class FluxBus {
   readonly #subscriptions = new Set<{ stop: () => void }>();
   readonly #ensured = new Set<string>();
   #validate: ((e: FluxEvent, subject: string) => void) | null = null;
+  #signer: Signer | null = null;
+  #verifier: Verifier | null = null;
 
   constructor(
     nc: NatsConnection,
@@ -239,10 +254,14 @@ export class FluxBus {
     // consumidor de otro equipo la semana que viene — 00-protocol.md §5.
     this.#validate?.(event, subject);
 
+    // Firmar es lo ULTIMO antes de serializar: la firma cubre el envelope completo,
+    // así que cualquier atributo añadido después la invalidaría — 07-signing.md §5.
+    const publicado = this.#signer ? this.#signer.sign(event) : event;
+
     // msgID pone la cabecera Nats-Msg-Id: deduplica reintentos de PUBLICACIÓN dentro
     // de duplicate_window. NO deduplica reentregas de consumo — 03-delivery.md §3.
-    await this.#js.publish(subject, serialize(event), { msgID: event.id });
-    return event;
+    await this.#js.publish(subject, serialize(publicado), { msgID: publicado.id });
+    return publicado as FluxEvent<T>;
   }
 
   async #traceparent(): Promise<{ traceparent?: string }> {
@@ -433,6 +452,9 @@ export class FluxBus {
       // L3 en consumo: el evento es sintácticamente válido pero incumple su
       // contrato. Reintentarlo dará exactamente el mismo resultado, así que la
       // clasificación correcta es PERMANENT — 04-errors.md §1.2.
+      // La firma se comprueba ANTES que el esquema: si el evento fue manipulado, su
+      // payload puede validar perfectamente y aun así no ser del productor que dice.
+      this.#verifier?.check(event);
       if (this.#opts.validation?.onConsume) this.#validate?.(event, subject);
       await runWithContext(contextFromEvent(event), async () =>
         handler(event, {
@@ -595,6 +617,8 @@ export class FluxBus {
   /** Lo llama connect(). Público solo porque connect() vive fuera de la clase. */
   async initValidation(): Promise<void> {
     this.#validate = await createValidator(this.#opts.validation ?? {});
+    this.#signer = createSigner(this.#opts.signing ?? {});
+    this.#verifier = createVerifier(this.#opts.signing ?? {});
   }
 
   // ─── ciclo de vida ─────────────────────────────────────────────────────────

@@ -457,8 +457,51 @@
     "protobuf",
     "avro",
     "field-level encryption",
-    "event signing",
     "real tenant isolation",
     "multi-cluster federation"
-  ]
+  ],
+  "signing": {
+    "status": "optional-extension-of-v1",
+    "spec": "specification/07-signing.md",
+    "algorithm": "Ed25519",
+    "algorithmNegotiation": "none",
+    "$commentAlgorithm": "Sin negociacion a proposito: los formatos con algoritmo negociable acumulan una familia de vulnerabilidades conocida (desde alg:none hasta la confusion HMAC/RSA) que solo existe porque hay algo que negociar.",
+    "attributes": {
+      "signkeyid": {
+        "type": "string",
+        "format": "<servicio>-<n>",
+        "signed": true
+      },
+      "signature": {
+        "type": "string",
+        "encoding": "base64url-no-padding",
+        "signed": false
+      }
+    },
+    "signedPayload": "serialize(evento sin `signature` y sin extensiones dlq*)",
+    "$commentPayload": "No hay canonicalizacion aparte para firmar: es el mismo serialize() del productor. Funciona porque 01-envelope.md 1.1 (UTF-8 literal), 2.2 (time con 3 decimales) y 6 (orden de claves, data al final) fijan una unica representacion en bytes. Las tres se escribieron para otros problemas y juntas resultaron ser la canonicalizacion que la firma necesitaba.",
+    "verificationModes": [
+      "off",
+      "warn",
+      "require"
+    ],
+    "defaultMode": "off",
+    "poisonCodes": {
+      "MISSING_SIGNATURE": "falta signature en modo require",
+      "INVALID_SIGNATURE": "la firma no verifica",
+      "UNKNOWN_SIGNING_KEY": "signkeyid desconocido"
+    },
+    "keyRotation": {
+      "keyIdMustChange": true,
+      "retainPublicKeysDays": 90,
+      "retiredKeyStillVerifies": true,
+      "$comment": "Retirar una clave impide EMITIR con ella, no VERIFICAR lo ya emitido. Tratar una clave retirada como invalida convierte una rotacion rutinaria en la invalidacion retroactiva de todo el historial. El minimo de 90 dias sale de la retencion de la DLQ."
+    },
+    "doesNotProvide": [
+      "confidencialidad",
+      "proteccion contra replay legitimo",
+      "autenticacion del broker",
+      "sustituto de las ACLs"
+    ]
+  }
 }

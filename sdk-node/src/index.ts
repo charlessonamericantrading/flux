@@ -70,5 +70,13 @@ export {
 } from "./validation.js";
 export type { ValidationOptions, ValidationMode, SchemaBundle } from "./validation.js";
 
+export {
+  createSigner,
+  createVerifier,
+  generateKeyPair,
+  SigningKeyError,
+} from "./signing.js";
+export type { SigningOptions, VerificationMode, Signer, Verifier } from "./signing.js";
+
 export { currentContext } from "./context.js";
 export type { EventContext } from "./context.js";

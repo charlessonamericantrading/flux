@@ -53,7 +53,7 @@ export const ALLOWED_ROOT_ATTRIBUTES = new Set([
   "dataschema", "subject", "correlationid", "tenantid", "producerversion",
   "dataclassification", "causationid", "partitionkey", "traceparent",
   "tracestate", "dlqreason", "dlqattempts", "dlqconsumer", "dlqerror",
-  "dlqtime", "data",
+  "dlqtime", "signkeyid", "signature", "data",
 ]);
 
 const REQUIRED_ATTRIBUTES = [

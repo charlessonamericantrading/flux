@@ -154,7 +154,7 @@ rediseñarse. La alternativa —cripto-borrado con clave por sujeto— queda fue
 
 | Tema | Estado | Nota |
 |---|---|---|
-| Firma de eventos (JWS) | Fase 4 | Hoy la autenticidad la garantiza la ACL del broker, no el evento. Un evento sacado del stream y reinyectado no es distinguible de uno legítimo. |
+| Firma de eventos | ✅ **Implementada** | Ed25519, extensión opcional — ver [07-signing.md](07-signing.md). Traslada la autenticidad del canal al evento. |
 | Cifrado a nivel de campo | Fase 4 | Hoy: no metas ahí lo que no puedas guardar en claro. |
 | Aislamiento real de tenant | Fase 4 | Ver §4. |
 | Auditoría inmutable de acceso | Fase 4 | Hoy: logs del servidor NATS. |

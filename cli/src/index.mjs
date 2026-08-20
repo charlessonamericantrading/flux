@@ -29,6 +29,7 @@ ${c.bold("COMANDOS")}
   ${c.cyan("dlq inspect")} <dominio>     Detalle de eventos muertos
   ${c.cyan("dlq replay")} <dominio>      Reproduce desde la DLQ (simulación por defecto)
   ${c.cyan("validate")} <subject>        Comprueba un subject contra el protocolo
+  ${c.cyan("keygen")} <servicio> <n>     Genera un par Ed25519 para firmar eventos
 
 ${c.bold("OPCIONES GLOBALES")}
   -s, --server <url>        nats://127.0.0.1:4222  (o \$NATS_URL)
@@ -138,6 +139,37 @@ const [cmd, sub, ...rest] = opts._;
 
 if (opts.help || !cmd) {
   console.log(HELP);
+  process.exit(0);
+}
+
+if (cmd === "keygen") {
+  const servicio = sub;
+  const n = opts._[2] ?? "1";
+  if (!servicio) die("uso: flux keygen <servicio> [n]   p.ej. flux keygen pedidos-api 1");
+  if (!/^[a-z0-9]+(-[a-z0-9]+)*$/.test(servicio)) {
+    die(`nombre de servicio inválido: "${servicio}". kebab-case en minúsculas.`);
+  }
+  const { generateKeyPairSync } = await import("node:crypto");
+  const { privateKey, publicKey } = generateKeyPairSync("ed25519");
+  const keyId = `${servicio}-${n}`;
+
+  console.log(`${c.bold("signkeyid:")} ${keyId}
+`);
+  console.log(c.bold("Clave PÚBLICA") + c.gray("  — se distribuye a los consumidores y se VERSIONA"));
+  console.log(publicKey.export({ type: "spki", format: "pem" }).toString());
+  console.log(c.bold(c.red("Clave PRIVADA")) + c.gray("  — al gestor de secretos. NUNCA a un repositorio"));
+  console.log(privateKey.export({ type: "pkcs8", format: "pem" }).toString());
+  console.log(
+    c.gray(
+      `Al rotar, incrementa el número: ${servicio}-${Number(n) + 1}.
+` +
+        `CONSERVA la pública antigua mientras existan eventos firmados con ella —
+` +
+        `mínimo 90 días, la retención de la DLQ. Retirar una clave impide EMITIR con
+` +
+        `ella, no VERIFICAR lo ya emitido (07-signing.md §6).`,
+    ),
+  );
   process.exit(0);
 }
 

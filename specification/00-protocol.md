@@ -118,7 +118,6 @@ Declarado explícitamente para evitar scope creep:
 - Sagas y orquestación de procesos de larga duración.
 - Protobuf y Avro (opt-in por subject en v2).
 - Cifrado a nivel de campo.
-- Firma criptográfica de eventos (ver [06-security.md §7](06-security.md)).
 - Federación multi-cluster.
 
 ## 7. Índice normativo
@@ -131,3 +130,4 @@ Declarado explícitamente para evitar scope creep:
 | [04-errors.md](04-errors.md) | Taxonomía de errores, DLQ, replay |
 | [05-compatibility.md](05-compatibility.md) | Evolución de esquemas, deprecación |
 | [06-security.md](06-security.md) | Accounts, ACLs, clasificación de datos |
+| [07-signing.md](07-signing.md) | Firma Ed25519 — extensión **opcional** |
