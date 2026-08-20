@@ -1,7 +1,6 @@
 {
   "$comment": "Vectores compartidos del arnés de conformidad cruzada. Todos los SDKs los ejecutan y el runner compara las salidas BYTE A BYTE. Todo es determinista —id, time, dlqtime y la clave vienen dados— porque si algo lo generase el SDK las salidas no serían comparables.",
   "spec": "conformance/harness/README.md",
-
   "vectors": [
     {
       "id": "envelope-minimo",
@@ -18,7 +17,10 @@
         "tenantid": "acme",
         "producerversion": "3.4.1",
         "dataclassification": "internal",
-        "data": { "pedidoId": "ped-123", "totalCents": 9990 }
+        "data": {
+          "pedidoId": "ped-123",
+          "totalCents": 9990
+        }
       }
     },
     {
@@ -39,7 +41,11 @@
         "dataclassification": "confidential",
         "aggregateId": "env-987",
         "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
-        "data": { "envioId": "env-987", "aggregateVersion": 3, "motivo": "ausente" }
+        "data": {
+          "envioId": "env-987",
+          "aggregateVersion": 3,
+          "motivo": "ausente"
+        }
       }
     },
     {
@@ -80,7 +86,9 @@
         "tenantid": "acme",
         "producerversion": "3.4.1",
         "dataclassification": "internal",
-        "data": { "pedidoId": "ped-123" }
+        "data": {
+          "pedidoId": "ped-123"
+        }
       },
       "dlq": {
         "reason": "permanent",
@@ -106,7 +114,10 @@
         "producerversion": "3.4.1",
         "dataclassification": "internal",
         "aggregateId": "ped-123",
-        "data": { "pedidoId": "ped-123", "totalCents": 9990 }
+        "data": {
+          "pedidoId": "ped-123",
+          "totalCents": 9990
+        }
       }
     },
     {
@@ -124,7 +135,9 @@
         "tenantid": "acme",
         "producerversion": "3.4.1",
         "dataclassification": "internal",
-        "data": { "nota": "señor Muñoz — 5€ ✅" }
+        "data": {
+          "nota": "señor Muñoz — 5€ ✅"
+        }
       }
     },
     {
@@ -143,7 +156,9 @@
         "tenantid": "acme",
         "producerversion": "3.4.1",
         "dataclassification": "internal",
-        "data": { "pedidoId": "ped-123" }
+        "data": {
+          "pedidoId": "ped-123"
+        }
       },
       "dlq": {
         "reason": "poison",
@@ -154,7 +169,6 @@
       }
     }
   ],
-
   "poisonVectors": [
     {
       "id": "poison-json-malformado",
@@ -171,65 +185,143 @@
     {
       "id": "poison-specversion",
       "spec": "01-envelope.md §2",
-      "mutate": { "specversion": "0.3" },
+      "mutate": {
+        "specversion": "0.3"
+      },
       "expect": "UNSUPPORTED_SPECVERSION"
     },
     {
       "id": "poison-falta-atributo-nucleo",
       "spec": "01-envelope.md §2",
-      "remove": ["dataschema"],
+      "remove": [
+        "dataschema"
+      ],
       "expect": "MISSING_REQUIRED_ATTRIBUTE"
     },
     {
       "id": "poison-atributo-nucleo-null",
       "spec": "01-envelope.md §4",
-      "mutate": { "source": null },
+      "mutate": {
+        "source": null
+      },
       "expect": "MISSING_REQUIRED_ATTRIBUTE"
     },
     {
       "id": "poison-falta-extension",
       "spec": "01-envelope.md §3.1",
-      "remove": ["tenantid"],
+      "remove": [
+        "tenantid"
+      ],
       "expect": "MISSING_REQUIRED_EXTENSION"
     },
     {
       "id": "poison-extension-vacia",
       "spec": "01-envelope.md §3.1",
-      "mutate": { "tenantid": "" },
+      "mutate": {
+        "tenantid": ""
+      },
       "expect": "MISSING_REQUIRED_EXTENSION"
     },
     {
       "id": "poison-clasificacion-vacia",
       "spec": "01-envelope.md §3.1",
-      "mutate": { "dataclassification": "" },
+      "mutate": {
+        "dataclassification": ""
+      },
       "expect": "MISSING_REQUIRED_EXTENSION",
       "why": "El vacío se evalúa ANTES que el enum. Un SDK que invierta el orden devuelve INVALID_DATACLASSIFICATION y la agrupación de la DLQ por causa deja de coincidir."
     },
     {
       "id": "poison-clasificacion-invalida",
       "spec": "01-envelope.md §3.1",
-      "mutate": { "dataclassification": "secreto" },
+      "mutate": {
+        "dataclassification": "secreto"
+      },
       "expect": "INVALID_DATACLASSIFICATION"
     },
     {
       "id": "poison-tipo-coaccionable",
       "spec": "01-envelope.md §2.4",
-      "mutate": { "tenantid": 42 },
+      "mutate": {
+        "tenantid": 42
+      },
       "expect": "WRONG_ATTRIBUTE_TYPE",
       "why": "Jackson lo convertiría en \"42\" en silencio. El código debe ser este y no uno genérico de parseo."
     },
     {
       "id": "poison-atributo-raiz-desconocido",
       "spec": "01-envelope.md §3.4",
-      "mutate": { "miMetadato": "algo" },
+      "mutate": {
+        "miMetadato": "algo"
+      },
       "expect": "UNKNOWN_ROOT_ATTRIBUTE"
     },
     {
       "id": "poison-clave-con-otra-caja",
       "spec": "01-envelope.md §2.3",
-      "mutate": { "ID": "otro" },
+      "mutate": {
+        "ID": "otro"
+      },
       "expect": "UNKNOWN_ROOT_ATTRIBUTE",
       "why": "encoding/json de Go empareja campos SIN distinguir mayúsculas: sin la regla de atributos raíz cerrados, {\"ID\":…} poblaría Event.ID en silencio."
     }
-  ]
+  ],
+  "verifyVectors": [
+    {
+      "id": "verify-firma-valida",
+      "spec": "07-signing.md §5.1",
+      "signVector": "firma-determinista",
+      "expect": "ok",
+      "why": "Cada SDK verifica la firma que produjo el SDK de REFERENCIA, no la suya. Verificar la propia no demuestra interoperabilidad: demuestra que uno es consistente consigo mismo."
+    },
+    {
+      "id": "verify-payload-manipulado",
+      "spec": "07-signing.md §1",
+      "signVector": "firma-determinista",
+      "mutate": {
+        "data": {
+          "pedidoId": "ped-999",
+          "totalCents": 1
+        }
+      },
+      "expect": "INVALID_SIGNATURE",
+      "why": "El caso que la ACL del broker no cubre: un evento sacado del stream, editado y reinyectado."
+    },
+    {
+      "id": "verify-tenant-manipulado",
+      "spec": "09-multitenancy.md §4",
+      "signVector": "firma-determinista",
+      "mutate": {
+        "tenantid": "otro-tenant"
+      },
+      "expect": "INVALID_SIGNATURE",
+      "why": "Es lo que liga criptograficamente el tenantid a la clave del productor."
+    },
+    {
+      "id": "verify-signkeyid-cambiado",
+      "spec": "07-signing.md §5",
+      "signVector": "firma-determinista",
+      "mutate": {
+        "signkeyid": "otro-servicio-9"
+      },
+      "expect": "UNKNOWN_SIGNING_KEY",
+      "why": "signkeyid va DENTRO de lo firmado justo para que cambiarlo no permita eludir la verificacion."
+    },
+    {
+      "id": "verify-sin-firma-en-require",
+      "spec": "07-signing.md §7",
+      "signVector": null,
+      "buildVector": "envelope-minimo",
+      "expect": "MISSING_SIGNATURE",
+      "why": "En modo require, un evento sin firma es POISON."
+    },
+    {
+      "id": "verify-firma-sobre-acentos",
+      "spec": "07-signing.md §5, 01-envelope.md §1.1",
+      "signVector": "firma-con-acentos",
+      "expect": "ok",
+      "why": "Un SDK que escape los no-ASCII firma sobre bytes distintos: su firma no verificaria en ningun otro, y al reves tampoco."
+    }
+  ],
+  "$commentVerify": "Los vectores de verify cruzan de verdad: el runner FIRMA con el SDK de referencia y pide a cada uno de los demas que VERIFIQUE esa firma. Es la unica prueba que demuestra interoperabilidad; que cada SDK verifique su propia firma solo demuestra consistencia consigo mismo."
 }

@@ -111,6 +111,50 @@ for (const p of vectores.poisonVectors) {
   });
 }
 
+// Vectores de `verify`: el SDK de REFERENCIA firma, y cada uno de los demás verifica
+// ESA firma. Verificar la propia solo demuestra consistencia consigo mismo; esto es lo
+// único que demuestra interoperabilidad.
+const refHarness = registro.harnesses.find((h) => h.reference) ?? registro.harnesses[0];
+for (const v of vectores.verifyVectors ?? []) {
+  const fuente = v.signVector
+    ? vectores.vectors.find((x) => x.id === v.signVector)
+    : vectores.vectors.find((x) => x.id === v.buildVector);
+  if (!fuente) {
+    console.error(red(`vector de verify "${v.id}" apunta a uno inexistente`));
+    process.exit(2);
+  }
+
+  const entradaFirma = { op: v.signVector ? "sign" : "build", event: fuente.event };
+  if (v.signVector) {
+    entradaFirma.signing = { privateKeyPem: claves.privateKeyPem, keyId: claves.keyId };
+  }
+  const firmado = await invocar(refHarness, entradaFirma);
+  if (firmado.__arnesRoto || !firmado.ok) {
+    console.error(red(`no se pudo preparar "${v.id}" con ${refHarness.sdk}`));
+    process.exit(2);
+  }
+
+  let bytes = firmado.bytes;
+  if (v.mutate) {
+    // Se manipula DESPUÉS de firmar: es exactamente el ataque que la firma detecta —
+    // un evento sacado del stream, editado y reinyectado (07-signing.md §1).
+    const obj = JSON.parse(Buffer.from(bytes, "base64").toString("utf8"));
+    Object.assign(obj, v.mutate);
+    bytes = Buffer.from(JSON.stringify(obj), "utf8").toString("base64");
+  }
+
+  operaciones.push({
+    id: v.id, spec: v.spec, why: v.why,
+    entrada: {
+      op: "verify", bytes,
+      publicKeys: { [claves.keyId]: claves.publicKeyPem },
+      mode: "require",
+    },
+    tipo: v.expect === "ok" ? "verifyOk" : "codigo",
+    esperado: v.expect,
+  });
+}
+
 // ─── Ejecutar ────────────────────────────────────────────────────────────────
 
 const activos = registro.harnesses.filter((h) => !solo || solo.has(h.sdk));
@@ -140,6 +184,12 @@ for (const op of operaciones) {
     if (r.__arnesRoto) {
       arnesesRotos.push(`${h.sdk} en ${op.id}: ${r.__arnesRoto}`);
       ok = null;
+    } else if (op.tipo === "verifyOk") {
+      ok = r.ok === true;
+      if (!ok) {
+        fallos.push({ op, sdk: h.sdk,
+          detalle: `esperaba que verificase, obtuvo code="${r.code ?? "?"}" ${r.detail ?? ""}` });
+      }
     } else if (op.tipo === "codigo") {
       ok = r.ok === false && r.code === op.esperado;
       if (!ok) {
@@ -159,7 +209,10 @@ for (const op of operaciones) {
     marcas.push(ok === null ? yellow("?") : ok ? green("✓") : red("✗"));
   }
 
-  const nombre = op.tipo === "codigo" ? `${op.id} ${gray(`→ ${op.esperado}`)}` : op.id;
+  const nombre =
+    op.tipo === "codigo" ? `${op.id} ${gray(`→ ${op.esperado}`)}`
+    : op.tipo === "verifyOk" ? `${op.id} ${gray("→ verifica")}`
+    : op.id;
   console.log(`  ${marcas.join(" ")}  ${nombre}`);
 }
 
