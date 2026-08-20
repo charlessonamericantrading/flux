@@ -1410,6 +1410,15 @@ impl Bus {
     /// Es defensa en profundidad y por eso es opt-in dentro de lo opt-in: el sitio donde un
     /// contrato roto se arregla es el productor. Aquí solo evita que un evento inválido
     /// llegue a un handler que asume que su `data` cumple lo que promete.
+    // Sin la feature `validation` esto es un no-op: no toca `self` y no puede fallar, así
+    // que clippy marca `unused_self` y `unnecessary_wraps`. La firma DEBE ser idéntica en
+    // las dos compilaciones —quien llama no sabe qué features están activas— y por eso el
+    // allow se aplica SOLO a esa variante, con `cfg_attr`: en la compilación con
+    // validación, donde ambos lints sí dirían algo, siguen activos.
+    #[cfg_attr(
+        not(feature = "validation"),
+        allow(clippy::unused_self, clippy::unnecessary_wraps)
+    )]
     fn validate_on_consume(&self, event: &Event, subject: &str) -> HandlerResult {
         #[cfg(feature = "validation")]
         if self.inner.opts.validation.on_consume {

@@ -80,6 +80,28 @@ bus.publish_with(
 `causationid`, `producerversion` y `traceparent`. Si tu código asigna alguno de esos a
 mano, está mal — [01-envelope.md §5](../specification/01-envelope.md).
 
+
+## ⚠️ Clippy: el CI es más estricto que tu máquina
+
+El job de CI usa `dtolnay/rust-toolchain@stable`, es decir, **el stable del día**. Si tu
+toolchain local va por detrás, `cargo clippy -- -D warnings` puede pasar en local y
+fallar en CI con lints que tu versión aún no conoce.
+
+Pasó de verdad: `unnecessary_wraps` sobre un método `&self` no lo marcaba clippy 1.96 y
+sí 1.98.
+
+Antes de dar por bueno un cambio:
+
+```bash
+rustup update stable
+cargo clippy --all-targets -- -D warnings              # sin features
+cargo clippy --all-targets --all-features -- -D warnings
+```
+
+**Las dos invocaciones**, porque las features cambian qué código se compila: un stub
+`#[cfg]`-eado sin la feature `validation` deja de usar `self` y de poder fallar, y eso
+son dos lints que la compilación completa no ve.
+
 ## Consumir
 
 ```rust
