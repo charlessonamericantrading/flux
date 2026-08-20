@@ -32,20 +32,10 @@ jobs:
         with:
           node-version: 22
 
-      - name: JSON parseable y $id coincide con la ruta
-        run: |
-          fail=0
-          for f in $(find schemas -name '*.json'); do
-            if ! jq empty "$f" 2>/dev/null; then
-              echo "✗ $f: JSON inválido"; fail=1; continue
-            fi
-            id=$(jq -r '.["$id"] // empty' "$f")
-            expected="https://schemas.internal/${f#schemas/}"
-            if [ "$id" != "$expected" ]; then
-              echo "✗ $f: \$id es '$id', se esperaba '$expected'"; fail=1
-            fi
-          done
-          exit $fail
+      # 05-compatibility.md §5: "Sin (1) y (2) automatizados, el resto de este
+      # documento es una sugerencia amable." Esto es (1) y (2).
+      - name: Esquemas conformes y BACKWARD-compatibles
+        run: node scripts/check-compat.mjs -v
 
       # 05-compatibility.md §4: los esquemas publicados son inmutables.
       # Editar 1.0.0 in situ invalida todos los eventos ya emitidos que lo referencian.

@@ -123,3 +123,14 @@ Un pipeline **DEBE** rechazar el PR si:
 4. Un evento nuevo no tiene un `CODEOWNER` que sea el equipo dueño del dominio.
 
 Sin (1) y (2) automatizados, el resto de este documento es una sugerencia amable.
+
+Implementado en [`scripts/check-compat.mjs`](../scripts/check-compat.mjs), que corre en
+CI. Detecta además dos rupturas que no están en la lista de §2.2 porque **no lo
+parecen**:
+
+- **Introducir un `enum` donde no lo había.** El campo pasa de aceptar cualquier valor
+  de su tipo a aceptar una lista cerrada, y todo dato ya emitido fuera de ella deja de
+  validar. Es la misma ruptura que bajar un `maxLength`, disfrazada de adición.
+- **Un campo monetario declarado como `number`.** Valida perfectamente hoy y pierde
+  precisión en producción — el caso de §2.2 "cambiar unidades o semántica", que ningún
+  validador de esquemas detecta por sí solo.
