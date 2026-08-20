@@ -374,7 +374,7 @@ que ahorras.
 | `id` | String | ✅ | **DEBE** ser un [UUIDv7](https://www.rfc-editor.org/rfc/rfc9562) en formato canónico. Lo genera el SDK. |
 | `source` | URI-ref | ✅ | **DEBE** ser `/<entorno>/<servicio>`. Ej.: `/produccion/pedidos-api`. |
 | `type` | String | ✅ | Reverse-DNS. Ver [02-naming.md §2](02-naming.md). |
-| `time` | Timestamp | ✅ | RFC 3339 en **UTC**, precisión de milisegundos. **DEBE** ser el instante en que ocurrió el hecho, no el de publicación. |
+| `time` | Timestamp | ✅ | RFC 3339 en **UTC**, **exactamente 3 decimales y sufijo `Z`**. Ver §2.3. **DEBE** ser el instante en que ocurrió el hecho, no el de publicación. |
 | `datacontenttype` | String | ✅ | `application/json` en v1. |
 | `dataschema` | URI | ✅ | URI absoluta al JSON Schema, con SemVer. Ver [05-compatibility.md](05-compatibility.md). |
 | `subject` | String | ⚠️ | **DEBE** ser el identificador del agregado (ej. `"ped-123"`). Ver el aviso de §2.1. |
@@ -394,7 +394,49 @@ NATS se llama siempre `subject` en las firmas de `publish`/`subscribe`, y el atr
 de CloudEvents se llama `aggregateId` en la API del SDK, mapeándose a `subject` solo
 al serializar.
 
-### 2.2 Unicidad
+### 2.2 ⚠️ Formato de `time`: exactamente 3 decimales
+
+```
+✅  2025-08-20T10:25:39.410Z
+✅  2025-08-20T10:25:39.400Z
+✅  2025-08-20T10:25:39.000Z
+❌  2025-08-20T10:25:39.41Z          ← ceros recortados
+❌  2025-08-20T10:25:39.410000+00:00 ← microsegundos y offset en vez de Z
+❌  2025-08-20T10:25:39Z             ← sin decimales
+```
+
+"Precisión de milisegundos" no basta como regla, porque los formateadores por defecto
+de cada lenguaje producen cosas distintas **todas válidas según RFC 3339**:
+
+| | Por defecto | Resultado |
+|---|---|---|
+| Go | `time.RFC3339Nano` | `…39.41Z` — recorta ceros finales |
+| Python | `datetime.isoformat()` | `…39.410000+00:00` — microsegundos y offset |
+| Node | `Date.toISOString()` | `…39.410Z` — correcto por casualidad |
+
+El resultado sería que **dos servicios del mismo ecosistema emiten `time` distintos
+para el mismo instante**. Eso rompe:
+
+- El **replay verbatim** desde la DLQ, que deja de ser byte a byte idéntico.
+- Cualquier **firma criptográfica** sobre el evento serializado (fase 4).
+- La **deduplicación por hash de contenido**.
+- Los **fixtures compartidos** entre SDKs en la suite de conformidad.
+
+Un SDK **DEBE** formatear explícitamente y **NO DEBE** usar el formateador ISO por
+defecto de su lenguaje. Verificado byte a byte entre Node, Python y Go.
+
+### 2.3 Comparación de nombres de atributo: case-sensitive
+
+Los nombres de atributo se comparan **respetando mayúsculas**. `{"ID": "..."}` **no**
+es el atributo `id`; es un atributo raíz desconocido y por tanto POISON (§3.3).
+
+La regla existe porque `encoding/json` de Go empareja campos **sin distinguir
+mayúsculas** por defecto: un `{"ID": ...}` poblaría `Event.ID` en silencio. Es
+exactamente el mismo fantasma que [02-naming.md §1.1](02-naming.md) combate en los
+subjects. La regla de atributos raíz cerrados lo tapa por accidente; esta sección lo
+hace explícito para que ningún SDK dependa de esa casualidad.
+
+### 2.4 Unicidad
 
 `id` + `source` **DEBEN** ser únicos en su conjunto. Esa pareja es la clave de
 deduplicación del ecosistema entero. Como `id` es UUIDv7 (monotónico en el tiempo),
@@ -427,7 +469,23 @@ no `correlation_id`. No es un capricho de estilo: es la especificación.
 | `dlqreason` | String | Solo presente en la DLQ. Lo añade el SDK. Ver [04-errors.md](04-errors.md). |
 | `dlqattempts` | Integer | Solo presente en la DLQ. |
 
-### 3.3 Prohibidas
+### 3.3 Ausente ≠ vacío
+
+Un atributo opcional **DEBE** omitirse cuando no aplica, y **NO DEBE** usar un valor
+vacío (`0`, `""`, `false`) con significado propio.
+
+La razón es de interoperabilidad, no de estilo: `omitempty` de Go, el default de
+`System.Text.Json` y varios serializadores más **colapsan cero y ausente**. Si
+`dlqattempts` pudiese valer `0`, desaparecería del JSON al serializar en Go y
+reaparecería como "ausente" al parsear en Node. Hoy no ocurre solo porque el mínimo
+legal de `dlqattempts` resulta ser `1` — es decir, **el envelope depende de una
+coincidencia en vez de una regla**.
+
+La alternativa a esta regla son punteros y tipos anulables en Go, C# y Java para cada
+opcional, que es exactamente la clase de fricción que un protocolo polyglot debe
+evitar.
+
+### 3.4 Prohibidas
 
 Cualquier atributo de nivel raíz que no aparezca en §2 o §3. **Todo lo demás va
 dentro de `data`.**
@@ -968,11 +1026,27 @@ tira eventos buenos a la basura por un hipo de red.
 
 El fallo no dice nada sobre el evento — dice algo sobre el mundo en este instante.
 
-- Timeout de red, DNS, conexión rechazada
-- HTTP 429, 502, 503, 504
-- Deadlock o lock timeout de base de datos
-- Pool de conexiones agotado
-- Dependencia en arranque o en despliegue
+La clasificación se define por **semántica**, no por una lista de códigos:
+
+| Categoría | Qué significa |
+|---|---|
+| Red no disponible o interrumpida | Conexión rechazada, reseteada, ruta inalcanzable, tubería rota |
+| Resolución de nombres temporal | El resolutor dice explícitamente "reinténtalo", no "no existe" |
+| Rechazo por carga | HTTP 429, 502, 503, 504 |
+| Contención en base de datos | Deadlock, lock timeout, pool agotado |
+| Dependencia arrancando o desplegándose | Aún no acepta tráfico |
+
+> **Los códigos concretos son ejemplos, no norma.** `ECONNRESET`, `ETIMEDOUT` y
+> `EAI_AGAIN` son nombres de libuv: existen en Node, aparecen con prefijo `WSA` en
+> Windows (`WSAECONNRESET`), y en Go `EAI_AGAIN` **no existe como errno** — el mismo
+> fallo se expresa como `*net.DNSError` con `IsTemporary`.
+>
+> Un SDK **DEBE** usar el mecanismo idiomático de su plataforma para reconocer estas
+> categorías. **NO DEBE** hacer `strings.Contains` sobre mensajes de error, que es
+> justo lo que invita a hacer una lista de códigos tratada como normativa.
+>
+> Un port literal de la lista de Node produjo un bug real: en Windows el mismo corte
+> de red se clasificaba PERMANENT y en Linux RETRYABLE.
 
 → `nak` con el backoff de [03-delivery.md §2](03-delivery.md). Tras agotar
 `max_deliver`, JetStream deja de entregar y el SDK enruta a la DLQ.

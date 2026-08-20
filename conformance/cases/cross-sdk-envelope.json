@@ -1,0 +1,76 @@
+{
+  "case": "cross-sdk-envelope",
+  "title": "Todos los SDKs serializan el mismo evento de forma byte a byte idéntica",
+  "spec": "specification/01-envelope.md §2.2, §2.3, §3.3",
+  "verifiedAgainst": "sdk-node, sdk-python, sdk-go",
+  "verifiedOn": "2026-08-20",
+
+  "rationale": "Un protocolo polyglot cuyo envelope no es reproducible entre lenguajes no es un protocolo: es una convención informal. Sin serialización idéntica se rompen el replay verbatim desde la DLQ, la firma criptográfica del evento (fase 4), la deduplicación por hash de contenido y los fixtures compartidos de esta misma suite. Este caso nació de tres divergencias reales que los ports a Python y Go destaparon.",
+
+  "divergencesFound": [
+    {
+      "id": "time-default-formatters-disagree",
+      "spec": "01-envelope.md §2.2",
+      "description": "\"Precisión de milisegundos\" no bastaba como regla: cada lenguaje produce un RFC 3339 válido pero distinto para el mismo instante.",
+      "observed": {
+        "instant": 1755685539410,
+        "go_RFC3339Nano": "2025-08-20T10:25:39.41Z",
+        "python_isoformat": "2025-08-20T10:25:39.410000+00:00",
+        "node_toISOString": "2025-08-20T10:25:39.410Z"
+      },
+      "rule": "Exactamente 3 decimales y sufijo Z. El SDK formatea explícitamente y NO usa el formateador ISO por defecto de su lenguaje.",
+      "afterFix": {
+        "node": "2025-08-20T10:25:39.410Z",
+        "python": "2025-08-20T10:25:39.410Z",
+        "go": "2025-08-20T10:25:39.410Z",
+        "identical": true
+      }
+    },
+    {
+      "id": "omitempty-collapses-zero-and-absent",
+      "spec": "01-envelope.md §3.3",
+      "description": "omitempty de Go y el default de System.Text.Json borran los campos con valor cero. Un dlqattempts de 0 desaparecería al serializar en Go y reaparecería como ausente al parsear en Node.",
+      "rule": "Ningún atributo opcional usa un valor vacío (0, \"\", false) con significado propio. Se omite o lleva un valor significativo.",
+      "note": "Hoy es inocuo solo porque el mínimo legal de dlqattempts resulta ser 1 — el envelope dependía de una coincidencia, no de una regla escrita."
+    },
+    {
+      "id": "json-field-matching-case-insensitive",
+      "spec": "01-envelope.md §2.3",
+      "description": "encoding/json de Go empareja campos SIN distinguir mayúsculas: {\"ID\": \"x\"} poblaría Event.ID en silencio. Es el mismo fantasma que la spec combate en los subjects de NATS.",
+      "rule": "La comparación de nombres de atributo es case-sensitive. {\"ID\": …} es un atributo raíz desconocido, y por tanto POISON.",
+      "note": "La regla de atributos raíz cerrados lo tapaba por accidente. Ahora es explícita para que ningún SDK dependa de esa casualidad."
+    }
+  ],
+
+  "fixture": {
+    "description": "Entrada canónica. Todo SDK DEBE producir exactamente `expectedJson` a partir de ella.",
+    "input": {
+      "subject": "pedidos.pedido.v1.creado",
+      "id": "01924f8e-7c3a-7b2d-9e14-3f8a1c9d0e55",
+      "source": "/produccion/pedidos-api",
+      "timeMillis": 1755685539410,
+      "aggregateId": "ped-123",
+      "dataschema": "https://schemas.internal/pedidos/pedido/creado/1.0.0.json",
+      "correlationid": "01924f8e-7c3a-7b2d-9e14-3f8a1c9d0e55",
+      "tenantid": "acme",
+      "producerversion": "3.4.1",
+      "dataclassification": "confidential",
+      "data": { "pedidoId": "ped-123", "aggregateVersion": 1, "totalCents": 9990, "moneda": "EUR" }
+    },
+    "expectedAttributes": {
+      "specversion": "1.0",
+      "type": "com.flux.pedidos.pedido.creado.v1",
+      "time": "2025-08-20T10:25:39.410Z",
+      "datacontenttype": "application/json",
+      "subject": "ped-123",
+      "partitionkey": "ped-123"
+    },
+    "assertions": [
+      { "id": "time-exactly-three-decimals", "expr": "/^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}\\.\\d{3}Z$/.test(event.time)" },
+      { "id": "type-derived-from-subject", "expr": "event.type == 'com.flux.pedidos.pedido.creado.v1'" },
+      { "id": "aggregate-id-goes-to-cloudevents-subject", "expr": "event.subject == 'ped-123'" },
+      { "id": "no-null-attributes", "expr": "Object.values(event).every(v => v !== null)" },
+      { "id": "no-unknown-root-attributes", "expr": "Object.keys(event).every(k => ALLOWED_ROOT_ATTRIBUTES.has(k))" }
+    ]
+  }
+}

@@ -110,9 +110,10 @@
         "type": "string",
         "format": "date-time",
         "timezone": "UTC",
-        "precision": "milliseconds",
+        "pattern": "^d{4}-d{2}-d{2}Td{2}:d{2}:d{2}.d{3}Z$",
+        "precision": "exactly-3-decimals",
         "generatedBy": "sdk",
-        "$comment": "Instante en que OCURRIO el hecho, no el de publicacion."
+        "$comment": "Instante en que OCURRIO el hecho, no el de publicacion. EXACTAMENTE 3 decimales y sufijo Z: los formateadores ISO por defecto divergen (Go RFC3339Nano recorta ceros -> .41Z; Python isoformat da microsegundos y +00:00). Un SDK DEBE formatear explicitamente."
       },
       "datacontenttype": {
         "type": "string",
@@ -208,7 +209,10 @@
       "Timestamp"
     ],
     "rootAttributesClosed": true,
-    "$comment": "Cualquier atributo raiz fuera de las tres listas anteriores DEBE ser rechazado en publish(). Las extensiones no admiten objetos ni arrays; permitirlas lleva a serializar JSON dentro de un string y el envelope deja de ser interoperable."
+    "$comment": "Cualquier atributo raiz fuera de las tres listas anteriores DEBE ser rechazado en publish(). Las extensiones no admiten objetos ni arrays; permitirlas lleva a serializar JSON dentro de un string y el envelope deja de ser interoperable.",
+    "attributeNameComparison": "case-sensitive",
+    "optionalAbsentNotEmpty": true,
+    "$commentAbsentNotEmpty": "Un atributo opcional se OMITE cuando no aplica; NUNCA usa un valor vacio (0, \"\", false) con significado propio. omitempty de Go y el default de System.Text.Json colapsan cero y ausente."
   },
   "data": {
     "rootType": "object",
@@ -303,6 +307,14 @@
           "EHOSTUNREACH",
           "ENETUNREACH",
           "EAI_AGAIN"
+        ],
+        "$comment": "Los codigos listados son EJEMPLOS, no norma. EAI_AGAIN no existe como errno en Go (*net.DNSError.IsTemporary); en Windows los codigos llevan prefijo WSA. Un SDK DEBE usar el mecanismo idiomatico de su plataforma y NO DEBE hacer matching de substrings sobre mensajes de error.",
+        "categories": [
+          "red no disponible o interrumpida",
+          "resolucion de nombres temporal",
+          "rechazo por carga (HTTP 429/502/503/504)",
+          "contencion en base de datos",
+          "dependencia arrancando"
         ]
       },
       "permanent": {

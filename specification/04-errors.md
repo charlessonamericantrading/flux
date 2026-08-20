@@ -24,11 +24,27 @@ tira eventos buenos a la basura por un hipo de red.
 
 El fallo no dice nada sobre el evento — dice algo sobre el mundo en este instante.
 
-- Timeout de red, DNS, conexión rechazada
-- HTTP 429, 502, 503, 504
-- Deadlock o lock timeout de base de datos
-- Pool de conexiones agotado
-- Dependencia en arranque o en despliegue
+La clasificación se define por **semántica**, no por una lista de códigos:
+
+| Categoría | Qué significa |
+|---|---|
+| Red no disponible o interrumpida | Conexión rechazada, reseteada, ruta inalcanzable, tubería rota |
+| Resolución de nombres temporal | El resolutor dice explícitamente "reinténtalo", no "no existe" |
+| Rechazo por carga | HTTP 429, 502, 503, 504 |
+| Contención en base de datos | Deadlock, lock timeout, pool agotado |
+| Dependencia arrancando o desplegándose | Aún no acepta tráfico |
+
+> **Los códigos concretos son ejemplos, no norma.** `ECONNRESET`, `ETIMEDOUT` y
+> `EAI_AGAIN` son nombres de libuv: existen en Node, aparecen con prefijo `WSA` en
+> Windows (`WSAECONNRESET`), y en Go `EAI_AGAIN` **no existe como errno** — el mismo
+> fallo se expresa como `*net.DNSError` con `IsTemporary`.
+>
+> Un SDK **DEBE** usar el mecanismo idiomático de su plataforma para reconocer estas
+> categorías. **NO DEBE** hacer `strings.Contains` sobre mensajes de error, que es
+> justo lo que invita a hacer una lista de códigos tratada como normativa.
+>
+> Un port literal de la lista de Node produjo un bug real: en Windows el mismo corte
+> de red se clasificaba PERMANENT y en Linux RETRYABLE.
 
 → `nak` con el backoff de [03-delivery.md §2](03-delivery.md). Tras agotar
 `max_deliver`, JetStream deja de entregar y el SDK enruta a la DLQ.
