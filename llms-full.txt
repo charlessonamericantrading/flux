@@ -1451,6 +1451,31 @@ servicio no puede falsificar un evento de otro dominio aunque su código lo inte
 la publicación es rechazada en el servidor. Es el mismo principio del mayor en el
 subject — el enrutado aplica el contrato, la documentación solo lo describe.
 
+### 3.0 Las ACLs se generan, no se escriben
+
+Escritas a mano divergen del diseño en el primer mes: alguien añade un consumidor y
+concede un dominio entero "temporalmente". Pero la regla de arriba es **derivable**:
+si sabes quién es dueño de cada dominio y qué consume cada servicio, las ACLs se
+calculan.
+
+El manifiesto de ownership ([`examples/services.json`](../examples/services.json)) es
+la fuente, y [`scripts/gen-acl.mjs`](../scripts/gen-acl.mjs) deriva la configuración.
+
+```bash
+node scripts/gen-acl.mjs examples/services.json          # genera
+node scripts/gen-acl.mjs examples/services.json --check  # valida (CI)
+```
+
+El generador rechaza los manifiestos que rompen el modelo, no solo los mal formados:
+
+| Rechaza | Por qué |
+|---|---|
+| Dos servicios dueños del mismo dominio | Con dos dueños nadie puede confiar en el `source` de un evento — [00-protocol.md §4](00-protocol.md) |
+| Un consumo con comodín en el dominio (`*.>`) | Conceder un dominio entero por comodín es lo contrario de una concesión explícita |
+| Consumir un dominio sin dueño declarado | O falta el productor en el manifiesto, o el subject está mal escrito |
+| Un servicio suscrito a su propio dominio | Suele indicar que ese flujo debería ser una llamada interna, no un evento |
+| Nombre de servicio fuera de `[a-z0-9-]` | Alimenta los nombres de durable consumer — [02-naming.md §4](02-naming.md) |
+
 ### 3.1 DLQ
 
 Un consumidor **DEBE** poder publicar en `dlq.<subject que consume>`, y eso significa

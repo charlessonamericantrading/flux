@@ -1,0 +1,26 @@
+{
+  "$comment": "Manifiesto de ownership del ecosistema. Alimenta scripts/gen-acl.mjs, que deriva las ACLs de NATS a partir de él. Ver specification/06-security.md §3.",
+  "environment": "produccion",
+  "services": [
+    {
+      "name": "pedidos-api",
+      "owns": ["pedidos"],
+      "consumes": ["inventario.stock.v1.>"]
+    },
+    {
+      "name": "facturacion-api",
+      "owns": ["facturacion"],
+      "consumes": ["pedidos.pedido.v1.>"]
+    },
+    {
+      "name": "inventario-api",
+      "owns": ["inventario"],
+      "consumes": ["pedidos.pedido.v1.>"]
+    },
+    {
+      "name": "logistica-api",
+      "owns": ["logistica"],
+      "consumes": ["pedidos.pedido.v1.>", "facturacion.factura.v2.>"]
+    }
+  ]
+}

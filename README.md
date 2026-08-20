@@ -109,7 +109,8 @@ protocolo a v2.
 ├── cli/                    ← flux doctor · tail · dlq · validate
 ├── conformance/            ← el contrato, ejecutable contra NATS real
 ├── docker-compose.yml      ← NATS JetStream local
-├── scripts/build-llms.mjs  ← regenera llms-full.txt
+├── examples/services.json  ← manifiesto de ownership → ACLs
+├── scripts/                ← build-llms · check-compat · bundle-schemas · gen-acl
 ├── sdk-node/               ← fase 1
 ├── sdk-python/             ← fase 1
 └── sdk-go/                 ← fase 1
@@ -157,4 +158,5 @@ propaga `correlationid` / `traceparent`. El desarrollador nunca los escribe a ma
 | **1 — Core** | Especificación v1, JetStream, SDK Node/Python/Go a nivel L2 | ✅ |
 | **2 — Cobertura** | SDK Java, .NET, Rust, PHP | 🚧 en curso |
 | **3 — Operación** | CLI `flux`: doctor, tail, triaje y replay de DLQ | ✅ |
-| **4 — Gobierno** | Schema Registry, validación L3, ACLs multi-tenant | ⏳ |
+| **4 — Gobierno** | Validación L3, verificador de compatibilidad, generador de ACLs | ✅ |
+| **5 — Pendiente** | Firma de eventos, aislamiento real de tenant, métricas | ⏳ |

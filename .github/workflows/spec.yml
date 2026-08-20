@@ -57,6 +57,18 @@ jobs:
           fi
           echo "✓ Solo adiciones"
 
+  acl-manifest:
+    name: Manifiesto de ownership coherente
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      # Un dominio con dos dueños destruye la premisa de que solo el propietario
+      # del agregado publica sus eventos, y nadie puede confiar ya en el .
+      - run: node scripts/gen-acl.mjs examples/services.json --check
+
   protocol-json-valid:
     name: protocol.json parseable
     runs-on: ubuntu-latest
