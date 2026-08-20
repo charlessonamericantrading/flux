@@ -1,0 +1,33 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "flux-sdk"
+version = "0.1.0"
+description = "Cliente delgado de flux Event Protocol v1 para Python. Nivel de conformidad objetivo: L2."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "UNLICENSED" }
+dependencies = [
+    # 2.6 es el mínimo con `backoff` en ConsumerConfig y `nak(delay=…)`: sin ambos no
+    # se puede implementar el backoff canónico de 03-delivery.md §2.
+    "nats-py>=2.6",
+]
+
+[project.optional-dependencies]
+# `uuid7` no aparece aquí a propósito: el SDK genera UUIDv7 con la stdlib
+# (flux/protocol.py). Python <3.14 no trae `uuid.uuid7()` y no compensa una dependencia
+# por 15 líneas que además hay que auditar por generar identidad de eventos.
+dev = ["pytest>=8"]
+otel = ["opentelemetry-api>=1.20"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["flux"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"

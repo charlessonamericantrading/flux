@@ -120,7 +120,11 @@ solo hay que borrar las extensiones `dlq*` y republicar en el subject original. 
 un wrapper habría que desenvolver, y cada consumidor de la DLQ tendría que conocer dos
 formatos. El replay se convierte en `jq 'del(.dlq*)'`.
 
-`dlqattempts` distingue de un vistazo un PERMANENT (`1`) de un RETRYABLE agotado (`6`).
+`dlqattempts` es el número de entrega en que el evento murió, **no** una propiedad de
+su clase. Un PERMANENT suele registrar `1` porque no gasta reintentos, pero si el
+handler falló dos veces con errores transitorios y a la tercera lanzó un PERMANENT,
+registra `3` — y eso es información útil, no una incoherencia. Un RETRYABLE agotado
+registra siempre `max_deliver` (`6`).
 
 Subject de destino: `dlq.<subject original>` — ver
 [02-naming.md §3.1](02-naming.md).

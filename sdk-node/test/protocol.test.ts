@@ -16,6 +16,7 @@ import {
   dlqSubject,
   sourceUri,
   InvalidSubjectError,
+  InvalidServiceNameError,
   CONSUMER_DEFAULTS,
 } from "../src/protocol.js";
 
@@ -92,6 +93,24 @@ describe("nombres que NATS restringe", () => {
 
   test("el durable valida el subject en vez de generar un nombre corrupto", () => {
     assert.throws(() => durableName("svc", "no-es-un-subject"), InvalidSubjectError);
+  });
+
+  test("el durable valida también el nombre de servicio", () => {
+    // NATS aceptaría `FacturacionAPI__pedidos_…` sin rechistar, y el incumplimiento
+    // del patrón del protocolo solo se descubriría al parsear nombres en una
+    // herramienta. Mejor fallar en connect().
+    assert.throws(
+      () => durableName("FacturacionAPI", "pedidos.pedido.v1.creado"),
+      InvalidServiceNameError,
+    );
+    assert.throws(
+      () => durableName("facturacion_api", "pedidos.pedido.v1.creado"),
+      InvalidServiceNameError,
+    );
+    assert.throws(
+      () => durableName("svc.api", "pedidos.pedido.v1.creado"),
+      InvalidServiceNameError,
+    );
   });
 });
 

@@ -48,6 +48,8 @@ export {
   MAX_MESSAGE_BYTES,
   SUBJECT_PATTERN,
   InvalidSubjectError,
+  InvalidServiceNameError,
+  SERVICE_PATTERN,
   parseSubject,
   isValidSubject,
   subjectToType,

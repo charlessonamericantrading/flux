@@ -40,12 +40,18 @@ Los dos números tienen que cuadrar: si `max_deliver` fuese 5, la última entrad
 backoff (`30m`) no se aplicaría nunca y la configuración mentiría sobre su propio
 comportamiento.
 
-**Tiempo total hasta la DLQ ≈ 51 min 30 s.** Ese número es una decisión de producto,
-no un detalle técnico: es cuánto tiempo estás dispuesto a que un evento transitorio
-siga reintentando antes de que un humano se entere. Es largo a propósito — los
-errores que llegan aquí son **solo** los RETRYABLE, y la mayoría de fallos
-transitorios se resuelven solos. Un PERMANENT no gasta ni un reintento: va a la DLQ
-en la primera entrega ([04-errors.md](04-errors.md)).
+**Tiempo hasta la DLQ: entre 51 min 30 s y ~54 min.** El límite inferior es
+`sum(backoff)` = 3090 s, y se da cuando el handler falla rápido: el `nak` es inmediato
+y solo se espera el backoff. El límite superior añade hasta un `ack_wait` (30 s) por
+intento, cuando el handler no falla sino que **agota el plazo** sin responder.
+`protocol.json` publica el límite inferior (`totalTimeToDlqSeconds: 3090`) por ser el
+determinista.
+
+Ese número es una decisión de producto, no un detalle técnico: es cuánto tiempo estás
+dispuesto a que un evento transitorio siga reintentando antes de que un humano se
+entere. Es largo a propósito — los errores que llegan aquí son **solo** los RETRYABLE,
+y la mayoría de fallos transitorios se resuelven solos. Un PERMANENT no gasta ni un
+reintento ([04-errors.md](04-errors.md)).
 
 ### 2.1 ⚠️ `backoff[0]` **es** `ack_wait` — el servidor lo sobrescribe en silencio
 

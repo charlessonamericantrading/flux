@@ -79,6 +79,16 @@ export interface ConnectOptions {
   schemaBaseUrl?: string;
   /** Política de clasificación de errores. Ver classify.ts. */
   classifier?: ClassifierOptions;
+  /**
+   * Réplicas de los streams que el SDK crea si no existen.
+   *
+   * El default es 1 porque el auto-provisionado es una comodidad de desarrollo: con 3
+   * no arrancaría contra un NATS de un solo nodo. **En producción los streams se
+   * provisionan por IaC con `replicas: 3`** (02-naming.md §3.2), no desde el SDK —
+   * dejar que un servicio cualquiera cree el stream compartido de su dominio con la
+   * configuración que le apetezca es una carrera esperando a ocurrir.
+   */
+  streamReplicas?: number;
   /** Credenciales NATS. NUNCA versionadas — 06-security.md §2. */
   credentials?: { creds?: string; token?: string; user?: string; pass?: string };
   /** Se invoca ante un POISON. Es el único caso que debe despertar a alguien. */
@@ -293,7 +303,19 @@ export class FluxBus {
     void (async () => {
       for await (const m of messages) {
         if (stopped) break;
-        await this.#dispatch(m, subject, durable, handler as Handler, options);
+        try {
+          await this.#dispatch(m, subject, durable, handler as Handler, options);
+        } catch (e) {
+          // Sin este catch, un fallo inesperado de #dispatch —por ejemplo que la
+          // publicación en la DLQ falle— rompe el `for await` y el consumidor deja
+          // de consumir EN SILENCIO: sin log, y con connected === true, así que el
+          // healthcheck sigue diciendo que todo va bien. Un consumidor muerto que
+          // parece vivo es peor que uno que se cae.
+          this.#opts.logger?.error(
+            `[flux] fallo inesperado despachando ${subject}: ${e instanceof Error ? e.message : String(e)}. ` +
+              `El mensaje no se confirma y será reentregado.`,
+          );
+        }
       }
     })();
 
@@ -352,7 +374,15 @@ export class FluxBus {
       const err = e instanceof PoisonError ? e : new PoisonError(String(e));
       this.#opts.onPoison?.({ subject, error: err, raw: m.data });
       this.#opts.logger?.error(`[flux] POISON en ${subject}: ${err.message}`);
-      await this.#sendRawToDlq(subject, m.data, durable, err.message);
+      try {
+        await this.#sendRawToDlq(subject, m.data, durable, err.message);
+      } catch {
+        // Igual que arriba: no se termina lo que no se ha llegado a guardar.
+        this.#opts.logger?.error(
+          `[flux] no se pudo guardar el POISON de ${subject} en la DLQ; se reentregará`,
+        );
+        return;
+      }
       m.term();
       return;
     }
@@ -408,7 +438,20 @@ export class FluxBus {
             ? "retryable" // agotó los reintentos
             : "permanent";
 
-      await this.#sendToDlq(subject, event, durable, attempt, reason, `${c.code}: ${message}`);
+      try {
+        await this.#sendToDlq(subject, event, durable, attempt, reason, `${c.code}: ${message}`);
+      } catch (dlqError) {
+        // NO se hace term(): terminar aquí borraría el evento sin haberlo guardado en
+        // ningún sitio. Se deja reentregar — es preferible reprocesar un evento que
+        // perderlo sin rastro. La causa suele ser un problema del broker, no del evento.
+        this.#opts.logger?.error(
+          `[flux] no se pudo publicar en la DLQ para ${subject} (evento ${event.id}): ` +
+            `${dlqError instanceof Error ? dlqError.message : String(dlqError)}. ` +
+            `El mensaje NO se termina; se reentregará.`,
+        );
+        return;
+      }
+
       this.#opts.onDlq?.({ subject, event, classification: c });
       this.#opts.logger?.error(
         `[flux] DLQ (${reason}) ${c.code} en ${subject} tras ${attempt} intento(s): ${message}`,
@@ -507,6 +550,7 @@ export class FluxBus {
         storage: StorageType.File,
         retention: RetentionPolicy.Limits,
         discard: DiscardPolicy.Old,
+        num_replicas: this.#opts.streamReplicas ?? 1,
         ...extra,
       });
     }

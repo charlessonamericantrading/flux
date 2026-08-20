@@ -99,11 +99,30 @@ export function dlqStreamName(domain: string): string {
   return `DLQ_${domain.replace(/-/g, "_").toUpperCase()}`;
 }
 
+/** Un nombre de servicio válido: `[a-z0-9-]+`. */
+export const SERVICE_PATTERN = /^[a-z0-9]+(-[a-z0-9]+)*$/;
+
+export class InvalidServiceNameError extends Error {
+  constructor(service: string) {
+    super(
+      `nombre de servicio inválido "${service}": debe ser kebab-case en minúsculas ([a-z0-9-]). ` +
+        `NATS aceptaría el durable resultante, pero incumpliría el patrón del protocolo ` +
+        `y rompería el filtrado por servicio en \`nats consumer ls\` (02-naming.md §4).`,
+    );
+    this.name = "InvalidServiceNameError";
+  }
+}
+
 /**
  * `facturacion-api__pedidos_pedido_v1_creado`.
  * NATS rechaza `.`, `*` y `>` en nombres de durable — 02-naming.md §4.
+ *
+ * El servicio se valida aquí y no solo el subject: NATS aceptaría sin rechistar un
+ * durable como `FacturacionAPI__pedidos_…`, y el incumplimiento del patrón solo se
+ * descubriría al intentar parsear nombres de consumidor en una herramienta.
  */
 export function durableName(service: string, subject: string): string {
+  if (!SERVICE_PATTERN.test(service)) throw new InvalidServiceNameError(service);
   parseSubject(subject);
   return `${service}__${subject.replace(/\./g, "_").replace(/-/g, "_")}`;
 }

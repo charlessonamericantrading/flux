@@ -109,7 +109,19 @@ podría reinyectarse en su propia DLQ.
 Prefijando `dlq.` el espacio de nombres queda **disjunto por construcción**, y la DLQ
 puede tener retención, replicación y ACLs propias.
 
-### 3.2 Configuración de referencia
+### 3.2 Quién crea los streams
+
+Un SDK **PUEDE** crear el stream de un dominio si no existe, como comodidad de
+desarrollo, y en ese caso **DEBE** usar `replicas: 1` por defecto — con 3 no arrancaría
+contra un NATS de un solo nodo.
+
+**En producción los streams se provisionan por IaC, no desde el SDK.** Un stream es un
+recurso compartido de todo el dominio: dejar que el primer servicio que arranque lo
+cree con la configuración que le apetezca convierte la retención, la replicación y la
+ventana de duplicados en una carrera. La configuración de abajo es la de producción y
+es responsabilidad de operaciones.
+
+### 3.3 Configuración de referencia
 
 ```
 EVT_PEDIDOS

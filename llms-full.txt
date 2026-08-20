@@ -637,7 +637,19 @@ podría reinyectarse en su propia DLQ.
 Prefijando `dlq.` el espacio de nombres queda **disjunto por construcción**, y la DLQ
 puede tener retención, replicación y ACLs propias.
 
-### 3.2 Configuración de referencia
+### 3.2 Quién crea los streams
+
+Un SDK **PUEDE** crear el stream de un dominio si no existe, como comodidad de
+desarrollo, y en ese caso **DEBE** usar `replicas: 1` por defecto — con 3 no arrancaría
+contra un NATS de un solo nodo.
+
+**En producción los streams se provisionan por IaC, no desde el SDK.** Un stream es un
+recurso compartido de todo el dominio: dejar que el primer servicio que arranque lo
+cree con la configuración que le apetezca convierte la retención, la replicación y la
+ventana de duplicados en una carrera. La configuración de abajo es la de producción y
+es responsabilidad de operaciones.
+
+### 3.3 Configuración de referencia
 
 ```
 EVT_PEDIDOS
@@ -742,12 +754,18 @@ Los dos números tienen que cuadrar: si `max_deliver` fuese 5, la última entrad
 backoff (`30m`) no se aplicaría nunca y la configuración mentiría sobre su propio
 comportamiento.
 
-**Tiempo total hasta la DLQ ≈ 51 min 30 s.** Ese número es una decisión de producto,
-no un detalle técnico: es cuánto tiempo estás dispuesto a que un evento transitorio
-siga reintentando antes de que un humano se entere. Es largo a propósito — los
-errores que llegan aquí son **solo** los RETRYABLE, y la mayoría de fallos
-transitorios se resuelven solos. Un PERMANENT no gasta ni un reintento: va a la DLQ
-en la primera entrega ([04-errors.md](04-errors.md)).
+**Tiempo hasta la DLQ: entre 51 min 30 s y ~54 min.** El límite inferior es
+`sum(backoff)` = 3090 s, y se da cuando el handler falla rápido: el `nak` es inmediato
+y solo se espera el backoff. El límite superior añade hasta un `ack_wait` (30 s) por
+intento, cuando el handler no falla sino que **agota el plazo** sin responder.
+`protocol.json` publica el límite inferior (`totalTimeToDlqSeconds: 3090`) por ser el
+determinista.
+
+Ese número es una decisión de producto, no un detalle técnico: es cuánto tiempo estás
+dispuesto a que un evento transitorio siga reintentando antes de que un humano se
+entere. Es largo a propósito — los errores que llegan aquí son **solo** los RETRYABLE,
+y la mayoría de fallos transitorios se resuelven solos. Un PERMANENT no gasta ni un
+reintento ([04-errors.md](04-errors.md)).
 
 ### 2.1 ⚠️ `backoff[0]` **es** `ack_wait` — el servidor lo sobrescribe en silencio
 
@@ -1046,7 +1064,11 @@ solo hay que borrar las extensiones `dlq*` y republicar en el subject original. 
 un wrapper habría que desenvolver, y cada consumidor de la DLQ tendría que conocer dos
 formatos. El replay se convierte en `jq 'del(.dlq*)'`.
 
-`dlqattempts` distingue de un vistazo un PERMANENT (`1`) de un RETRYABLE agotado (`6`).
+`dlqattempts` es el número de entrega en que el evento murió, **no** una propiedad de
+su clase. Un PERMANENT suele registrar `1` porque no gasta reintentos, pero si el
+handler falló dos veces con errores transitorios y a la tercera lanzó un PERMANENT,
+registra `3` — y eso es información útil, no una incoherencia. Un RETRYABLE agotado
+registra siempre `max_deliver` (`6`).
 
 Subject de destino: `dlq.<subject original>` — ver
 [02-naming.md §3.1](02-naming.md).
