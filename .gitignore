@@ -19,8 +19,12 @@ venv/
 *.egg-info/
 
 # .NET
-bin/
-obj/
+# .NET: anclados a `sdk-dotnet/` a propósito. Un `bin/` suelto ignora CUALQUIER
+# directorio bin del repo a cualquier profundidad, y eso se tragó
+# `sdk-rust/src/bin/conformance-harness.rs` sin decir nada: el fichero existía, los
+# tests pasaban en local, y simplemente no llegaba al commit.
+sdk-dotnet/**/bin/
+sdk-dotnet/**/obj/
 *.user
 TestResults/
 
