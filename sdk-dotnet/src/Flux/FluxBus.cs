@@ -487,9 +487,9 @@ public sealed class FluxBus : IAsyncDisposable
             AckPolicy = ConsumerConfigAckPolicy.Explicit,
             // ack_wait DEBE ser backoff[0]: JetStream lo sobrescribe con ese valor sin
             // avisar. Ver 03-delivery.md §2.1 y Protocol.CanonicalBackoff.
-            AckWait = Protocol.DefaultAckWait,
+            AckWait = ToNanos(Protocol.DefaultAckWait),
             MaxDeliver = Protocol.DefaultMaxDeliver,
-            Backoff = Protocol.CanonicalBackoff.ToArray(),
+            Backoff = Protocol.CanonicalBackoff.Select(ToNanos).ToArray(),
             MaxAckPending = maxAckPending,
             DeliverPolicy = ConsumerConfigDeliverPolicy.All,
             ReplayPolicy = ConsumerConfigReplayPolicy.Instant,
@@ -520,11 +520,19 @@ public sealed class FluxBus : IAsyncDisposable
     /// Este método es la frontera: a partir de aquí no hay tipos de NATS. Es lo que permite
     /// probar la verificación L2 en un test unitario, sin broker.
     /// </remarks>
+    // NATS.Net expresa las duraciones como nanosegundos (long) en el cable; flux las
+    // maneja como TimeSpan. La conversion vive AQUI y solo aqui: es la frontera de la
+    // capa 1 del protocolo, y dejar escapar un long de nanosegundos hacia la API
+    // publica seria filtrar un detalle del broker (00-protocol.md 3).
+    private static long ToNanos(TimeSpan t) => (long)(t.Ticks * 100L);
+
+    private static TimeSpan FromNanos(long nanos) => TimeSpan.FromTicks(nanos / 100L);
+
     private static ConsumerConfigSnapshot Snapshot(ConsumerConfig config) => new()
     {
-        AckWait = config.AckWait,
-        MaxDeliver = config.MaxDeliver,
-        MaxAckPending = config.MaxAckPending,
+        AckWait = FromNanos(config.AckWait),
+        MaxDeliver = (int)config.MaxDeliver,
+        MaxAckPending = (int)config.MaxAckPending,
         AckPolicy = config.AckPolicy switch
         {
             ConsumerConfigAckPolicy.Explicit => "explicit",
@@ -532,7 +540,7 @@ public sealed class FluxBus : IAsyncDisposable
             ConsumerConfigAckPolicy.None => "none",
             _ => "desconocida",
         },
-        Backoff = config.Backoff?.ToArray() ?? Array.Empty<TimeSpan>(),
+        Backoff = config.Backoff?.Select(FromNanos).ToArray() ?? Array.Empty<TimeSpan>(),
     };
 
     // ─── despacho ────────────────────────────────────────────────────────────
