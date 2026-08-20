@@ -84,6 +84,11 @@ public final class Envelope {
      * y prohibe los escapes {@code \\uXXXX} —el encoder por defecto de
      * {@code System.Text.Json} los emite y rompe la paridad byte a byte—, asi que
      * {@code EnvelopeTest.serializeEmiteUtf8Literal} lo fija en vez de confiar en el default.
+     *
+     * <p>Con una excepcion que NO es configurable y que por eso se resuelve en
+     * {@link #serialize}: el generador UTF-8 de Jackson escapa los caracteres fuera del BMP
+     * (los emoji, entre otros) aunque el mapper no se lo pida. Ver el comentario de ese
+     * metodo.
      */
     private static final ObjectMapper MAPPER = JsonMapper.builder()
             .disable(MapperFeature.ACCEPT_CASE_INSENSITIVE_PROPERTIES)
@@ -459,7 +464,21 @@ public final class Envelope {
     public static byte[] serialize(FluxEvent event) {
         byte[] bytes;
         try {
-            bytes = MAPPER.writeValueAsBytes(event);
+            // ⚠️ writeValueAsString().getBytes(UTF_8) y NO writeValueAsBytes(): el generador
+            // UTF-8 de Jackson (UTF8JsonGenerator._outputMultiByteChar) escapa todo caracter
+            // FUERA DEL BMP como la pareja de escapes de sus dos suplentes, asi que U+1F680
+            // sale como los doce ASCII \\uD83D\\uDE80 en vez de como sus cuatro octetos
+            // F0 9F 9A 80. El JSON es equivalente al parsearlo, pero NO son los mismos bytes,
+            // y de los bytes dependen el replay verbatim desde la DLQ y la firma Ed25519: un
+            // evento con un emoji firmado aqui NO verificaba en Node, Go ni Python, que
+            // emiten el literal — y 01-envelope.md §1.1 prohibe los escapes \\uXXXX. El
+            // generador que escribe sobre un Writer no tiene esa rama y emite el caracter tal
+            // cual. Lo detecto el vector `utf8-literal` del arnes de conformidad cruzada; los
+            // tests de un solo SDK no podian verlo porque solo cubrian el BMP.
+            //
+            // El String intermedio cuesta una copia por evento. Es el precio de la paridad
+            // byte a byte, y el limite de 1 MiB de mas abajo acota lo que puede costar.
+            bytes = MAPPER.writeValueAsString(event).getBytes(StandardCharsets.UTF_8);
         } catch (JsonProcessingException e) {
             throw new EnvelopeException("el evento no es serializable a JSON: " + e.getMessage(), e);
         }

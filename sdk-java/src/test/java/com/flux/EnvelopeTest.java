@@ -421,9 +421,18 @@ class EnvelopeTest {
         // que la regla es normativa y este test la fija en vez de dejarla al default.
         Map<String, Object> data = new LinkedHashMap<>();
         data.put("nota", "café ñandú 東京 €");
+        // Fuera del BMP a proposito: el generador UTF-8 de Jackson escapa estos caracteres
+        // como la pareja de escapes de sus suplentes aunque el mapper no se lo pida, y con
+        // solo caracteres del BMP este test pasaba mientras el SDK emitia \\uD83D\\uDE80
+        // donde Node, Go y Python emiten F0 9F 9A 80. Un evento asi no verifica su firma en
+        // ningun otro SDK. Lo cazo el vector `utf8-literal` del arnes cross-SDK; aqui queda
+        // fijado para que no vuelva.
+        data.put("emoji", "🚀");
         byte[] bytes = Envelope.serialize(entradaValida().data(data).build());
 
         assertTrue(new String(bytes, StandardCharsets.UTF_8).contains("café ñandú 東京 €"));
+        assertTrue(contieneSecuencia(bytes, "🚀".getBytes(StandardCharsets.UTF_8)),
+                "un caracter fuera del BMP debe viajar como sus cuatro octetos UTF-8");
 
         // A nivel de BYTES: si Jackson hubiese escapado, la salida seria ASCII puro y la 'e'
         // acentuada apareceria como los seis caracteres "é" en vez de los dos octetos

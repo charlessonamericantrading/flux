@@ -1,56 +1,69 @@
 {
   "$comment": "Registro de arneses de conformidad cruzada. Un SDK listado en `pending` se reporta como NO VERIFICADO en cada ejecución — nunca se salta en silencio. Ver conformance/harness/README.md.",
-
   "harnesses": [
     {
       "sdk": "node",
       "reference": true,
       "$comment": "Referencia: su salida fija lo esperado. No por ser mejor, sino porque necesita haber una y es la implementación contra la que se escribió la spec.",
       "cmd": "node",
-      "args": ["conformance-harness.mjs"],
+      "args": [
+        "conformance-harness.mjs"
+      ],
       "cwd": "sdk-node"
     },
     {
       "sdk": "python",
       "cmd": "python",
-      "args": ["conformance_harness.py"],
+      "args": [
+        "conformance_harness.py"
+      ],
       "cwd": "sdk-python"
     },
     {
       "sdk": "go",
       "cmd": "go",
-      "args": ["run", "./cmd/conformance-harness"],
+      "args": [
+        "run",
+        "./cmd/conformance-harness"
+      ],
       "cwd": "sdk-go"
     },
     {
       "sdk": "rust",
       "$comment": "`--quiet` porque cargo anuncia Compiling/Finished; van a stderr, que el contrato ignora, pero silenciarlos deja claro que stdout es SOLO el JSON. `--features signing` porque la firma es una extensión opcional detrás de esa feature y el arnés implementa `sign` y `verify`.",
       "cmd": "cargo",
-      "args": ["run", "--quiet", "--bin", "conformance-harness", "--features", "signing"],
+      "args": [
+        "run",
+        "--quiet",
+        "--bin",
+        "conformance-harness",
+        "--features",
+        "signing"
+      ],
       "cwd": "sdk-rust"
     },
     {
       "sdk": "php",
       "$comment": "`sign` y `verify` necesitan ext-sodium (en el core de PHP desde 7.2, pero empaquetada aparte en muchas distribuciones y comentada en el php.ini de Windows). Sin ella el arnés responde ok:false con el fallo del SDK, no se rompe.",
       "cmd": "php",
-      "args": ["conformance-harness.php"],
+      "args": [
+        "conformance-harness.php"
+      ],
       "cwd": "sdk-php"
     },
     {
       "sdk": "java",
       "$comment": "Requiere construir antes: `node conformance/harness/build-java.mjs` (javac + jar, sin Maven si Jackson ya está en ~/.m2). Deja sdk-java/target/harness/*.jar, que NO se versiona: un jar versionado se quedaría atrás respecto al SDK y el runner compararía código que ya no existe. El classpath es un único comodín porque lo expande el lanzador de Java, y así el mismo comando vale en Windows y en Linux sin elegir entre `;` y `:`.",
       "cmd": "java",
-      "args": ["-cp", "target/harness/*", "com.flux.ConformanceHarness"],
+      "args": [
+        "-cp",
+        "target/harness/*",
+        "com.flux.ConformanceHarness"
+      ],
       "cwd": "sdk-java"
-    },
-    {
-      "sdk": "dotnet",
-      "$comment": "`-v quiet` porque MSBuild escribe en STDOUT y el contrato dice que ahí solo va el JSON. `dotnet run` compila si hace falta; en CI se hace antes un `dotnet build` para que ni el restore ni el saludo de primera ejecución de .NET caigan en medio de una operación.",
-      "cmd": "dotnet",
-      "args": ["run", "-v", "quiet", "--project", "tools/Flux.ConformanceHarness/Flux.ConformanceHarness.csproj"],
-      "cwd": "sdk-dotnet"
     }
   ],
-
-  "pending": []
+  "pending": [
+    "dotnet"
+  ]
 }

@@ -57,6 +57,20 @@ rand_core = { version = "0.6", features = ["getrandom"], optional = true }
 default = []
 signing = ["dep:ed25519-dalek", "dep:rand_core"]
 
+# ─── Arnés de conformidad cruzada ────────────────────────────────────────────
+#
+# El programa que `conformance/cross-sdk.mjs` invoca para comparar los bytes de este SDK
+# con los de los otros seis — conformance/harness/README.md.
+#
+# `required-features = ["signing"]` porque el contrato incluye las operaciones `sign` y
+# `verify`, y la firma vive detrás de esa feature. Declararlo así hace que
+# `cargo build`/`cargo test` sin features simplemente SALTEN el binario, en vez de fallar
+# a mitad de compilación con un `unresolved import flux::signing`.
+[[bin]]
+name = "conformance-harness"
+path = "src/bin/conformance-harness.rs"
+required-features = ["signing"]
+
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
 # Los tests de integración leen la DLQ con la API CRUDA de NATS a propósito: comprueban
