@@ -15,6 +15,11 @@ final class Envelope
         'specversion', 'id', 'source', 'type', 'time', 'datacontenttype', 'dataschema',
         'subject', 'correlationid', 'tenantid', 'producerversion', 'dataclassification',
         'causationid', 'partitionkey', 'traceparent', 'tracestate',
+        // Extensión OPCIONAL de la firma — 07-signing.md §4. Se aceptan SIEMPRE, aunque el
+        // SDK no verifique: un evento firmado tiene que poder consumirse en modo `off`, o
+        // la adopción gradual de §7 sería imposible (el primer productor que firmara
+        // dejaría a todos los consumidores emitiendo UNKNOWN_ROOT_ATTRIBUTE).
+        'signkeyid', 'signature',
         'dlqreason', 'dlqattempts', 'dlqconsumer', 'dlqerror', 'dlqtime', 'data',
     ];
 
@@ -438,6 +443,31 @@ final class Envelope
     public static function stripDlqExtensions(FluxEvent $event): FluxEvent
     {
         return $event->withoutDlq();
+    }
+
+    // ─── Firma ────────────────────────────────────────────────────────────────
+
+    /**
+     * Los bytes que se firman: el evento **sin `signature` y sin las extensiones `dlq*`**
+     * — 07-signing.md §5.
+     *
+     * - `signkeyid` **SÍ** entra. Si quedara fuera, un atacante podría cambiarlo para que
+     *   la verificación buscara otra clave.
+     * - `signature` no puede firmarse a sí misma.
+     * - Las `dlq*` se añaden **después** de firmar, así que quitarlas es exactamente lo que
+     *   hace el replay — por eso un evento reproducido conserva su firma válida (§5.1).
+     *
+     * **No hay una canonicalización aparte para firmar: es el mismo `serialize()` que usa
+     * el productor.** Funciona porque 01-envelope.md §1.1 (UTF-8 literal), §2.2 (`time`
+     * con 3 decimales) y §6 (orden de claves, `data` al final) fijan una única
+     * representación en bytes. Las tres se escribieron para otros problemas y juntas
+     * resultaron ser justo lo que la firma necesitaba.
+     *
+     * @throws EnvelopeException
+     */
+    public static function signablePayload(FluxEvent $event): string
+    {
+        return self::serialize($event->withoutDlq()->withoutSignature());
     }
 
     // ─── Utilidades ───────────────────────────────────────────────────────────

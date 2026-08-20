@@ -83,4 +83,46 @@ final class Ack
 
         return max(1, (int) $tokens[$offset]);
     }
+
+    /**
+     * Mensajes que el servidor sabe pendientes para este consumidor, leído del **último**
+     * token del subject de respuesta.
+     *
+     * Alimenta `flux_consumer_pending`, que es la única métrica que delata a un consumidor
+     * cuyo bucle murió: la conexión sigue reportándose sana y solo el crecimiento de
+     * `pending` lo evidencia — 08-observability.md §4. Que salga del subject y no de una
+     * API del cliente es lo mismo que ya pasa con el número de entrega, y por el mismo
+     * motivo: así se puede testear sin broker.
+     *
+     *     v1 (9 tokens):  …<entregas>.<sseq>.<cseq>.<tm>.<pending>            ← el último
+     *     v2 (12 tokens): …<entregas>.<sseq>.<cseq>.<tm>.<pending>.<aleatorio> ← el penúltimo
+     *
+     * ⚠️ En v2 `pending` **no** es el último token: detrás va un token aleatorio. Leer
+     * siempre el último daría un número sin sentido —y plausible— en los servidores
+     * modernos, que es la peor forma de equivocarse en una métrica.
+     *
+     * Devuelve `null` si no se puede determinar. `null` y no `0`: un cero se dibujaría en
+     * el panel como "no hay nada pendiente", que es justo la conclusión contraria a "no lo
+     * sabemos".
+     */
+    public static function pending(?string $replyTo): ?int
+    {
+        if ($replyTo === null) {
+            return null;
+        }
+
+        $tokens = explode('.', $replyTo);
+
+        $index = match (true) {
+            count($tokens) === 9 => 8,
+            count($tokens) >= 12 => count($tokens) - 2,
+            default => null,
+        };
+
+        if ($index === null || !ctype_digit($tokens[$index])) {
+            return null;
+        }
+
+        return (int) $tokens[$index];
+    }
 }

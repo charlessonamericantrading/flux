@@ -97,12 +97,25 @@ pub mod client;
 pub mod context;
 pub mod envelope;
 pub mod errors;
+pub mod metrics;
 pub mod protocol;
+
+/// Firma Ed25519 de eventos — **extensión OPCIONAL**, detrás de la feature `signing`.
+///
+/// No se activa por defecto: un evento sin firma sigue siendo válido (07-signing.md), así
+/// que imponer `ed25519-dalek` a todo el ecosistema sería cobrar a todos por lo que usan
+/// unos pocos.
+///
+/// ```toml
+/// flux = { path = "../sdk-rust", features = ["signing"] }
+/// ```
+#[cfg(feature = "signing")]
+pub mod signing;
 
 pub use classify::{Classifier, ClassifierOptions, HttpError, Rule, UnknownPolicy};
 pub use client::{
     connect, Bus, ConnectOptions, Credentials, Delivery, DlqEventInfo, Handler, LogFn, LogLevel,
-    PoisonInfo, PublishOptions, SubscribeOptions, Subscription, TraceparentFn,
+    PoisonInfo, PublishOptions, SubscribeOptions, Subscription, TenantIsolation, TraceparentFn,
 };
 pub use context::EventContext;
 pub use envelope::{
@@ -114,6 +127,10 @@ pub use errors::{
     as_classified, describe, Classification, ConfigDifference, ErrorClass, Failure, FluxError,
     HandlerError, HandlerResult,
 };
+pub use metrics::{
+    ConnectionState, ConsumeOutcome, DlqReasonLabel, InMemoryMetrics, MetricsSink, NoMetrics,
+    PublishOutcome, DURATION_BUCKETS,
+};
 pub use protocol::{
     dlq_stream_name, dlq_subject, durable_name, is_dlq_subject, is_valid_subject, parse_subject,
     source_uri, stream_name, subject_to_type, total_time_to_dlq, validate_service_name,
@@ -121,3 +138,5 @@ pub use protocol::{
     DEFAULT_MAX_ACK_PENDING, DEFAULT_MAX_DELIVER, DLQ_STREAM_MAX_AGE, DUPLICATE_WINDOW,
     MAX_MESSAGE_BYTES, PROTOCOL_NAME, PROTOCOL_VERSION, SPEC_VERSION, STREAM_MAX_AGE,
 };
+#[cfg(feature = "signing")]
+pub use signing::{generate_key_pair, Signer, SigningOptions, VerificationMode, Verifier};

@@ -13,6 +13,7 @@
         "phpunit/phpunit": "^10.5"
     },
     "suggest": {
+        "ext-sodium": "Necesaria SOLO para la firma Ed25519 de eventos (specification/07-signing.md), que es una extensión OPCIONAL del protocolo. Está en el core de PHP desde 7.2, así que la firma no añade ninguna dependencia de Composer; pero muchas distribuciones la empaquetan aparte (php-sodium) y en Windows viene comentada en php.ini. Sin ella, todo lo demás del SDK funciona igual.",
         "basis-company/nats": "Cliente de NATS necesario para Flux\\Transport\\BasisNatsTransport. Si usas otro cliente, implementa Flux\\Transport\\NatsTransport.",
         "open-telemetry/api": "Si está presente, el SDK rellena `traceparent` desde el span activo.",
         "ext-mbstring": "No es necesario, pero mejora los mensajes de error con texto multibyte."

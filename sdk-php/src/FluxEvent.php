@@ -52,6 +52,20 @@ final readonly class FluxEvent
         public ?string $dlqconsumer = null,
         public ?string $dlqerror = null,
         public ?string $dlqtime = null,
+        /**
+         * Identifica la clave pública con la que verificar. Formato `<servicio>-<n>`.
+         *
+         * **Va DENTRO de lo firmado** — 07-signing.md §5. Si quedara fuera, un atacante
+         * podría cambiarlo para que la verificación buscara otra clave.
+         */
+        public ?string $signkeyid = null,
+        /**
+         * Firma Ed25519 en **base64url sin padding** — 07-signing.md §4.
+         *
+         * **No va firmada**: no puede firmarse a sí misma. Se quita antes de calcular los
+         * bytes canónicos, igual que las extensiones `dlq*`.
+         */
+        public ?string $signature = null,
     ) {
     }
 
@@ -101,6 +115,18 @@ final readonly class FluxEvent
             'partitionkey' => $this->partitionkey,
             'traceparent' => $this->traceparent,
             'tracestate' => $this->tracestate,
+            // La firma va entre las extensiones y ANTES de `data` — 07-signing.md §4, en
+            // este orden: `signkeyid` primero porque va DENTRO de lo firmado, `signature`
+            // después porque no puede firmarse a sí misma.
+            //
+            // ⚠️ Y ANTES de las `dlq*`, que es el orden que emiten Node, Python, Go, Java y
+            // .NET. No cambia si la firma verifica —la verificación quita las `dlq*` en
+            // cualquier caso— pero sí los BYTES del mensaje que acaba en la DLQ, y de esos
+            // dependen el replay verbatim, la deduplicación por hash y los fixtures
+            // compartidos (01-envelope.md §6). Es exactamente la misma clase de divergencia
+            // que el `{...event, dlq*}` de Node que dio origen a §6.
+            'signkeyid' => $this->signkeyid,
+            'signature' => $this->signature,
             'dlqreason' => $this->dlqreason,
             'dlqattempts' => $this->dlqattempts,
             'dlqconsumer' => $this->dlqconsumer,
@@ -138,7 +164,14 @@ final readonly class FluxEvent
         ]);
     }
 
-    /** Quita las extensiones `dlq*`. El `id` original se conserva — 04-errors.md §4.1. */
+    /**
+     * Quita las extensiones `dlq*`. El `id` original se conserva — 04-errors.md §4.1.
+     *
+     * **La firma no se toca**, y por eso un evento reproducido desde la DLQ sigue
+     * verificando: las `dlq*` se añadieron después de firmar y no estaban cubiertas, así
+     * que quitarlas devuelve exactamente los bytes que se firmaron. El replay redistribuye
+     * un hecho ya emitido, no crea uno nuevo — 07-signing.md §5.1.
+     */
     public function withoutDlq(): self
     {
         return $this->copy([
@@ -148,6 +181,29 @@ final readonly class FluxEvent
             'dlqerror'    => null,
             'dlqtime'     => null,
         ]);
+    }
+
+    /**
+     * Copia con `signkeyid` y `signature` puestos — 07-signing.md §4.
+     *
+     * `$signature = null` deja solo el `signkeyid`, que es el estado intermedio que hace
+     * falta para **calcular** la firma: `signkeyid` va DENTRO de lo firmado y `signature`
+     * no puede firmarse a sí misma (§5).
+     */
+    public function withSignature(string $keyId, ?string $signature = null): self
+    {
+        return $this->copy(['signkeyid' => $keyId, 'signature' => $signature]);
+    }
+
+    /**
+     * Copia sin `signature`, conservando `signkeyid`.
+     *
+     * Es el paso 3 de la verificación (§5.1): `signkeyid` **SÍ** entra en los bytes
+     * firmados y `signature` no puede firmarse a sí misma.
+     */
+    public function withoutSignature(): self
+    {
+        return $this->copy(['signature' => null]);
     }
 
     /**
@@ -181,6 +237,8 @@ final readonly class FluxEvent
             'dlqconsumer'        => $this->dlqconsumer,
             'dlqerror'           => $this->dlqerror,
             'dlqtime'            => $this->dlqtime,
+            'signkeyid'          => $this->signkeyid,
+            'signature'          => $this->signature,
         ];
 
         return new self(...array_merge($attributes, $overrides));

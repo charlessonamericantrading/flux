@@ -184,6 +184,30 @@ pub struct Event {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tracestate: Option<String>,
 
+    // ── Firma — extensión OPCIONAL — 07-signing.md §4 ──
+    //
+    // ⚠️ Van declarados ANTES de las `dlq*`, y eso es normativo, no estético: `serde`
+    // serializa en orden de declaración, las `dlq*` se añaden DESPUÉS de firmar y el orden
+    // de claves es parte del contrato (01-envelope.md §6). Es también el orden que emiten
+    // Node, Python, Go, Java y .NET, así que moverlos aquí abajo haría que el mismo evento
+    // firmado produjera bytes distintos en Rust y en el resto del ecosistema en cuanto
+    // pasara por la DLQ. La firma seguiría verificando —la verificación quita las `dlq*`—
+    // pero el replay verbatim y los fixtures compartidos dejarían de comparar.
+    /// Identifica la clave pública con la que verificar. Formato `<servicio>-<n>`.
+    ///
+    /// **Va DENTRO de lo firmado.** Si quedara fuera, un atacante podría cambiarlo para
+    /// que la verificación buscara otra clave — 07-signing.md §5. Por eso está declarado
+    /// aquí, antes de `signature` y antes de `data`, y no se toca al firmar.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub signkeyid: Option<String>,
+
+    /// Firma Ed25519 en **base64url sin padding**.
+    ///
+    /// **No va firmada**: no puede firmarse a sí misma. Se quita antes de calcular los
+    /// bytes canónicos, igual que las extensiones `dlq*` — 07-signing.md §5.1.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub signature: Option<String>,
+
     // ── Extensiones de DLQ — solo en dlq.<subject> — 04-errors.md §3 ──
     /// Solo presente en la DLQ.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -253,6 +277,8 @@ impl PartialEq for Event {
             && self.dlqattempts == other.dlqattempts
             && self.dlqconsumer == other.dlqconsumer
             && self.dlqerror == other.dlqerror
+            && self.signkeyid == other.signkeyid
+            && self.signature == other.signature
             && self.dlqtime == other.dlqtime
             && self.data.get() == other.data.get()
     }
@@ -343,7 +369,7 @@ impl Event {
 /// `String`, `Integer`, `Boolean`, `Binary`, `URI` y `Timestamp`, nunca objetos ni
 /// arrays. Un equipo que empieza a colgar metadatos de la raíz acaba serializando JSON
 /// dentro de un string, y a partir de ahí el envelope deja de ser interoperable.
-pub const ALLOWED_ROOT_ATTRIBUTES: [&str; 22] = [
+pub const ALLOWED_ROOT_ATTRIBUTES: [&str; 24] = [
     "specversion",
     "id",
     "source",
@@ -360,6 +386,11 @@ pub const ALLOWED_ROOT_ATTRIBUTES: [&str; 22] = [
     "partitionkey",
     "traceparent",
     "tracestate",
+    // Extensión OPCIONAL de la firma — 07-signing.md §4. Se aceptan siempre, aunque el
+    // SDK no verifique: un evento firmado tiene que poder consumirse en modo `off`, o la
+    // adopción gradual de la firma sería imposible (07-signing.md §7).
+    "signkeyid",
+    "signature",
     "dlqreason",
     "dlqattempts",
     "dlqconsumer",
@@ -536,6 +567,11 @@ pub fn build_event(input: BuildEventInput) -> Result<Event, FluxError> {
         partitionkey,
         traceparent: input.traceparent,
         tracestate: input.tracestate,
+        // La firma se aplica DESPUÉS de construir el envelope, y es lo último antes de
+        // serializar: cubre el evento completo, así que cualquier atributo añadido después
+        // la invalidaría — 07-signing.md §5.
+        signkeyid: None,
+        signature: None,
         dlqreason: None,
         dlqattempts: None,
         dlqconsumer: None,
@@ -783,6 +819,11 @@ pub fn to_dlq_event(mut event: Event, info: &DlqInfo, now: DateTime<Utc>) -> Eve
 /// El `id` original se **CONSERVA**. Regenerarlo rompe la idempotencia de todos los
 /// consumidores aguas abajo y convierte una recuperación en un incidente nuevo
 /// — 04-errors.md §4.1.
+///
+/// La firma **no se toca**, y por eso un evento reproducido desde la DLQ sigue
+/// verificando: las extensiones `dlq*` se añadieron después de firmar y no estaban
+/// cubiertas, así que quitarlas devuelve exactamente los bytes que se firmaron. El replay
+/// redistribuye un hecho ya emitido, no crea uno nuevo — 07-signing.md §5.1.
 #[must_use]
 pub fn strip_dlq_extensions(mut event: Event) -> Event {
     event.dlqreason = None;
@@ -954,6 +995,93 @@ mod tests {
             let pos = json.find(&format!("\"{ext}\":")).unwrap();
             assert!(pos < data_pos, "{ext} debería ir antes de data: {json}");
         }
+    }
+
+    /// `signkeyid` y `signature` van entre las extensiones y **antes de `data`**
+    /// — 07-signing.md §4. En Rust el orden lo fija la declaración del struct, así que
+    /// este test es lo que impide que alguien los mueva sin darse cuenta: moverlos cambia
+    /// los bytes de TODOS los eventos firmados del ecosistema.
+    #[test]
+    fn la_firma_va_entre_las_extensiones_y_antes_de_data() {
+        let mut ev = build_event(input()).unwrap();
+        ev.signkeyid = Some("pedidos-api-3".into());
+        ev.signature = Some("Yhv5dV5yVxHz7w2f".into());
+
+        let json = String::from_utf8(serialize(&ev).unwrap()).unwrap();
+        let pos = |k: &str| json.find(&format!("\"{k}\":")).expect(k);
+        assert!(pos("dataclassification") < pos("signkeyid"));
+        assert!(pos("signkeyid") < pos("signature"));
+        assert!(pos("signature") < pos("data"));
+
+        let raiz: serde_json::Map<String, serde_json::Value> = serde_json::from_str(&json).unwrap();
+        assert_eq!(raiz.keys().next_back().map(String::as_str), Some("data"));
+    }
+
+    /// Y en el evento de DLQ van **antes de las `dlq*`**, que es el orden que emiten Node,
+    /// Python, Go, Java y .NET.
+    ///
+    /// No cambia si la firma verifica —la verificación quita las `dlq*` en cualquier
+    /// caso—, pero sí los bytes del mensaje que acaba en la DLQ, y de esos dependen el
+    /// replay verbatim, la deduplicación por hash y los fixtures compartidos
+    /// (01-envelope.md §6).
+    #[test]
+    fn en_la_dlq_la_firma_va_antes_de_las_extensiones_dlq() {
+        let mut ev = build_event(input()).unwrap();
+        ev.signkeyid = Some("pedidos-api-3".into());
+        ev.signature = Some("Yhv5dV5yVxHz7w2f".into());
+
+        let dlq = to_dlq_event(
+            ev,
+            &DlqInfo {
+                reason: DlqReason::Permanent,
+                attempts: 1,
+                consumer: "c".into(),
+                error: "PEDIDO_YA_CANCELADO".into(),
+            },
+            Utc::now(),
+        );
+        let json = String::from_utf8(serialize(&dlq).unwrap()).unwrap();
+        let pos = |k: &str| json.find(&format!("\"{k}\":")).expect(k);
+
+        assert!(pos("signature") < pos("dlqreason"), "{json}");
+        assert!(pos("dlqtime") < pos("data"), "{json}");
+    }
+
+    /// Un evento firmado se parsea igual aunque el SDK no verifique nada: si los
+    /// atributos de la firma no estuvieran en la lista cerrada, un consumidor en modo
+    /// `off` los vería como `UNKNOWN_ROOT_ATTRIBUTE` y la adopción gradual de §7 sería
+    /// imposible.
+    #[test]
+    fn un_evento_firmado_se_parsea_aunque_no_se_verifique() {
+        let mut v = valido();
+        v["signkeyid"] = json!("pedidos-api-1");
+        v["signature"] = json!("Yhv5dV5yVxHz7w2f");
+
+        let ev = parse_event(&serde_json::to_vec(&v).unwrap()).unwrap();
+        assert_eq!(ev.signkeyid.as_deref(), Some("pedidos-api-1"));
+        assert_eq!(ev.signature.as_deref(), Some("Yhv5dV5yVxHz7w2f"));
+    }
+
+    /// `strip_dlq_extensions` NO toca la firma: es lo que hace que un evento reproducido
+    /// desde la DLQ siga verificando — 07-signing.md §5.1.
+    #[test]
+    fn el_replay_conserva_la_firma() {
+        let mut ev = build_event(input()).unwrap();
+        ev.signkeyid = Some("pedidos-api-1".into());
+        ev.signature = Some("Yhv5dV5yVxHz7w2f".into());
+
+        let dlq = to_dlq_event(
+            ev.clone(),
+            &DlqInfo {
+                reason: DlqReason::Permanent,
+                attempts: 1,
+                consumer: "c".into(),
+                error: "X".into(),
+            },
+            Utc::now(),
+        );
+        assert_eq!(dlq.signature, ev.signature);
+        assert_eq!(strip_dlq_extensions(dlq), ev);
     }
 
     // ── UTF-8 literal ─────────────────────────────────────────────────────────

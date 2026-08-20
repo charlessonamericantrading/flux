@@ -14,9 +14,14 @@ composer require flux/sdk        # requiere PHP >= 8.2
 
 > ### Estado de verificación
 >
-> ✅ **Suite ejecutada y en verde: 201 tests, 385 assertions** (PHP 8.3.30, PHPUnit 10.5.64).
-> Cubre naming, envelope, serialización byte a byte, clasificación de errores y todo el
-> runtime del consumidor. **Ninguno necesita broker.**
+> ✅ **Suite ejecutada y en verde: 272 tests, 740 assertions** (PHP 8.3.30 con `ext-sodium`,
+> PHPUnit 10.5.64). Cubre naming, envelope, serialización byte a byte, clasificación de
+> errores, firma Ed25519, métricas, aislamiento de tenant y todo el runtime del consumidor.
+> **Ninguno necesita broker.**
+>
+> Sin `ext-sodium` la suite sigue en verde con 37 tests saltados —los de firma—, que es
+> exactamente el comportamiento que se quiere: la firma es una extensión **opcional** del
+> protocolo y no debe impedir usar el resto del SDK.
 >
 > ⚠️ `Flux\Transport\BasisNatsTransport` **sigue sin verificarse contra un servidor NATS
 > real.** Sus tests usan un cliente falso: fijan cómo reacciona ante un PubAck correcto, un
@@ -196,6 +201,14 @@ new ClassifierOptions(
 );
 ```
 
+> ⚠️ **`retryAfterMs` es una sugerencia para el PRIMER reintento, no un control del
+> calendario de reintentos.** Con `backoff` configurado —y flux lo configura **siempre**—
+> JetStream honra el delay de un `nak` solo en la primera reentrega; a partir de la segunda
+> manda el array `backoff` y el delay pedido **se ignora sin ningún aviso**
+> ([03-delivery.md §2.2](../specification/), medido contra NATS 2.14.5). Un `Retry-After: 5`
+> de un proveedor acorta el primer reintento y nada más; los siguientes siguen el backoff
+> canónico (1 m, 5 m, 15 m, 30 m). No construyas lógica que dependa de lo contrario.
+
 ### Cómo se reconoce un error transitorio en PHP
 
 [04-errors.md §1.1](../specification/) prohíbe hacer `str_contains()` sobre mensajes de
@@ -232,6 +245,176 @@ procesando ahora mismo" es un concepto literal.
 > varias cosas a la vez, ese almacenamiento estático se comparte entre fibras y el
 > `correlationid` se cruzaría. El bucle del SDK es estrictamente secuencial y no las usa;
 > si las usas por dentro, publica desde la fibra principal.
+
+## Firma de eventos (opcional)
+
+[07-signing.md](../specification/). Traslada la autenticidad **del canal al evento**: hoy la
+garantiza la ACL del broker, y eso deja tres huecos —un evento sacado del stream y
+reinyectado, un evento exportado a un data lake donde ya no hay ACL, y un broker
+comprometido que fabrica eventos—. Un evento firmado sigue siendo verificable dentro de un
+fichero, un backup o un correo.
+
+```php
+use Flux\Signing\{Keys, SigningOptions, VerificationMode};
+
+// Productor
+new ConnectOptions(
+    // …
+    signing: new SigningOptions(privateKey: $pemPrivada, keyId: 'pedidos-api-3'),
+);
+
+// Consumidor
+new ConnectOptions(
+    // …
+    signing: new SigningOptions(
+        publicKeys: [
+            'pedidos-api-3' => $pemPublica,   // activa
+            'pedidos-api-2' => $pemRetirada,  // RETIRADA, conservada
+        ],
+        verify: VerificationMode::Require,
+    ),
+);
+
+['privateKeyPem' => $priv, 'publicKeyPem' => $pub] = Keys::generateKeyPair();
+```
+
+| Modo | Evento sin firma | Firma inválida |
+|---|---|---|
+| `Off` (**default**) | Se acepta | Se acepta (no se mira) |
+| `Warn` | Se registra por el `LoggerInterface` y se acepta | Se registra y se acepta |
+| `Require` | POISON `MISSING_SIGNATURE` | POISON `INVALID_SIGNATURE` / `UNKNOWN_SIGNING_KEY` |
+
+Cuatro cosas que un port suele dar por hechas y no lo están:
+
+- **`Warn` no es un adorno.** Adoptar la firma en un ecosistema en marcha exige un periodo
+  en el que unos productores firman y otros no; pasar directo a `Require` convierte en
+  POISON todo evento de un servicio aún no migrado — es decir, tumba a los consumidores de
+  los servicios que van por delante, no a los que van por detrás.
+- **`Warn` DEBE ser observable** ([§7.1](../specification/)). Un evento aceptado en `warn`
+  se cuenta igual como `flux_events_consumed_total{outcome="invalid_signature"}` — **no
+  basta con escribir en el log**. Sin esa métrica, `warn` es inútil para lo único que
+  existe, *pilotar la migración*: la pregunta "¿cuántos eventos siguen sin firma y de qué
+  productores?" no la contesta un log, hay que buscarla a mano en siete servicios. Por eso
+  `Verifier::check()` **devuelve el código** en vez de tragarse el fallo, y funciona sin
+  `LoggerInterface` ninguno: §7.1 prohíbe explícitamente imponer una fachada de logging, la
+  parte normativa es la métrica. El aviso **sustituye** al `ok` en vez de sumarse: contarlo
+  dos veces rompería `sum by (outcome) == total consumido`.
+- **Un fallo de firma se cuenta como `invalid_signature`, no como `poison`**
+  ([§7.2](../specification/)), aunque su `dlqreason` en la DLQ sí sea `poison`. Son dos
+  preguntas distintas: `poison` es "un productor publica basura" —un bug de
+  serialización—; `invalid_signature` es "alguien publica eventos que no son suyos" —un
+  incidente de seguridad, o una migración a medias—.
+- **Una clave RETIRADA sigue verificando** mientras se conserve su pública (mínimo 90 días,
+  la retención de la DLQ). Retirar una clave impide **emitir** con ella, no **verificar** lo
+  ya emitido. Es la regla que más se equivoca, y equivocarla convierte una rotación
+  rutinaria en la invalidación retroactiva de todo el historial.
+- **Un evento que pasó por la DLQ sigue verificando.** Las extensiones `dlq*` se añaden
+  después de firmar y la verificación las ignora; si no lo hiciera, todo evento en la DLQ
+  parecería manipulado.
+
+### `ext-sodium`: única dependencia, y no es de Composer
+
+`sodium_crypto_sign_*` está en el **core de PHP desde 7.2**, así que la firma **no añade
+ninguna dependencia de Composer**. Lo que sí puede faltar es la extensión: muchas
+distribuciones la empaquetan aparte (`php-sodium`) y en Windows viene comentada en
+`php.ini`. El SDK lo comprueba al construir el `Signer`/`Verifier` y falla con un mensaje
+que dice qué instalar, en vez de con un `Call to undefined function`.
+
+### El formato de clave **NO** diverge: es PEM, como en los otros cinco SDKs
+
+Merece decirse explícitamente porque la tentación es la contraria. libsodium trabaja con
+bytes crudos —32 de clave pública, **64 de "secret key"** (semilla ‖ pública)— y los otros
+SDKs usan PEM: PKCS#8 la privada, SPKI la pública. Adoptar el formato nativo de libsodium
+habría hecho que **una clave generada en PHP no sirviera en ningún otro SDK y al revés**, y
+como [07-signing.md §6](../specification/) obliga a conservar las públicas retiradas 90 días,
+eso multiplica por seis el material que hay que custodiar y traducir en cada rotación.
+
+La conversión sale gratis porque la envoltura DER de una clave Ed25519 es de **tamaño fijo**
+(RFC 8410): 16 bytes de cabecera constante + 32 de semilla en PKCS#8, y 12 + 32 en SPKI. No
+hay que parsear ASN.1, hay que comparar un prefijo — 30 líneas en `Flux\Signing\Keys`, sin
+`ext-openssl` (que además no sabe firmar Ed25519). El SDK de Rust hace exactamente lo mismo.
+
+También se acepta la clave **cruda en base64** (32 bytes de semilla, o los 64 de libsodium),
+porque es lo que devuelve `sodium_crypto_sign_keypair()` y lo que entregan algunos gestores
+de secretos. Las dos formas producen firmas idénticas y hay un test que lo fija.
+
+La interoperabilidad no se afirma, se fija con un test: `SigningTest` lleva un **vector
+FIJO** —la semilla del TEST 1 de RFC 8032, un evento literal y su firma en base64url— que
+producen y aceptan por igual este SDK, `node:crypto` y `ed25519-dalek` de Rust. Lleva además
+el evento de DLQ firmado **byte a byte**, el mismo literal que tiene el SDK de Rust.
+
+## Métricas
+
+[08-observability.md](../specification/), normativo para L2. Las siete métricas, con sus
+nombres y etiquetas exactos, **son contrato entre SDKs**: si el de PHP y el de Go nombraran
+distinto la tasa de DLQ, un panel del ecosistema sería imposible.
+
+```php
+use Flux\Metrics\InMemoryMetrics;
+
+$metrics = new InMemoryMetrics();
+$bus = FluxBus::connect(new ConnectOptions(/* … */, metrics: $metrics), $transport);
+
+// …dentro del worker, o en un endpoint de scrape del propio proceso
+echo $metrics->render();
+```
+
+El default es `NoMetrics`: un SDK no debe imponer un backend. `InMemoryMetrics` es un
+recolector **sin dependencias** que renderiza el formato de texto de Prometheus; si ya usas
+un cliente de Prometheus, implementa `Flux\Metrics\MetricsSink` contra él — lo que importa
+es conservar los nombres.
+
+⚠️ **`MetricsSink` tiene un método por métrica con parámetros propios, no un
+`array $labels`.** No es estilo: un mapa de etiquetas es exactamente el agujero por el que
+se cuela un `tenantid` que multiplica las series temporales. Con esta forma, etiquetar por
+tenant exige cambiar la firma de la interfaz, y eso se ve en una revisión. **Nunca** se
+etiqueta por `tenantid`, `id` ni `correlationid` (§2.2); para eso están las trazas.
+
+El último bucket del histograma es `30` porque **es el `ack_wait`**: un handler que cae ahí
+está a punto de que su mensaje se reentregue mientras aún se ejecuta.
+`MetricsTest::testElUltimoBucketEsElAckWait()` lo ata a `Protocol::ACK_WAIT_MS` para que no
+se desincronicen, y otro test los compara con `protocol.json`.
+
+> ⚠️ **`InMemoryMetrics` vive en la memoria del proceso.** En un worker CLI de larga vida
+> (`$bus->run()`) es justo lo que se quiere. **Bajo FPM no**: cada petición es un proceso
+> nuevo y los contadores nacen a cero, así que un `/metrics` servido desde FPM reportaría
+> casi nada siempre. Para publicar métricas de un publisher web hace falta un backend con
+> estado compartido (APCu, Redis) implementando `MetricsSink`. Es la contrapartida del
+> modelo de ejecución de PHP, no una limitación del recolector.
+
+## Aislamiento de tenant
+
+[09-multitenancy.md §3](../specification/). El Modelo A de v1 mezcla todos los tenants en un
+stream por dominio y **el aislamiento es una convención del SDK, no una frontera del
+broker**.
+
+```php
+new ConnectOptions(
+    // …
+    tenantId: 'acme',
+    tenantIsolation: TenantIsolation::Strict,
+);
+```
+
+- En `Strict`, **suscribirse sin filtro de tenant lanza `TenantIsolationException`**, no es
+  un descuido silencioso. Ese es el punto entero de la sección: un filtro que hay que
+  acordarse de poner es un filtro que alguien olvidará, y el fallo —ver los datos de otro
+  tenant— no produce ningún error; produce un incidente de privacidad que se descubre
+  semanas después.
+- El error llega **antes** de crear el durable consumer: un servicio mal configurado no
+  arranca, en vez de arrancar y fallar cuando ya está en producción.
+- El filtrado ocurre **antes del handler**. El evento ajeno se **ACKea** y se descarta: no es
+  un fallo, no es para nosotros.
+- **`"system"` NO cuenta como filtro.** Es la *ausencia* de tenant, reservada a los eventos
+  de plataforma, y está prohibido usarla como comodín (§5). Como además es el **valor por
+  defecto** de `ConnectOptions::$tenantId`, si contase, el modo estricto no protegería
+  precisamente en el caso más probable: el de quien olvidó configurar el tenant.
+
+Lo que `Strict` **no** hace: cerrar las dos amenazas que §1 declara descubiertas —un
+productor legítimo comprometido que publica con el `tenantid` de otro, y un consumidor
+comprometido que lee el subject entero—. Para eso hace falta el Modelo B (una account de
+NATS por tenant). Lo que sí añade la firma es que alterar el `tenantid` en tránsito o en
+reposo **invalida la firma** (§4).
 
 ## Transporte
 
@@ -276,6 +459,9 @@ Ninguna cambia la semántica en el cable salvo donde se dice explícitamente.
 | `FluxError.code` | `FluxError::$errorCode` | `\Exception::$code` ya existe, es `protected` y es `int`. Redeclararlo como `?string` sería un error fatal de compilación |
 | `errors.py` con 4 clases | Un fichero por clase | PSR-4 exige una clase por fichero. Es la única desviación respecto al árbol de ficheros propuesto |
 | Handler `async` | Handler síncrono | No hay `await`. Un handler que bloquea bloquea el worker entero, y `max_ack_pending` deja de ser una ventana de concurrencia real |
+| `signing.ts` / `metrics.ts` sueltos | `Flux\Signing\*` y `Flux\Metrics\*` | Mismo motivo que arriba: PSR-4, una clase por fichero. La contrapartida es que `VerificationMode`, `ConnectionState` y los `outcome` son **enums de verdad** en vez de uniones de cadenas, así que un valor de etiqueta inventado no compila |
+| `node:crypto` con PEM | `ext-sodium` **con PEM** | libsodium usa bytes crudos, pero el SDK convierte desde/hacia PEM para no romper la interoperabilidad de claves. Ver arriba |
+| WIP automático → duración medida por el temporizador | `microtime(true)` alrededor del handler | Sin bucle de eventos no hay temporizador, pero la duración del handler sí se puede medir: es código estrictamente secuencial |
 
 ### La trampa de `json_encode`
 
@@ -333,6 +519,18 @@ fingir que no existen.
 6. **Reconexión con jitter.** [03-delivery.md §6](../specification/) la exige. Aquí es
    responsabilidad del cliente de NATS que inyectes, porque el SDK ya no gestiona la
    conexión — es la contrapartida del puerto. Configúralo al construir tu `Client`.
+7. **Las métricas no sobreviven a la petición.** `InMemoryMetrics` vale en un worker CLI y
+   no bajo FPM, donde cada petición arranca a cero. Ver la sección de Métricas. Es el mismo
+   modelo de ejecución que obliga al WIP manual, visto desde otro lado.
+8. **`flux_connection_state` es lo que el transporte diga.** Sin bucle de eventos no hay
+   quien observe una reconexión, así que el gauge se escribe en `connect()` y en `close()`,
+   y el valor `2` (reconectando) **no se emite nunca** desde este SDK. Existe en el enum
+   porque la etiqueta es del protocolo; si tu transporte sabe distinguirlo, es una línea.
+9. **Formatear un `float` para Prometheus no es `(string)`.** El casting de PHP puede dar
+   notación científica (`1.0E-5`) y, en algunas builds, el separador decimal del locale.
+   `InMemoryMetrics` formatea a mano, y además imprime `le="30"` y no `le="30.0"`: para
+   Prometheus son **dos series distintas** y el dashboard del ecosistema agrupa por la
+   primera.
 
 ### Estricto donde los otros no lo son
 
@@ -346,6 +544,29 @@ Tres divergencias deliberadas, todas en la dirección de rechazar antes:
 - **El nombre de servicio se valida en `connect()`.** NATS aceptaría
   `FacturacionAPI__pedidos_…` sin error; sin esta comprobación el incumplimiento solo se
   descubre al parsear nombres en una herramienta.
+
+### Fricción encontrada en este port: §4 no dice dónde van `signkeyid` y `signature`
+
+[07-signing.md §4](../specification/) dice que van "entre las extensiones, antes de `data`".
+Eso deja sin resolver **dónde exactamente respecto a las `dlq*`**, y hay dos respuestas
+defendibles: la lista de atributos permitidos del SDK de Node los declara detrás de
+`dlqtime`, pero su `toDlqEvent` los emite delante, porque construye el evento de DLQ como
+`{...evento_firmado, dlq*, data}`.
+
+Elegir mal **no rompe la firma** —la verificación quita las `dlq*` en cualquier caso, así que
+el payload firmado sale idéntico— pero sí rompe la igualdad byte a byte del mensaje que
+acaba en la DLQ, y de esos bytes dependen el replay verbatim, la deduplicación por hash de
+contenido y los fixtures compartidos. Es exactamente la misma clase de divergencia que el
+`{...event, dlq*}` que dio origen a [01-envelope.md §6](../specification/), y con la misma
+forma: silenciosa, e invisible para cualquier test que compare datos en vez de bytes.
+
+Este SDK las emite **antes** de las `dlq*`, que es lo que hacen Node, Python, Go, Java, .NET
+y Rust. Está fijado con un vector literal (`SigningTest::DLQ_VECTOR`) que el SDK de Rust
+lleva idéntico.
+
+**Sugerencia para la spec:** §4 debería nombrar la posición completa —`… tracestate,
+signkeyid, signature, dlqreason, …, dlqtime, data`— en vez de "antes de `data`". Un SDK
+nuevo no puede deducirla, y el primero que la deduzca al revés no se enterará.
 
 ## Qué rechaza `Envelope::parse()`
 
@@ -366,6 +587,14 @@ las métricas dejaría de funcionar en cuanto el ecosistema es polyglot, que es 
 | `UNSUPPORTED_CONTENT_TYPE` | `datacontenttype` != `application/json` |
 | `UNKNOWN_ROOT_ATTRIBUTE` | Un atributo raíz fuera de la lista cerrada |
 
+Y con `signing.verify` distinto de `Off`, tres más — [07-signing.md §7](../specification/):
+
+| `errorCode` | Cuándo |
+|---|---|
+| `MISSING_SIGNATURE` | Falta `signature` en modo `require` |
+| `INVALID_SIGNATURE` | La firma no verifica (evento alterado, o no lo emitió quien dice) |
+| `UNKNOWN_SIGNING_KEY` | `signkeyid` desconocido, o `signature` sin `signkeyid` |
+
 Dos reglas que un port suele dar por hechas y no lo están:
 
 - Las cuatro extensiones son **obligatorias de verdad**. No se les asume un default porque
@@ -381,20 +610,29 @@ Dos reglas que un port suele dar por hechas y no lo están:
 ```bash
 cd sdk-php
 composer install
-vendor/bin/phpunit          # 201 tests, 385 assertions
+vendor/bin/phpunit                                    # 272 tests, 740 assertions (1 saltado)
+php -d extension=sodium -d extension=sockets vendor/bin/phpunit   # 744 assertions, 0 saltados
 ```
 
 Ninguno necesita broker. Varios leen `protocol.json` del repositorio directamente, de modo
 que una divergencia entre el SDK y el contrato falla en CI en vez de en producción con otro
-SDK del ecosistema.
+SDK del ecosistema — incluidos los buckets del histograma, la lista de las siete métricas y
+las etiquetas prohibidas.
 
-Un único test se salta sin `ext-sockets`: el que comprueba que `SOCKET_ECONNRESET` se
-traduce a `"ECONNRESET"` por **nombre** de constante y no por valor (10054 en Windows, 104
-en Linux). Con la extensión cargada pasa en ambos:
+| Suite | Tests | Se salta sin |
+|---|--:|---|
+| `EnvelopeTest`, `ProtocolTest`, `ClassifierTest`, `FluxBusTest`, `AckTest`, … | 203 | 1 de ellos, `ext-sockets` |
+| `SigningTest` | 33 | `ext-sodium` |
+| `MetricsTest` | 19 | — |
+| `TenantIsolationTest` (incluye firma y métricas **a través del bus**) | 17 | 4 de ellos, `ext-sodium` |
 
-```bash
-php -d extension=sockets vendor/bin/phpunit
-```
+Dos extensiones opcionales hacen que algunos tests se salten, y en los dos casos eso es
+deliberado:
+
+- **`ext-sodium`** (37 tests): la firma es una extensión **opcional** del protocolo, así que
+  no tenerla no debe impedir usar el resto del SDK.
+- **`ext-sockets`** (1 test): el que comprueba que `SOCKET_ECONNRESET` se traduce a
+  `"ECONNRESET"` por **nombre** de constante y no por valor (10054 en Windows, 104 en Linux).
 
 Para los invariantes que sí requieren un servidor real —que `ack_wait` sobrevive, que un
 durable con puntos es rechazado, que un publish de core a un subject mal escrito se evapora

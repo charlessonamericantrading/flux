@@ -128,13 +128,13 @@ protocolo a v2.
 
 | SDK | Nivel | Tests | Verificado |
 |---|---|---|---|
-| [Node / TypeScript](sdk-node/) | **L3** | 103 | ✅ |
-| [Python](sdk-python/) | L2 | 104 | ✅ |
-| [Go](sdk-go/) | L2 | 75 | ✅ (también con `-race`) |
-| [Java](sdk-java/) | L2 | 75 | ✅ (Maven en el runner) |
-| [.NET](sdk-dotnet/) | L2 | — | ✅ |
-| [Rust](sdk-rust/) | L2 | 105 | ✅ (incl. 7 contra NATS real) |
-| [PHP](sdk-php/) | L2 | 201 | ⚠️ el adaptador NATS no se ha probado contra un broker real |
+| [Node / TypeScript](sdk-node/) | **L3** | 105 | ✅ |
+| [Python](sdk-python/) | L2 | 166 | ✅ |
+| [Go](sdk-go/) | L2 | 127 | ✅ (también con `-race`) |
+| [Java](sdk-java/) | L2 | 121 | ✅ (Maven en el runner) |
+| [.NET](sdk-dotnet/) | L2 | 119 | ✅ |
+| [Rust](sdk-rust/) | L2 | 175 | ✅ (incl. 14 contra NATS real) |
+| [PHP](sdk-php/) | L2 | 272 | ⚠️ el adaptador NATS no se ha probado contra un broker real |
 | [PHP](sdk-php/) | L2 | 201 | ✅ (transporte no — ver abajo) |
 
 Los cinco primeros se compilan y ejecutan en CI en cada push. La suite de conformidad corre

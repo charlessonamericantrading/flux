@@ -48,6 +48,31 @@ final class AckTest extends TestCase
         self::assertSame('+WPI', Ack::WIP);
     }
 
+    /**
+     * `pending` alimenta `flux_consumer_pending`, la única métrica que delata a un
+     * consumidor cuyo bucle murió — 08-observability.md §4.
+     *
+     * ⚠️ En el formato v2 NO es el último token: detrás va uno aleatorio. Leer siempre el
+     * último daría un número plausible pero sin sentido, que es la peor forma de
+     * equivocarse en una métrica.
+     */
+    public function testExtraeLosPendientesDelSubjectDeRespuesta(): void
+    {
+        self::assertSame(17, Ack::pending(
+            '$JS.ACK.EVT_PEDIDOS.facturacion-api__pedidos_pedido_v1_creado.1.42.7.1755689139000000000.17'
+        ));
+        self::assertSame(17, Ack::pending(
+            '$JS.ACK.hub.ACCHASH.EVT_PEDIDOS.facturacion-api__pedidos_pedido_v1_creado.3.42.7.1755689139000000000.17.rand'
+        ));
+    }
+
+    /** `null` y no `0`: un cero se dibujaría como "no hay nada pendiente". */
+    public function testSinSubjectDeRespuestaLosPendientesSonDesconocidos(): void
+    {
+        self::assertNull(Ack::pending(null));
+        self::assertNull(Ack::pending('$JS.ACK.demasiado.corto'));
+    }
+
     /** @return iterable<string,array{string,int}> */
     public static function subjectsDeAck(): iterable
     {

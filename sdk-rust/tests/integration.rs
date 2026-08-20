@@ -418,13 +418,20 @@ async fn leer_ultimo_de_dlq(url: &str, dominio: &str, subject: &str) -> Option<V
     let stream = js.get_stream(flux::dlq_stream_name(dominio)).await.ok()?;
     let consumer = stream
         .create_consumer(pull::Config {
-            deliver_policy: DeliverPolicy::All,
+            // `LastPerSubject`, NO `All`. Con `All` + fetch(10) se leen los diez
+            // mensajes MÁS ANTIGUOS del stream y se toma el décimo, así que en cuanto
+            // una ejecución previa deja más de diez muertos en el subject, el test
+            // compara contra un evento de otra ejecución y falla sin motivo aparente.
+            //
+            // Es la clase de test que solo falla en la máquina de alguien que ya lo
+            // había ejecutado antes, que es la peor.
+            deliver_policy: DeliverPolicy::LastPerSubject,
             filter_subject: subject.to_string(),
             ..Default::default()
         })
         .await
         .ok()?;
-    let mut batch = consumer.fetch().max_messages(10).messages().await.ok()?;
+    let mut batch = consumer.fetch().max_messages(1).messages().await.ok()?;
     let mut ultimo = None;
     while let Some(Ok(m)) = batch.next().await {
         ultimo = Some(m.payload.to_vec());
@@ -502,4 +509,385 @@ async fn esperar(sink: &Arc<Mutex<Option<Event>>>) -> Option<Event> {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     None
+}
+
+// ─── Fase 5: firma, métricas y aislamiento de tenant ─────────────────────────
+
+/// 09-multitenancy.md §3.3: en `strict`, suscribirse sin filtro de tenant es un **error
+/// de configuración**, no un descuido silencioso.
+///
+/// Esto importa más de lo que parece: un filtro que hay que acordarse de poner es un
+/// filtro que alguien olvidará, y el fallo —ver los datos de otro tenant— **no produce
+/// ningún error**: produce un incidente de privacidad que se descubre semanas después.
+#[tokio::test]
+async fn strict_sin_tenant_es_un_error_de_configuracion() {
+    let url = broker!();
+    let bus = connect(
+        ConnectOptions::new(&url, "pedidos-api", "test", "1.0.0")
+            .with_tenant_isolation(flux::TenantIsolation::Strict)
+            .with_schema_base_url("https://schemas.internal"),
+    )
+    .await
+    .expect("conexión");
+
+    let err = bus
+        .subscribe(&subject("itrust8"), |_ev: Event, _d| async { Ok(()) })
+        .await
+        .unwrap_err();
+
+    assert!(matches!(err, FluxError::TenantIsolation { .. }), "{err:?}");
+    assert!(err.to_string().contains("TODOS los tenants"), "{err}");
+
+    bus.close().await.expect("close");
+}
+
+/// `"system"` NO cuenta como filtro de tenant: es la AUSENCIA de tenant, reservada a los
+/// eventos de plataforma — 09-multitenancy.md §5.
+#[tokio::test]
+async fn strict_rechaza_system_como_filtro() {
+    let url = broker!();
+    let bus = connect(
+        ConnectOptions::new(&url, "pedidos-api", "test", "1.0.0")
+            .with_tenant_id("system")
+            .with_tenant_isolation(flux::TenantIsolation::Strict)
+            .with_schema_base_url("https://schemas.internal"),
+    )
+    .await
+    .expect("conexión");
+
+    let err = bus
+        .subscribe(&subject("itrust9"), |_ev: Event, _d| async { Ok(()) })
+        .await
+        .unwrap_err();
+    assert!(matches!(err, FluxError::TenantIsolation { .. }), "{err:?}");
+    assert!(err.to_string().contains("AUSENCIA de tenant"), "{err}");
+
+    bus.close().await.expect("close");
+}
+
+/// El evento de otro tenant se **confirma y se descarta antes del handler**: no es un
+/// fallo, no es para nosotros — 09-multitenancy.md §3.2.
+#[tokio::test]
+async fn el_evento_de_otro_tenant_no_llega_al_handler() {
+    let url = broker!();
+    let subject = subject("itrust10");
+
+    let consumidor = connect(
+        ConnectOptions::new(&url, "facturacion-api", "test", "1.0.0")
+            .with_tenant_id("acme")
+            .with_tenant_isolation(flux::TenantIsolation::Strict)
+            .with_schema_base_url("https://schemas.internal"),
+    )
+    .await
+    .expect("conexión");
+
+    let vistos: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let sink = vistos.clone();
+    let sub = consumidor
+        .subscribe(&subject, move |ev: Event, _d| {
+            let sink = sink.clone();
+            async move {
+                sink.lock().unwrap().push(ev.tenantid.clone());
+                Ok(())
+            }
+        })
+        .await
+        .expect("suscripción");
+
+    let productor = bus(&url, "pedidos-api").await;
+    productor
+        .publish_with(
+            &subject,
+            &json!({ "pedidoId": "de-globex" }),
+            PublishOptions::default().with_tenant_id("globex"),
+        )
+        .await
+        .expect("publicación ajena");
+    productor
+        .publish_with(
+            &subject,
+            &json!({ "pedidoId": "de-acme" }),
+            PublishOptions::default().with_tenant_id("acme"),
+        )
+        .await
+        .expect("publicación propia");
+
+    for _ in 0..100 {
+        if !vistos.lock().unwrap().is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    // Margen para que un ajeno mal filtrado tuviese tiempo de aparecer.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    assert_eq!(
+        *vistos.lock().unwrap(),
+        vec!["acme".to_string()],
+        "el evento de globex debería haberse ACKeado y descartado antes del handler"
+    );
+
+    sub.unsubscribe();
+    consumidor.close().await.expect("close");
+    productor.close().await.expect("close");
+}
+
+/// 08-observability.md: los nombres y las etiquetas son contrato entre SDKs, así que se
+/// comprueban sobre la salida real de un ciclo publicar → consumir.
+#[tokio::test]
+async fn las_metricas_del_protocolo_se_emiten_al_publicar_y_consumir() {
+    let url = broker!();
+    let subject = subject("itrust11");
+    let metrics = Arc::new(flux::InMemoryMetrics::new());
+
+    let bus = connect(
+        ConnectOptions::new(&url, "pedidos-api", "test", "1.0.0")
+            .with_tenant_id("acme")
+            .with_metrics(metrics.clone())
+            .with_schema_base_url("https://schemas.internal"),
+    )
+    .await
+    .expect("conexión");
+
+    let recibido: Arc<Mutex<Option<Event>>> = Arc::new(Mutex::new(None));
+    let sink = recibido.clone();
+    let sub = bus
+        .subscribe(&subject, move |ev: Event, _d| {
+            let sink = sink.clone();
+            async move {
+                *sink.lock().unwrap() = Some(ev);
+                Ok(())
+            }
+        })
+        .await
+        .expect("suscripción");
+
+    bus.publish(&subject, &json!({ "pedidoId": "ped-1" }))
+        .await
+        .expect("publicación");
+    esperar(&recibido).await.expect("el evento debería llegar");
+
+    let salida = metrics.render();
+    assert!(
+        salida.contains(&format!(
+            "flux_events_published_total{{subject=\"{subject}\",outcome=\"ok\"}} 1"
+        )),
+        "{salida}"
+    );
+    assert!(
+        salida.contains(&format!(
+            "flux_events_consumed_total{{subject=\"{subject}\",consumer=\"{}\",outcome=\"ok\"}} 1",
+            sub.durable
+        )),
+        "{salida}"
+    );
+    assert!(salida.contains("flux_connection_state 1"), "{salida}");
+    assert!(salida.contains("flux_consumer_pending{"), "{salida}");
+    assert!(
+        salida.contains("flux_event_handler_duration_seconds_bucket{"),
+        "{salida}"
+    );
+    // §2.2: NUNCA se etiqueta por tenant, aunque el bus tenga uno configurado.
+    assert!(!salida.contains("acme"), "{salida}");
+
+    sub.unsubscribe();
+    bus.close().await.expect("close");
+
+    // close() marca la conexión como caída: sin esto, un panel no distingue "sano" de
+    // "el proceso se fue".
+    assert!(metrics.render().contains("flux_connection_state 0"));
+}
+
+/// El ciclo completo de 07-signing.md contra un broker real: firmar al publicar,
+/// verificar al consumir, y que la firma sobreviva al viaje por JetStream.
+#[cfg(feature = "signing")]
+#[tokio::test]
+async fn un_evento_firmado_viaja_y_verifica_end_to_end() {
+    let url = broker!();
+    let subject = subject("itrust12");
+    let (priv_pem, pub_pem) = flux::generate_key_pair();
+
+    let productor = connect(
+        ConnectOptions::new(&url, "pedidos-api", "test", "1.0.0")
+            .with_tenant_id("acme")
+            .with_schema_base_url("https://schemas.internal")
+            .with_signing(
+                flux::SigningOptions::default().with_private_key(&priv_pem, "pedidos-api-1"),
+            ),
+    )
+    .await
+    .expect("conexión del productor");
+
+    let consumidor = connect(
+        ConnectOptions::new(&url, "facturacion-api", "test", "1.0.0")
+            .with_tenant_id("acme")
+            .with_schema_base_url("https://schemas.internal")
+            .with_signing(
+                flux::SigningOptions::default()
+                    .with_public_key("pedidos-api-1", &pub_pem)
+                    .with_verify(flux::VerificationMode::Require),
+            ),
+    )
+    .await
+    .expect("conexión del consumidor");
+
+    let recibido: Arc<Mutex<Option<Event>>> = Arc::new(Mutex::new(None));
+    let sink = recibido.clone();
+    let sub = consumidor
+        .subscribe(&subject, move |ev: Event, _d| {
+            let sink = sink.clone();
+            async move {
+                *sink.lock().unwrap() = Some(ev);
+                Ok(())
+            }
+        })
+        .await
+        .expect("suscripción");
+
+    let publicado = productor
+        .publish(&subject, &json!({ "pedidoId": "ped-firmado" }))
+        .await
+        .expect("publicación");
+    assert_eq!(publicado.signkeyid.as_deref(), Some("pedidos-api-1"));
+
+    let ev = esperar(&recibido)
+        .await
+        .expect("el evento firmado debería llegar y verificar");
+    assert_eq!(ev.signature, publicado.signature, "la firma no se altera");
+
+    sub.unsubscribe();
+    productor.close().await.expect("close");
+    consumidor.close().await.expect("close");
+}
+
+/// En modo `require`, un evento **sin firma** es POISON y acaba en la DLQ con
+/// `MISSING_SIGNATURE` — 07-signing.md §7.
+#[cfg(feature = "signing")]
+#[tokio::test]
+async fn require_manda_a_la_dlq_un_evento_sin_firma() {
+    let url = broker!();
+    let dominio = "itrust13";
+    let subject = subject(dominio);
+    let (_, pub_pem) = flux::generate_key_pair();
+
+    let consumidor = connect(
+        ConnectOptions::new(&url, "facturacion-api", "test", "1.0.0")
+            .with_tenant_id("acme")
+            .with_schema_base_url("https://schemas.internal")
+            .with_signing(
+                flux::SigningOptions::default()
+                    .with_public_key("pedidos-api-1", &pub_pem)
+                    .with_verify(flux::VerificationMode::Require),
+            ),
+    )
+    .await
+    .expect("conexión del consumidor");
+
+    let llego = Arc::new(AtomicU32::new(0));
+    let contador = llego.clone();
+    let sub = consumidor
+        .subscribe(&subject, move |_ev: Event, _d| {
+            let contador = contador.clone();
+            async move {
+                contador.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+        })
+        .await
+        .expect("suscripción");
+
+    // El productor NO firma.
+    let productor = bus(&url, "pedidos-api").await;
+    productor
+        .publish(&subject, &json!({ "pedidoId": "sin-firma" }))
+        .await
+        .expect("publicación");
+
+    let raw = esperar_dlq(&url, dominio, &format!("dlq.{subject}"))
+        .await
+        .expect("el evento sin firma debería acabar en la DLQ");
+    let texto = String::from_utf8_lossy(&raw);
+    assert!(texto.contains("MISSING_SIGNATURE"), "{texto}");
+    // El handler nunca lo vio: la firma se comprueba ANTES.
+    assert_eq!(llego.load(Ordering::SeqCst), 0);
+
+    sub.unsubscribe();
+    productor.close().await.expect("close");
+    consumidor.close().await.expect("close");
+}
+
+/// 07-signing.md §7.1: **`warn` DEBE ser observable.** El evento se acepta y llega al
+/// handler, pero `flux_events_consumed_total{outcome="invalid_signature"}` se emite igual.
+///
+/// Sin esa métrica, `warn` es inútil para lo único que existe —pilotar la migración—: la
+/// pregunta "¿cuántos eventos siguen sin firma y de qué productores?" habría que buscarla
+/// a mano en los logs de siete servicios.
+#[cfg(feature = "signing")]
+#[tokio::test]
+async fn warn_acepta_el_evento_pero_lo_cuenta_como_invalid_signature() {
+    let url = broker!();
+    let subject = subject("itrust14");
+    let (_, pub_pem) = flux::generate_key_pair();
+    let metrics = Arc::new(flux::InMemoryMetrics::new());
+
+    let consumidor = connect(
+        ConnectOptions::new(&url, "facturacion-api", "test", "1.0.0")
+            .with_tenant_id("acme")
+            .with_metrics(metrics.clone())
+            .with_schema_base_url("https://schemas.internal")
+            .with_signing(
+                flux::SigningOptions::default()
+                    .with_public_key("pedidos-api-1", &pub_pem)
+                    .with_verify(flux::VerificationMode::Warn),
+            ),
+    )
+    .await
+    .expect("conexión del consumidor");
+
+    let recibido: Arc<Mutex<Option<Event>>> = Arc::new(Mutex::new(None));
+    let sink = recibido.clone();
+    let sub = consumidor
+        .subscribe(&subject, move |ev: Event, _d| {
+            let sink = sink.clone();
+            async move {
+                *sink.lock().unwrap() = Some(ev);
+                Ok(())
+            }
+        })
+        .await
+        .expect("suscripción");
+
+    // El productor NO firma.
+    let productor = bus(&url, "pedidos-api").await;
+    productor
+        .publish(&subject, &json!({ "pedidoId": "sin-firma" }))
+        .await
+        .expect("publicación");
+
+    // `warn` acepta: el handler SÍ lo ve, y no hay nada en la DLQ.
+    esperar(&recibido)
+        .await
+        .expect("en warn el evento debe llegar al handler");
+
+    let salida = metrics.render();
+    assert!(
+        salida.contains(&format!(
+            "flux_events_consumed_total{{subject=\"{subject}\",consumer=\"{}\",outcome=\"invalid_signature\"}} 1",
+            sub.durable
+        )),
+        "§7.1 exige la métrica, no solo el log:\n{salida}"
+    );
+    // Y NO se cuenta además como `ok`: si se contase dos veces, `sum by (outcome)` dejaría
+    // de cuadrar con el total de eventos consumidos.
+    assert!(
+        !salida.contains(&format!(
+            "flux_events_consumed_total{{subject=\"{subject}\",consumer=\"{}\",outcome=\"ok\"}}",
+            sub.durable
+        )),
+        "{salida}"
+    );
+
+    sub.unsubscribe();
+    productor.close().await.expect("close");
+    consumidor.close().await.expect("close");
 }

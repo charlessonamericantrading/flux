@@ -4,6 +4,8 @@ declare(strict_types=1);
 
 namespace Flux;
 
+use Flux\Metrics\MetricsSink;
+use Flux\Signing\SigningOptions;
 use Psr\Log\LoggerInterface;
 
 /**
@@ -21,7 +23,19 @@ final readonly class ConnectOptions
      * @param string $version SemVer del servicio. Va en `producerversion`; sin él un bug
      *        de payload en producción no se puede acotar a un despliegue.
      * @param string $tenantId Tenant por defecto de los eventos publicados. `system` para
-     *        eventos de plataforma.
+     *        eventos de plataforma — y **solo** para eso: `"system"` NO DEBE usarse como
+     *        comodín ni como default cuando el tenant real se desconoce, porque si no se
+     *        sabe de quién es un evento el bug está aguas arriba (09-multitenancy.md §5).
+     * @param TenantIsolation $tenantIsolation Con `Strict`, toda suscripción filtra por
+     *        tenant y suscribirse sin uno configurado lanza `TenantIsolationException`
+     *        — 09-multitenancy.md §3.
+     * @param SigningOptions|null $signing Firma Ed25519 de eventos. Extensión **OPCIONAL**
+     *        — 07-signing.md. Traslada la autenticidad del canal al evento: un evento
+     *        firmado sigue siendo verificable dentro de un fichero, un backup o un correo,
+     *        donde ya no hay ACL que lo respalde.
+     * @param MetricsSink|null $metrics Destino de las métricas. `null` = `NoMetrics`.
+     *        Los nombres y las etiquetas los fija el protocolo (08-observability.md), no la
+     *        aplicación; lo que la aplicación elige es el backend.
      * @param string $classification Clasificación por defecto — 06-security.md §5.
      * @param array<string,string> $schemas Mapa exacto subject → URI de `dataschema`.
      *        Gana sobre `schemaBaseUrl`.
@@ -40,10 +54,13 @@ final readonly class ConnectOptions
         public string $environment,
         public string $version,
         public string $tenantId = 'system',
+        public TenantIsolation $tenantIsolation = TenantIsolation::Off,
         public string $classification = 'internal',
         public array $schemas = [],
         public ?string $schemaBaseUrl = null,
         public ?ClassifierOptions $classifier = null,
+        public ?SigningOptions $signing = null,
+        public ?MetricsSink $metrics = null,
         public bool $createStreams = true,
         public ?\Closure $onPoison = null,
         public ?\Closure $onDlq = null,

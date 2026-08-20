@@ -4,6 +4,13 @@ declare(strict_types=1);
 
 namespace Flux;
 
+use Flux\Metrics\ConnectionState;
+use Flux\Metrics\ConsumeOutcome;
+use Flux\Metrics\MetricsSink;
+use Flux\Metrics\NoMetrics;
+use Flux\Metrics\PublishOutcome;
+use Flux\Signing\Signer;
+use Flux\Signing\Verifier;
 use Flux\Transport\Ack;
 use Flux\Transport\NatsTransport;
 use Flux\Transport\RawMessage;
@@ -27,6 +34,9 @@ final class FluxBus
 {
     private readonly Classifier $classifier;
     private readonly string $source;
+    private readonly MetricsSink $metrics;
+    private readonly ?Signer $signer;
+    private readonly ?Verifier $verifier;
 
     /** @var list<Subscription> */
     private array $subscriptions = [];
@@ -40,6 +50,29 @@ final class FluxBus
     ) {
         $this->classifier = new Classifier($options->classifier);
         $this->source = Protocol::sourceUri($options->environment, $options->service);
+        $this->metrics = $options->metrics ?? new NoMetrics();
+
+        // El firmante y el verificador se construyen al CONECTAR, no al primer evento: una
+        // clave mal configurada es un fallo de arranque. Si se construyeran perezosamente,
+        // un servicio con la clave equivocada pasaría el healthcheck y solo fallaría al
+        // llegar el primer mensaje — 07-signing.md §7.
+        $this->signer = Signer::fromOptions($options->signing);
+        $this->verifier = Verifier::fromOptions($options->signing, $options->logger);
+
+        $this->metrics->connectionState(
+            $transport->isConnected() ? ConnectionState::Connected : ConnectionState::Disconnected
+        );
+    }
+
+    /**
+     * El destino de métricas configurado. Útil para servir `/metrics` desde el worker.
+     *
+     * ⚠️ Solo tiene sentido en un proceso de larga vida: bajo FPM cada petición arranca con
+     * los contadores a cero. Ver la nota de `Flux\Metrics\InMemoryMetrics`.
+     */
+    public function metrics(): MetricsSink
+    {
+        return $this->metrics;
     }
 
     /**
@@ -138,15 +171,27 @@ final class FluxBus
             tracestate: $inherited?->tracestate,
         );
 
-        // La cabecera `Nats-Msg-Id` deduplica reintentos de PUBLICACIÓN dentro de
-        // `duplicate_window`. NO deduplica reentregas de consumo — 03-delivery.md §3. Es
-        // el malentendido más común del protocolo y nunca sustituye a la idempotencia del
-        // consumidor.
-        $this->transport->publish(
-            $subject,
-            Envelope::serialize($event),
-            [Protocol::MSG_ID_HEADER => $event->id],
-        );
+        // Firmar es LO ÚLTIMO antes de serializar: la firma cubre el envelope completo, así
+        // que cualquier atributo añadido después la invalidaría — 07-signing.md §5.
+        $event = $this->signer?->sign($event) ?? $event;
+
+        try {
+            // La cabecera `Nats-Msg-Id` deduplica reintentos de PUBLICACIÓN dentro de
+            // `duplicate_window`. NO deduplica reentregas de consumo — 03-delivery.md §3.
+            // Es el malentendido más común del protocolo y nunca sustituye a la
+            // idempotencia del consumidor.
+            $this->transport->publish(
+                $subject,
+                Envelope::serialize($event),
+                [Protocol::MSG_ID_HEADER => $event->id],
+            );
+        } catch (\Throwable $e) {
+            $this->metrics->eventPublished($subject, PublishOutcome::Error);
+
+            throw $e;
+        }
+
+        $this->metrics->eventPublished($subject, PublishOutcome::Ok);
 
         return $event;
     }
@@ -187,8 +232,10 @@ final class FluxBus
      * alerta (04-errors.md).
      *
      * @param callable(FluxEvent,HandlerContext):void $handler
+     * @param string|null $tenantId Filtro de tenant de ESTA suscripción. Gana sobre el de
+     *        la conexión — 09-multitenancy.md §3.
      *
-     * @throws InvalidSubjectException|ConsumerConfigMismatchException
+     * @throws InvalidSubjectException|ConsumerConfigMismatchException|TenantIsolationException
      */
     public function subscribe(
         string $subject,
@@ -198,6 +245,17 @@ final class FluxBus
         ?string $tenantId = null,
     ): Subscription {
         $parsed = Protocol::parseSubject($subject);
+
+        // El filtro efectivo se resuelve ANTES de crear nada: si `strict` no encuentra
+        // tenant, no tiene sentido dejar un durable consumer huérfano en el servidor.
+        $tenantFilter = self::effectiveTenantFilter($tenantId, $this->options->tenantId);
+        if ($this->options->tenantIsolation === TenantIsolation::Strict && $tenantFilter === null) {
+            throw new TenantIsolationException(
+                $subject,
+                self::tenantIsolationReason($this->options->tenantId),
+            );
+        }
+
         $this->ensureEventStream($parsed->domain);
         $this->ensureDlqStream($parsed->domain);
 
@@ -230,12 +288,44 @@ final class FluxBus
             // `[$objeto, 'metodo']` o un `'funcion'`, que es como se escriben los handlers
             // en la mayoría de aplicaciones PHP con inyección de dependencias.
             handler: \Closure::fromCallable($handler),
-            tenantId: $tenantId,
+            tenantId: $tenantFilter,
         );
 
         $this->subscriptions[] = $subscription;
 
         return $subscription;
+    }
+
+    /**
+     * El filtro de tenant que aplicará una suscripción.
+     *
+     * El de la suscripción gana sobre el de la conexión. Y **`"system"` NO cuenta como
+     * filtro**: es la AUSENCIA de tenant, el valor reservado para los eventos de
+     * plataforma, y usarlo como comodín o como default cuando el tenant real se desconoce
+     * está prohibido (09-multitenancy.md §5). Si contase, un servicio sin tenant real
+     * —y `system` es el default de `ConnectOptions`— pasaría la comprobación de `strict`
+     * sin filtrar absolutamente nada, que es exactamente el descuido silencioso que §3
+     * obliga a convertir en error.
+     */
+    private static function effectiveTenantFilter(?string $subscription, ?string $connection): ?string
+    {
+        $tenant = $subscription ?? $connection;
+
+        return ($tenant === null || $tenant === '' || $tenant === 'system') ? null : $tenant;
+    }
+
+    /** Por qué `strict` no encontró filtro, dicho de forma accionable. */
+    private static function tenantIsolationReason(string $connectionTenant): string
+    {
+        if ($connectionTenant === 'system') {
+            return 'el tenant de la conexión es "system", que es la AUSENCIA de tenant y no un '
+                . 'filtro: se reserva para eventos de plataforma y no debe usarse como comodín '
+                . '(09-multitenancy.md §5). Pasa un tenant real en ConnectOptions::$tenantId o '
+                . 'en el parámetro $tenantId de subscribe()';
+        }
+
+        return 'no hay tenant ni en ConnectOptions::$tenantId ni en el parámetro $tenantId de '
+            . 'subscribe()';
     }
 
     /**
@@ -388,6 +478,13 @@ final class FluxBus
         $attempt = Ack::deliveryAttempt($message->replyTo);
         $maxAttempts = Protocol::MAX_DELIVER;
 
+        // La única señal que delata a un consumidor cuyo bucle murió: la conexión sigue
+        // sana y solo el crecimiento de `pending` lo evidencia — 08-observability.md §4.
+        $pending = Ack::pending($message->replyTo);
+        if ($pending !== null) {
+            $this->metrics->consumerPending($subject, $subscription->durable, $pending);
+        }
+
         // POISON se detecta ANTES del handler: el mensaje no es interpretable, así que el
         // handler nunca llega a verlo — 04-errors.md §1.3.
         try {
@@ -397,6 +494,9 @@ final class FluxBus
                 ? $e
                 : new PoisonError($e->getMessage(), 'MALFORMED_MESSAGE', $e);
 
+            $code = $poison->errorCode ?? 'POISON';
+            $this->metrics->eventConsumed($subject, $subscription->durable, ConsumeOutcome::Poison);
+            $this->metrics->eventDlq($subject, $subscription->durable, ErrorClass::Poison, $code);
             $this->notifyPoison($subject, $poison, $message->payload);
             $this->log('error', "[flux] POISON en {$subject}: " . $poison->getMessage());
 
@@ -409,8 +509,10 @@ final class FluxBus
             return;
         }
 
+        // Filtrar ANTES del handler: un evento de otro tenant no es un fallo, no es para
+        // nosotros. Se ACKea y se descarta — 09-multitenancy.md §3.2.
         if ($subscription->tenantId !== null && $event->tenantid !== $subscription->tenantId) {
-            $this->respond($message, Ack::ACK); // no es para nosotros
+            $this->respond($message, Ack::ACK);
             return;
         }
 
@@ -423,16 +525,55 @@ final class FluxBus
             },
         );
 
+        $started = microtime(true);
+        $signatureWarning = false;
+
         try {
+            // La firma se comprueba ANTES del handler y antes que cualquier validación de
+            // payload: un evento manipulado puede tener un `data` impecable y aun así no
+            // ser del productor que dice — 07-signing.md §5. Va dentro del `try` para que
+            // un POISON de firma recorra el mismo camino que cualquier otro fallo:
+            // clasificar, contar y enrutar a la DLQ.
+            //
+            // En modo `warn` el evento se acepta, pero el fallo **se cuenta igual**: sin
+            // esa métrica, `warn` es inútil para lo único que existe —pilotar la
+            // migración—, y la pregunta "¿cuántos eventos siguen sin firma?" habría que
+            // buscarla a mano en los logs de siete servicios (§7.1).
+            $signatureWarning = $this->verifier?->check($event) !== null;
+
             EventContext::run(
                 EventContext::fromEvent($event),
                 fn () => ($subscription->handler)($event, $context),
             );
             $this->respond($message, Ack::ACK);
 
+            // El aviso de firma GANA sobre el `ok`: el evento se procesó, sí, pero la
+            // pregunta que hay que poder responder antes de pasar a `require` es cuántos
+            // eventos siguen sin firmar. Contarlo como `ok` la borraría, y contarlo dos
+            // veces rompería `sum by (outcome) == total consumido`.
+            $this->metrics->eventConsumed(
+                $subject,
+                $subscription->durable,
+                $signatureWarning ? ConsumeOutcome::InvalidSignature : ConsumeOutcome::Ok,
+            );
+            $this->metrics->handlerDuration(
+                $subject,
+                $subscription->durable,
+                microtime(true) - $started,
+            );
+
             return;
         } catch (\Throwable $e) {
-            $this->handleFailure($subscription, $message, $event, $e, $attempt, $maxAttempts);
+            $this->handleFailure(
+                $subscription,
+                $message,
+                $event,
+                $e,
+                $attempt,
+                $maxAttempts,
+                $started,
+                $signatureWarning,
+            );
         }
     }
 
@@ -443,6 +584,8 @@ final class FluxBus
         \Throwable $error,
         int $attempt,
         int $maxAttempts,
+        float $started,
+        bool $signatureWarning = false,
     ): void {
         $classification = $this->classifier->classify($error);
         $detail = $error->getMessage() !== '' ? $error->getMessage() : $error::class;
@@ -465,8 +608,14 @@ final class FluxBus
                 (int) $delayMs,
             ));
 
+            $this->metrics->eventRetried($subscription->subject, $subscription->durable, $attempt);
+
             // Retraso explícito según el backoff canónico en vez de dejar expirar
             // `ack_wait`: así no se retiene la ranura de `max_ack_pending` 30 s de más.
+            //
+            // ⚠️ El delay solo se honra en la PRIMERA reentrega: con `backoff` configurado
+            // —y flux lo configura siempre— el servidor manda el array a partir de la
+            // segunda y el delay pedido se ignora sin aviso (03-delivery.md §2.2).
             $this->respond($message, Ack::nakWithDelay($delayMs));
 
             return;
@@ -502,6 +651,33 @@ final class FluxBus
             return;
         }
 
+        // `invalid_signature` no es una clase de error aparte —un fallo de firma es POISON,
+        // y su `dlqreason` en la DLQ **sí** es `poison`— pero sí es un `outcome` propio:
+        // 07-signing.md §7.2 lo exige porque son dos preguntas distintas y las dos importan.
+        // `outcome="poison"` es "un productor publica basura", un bug de serialización;
+        // `outcome="invalid_signature"` es "alguien publica eventos que no son suyos", un
+        // incidente de seguridad o una migración a medias. Mezclarlas hace que
+        // `rate(…{outcome="poison"})` mida cosas distintas según el lenguaje del consumidor,
+        // que es justo lo que 08-observability.md §1 existe para impedir.
+        $this->metrics->eventConsumed(
+            $subscription->subject,
+            $subscription->durable,
+            $signatureWarning || self::isSignatureCode($classification->code)
+                ? ConsumeOutcome::InvalidSignature
+                : ConsumeOutcome::fromErrorClass($reason),
+        );
+        $this->metrics->eventDlq(
+            $subscription->subject,
+            $subscription->durable,
+            $reason,
+            $classification->code,
+        );
+        $this->metrics->handlerDuration(
+            $subscription->subject,
+            $subscription->durable,
+            microtime(true) - $started,
+        );
+
         $this->notifyDlq($subscription->subject, $event, $classification);
         $this->log('error', sprintf(
             '[flux] DLQ (%s) %s en %s tras %d intento(s): %s',
@@ -513,6 +689,16 @@ final class FluxBus
         ));
 
         $this->respond($message, Ack::TERM);
+    }
+
+    /** Los tres códigos POISON de la firma — 07-signing.md §7. */
+    private static function isSignatureCode(string $code): bool
+    {
+        return in_array(
+            $code,
+            ['MISSING_SIGNATURE', 'INVALID_SIGNATURE', 'UNKNOWN_SIGNING_KEY'],
+            true,
+        );
     }
 
     /** Backoff canónico para el intento `$attempt` (1-based). */
@@ -669,6 +855,10 @@ final class FluxBus
         }
 
         $this->transport->close();
+
+        // Sin esto, un panel no distingue "el servicio está sano" de "el proceso se fue"
+        // — 08-observability.md §2.1.
+        $this->metrics->connectionState(ConnectionState::Disconnected);
     }
 
     // ─── observabilidad ───────────────────────────────────────────────────────

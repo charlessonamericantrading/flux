@@ -36,6 +36,9 @@ use crate::envelope::{
 use crate::errors::{
     describe, Classification, ConfigDifference, ErrorClass, FluxError, HandlerError, HandlerResult,
 };
+use crate::metrics::{
+    ConnectionState, ConsumeOutcome, DlqReasonLabel, MetricsSink, NoMetrics, PublishOutcome,
+};
 use crate::protocol::{
     dlq_stream_name, dlq_subject, durable_name, parse_subject, source_uri, stream_name,
     validate_service_name, ParsedSubject, CANONICAL_BACKOFF, DEFAULT_ACK_WAIT,
@@ -94,6 +97,25 @@ pub struct DlqEventInfo {
     pub classification: Classification,
 }
 
+/// Aislamiento entre tenants — 09-multitenancy.md §3.
+///
+/// El Modelo A de v1 mezcla todos los tenants en un stream por dominio y **el aislamiento
+/// es una convención del SDK, no una frontera del broker**. Con `Strict`, esa convención
+/// deja al menos de depender de que alguien se acuerde.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TenantIsolation {
+    /// **Default.** El filtrado es opcional por suscripción.
+    #[default]
+    Off,
+    /// Toda suscripción filtra por tenant, y suscribirse sin uno configurado es un
+    /// [`FluxError::TenantIsolation`].
+    ///
+    /// Es el punto que importa de §3: un filtro que hay que acordarse de poner es un
+    /// filtro que alguien olvidará, y el fallo —ver los datos de otro tenant— **no produce
+    /// ningún error**: produce un incidente de privacidad que se descubre semanas después.
+    Strict,
+}
+
 // ─── Opciones de conexión ────────────────────────────────────────────────────
 
 /// Credenciales de NATS. **NUNCA versionadas** — 06-security.md §2.
@@ -132,8 +154,25 @@ pub struct ConnectOptions {
 
     /// Tenant por defecto de los eventos publicados. `None` significa `"system"`.
     pub tenant_id: Option<String>,
+    /// Aislamiento entre tenants al consumir — 09-multitenancy.md §3.
+    pub tenant_isolation: TenantIsolation,
     /// Clasificación por defecto. `None` significa `internal` — 06-security.md §5.
     pub classification: Option<DataClassification>,
+
+    /// Destino de las métricas. `None` significa [`NoMetrics`].
+    ///
+    /// Los nombres y las etiquetas los fija el protocolo (08-observability.md), no la
+    /// aplicación: si cada SDK nombrara a su manera, un panel del ecosistema sería
+    /// imposible. Lo que elige la aplicación es el backend.
+    pub metrics: Option<Arc<dyn MetricsSink>>,
+
+    /// Firma Ed25519 de eventos — extensión **OPCIONAL**, detrás de la feature `signing`.
+    ///
+    /// Traslada la autenticidad del canal al evento: un evento firmado sigue siendo
+    /// verificable dentro de un fichero, un backup o un correo, donde ya no hay ACL que lo
+    /// respalde — 07-signing.md §1.
+    #[cfg(feature = "signing")]
+    pub signing: crate::signing::SigningOptions,
 
     /// Mapa exacto subject → URI de `dataschema`. Gana sobre [`Self::schema_base_url`].
     pub schemas: HashMap<String, String>,
@@ -168,6 +207,7 @@ impl fmt::Debug for ConnectOptions {
             .field("environment", &self.environment)
             .field("version", &self.version)
             .field("tenant_id", &self.tenant_id)
+            .field("tenant_isolation", &self.tenant_isolation)
             .field("classification", &self.classification)
             .field("schema_base_url", &self.schema_base_url)
             .field("classifier", &self.classifier)
@@ -192,7 +232,11 @@ impl ConnectOptions {
             environment: environment.into(),
             version: version.into(),
             tenant_id: None,
+            tenant_isolation: TenantIsolation::Off,
             classification: None,
+            metrics: None,
+            #[cfg(feature = "signing")]
+            signing: crate::signing::SigningOptions::default(),
             schemas: HashMap::new(),
             schema_base_url: None,
             classifier: ClassifierOptions::default(),
@@ -208,6 +252,28 @@ impl ConnectOptions {
     #[must_use]
     pub fn with_tenant_id(mut self, tenant: impl Into<String>) -> Self {
         self.tenant_id = Some(tenant.into());
+        self
+    }
+
+    /// Exige filtro de tenant en toda suscripción — 09-multitenancy.md §3.
+    #[must_use]
+    pub fn with_tenant_isolation(mut self, isolation: TenantIsolation) -> Self {
+        self.tenant_isolation = isolation;
+        self
+    }
+
+    /// Destino de las métricas — 08-observability.md.
+    #[must_use]
+    pub fn with_metrics(mut self, metrics: Arc<dyn MetricsSink>) -> Self {
+        self.metrics = Some(metrics);
+        self
+    }
+
+    /// Firma Ed25519 de eventos — 07-signing.md.
+    #[cfg(feature = "signing")]
+    #[must_use]
+    pub fn with_signing(mut self, signing: crate::signing::SigningOptions) -> Self {
+        self.signing = signing;
         self
     }
 
@@ -459,6 +525,11 @@ struct BusInner {
     opts: ConnectOptions,
     classifier: Classifier,
     source: String,
+    metrics: Arc<dyn MetricsSink>,
+    #[cfg(feature = "signing")]
+    signer: Option<crate::signing::Signer>,
+    #[cfg(feature = "signing")]
+    verifier: Option<crate::signing::Verifier>,
     ensured: Mutex<HashSet<String>>,
     stops: Mutex<Vec<watch::Sender<bool>>>,
 }
@@ -524,6 +595,15 @@ pub async fn connect(mut opts: ConnectOptions) -> Result<Bus, FluxError> {
     // herramienta de operación, así que se valida aquí y no al crear el durable.
     validate_service_name(&opts.service)?;
 
+    // El firmante y el verificador se construyen ANTES de tocar la red: una clave mal
+    // configurada es un fallo de arranque, no algo que descubrir con el primer evento
+    // — 07-signing.md §7.
+    #[cfg(feature = "signing")]
+    let (signer, verifier) = (
+        crate::signing::Signer::new(&opts.signing)?,
+        crate::signing::Verifier::new(&opts.signing, opts.logger.clone())?,
+    );
+
     let mut nats = async_nats::ConnectOptions::new()
         .name(format!("{}@{}", opts.service, opts.environment))
         // -1 en Go, None aquí: reconexión indefinida.
@@ -556,6 +636,12 @@ pub async fn connect(mut opts: ConnectOptions) -> Result<Bus, FluxError> {
     // cambiar bajo los pies de un consumidor en marcha.
     let classifier = Classifier::new(std::mem::take(&mut opts.classifier));
 
+    let metrics: Arc<dyn MetricsSink> = opts
+        .metrics
+        .clone()
+        .unwrap_or_else(|| Arc::new(NoMetrics) as Arc<dyn MetricsSink>);
+    metrics.connection_state(ConnectionState::Connected);
+
     Ok(Bus {
         inner: Arc::new(BusInner {
             client,
@@ -563,6 +649,11 @@ pub async fn connect(mut opts: ConnectOptions) -> Result<Bus, FluxError> {
             opts,
             classifier,
             source,
+            metrics,
+            #[cfg(feature = "signing")]
+            signer,
+            #[cfg(feature = "signing")]
+            verifier,
             ensured: Mutex::new(HashSet::new()),
             stops: Mutex::new(Vec::new()),
         }),
@@ -602,10 +693,19 @@ impl Bus {
             let _ = s.send(true);
         }
         self.inner
+            .metrics
+            .connection_state(ConnectionState::Disconnected);
+        self.inner
             .client
             .drain()
             .await
             .map_err(|e| transport("fallo al drenar la conexión", e))
+    }
+
+    /// El destino de métricas configurado. Útil para servir `/metrics` desde el healthcheck.
+    #[must_use]
+    pub fn metrics(&self) -> &Arc<dyn MetricsSink> {
+        &self.inner.metrics
     }
 
     fn log(&self, level: LogLevel, msg: &str) {
@@ -718,8 +818,32 @@ impl Bus {
             tracestate,
         })?;
 
-        let payload = serialize(&event)?;
-        self.publish_raw(subject, payload, &event.id).await?;
+        // Firmar es LO ÚLTIMO antes de serializar: la firma cubre el envelope completo, así
+        // que cualquier atributo añadido después la invalidaría — 07-signing.md §5.
+        #[cfg(feature = "signing")]
+        let event = match &self.inner.signer {
+            Some(signer) => signer.sign(event)?,
+            None => event,
+        };
+
+        let payload = match serialize(&event) {
+            Ok(p) => p,
+            Err(e) => {
+                self.inner
+                    .metrics
+                    .event_published(subject, PublishOutcome::Error);
+                return Err(e);
+            }
+        };
+        if let Err(e) = self.publish_raw(subject, payload, &event.id).await {
+            self.inner
+                .metrics
+                .event_published(subject, PublishOutcome::Error);
+            return Err(e);
+        }
+        self.inner
+            .metrics
+            .event_published(subject, PublishOutcome::Ok);
         Ok(event)
     }
 
@@ -821,6 +945,20 @@ impl Bus {
         opts: SubscribeOptions,
     ) -> Result<Subscription, FluxError> {
         let parsed = parse_subject(subject)?;
+
+        // El filtro efectivo se resuelve ANTES de crear nada: si `strict` no encuentra
+        // tenant, no tiene sentido dejar un durable consumer huérfano en el servidor.
+        let tenant_filter = effective_tenant_filter(
+            opts.tenant_filter.as_deref(),
+            self.inner.opts.tenant_id.as_deref(),
+        );
+        if self.inner.opts.tenant_isolation == TenantIsolation::Strict && tenant_filter.is_none() {
+            return Err(FluxError::TenantIsolation {
+                subject: subject.to_string(),
+                reason: tenant_isolation_reason(self.inner.opts.tenant_id.as_deref()).to_string(),
+            });
+        }
+
         self.ensure_stream(&parsed).await?;
         self.ensure_dlq_stream(&parsed).await?;
 
@@ -909,7 +1047,7 @@ impl Bus {
                     &sub_subject,
                     &sub_durable,
                     handler.as_ref(),
-                    &opts,
+                    tenant_filter.as_deref(),
                 ))
                 .catch_unwind()
                 .await;
@@ -941,13 +1079,21 @@ impl Bus {
         subject: &str,
         durable: &str,
         handler: &dyn Handler,
-        opts: &SubscribeOptions,
+        tenant_filter: Option<&str>,
     ) {
+        let info = msg.info().ok();
         // `delivered` empieza en 1 en la primera entrega, no en 0.
-        let attempt = msg
-            .info()
-            .ok()
+        let attempt = info
+            .as_ref()
             .map_or(1, |i| u32::try_from(i.delivered).unwrap_or(1).max(1));
+
+        // La única señal que delata a un consumidor cuyo bucle murió: la conexión sigue
+        // sana y solo el crecimiento de `pending` lo evidencia — 08-observability.md §4.
+        if let Some(i) = &info {
+            self.inner
+                .metrics
+                .consumer_pending(subject, durable, i.pending);
+        }
 
         // POISON se detecta ANTES del handler: el mensaje no es interpretable, así que el
         // handler nunca llega a verlo — 04-errors.md §1.3.
@@ -959,9 +1105,11 @@ impl Bus {
             }
         };
 
-        if let Some(want) = &opts.tenant_filter {
-            if &event.tenantid != want {
-                let _ = msg.ack().await; // no es para nosotros
+        // Filtrar ANTES del handler: un evento de otro tenant no es un fallo, no es para
+        // nosotros. Se ACKea y se descarta — 09-multitenancy.md §3.
+        if let Some(want) = tenant_filter {
+            if event.tenantid != want {
+                let _ = msg.ack().await;
                 return;
             }
         }
@@ -973,11 +1121,32 @@ impl Bus {
             durable: durable.to_string(),
         };
 
-        let outcome = self.run_handler(handler, &msg, &event, delivery).await;
+        let inicio = std::time::Instant::now();
+
+        let (signature_warning, outcome) =
+            self.verify_and_run(handler, &msg, &event, delivery).await;
 
         let handler_err: HandlerError = match outcome {
             Ok(Ok(())) => {
                 let _ = msg.ack().await;
+                // El aviso de firma GANA sobre el `ok`: el evento se procesó, sí, pero la
+                // pregunta que hay que poder responder antes de pasar a `require` es
+                // cuántos eventos siguen sin firmar. Contarlo como `ok` la borraría, y
+                // contarlo dos veces rompería `sum by (outcome) == total consumido`.
+                self.inner.metrics.event_consumed(
+                    subject,
+                    durable,
+                    if signature_warning {
+                        ConsumeOutcome::InvalidSignature
+                    } else {
+                        ConsumeOutcome::Ok
+                    },
+                );
+                self.inner.metrics.handler_duration(
+                    subject,
+                    durable,
+                    inicio.elapsed().as_secs_f64(),
+                );
                 return;
             }
             Ok(Err(e)) => e,
@@ -1004,10 +1173,79 @@ impl Bus {
                     c.code, delay
                 ),
             );
+            self.inner.metrics.event_retried(subject, durable, attempt);
             let _ = msg.ack_with(AckKind::Nak(Some(delay))).await;
             return;
         }
 
+        self.route_to_dlq(
+            msg,
+            subject,
+            durable,
+            event,
+            &handler_err,
+            &c,
+            attempt,
+            inicio,
+            signature_warning,
+        )
+        .await;
+    }
+
+    /// Verifica la firma y ejecuta el handler.
+    ///
+    /// La firma se comprueba **ANTES del handler** y antes que cualquier validación de
+    /// payload: un evento manipulado puede tener un `data` impecable y aun así no ser del
+    /// productor que dice — 07-signing.md §5.
+    ///
+    /// El `bool` devuelto es "este evento habría sido rechazado en modo `require`". En
+    /// modo `warn` el evento se acepta, pero el fallo **se cuenta igual**: sin esa métrica,
+    /// `warn` es inútil para lo único que existe —pilotar la migración—, y la pregunta
+    /// "¿cuántos eventos siguen sin firma y de qué productores?" habría que buscarla a
+    /// mano en los logs de siete servicios (07-signing.md §7.1).
+    #[allow(clippy::type_complexity)]
+    async fn verify_and_run(
+        &self,
+        handler: &dyn Handler,
+        msg: &async_nats::jetstream::Message,
+        event: &Event,
+        delivery: Delivery,
+    ) -> (bool, Result<HandlerResult, Box<dyn std::any::Any + Send>>) {
+        #[cfg(feature = "signing")]
+        match self
+            .inner
+            .verifier
+            .as_ref()
+            .map_or(Ok(None), |v| v.check(event))
+        {
+            Ok(aviso) => (
+                aviso.is_some(),
+                self.run_handler(handler, msg, event, delivery).await,
+            ),
+            Err(e) => (false, Ok(Err(Box::new(e) as HandlerError))),
+        }
+
+        #[cfg(not(feature = "signing"))]
+        (false, self.run_handler(handler, msg, event, delivery).await)
+    }
+
+    /// El final del despacho: guardar en la DLQ, contar y terminar el mensaje.
+    ///
+    /// Vive aparte de [`Bus::dispatch`] solo por tamaño; el orden de los pasos es el que
+    /// importa y es el mismo: **primero guardar, después terminar**.
+    #[allow(clippy::too_many_arguments)]
+    async fn route_to_dlq(
+        &self,
+        msg: async_nats::jetstream::Message,
+        subject: &str,
+        durable: &str,
+        event: Event,
+        handler_err: &HandlerError,
+        c: &Classification,
+        attempt: u32,
+        inicio: std::time::Instant,
+        signature_warning: bool,
+    ) {
         let reason = DlqReason::from(c.class);
         let error_text = format!("{}: {}", c.code, describe(handler_err.as_ref()));
 
@@ -1032,6 +1270,30 @@ impl Bus {
                 return;
             }
         };
+
+        // `invalid_signature` no es una clase de error aparte —un fallo de firma es POISON,
+        // y su `dlqreason` en la DLQ **sí** es `poison`— pero sí es un `outcome` propio:
+        // 07-signing.md §7.2 lo exige porque son dos preguntas distintas y las dos
+        // importan. `outcome="poison"` es "un productor publica basura", un bug de
+        // serialización; `outcome="invalid_signature"` es "alguien publica eventos que no
+        // son suyos", un incidente de seguridad o una migración a medias. Mezclarlas hace
+        // que `rate(…{outcome="poison"})` mida cosas distintas según el lenguaje del
+        // consumidor, que es justo lo que 08-observability.md §1 existe para impedir.
+        self.inner.metrics.event_consumed(
+            subject,
+            durable,
+            if signature_warning || is_signature_code(&c.code) {
+                ConsumeOutcome::InvalidSignature
+            } else {
+                ConsumeOutcome::from(reason)
+            },
+        );
+        self.inner
+            .metrics
+            .event_dlq(subject, durable, DlqReasonLabel::from(reason), &c.code);
+        self.inner
+            .metrics
+            .handler_duration(subject, durable, inicio.elapsed().as_secs_f64());
 
         if let Some(cb) = &self.inner.opts.on_dlq {
             cb(DlqEventInfo {
@@ -1100,6 +1362,13 @@ impl Bus {
         err: FluxError,
     ) {
         let text = describe(&err);
+        let code = err.code().unwrap_or("POISON").to_string();
+        self.inner
+            .metrics
+            .event_consumed(subject, durable, ConsumeOutcome::Poison);
+        self.inner
+            .metrics
+            .event_dlq(subject, durable, DlqReasonLabel::Poison, &code);
         self.log(LogLevel::Error, &format!("POISON en {subject}: {text}"));
         if let Some(cb) = &self.inner.opts.on_poison {
             cb(PoisonInfo {
@@ -1315,6 +1584,55 @@ fn effective_budget(max_attempts: Option<u32>) -> u32 {
     max_attempts.map_or(DEFAULT_MAX_DELIVER, |m| m.min(DEFAULT_MAX_DELIVER))
 }
 
+/// El filtro de tenant que aplicará esta suscripción.
+///
+/// El de la suscripción gana sobre el de la conexión. Y **`"system"` NO cuenta como
+/// filtro**: es la ausencia de tenant, el valor reservado para los eventos de plataforma,
+/// y usarlo como comodín o como default cuando el tenant real se desconoce está prohibido
+/// — 09-multitenancy.md §5. Si `"system"` contase, un servicio sin `tenant_id` real
+/// pasaría la comprobación de `strict` sin filtrar nada, que es exactamente el descuido
+/// silencioso que §3 obliga a convertir en error.
+fn effective_tenant_filter(subscription: Option<&str>, connection: Option<&str>) -> Option<String> {
+    subscription
+        .or(connection)
+        .filter(|t| !t.is_empty() && *t != "system")
+        .map(ToString::to_string)
+}
+
+/// Por qué `strict` no encontró filtro, dicho de forma accionable.
+fn tenant_isolation_reason(connection_tenant: Option<&str>) -> &'static str {
+    match connection_tenant {
+        Some("system") => {
+            "el tenant de la conexión es \"system\", que es la AUSENCIA de tenant y no un \
+             filtro: se reserva para eventos de plataforma y no debe usarse como comodín \
+             (09-multitenancy.md §5). Pasa un tenant real en ConnectOptions::with_tenant_id \
+             o en SubscribeOptions::with_tenant_filter"
+        }
+        _ => {
+            "no hay tenant ni en ConnectOptions::with_tenant_id ni en \
+             SubscribeOptions::with_tenant_filter"
+        }
+    }
+}
+
+/// Los tres códigos POISON de la firma — 07-signing.md §7.
+fn is_signature_code(code: &str) -> bool {
+    matches!(
+        code,
+        "MISSING_SIGNATURE" | "INVALID_SIGNATURE" | "UNKNOWN_SIGNING_KEY"
+    )
+}
+
+impl From<DlqReason> for ConsumeOutcome {
+    fn from(r: DlqReason) -> Self {
+        match r {
+            DlqReason::Retryable => Self::Retryable,
+            DlqReason::Permanent => Self::Permanent,
+            DlqReason::Poison => Self::Poison,
+        }
+    }
+}
+
 /// El retraso del siguiente intento.
 ///
 /// Se emite un retraso **explícito** según el backoff canónico en vez de dejar expirar
@@ -1322,21 +1640,25 @@ fn effective_budget(max_attempts: Option<u32>) -> u32 {
 /// `retry_after` de la clasificación gana, porque viene de un `Retry-After` que la
 /// dependencia anunció.
 ///
-/// ⚠️ **Hallazgo verificado contra nats-server 2.14.5, no documentado en la spec.**
-/// Cuando el consumidor tiene `backoff` configurado —y en flux lo tiene siempre—, el
+/// ⚠️ **`retry_after` es una SUGERENCIA para el PRIMER reintento, no un control del
+/// calendario de reintentos** — 03-delivery.md §2.2.
+///
+/// Medido contra nats-server 2.14.5 durante el port a Rust, y ya normativo en la spec:
+/// cuando el consumidor tiene `backoff` configurado —y en flux lo tiene **siempre**—, el
 /// servidor honra el delay de un `-NAK` **solo en la primera reentrega**. A partir de la
-/// segunda manda el array `backoff`, y el delay pedido se ignora en silencio:
+/// segunda manda el array `backoff`, y el delay pedido se ignora sin ningún aviso:
 ///
 /// ```text
 /// consumidor SIN backoff, nak(300ms): entregas a 0 ms, 300 ms, 600 ms, 900 ms  ← honrado siempre
 /// consumidor CON backoff, nak(300ms): entregas a 0 ms, 300 ms, luego backoff[1] = 60 s
 /// ```
 ///
-/// Consecuencia práctica: un `Retry-After` de una dependencia solo acorta el **primer**
-/// reintento. Los cinco SDKs anteriores emiten el mismo `nak(delay)` dando por hecho que
-/// se respeta en los seis, así que el comportamiento es idéntico entre ellos —no hay
-/// divergencia que arreglar— pero la spec afirma más de lo que el servidor cumple. Ver la
-/// sección "Fricciones" del README.
+/// Consecuencia práctica: un `Retry-After: 5` de un proveedor **acorta el primer reintento
+/// y nada más**; del segundo en adelante manda el backoff canónico (1 m, 5 m, 15 m, 30 m).
+/// Los seis SDKs emiten el mismo `nak(delay)` y obtienen el mismo comportamiento, así que
+/// no hay divergencia entre ellos — lo que había que arreglar era la documentación. **Un
+/// SDK NO DEBE construir lógica que dependa de que el delay se respete más allá de la
+/// primera vez.** Ver `conformance/cases/nak-delay-ignored-with-backoff.json`.
 fn retry_delay(attempt: u32, retry_after: Option<Duration>) -> Duration {
     retry_after.unwrap_or_else(|| {
         // `attempt` empieza en 1, así que el primer reintento usa backoff[0]. Se satura
@@ -1587,6 +1909,116 @@ mod tests {
         ] {
             assert_eq!(DlqReason::from(class), reason);
         }
+    }
+
+    // ── aislamiento de tenant — 09-multitenancy.md §3 ─────────────────────────
+
+    #[test]
+    fn el_filtro_de_la_suscripcion_gana_al_de_la_conexion() {
+        assert_eq!(
+            effective_tenant_filter(Some("globex"), Some("acme")),
+            Some("globex".to_string())
+        );
+    }
+
+    #[test]
+    fn sin_filtro_de_suscripcion_manda_el_de_la_conexion() {
+        assert_eq!(
+            effective_tenant_filter(None, Some("acme")),
+            Some("acme".to_string())
+        );
+    }
+
+    /// `"system"` es la AUSENCIA de tenant, no un tenant: se reserva para eventos de
+    /// plataforma y **NO DEBE** usarse como comodín ni como default — 09-multitenancy.md
+    /// §5. Si contase como filtro, un servicio sin tenant real pasaría la comprobación de
+    /// `strict` sin filtrar nada.
+    #[test]
+    fn system_no_cuenta_como_filtro_de_tenant() {
+        assert_eq!(effective_tenant_filter(None, Some("system")), None);
+        assert_eq!(effective_tenant_filter(Some("system"), None), None);
+        assert_eq!(effective_tenant_filter(None, Some("")), None);
+        assert_eq!(effective_tenant_filter(None, None), None);
+    }
+
+    #[test]
+    fn el_default_es_off() {
+        assert_eq!(
+            ConnectOptions::new("nats://x", "svc", "produccion", "1.0.0").tenant_isolation,
+            TenantIsolation::Off
+        );
+    }
+
+    /// El mensaje tiene que decir qué hacer, y distinguir el caso de `"system"` del de
+    /// "no hay tenant": son dos errores distintos con la misma cara.
+    #[test]
+    fn el_error_de_strict_explica_el_caso_de_system() {
+        assert!(tenant_isolation_reason(Some("system")).contains("AUSENCIA de tenant"));
+        assert!(tenant_isolation_reason(None).contains("with_tenant_id"));
+    }
+
+    #[test]
+    fn el_error_de_aislamiento_nombra_el_subject_y_la_seccion() {
+        let err = FluxError::TenantIsolation {
+            subject: "pedidos.pedido.v1.creado".into(),
+            reason: tenant_isolation_reason(None).to_string(),
+        }
+        .to_string();
+        assert!(err.contains("pedidos.pedido.v1.creado"), "{err}");
+        assert!(err.contains("09-multitenancy.md §3"), "{err}");
+        assert!(err.contains("TODOS los tenants"), "{err}");
+    }
+
+    /// Suscribirse en `strict` sin tenant es un error de CONFIGURACIÓN y falla **antes**
+    /// de tocar la red: si esperase al broker, un servicio mal configurado arrancaría, se
+    /// conectaría y solo fallaría al llegar el primer evento.
+    #[tokio::test]
+    async fn strict_sin_tenant_falla_antes_de_conectar() {
+        // `connect` sí necesitaría broker, así que se comprueba la decisión pura: es la
+        // misma que toma `subscribe_with` antes de crear el consumidor.
+        let opts = ConnectOptions::new("nats://x", "svc", "produccion", "1.0.0")
+            .with_tenant_isolation(TenantIsolation::Strict);
+        assert_eq!(opts.tenant_isolation, TenantIsolation::Strict);
+        assert!(effective_tenant_filter(None, opts.tenant_id.as_deref()).is_none());
+    }
+
+    // ── métricas ──────────────────────────────────────────────────────────────
+
+    #[test]
+    fn los_codigos_de_firma_producen_el_outcome_invalid_signature() {
+        // 08-observability.md §2.1 distingue `invalid_signature` de `poison` para que un
+        // pico de firmas rotas no se confunda con un pico de JSON corrupto: tienen causas
+        // y respuestas distintas.
+        for code in [
+            "MISSING_SIGNATURE",
+            "INVALID_SIGNATURE",
+            "UNKNOWN_SIGNING_KEY",
+        ] {
+            assert!(is_signature_code(code), "{code}");
+        }
+        for code in ["MALFORMED_JSON", "HTTP_503", "PEDIDO_YA_CANCELADO"] {
+            assert!(!is_signature_code(code), "{code}");
+        }
+    }
+
+    #[test]
+    fn la_razon_de_dlq_se_traduce_al_outcome_correspondiente() {
+        for (reason, outcome) in [
+            (DlqReason::Retryable, ConsumeOutcome::Retryable),
+            (DlqReason::Permanent, ConsumeOutcome::Permanent),
+            (DlqReason::Poison, ConsumeOutcome::Poison),
+        ] {
+            assert_eq!(ConsumeOutcome::from(reason), outcome);
+        }
+    }
+
+    #[test]
+    fn el_default_de_metricas_es_no_op() {
+        let opts = ConnectOptions::new("nats://x", "svc", "produccion", "1.0.0");
+        assert!(
+            opts.metrics.is_none(),
+            "un SDK no debe imponer un backend de métricas"
+        );
     }
 
     #[test]

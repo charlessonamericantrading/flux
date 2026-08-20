@@ -74,9 +74,15 @@ pub struct Classification {
     /// El mensaje del error cambia; el código no debería.
     pub code: String,
 
-    /// Solo aplica a [`ErrorClass::Retryable`]: sobrescribe el backoff canónico para
-    /// ESTE intento. Úsalo cuando la dependencia dice explícitamente cuánto esperar
-    /// (cabecera `Retry-After`). `None` significa "usa el backoff canónico".
+    /// Solo aplica a [`ErrorClass::Retryable`]: **sugerencia para el PRIMER reintento**.
+    /// Úsala cuando la dependencia dice explícitamente cuánto esperar (cabecera
+    /// `Retry-After`). `None` significa "usa el backoff canónico".
+    ///
+    /// ⚠️ **No sobrescribe el calendario de reintentos** — 03-delivery.md §2.2. Con
+    /// `backoff` configurado —y flux lo configura siempre—, JetStream honra el delay de un
+    /// `nak` solo en la primera reentrega; a partir de la segunda manda el array `backoff`
+    /// y el delay pedido se ignora **sin ningún aviso**. Un `Retry-After: 5` acorta el
+    /// primer reintento y nada más. No construyas lógica que dependa de lo contrario.
     pub retry_after: Option<Duration>,
 
     /// Solo aplica a [`ErrorClass::Retryable`]: entregas máximas para ESTE error, por
@@ -230,6 +236,33 @@ pub enum FluxError {
     /// Configuración de `connect()` incompleta o incoherente.
     #[error("{0}")]
     Config(String),
+
+    /// Material de clave o configuración de firma inválidos — 07-signing.md.
+    ///
+    /// Es un error de **arranque**, no de mensaje: se produce al construir el firmante o
+    /// el verificador, antes de tocar la red. Un evento con la firma rota no da esto, da
+    /// [`FluxError::Poison`] con `INVALID_SIGNATURE`.
+    #[error("{0}")]
+    Signing(String),
+
+    /// `tenant_isolation = strict` y una suscripción sin filtro de tenant.
+    ///
+    /// Requisito de 09-multitenancy.md §3: consumir sin filtro **DEBE** ser un error de
+    /// configuración, no un descuido silencioso. Un filtro que hay que acordarse de poner
+    /// es un filtro que alguien olvidará, y el fallo —ver los datos de otro tenant— no
+    /// produce ningún error visible: produce un incidente de privacidad que se descubre
+    /// semanas después.
+    #[error(
+        "tenant_isolation = strict, pero {reason} al suscribirse a `{subject}`. Sin filtro \
+         de tenant este consumidor vería los eventos de TODOS los tenants, y eso no produce \
+         ningún error (09-multitenancy.md §3)"
+    )]
+    TenantIsolation {
+        /// Subject al que se intentaba suscribir.
+        subject: String,
+        /// Qué falta exactamente.
+        reason: String,
+    },
 
     /// El servidor aplicó una configuración de consumidor distinta de la solicitada.
     ///

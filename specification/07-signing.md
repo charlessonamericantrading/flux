@@ -82,7 +82,32 @@ extensión, y un servicio que no la use no debe pagarla.
 | `signkeyid` | String | Identifica la clave pública. Formato `<servicio>-<n>`, p. ej. `pedidos-api-3`. **Va firmado**. |
 | `signature` | String | Firma Ed25519 en **base64url sin padding**. **No va firmada** (no puede firmarse a sí misma). |
 
-Ambas van entre las extensiones, **antes de `data`**, en el orden declarado arriba.
+### 4.1 Posición exacta
+
+"Antes de `data`" **no basta como regla**: deja indefinido dónde van respecto a las
+extensiones `dlq*`, y dos SDKs pueden cumplirla produciendo bytes distintos.
+
+El orden completo del envelope es:
+
+```
+specversion · id · source · type · time · datacontenttype · dataschema · subject
+correlationid · tenantid · producerversion · dataclassification
+causationid · partitionkey · traceparent · tracestate
+signkeyid · signature          ← aquí
+dlqreason · dlqattempts · dlqconsumer · dlqerror · dlqtime
+data                           ← siempre el último
+```
+
+`signkeyid` y `signature` van **antes** de las `dlq*`, no después.
+
+> Ponerlas detrás **no rompe la verificación** —el verificador quita las `dlq*` de
+> todos modos— pero sí la **igualdad byte a byte del evento en la DLQ**, de la que
+> dependen el replay verbatim, la deduplicación por hash y los fixtures compartidos.
+> Es un fallo que **pasa todos los tests de firma** y solo se ve comparando bytes
+> entre dos SDKs.
+>
+> Lo destapó el port a Rust: su primera versión las puso detrás y ninguna prueba de
+> firma lo detectó.
 
 ## 5. Qué se firma
 

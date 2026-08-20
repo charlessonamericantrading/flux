@@ -39,6 +39,24 @@ futures = "0.3"
 
 async-nats = "0.50"
 
+# ─── Firma Ed25519 — extensión OPCIONAL de v1 (07-signing.md) ────────────────
+#
+# Va detrás de la feature `signing` y NO se activa por defecto a propósito: la firma es
+# una extensión opcional del protocolo (un evento sin firma sigue siendo válido), así que
+# imponer curve25519-dalek al árbol de dependencias de TODO servicio del ecosistema —con
+# su tiempo de compilación y su superficie de auditoría— por algo que la mayoría no usa
+# sería cobrar a todos por lo que usan unos pocos.
+#
+# `rand_core` solo lo necesita `generate_key_pair`, que es comodidad para tests y para
+# `flux keygen`; firmar y verificar no consumen aleatoriedad (Ed25519 es determinista, y
+# de ahí que la firma de un mismo evento sea siempre la misma — 07-signing.md §2).
+ed25519-dalek = { version = "2.2", features = ["rand_core"], optional = true }
+rand_core = { version = "0.6", features = ["getrandom"], optional = true }
+
+[features]
+default = []
+signing = ["dep:ed25519-dalek", "dep:rand_core"]
+
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
 # Los tests de integración leen la DLQ con la API CRUDA de NATS a propósito: comprueban
