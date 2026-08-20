@@ -124,8 +124,17 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - run: pip install pytest
+      # `cryptography` es un extra OPCIONAL del SDK (la firma es una extensión
+      # opcional de v1), pero en CI se instala a propósito: si no, los tests de firma
+      # se saltan y el CI daría verde sin haberlos ejecutado NUNCA.
+      - run: pip install pytest cryptography
       - run: python -m pytest sdk-python/tests -q
+      # Y sin el extra: el resto de la suite DEBE seguir pasando, saltando solo la
+      # firma. Una dependencia opcional que rompe la recolección entera no es opcional.
+      - name: La suite pasa también SIN el extra de firma
+        run: |
+          pip uninstall -y cryptography
+          python -m pytest sdk-python/tests -q
 
   sdk-go:
     name: SDK Go — vet, test y gofmt

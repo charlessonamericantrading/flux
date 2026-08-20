@@ -28,6 +28,18 @@ from flux.signing import (
     generate_key_pair,
 )
 
+# `cryptography` es un extra OPCIONAL, así que su ausencia debe SALTAR estos tests, no
+# tumbar la recolección entera. Una dependencia opcional que rompe toda la suite no es
+# opcional: el resto del SDK (envelope, naming, clasificación) no la necesita para nada.
+#
+# Va a nivel de módulo y no dentro de cada test porque `generate_key_pair()` se llama al
+# importar: sin el skip, el fallo ocurre en la fase de COLECCIÓN y pytest aborta con
+# exit 2 sin llegar a ejecutar ningún test de ningún fichero.
+pytest.importorskip(
+    "cryptography",
+    reason='la firma Ed25519 necesita el extra: pip install "flux-sdk[signing]"',
+)
+
 KEY_ID = "pedidos-api-1"
 PAR = generate_key_pair()
 
