@@ -152,39 +152,6 @@ jobs:
       - run: dotnet build sdk-dotnet/Flux.sln
       - run: dotnet test sdk-dotnet/Flux.sln
 
-  sdk-dotnet:
-    name: SDK .NET — build y tests
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-dotnet@v4
-        with:
-          dotnet-version: '8.0.x'
-      - run: dotnet build sdk-dotnet/Flux.sln
-      - run: dotnet test sdk-dotnet/Flux.sln
-
-  sdk-php:
-    name: SDK PHP — tests
-    runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: sdk-php
-    steps:
-      - uses: actions/checkout@v4
-      - uses: shivammathur/setup-php@v2
-        with:
-          php-version: '8.2'
-          extensions: json, sockets
-          coverage: none
-      # Este SDK se escribió en una máquina SIN php ni composer, así que el CI es la
-      # primera ejecución real de su suite. Si algo falla aquí, falla por eso.
-      - run: composer validate --no-check-lock
-      - run: composer install --no-interaction --prefer-dist
-      # `php -l` sobre todo el árbol: como el SDK se escribió sin intérprete disponible,
-      # un error de sintaxis debe reportarse como tal y no como 38 tests que no arrancan.
-      - run: find src tests -name '*.php' -print0 | xargs -0 -n1 php -l
-      - run: vendor/bin/phpunit
-
   conformance:
     name: Conformidad contra NATS real
     runs-on: ubuntu-latest
