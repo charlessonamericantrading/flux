@@ -206,7 +206,7 @@ jobs:
       # levantado en este punto. Sin excluirlos se saltan, y `--fail-on-skipped` —que
       # existe para que una extension ausente no pase por cobertura— los tomaria por un
       # fallo. Se ejecutan mas abajo, con NATS ya en pie.
-      - run: vendor/bin/phpunit --exclude-group integration --fail-on-skipped
+      - run: vendor/bin/phpunit --exclude-group integration,sin-libreria-nats --fail-on-skipped
 
       # El adaptador de NATS contra un broker REAL. Estuvo sin verificar y escondia un
       # bug de raiz que los tests con cliente falso no podian ver: el mensaje se

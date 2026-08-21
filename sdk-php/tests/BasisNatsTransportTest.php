@@ -110,6 +110,19 @@ final class BasisNatsTransportTest extends TestCase
         $this->expectNotToPerformAssertions();
     }
 
+    /**
+     * Solo corre cuando `basis-company/nats` NO está instalada, así que se salta en
+     * cualquier entorno normal — está en `require-dev` para los tests de integración.
+     *
+     * Va en su propio grupo para poder excluirlo de la pasada con `--fail-on-skipped`:
+     * ese flag existe para cazar tests que se saltan **porque falta una extensión**, y
+     * confundir eso con un salto por condición legítima y permanente convierte la
+     * comprobación en ruido que alguien acabará desactivando.
+     *
+     * Para ejecutarlo:  composer remove --dev basis-company/nats && vendor/bin/phpunit
+     *
+     * @group sin-libreria-nats
+     */
     public function testSinLaLibreriaNoSePierdenLasCabecerasEnSilencio(): void
     {
         // Perder las cabeceras sería perder `Nats-Msg-Id`, y con él la deduplicación de
