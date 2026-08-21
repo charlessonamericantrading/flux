@@ -202,7 +202,11 @@ jobs:
       # `--fail-on-skipped`: en CI todas las extensiones están, así que un test saltado
       # significa que falta una y la cobertura sería ficticia. En local es correcto que
       # se salten; en CI, no.
-      - run: vendor/bin/phpunit --fail-on-skipped
+      # `--exclude-group integration`: esos tests necesitan el broker, que aun no esta
+      # levantado en este punto. Sin excluirlos se saltan, y `--fail-on-skipped` —que
+      # existe para que una extension ausente no pase por cobertura— los tomaria por un
+      # fallo. Se ejecutan mas abajo, con NATS ya en pie.
+      - run: vendor/bin/phpunit --exclude-group integration --fail-on-skipped
 
       # El adaptador de NATS contra un broker REAL. Estuvo sin verificar y escondia un
       # bug de raiz que los tests con cliente falso no podian ver: el mensaje se
@@ -215,6 +219,14 @@ jobs:
             sleep 1
           done
           echo "NATS no arranco"; docker logs flux-nats-php; exit 1
+      # ⚠️ EL ORDEN IMPORTA y no es casual. `basis-company/nats` se instala DESPUES de
+      # la suite principal a proposito: hay un test que solo corre cuando la libreria NO
+      # esta —comprueba que sin ella las cabeceras no se pierden en silencio— y se salta
+      # en cuanto se instala. Instalarla antes lo dejaria saltado, y `--fail-on-skipped`
+      # tomaria por fallo algo correcto.
+      #
+      # Asi se prueban las DOS configuraciones en la misma ejecucion: sin la libreria (el
+      # camino de reserva) y con ella (la integracion real).
       - run: composer require --dev --no-interaction --no-progress basis-company/nats
       - run: vendor/bin/phpunit --group integration --fail-on-skipped
 
