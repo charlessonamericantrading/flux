@@ -1,7 +1,7 @@
 # @flux/sdk — Node.js / TypeScript
 
 Cliente delgado del [flux Event Protocol v1](../README.md).
-**Nivel de conformidad: L2** (resiliente).
+**Nivel de conformidad: L3** (gobernado).
 
 El SDK resuelve infraestructura, no negocio. Si te encuentras metiendo lógica de
 dominio aquí, va en tu servicio.
@@ -68,19 +68,24 @@ await bus.subscribe("pedidos.pedido.v1.creado", async (evento, ctx) => {
   puede saber qué significa "el mismo evento" en tu dominio.
 - **Orden.** flux no lo garantiza. Usa `aggregateVersion` y
   `WHERE aggregate_version < $n`.
-- **Validación contra el Schema Registry.** Llega con L3, en fase 4.
+- **Aislamiento entre tenants.** El SDK filtra, pero el modelo por defecto no resiste a
+  un servicio legítimo comprometido. Ver [09-multitenancy.md](../specification/09-multitenancy.md).
 
 ## Clasificación de errores — la decisión que es vuestra
 
-El default de la spec para un error desconocido es `PERMANENT`: un evento en la DLQ es
-recuperable, una cola atascada 51 minutos en hora punta no lo es. Si vuestras
-dependencias internas tienen hipos frecuentes, esa asimetría puede no ser la vuestra:
+El default para un error **desconocido** es `retryable-bounded`: reintenta, pero con un
+presupuesto de 2 entregas en vez de las 6 completas. Domina a las alternativas — un
+transitorio se recupera en el segundo intento y un sistemático llega a la DLQ en ~30 s
+sin atascar la cola. Los RETRYABLE **reconocidos** (503, ECONNRESET) conservan sus 6.
+
+Si vuestras dependencias fallan de otra manera, la política es vuestra:
 
 ```ts
 const bus = await connect({
   // …
   classifier: {
-    unknownErrorPolicy: "retryable",   // default: "permanent"
+    unknownErrorPolicy: "permanent",   // default: "retryable-bounded"
+    unknownRetryBudget: 3,             // default: 2
     timeoutPolicy: "permanent",        // default: "retryable"
     rules: [
       (e) => /deadlock/i.test(String(e?.message))
@@ -101,16 +106,129 @@ error. Sin esta comprobación, un `ack_wait` de 1 segundo pasa inadvertido hasta
 producción los handlers empiezan a ejecutarse en concurrencia consigo mismos. Ver
 [03-delivery.md §2.1](../specification/03-delivery.md).
 
+## Validación L3 (opcional)
+
+Sin esto, un productor puede publicar un payload que viola su propio `dataschema` y
+nadie se entera hasta que un consumidor —posiblemente de otro equipo y otra semana— se
+atraganta. El error aparece lejísimos de su causa.
+
+```ts
+import bundle from "../schemas/bundle.json" with { type: "json" };
+
+const bus = await connect({
+  // …
+  validation: { mode: "strict", bundle, onConsume: false },
+});
+```
+
+| Modo | Qué hace |
+|---|---|
+| `off` (default) | Nada. L2, sin coste. |
+| `warn` | Registra y publica igual. Para introducir validación en un ecosistema en marcha. |
+| `strict` | `publish()` **lanza**. Un contrato roto pasa a ser un fallo del productor. |
+
+- `ajv` es **dependencia opcional**: L3 es opt-in, así que su coste también.
+  `npm install ajv`.
+- El bundle se despliega **con el servicio**; el `dataschema` nunca se resuelve por HTTP.
+  Validar está en la ruta caliente y una caché con TTL abriría una ventana en la que dos
+  servicios validan contra versiones distintas del mismo esquema.
+- Tras cambiar un esquema: `node scripts/bundle-schemas.mjs`.
+- Reporta **todos** los errores, no solo el primero: de uno en uno, arreglar un payload
+  con tres campos mal cuesta tres despliegues.
+
+> Los esquemas declaran `$schema: draft/2020-12`, así que se usa `ajv/dist/2020` y no el
+> export por defecto. Un Ajv de draft-07 no da un error de versión: da
+> `no schema with key or ref ".../2020-12/schema"`, que no dice nada.
+
+## Firma de eventos (opcional)
+
+Traslada la autenticidad **del canal al evento**: uno firmado sigue siendo verificable
+dentro de un fichero, un backup o un correo, donde ya no hay ACL que lo respalde.
+
+```ts
+// Generar el par:  flux keygen pedidos-api 1
+const productor = await connect({
+  // …
+  signing: { privateKeyPem, keyId: "pedidos-api-1" },
+});
+
+const consumidor = await connect({
+  // …
+  signing: { publicKeys: { "pedidos-api-1": publicKeyPem }, verify: "require" },
+});
+```
+
+- **Ed25519 sin negociación de algoritmo**, desde `node:crypto`. Sin dependencias.
+- Modos `off` (default) | `warn` | `require`.
+- **Conserva la pública de las claves retiradas** mientras existan eventos firmados con
+  ellas — mínimo 90 días, la retención de la DLQ. Retirar una clave impide *emitir* con
+  ella, no *verificar* lo ya emitido.
+- La firma sobrevive al paso por la DLQ y al replay: las extensiones `dlq*` se añaden
+  después de firmar y la verificación las ignora.
+
+Ver [`07-signing.md`](../specification/07-signing.md) para qué **no** resuelve.
+
+## Métricas
+
+Los nombres y etiquetas los fija el protocolo, no la aplicación: si cada SDK nombrara a
+su manera, un panel del ecosistema sería imposible.
+
+```ts
+import { InMemoryMetrics } from "@flux/sdk";
+
+const metrics = new InMemoryMetrics();
+const bus = await connect({ /* … */ metrics });
+
+// Sírvelo en /metrics
+app.get("/metrics", (_req, res) => res.type("text/plain").send(metrics.render()));
+```
+
+El default es no-op: un SDK no debe imponer un backend. Implementa `MetricsSink` para
+enchufar prom-client u OpenTelemetry **conservando los nombres**.
+
+- **Nunca** etiquetes por `tenantid`, `id` ni `correlationid`: un tenant nuevo no debe
+  crear series temporales. En trazas sí.
+- `flux_consumer_pending` se alimenta de **dos** fuentes —metadatos del mensaje y sondeo
+  periódico— porque si el bucle del consumidor muere dejan de llegar mensajes y una
+  métrica alimentada solo desde metadatos se queda plana en vez de crecer.
+- `pendingPollMs`: positivo = intervalo, `0` = el default de 15 s, negativo = desactivado.
+
+## Aislamiento entre tenants
+
+```ts
+const bus = await connect({
+  // …
+  tenantId: "acme",
+  tenantIsolation: "strict",   // toda suscripción filtra; olvidarlo LANZA
+});
+```
+
+`strict` convierte "olvidé filtrar por tenant" en un error de configuración al
+suscribirse. Un filtro que hay que acordarse de poner es un filtro que alguien
+olvidará, y el fallo —ver los datos de otro tenant— **no produce ningún error**:
+produce un incidente de privacidad que se descubre semanas después.
+
+El evento de otro tenant se descarta con `ack` antes de llegar al handler: no es un
+fallo, no es para nosotros.
+
+> El modelo por defecto **no resiste a un servicio legítimo comprometido**. Si necesitas
+> esa garantía, es account de NATS por tenant — ver
+> [09-multitenancy.md §2](../specification/09-multitenancy.md), que lista el coste real.
+
 ## Desarrollo
 
 ```bash
 npm run typecheck
-npm test          # 54 tests, sin broker
+npm test          # 105 tests, sin broker
 npm run build
 
-# Suite de conformidad — necesita NATS
+# Suite de conformidad contra NATS real
 docker compose up -d          # desde la raíz del repo
 cd ../conformance && npm test
+
+# Conformidad CRUZADA: los mismos vectores en los siete SDKs, byte a byte
+node conformance/cross-sdk.mjs --only node        # sin broker
+node conformance/cross-sdk.mjs --verbose          # todos
 ```
 
 ## Sobre la dependencia de NATS

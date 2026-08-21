@@ -204,6 +204,20 @@ jobs:
       # se salten; en CI, no.
       - run: vendor/bin/phpunit --fail-on-skipped
 
+      # El adaptador de NATS contra un broker REAL. Estuvo sin verificar y escondia un
+      # bug de raiz que los tests con cliente falso no podian ver: el mensaje se
+      # entregaba y nunca llegaba al handler. Sin este paso, vuelve a pudrirse.
+      - name: Levantar NATS con JetStream
+        run: |
+          docker run -d --name flux-nats-php -p 4222:4222 -p 8222:8222             nats:2.14-alpine --jetstream --http_port=8222
+          for i in $(seq 1 30); do
+            curl -sf http://127.0.0.1:8222/healthz >/dev/null && exit 0
+            sleep 1
+          done
+          echo "NATS no arranco"; docker logs flux-nats-php; exit 1
+      - run: composer require --dev --no-interaction --no-progress basis-company/nats
+      - run: vendor/bin/phpunit --group integration --fail-on-skipped
+
   sdk-rust:
     name: SDK Rust — fmt, clippy y tests
     runs-on: ubuntu-latest

@@ -27,14 +27,30 @@ composer require flux/sdk        # requiere PHP >= 8.2
 > protocolo y no debe impedir usar el resto del SDK. Lo mismo vale para
 > `opis/json-schema` y la validación L3.
 >
-> ⚠️ `Flux\Transport\BasisNatsTransport` **sigue sin verificarse contra un servidor NATS
-> real.** Sus tests usan un cliente falso: fijan cómo reacciona ante un PubAck correcto, un
-> error del stream y el silencio, pero **no** demuestran que hable bien con NATS ni que la
-> API de `basis-company/nats` sea la que asume. Lo que afirma del protocolo (subjects
-> `$JS.API.*`, forma de las peticiones, nanosegundos) sale de la especificación de
-> JetStream; lo que afirma de la librería sale de su README y puede cambiar entre versiones
-> menores. Valídalo antes de producción, o implementa `Flux\Transport\NatsTransport` sobre
-> el cliente que uses — para eso existe el puerto.
+> ✅ `Flux\Transport\BasisNatsTransport` **está verificado contra un servidor NATS real**
+> (2.14.5) con `basis-company/nats` 1.2.3 —
+> `tests/Integration/BasisNatsTransportIntegrationTest.php`.
+>
+> Lo estuvo sin verificar y escondía un bug de raíz. `fetch()` usaba `Client::request()`,
+> que registra el handler en un inbox `_REQS.n`; pero JetStream entrega el mensaje extraído
+> **en su subject original**, con `reply-to` de `$JS.ACK…`. La librería no sabía enrutarlo:
+> el servidor entregaba el mensaje —quedaba en `num_ack_pending`— y **nunca llegaba al
+> handler ni se confirmaba**. Un consumidor que consume sin procesar.
+>
+> Los tests con cliente falso no podían verlo: devolvían obedientemente lo que el adaptador
+> esperaba. Es el argumento entero a favor de probar los adaptadores contra el sistema real,
+> y no solo contra la idea que uno tiene de él.
+>
+> Ejecutar la suite de integración:
+>
+> ```bash
+> docker compose up -d          # desde la raíz del repo
+> composer require --dev basis-company/nats
+> vendor/bin/phpunit --group integration
+> ```
+>
+> Se **salta sola** si no hay broker o falta `ext-sockets`: "no hay NATS aquí" no debe
+> parecerse a "el SDK está roto".
 
 ---
 

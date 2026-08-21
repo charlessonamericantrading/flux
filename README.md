@@ -134,7 +134,7 @@ protocolo a v2.
 | [Java](sdk-java/) | **L3** | 144 | ✅ (Maven en el runner) |
 | [.NET](sdk-dotnet/) | **L3** | 189 | ✅ |
 | [Rust](sdk-rust/) | L2 | 175 | ✅ (incl. 14 contra NATS real) |
-| [PHP](sdk-php/) | L2 | 272 | ⚠️ el adaptador NATS no se ha probado contra un broker real |
+| [PHP](sdk-php/) | **L3** | 304 | ✅ incl. 3 de integración contra NATS real |
 | [PHP](sdk-php/) | L2 | 201 | ✅ (transporte no — ver abajo) |
 
 Los cinco primeros se compilan y ejecutan en CI en cada push. La suite de conformidad corre

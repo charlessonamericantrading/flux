@@ -9,22 +9,24 @@ use Flux\Protocol;
 /**
  * Adaptador sobre `basis-company/nats`.
  *
- * ⚠️ **ESTADO: NO VERIFICADO CONTRA UN BROKER REAL.** Todo lo demás del SDK está cubierto
- * por tests que no necesitan broker; este fichero no puede estarlo. Léelo con esa
- * advertencia delante y valídalo contra tu versión de la librería antes de producción.
- * Lo que aquí se afirma del **protocolo** (subjects `$JS.API.*`, forma de las peticiones,
- * unidades) sí está tomado de la especificación de JetStream; lo que se afirma de la
- * **librería** (nombres de clase y firmas) es lo que documenta su README y puede haber
- * cambiado entre versiones menores.
+ * ✅ **VERIFICADO contra NATS 2.14.5 y basis-company/nats 1.2.3** —
+ * `tests/Integration/BasisNatsTransportIntegrationTest.php`, ejecutado con broker real.
  *
- * Decisión de diseño: en lugar de usar las abstracciones de alto nivel de la librería
- * (`Stream`, `Consumer`), este adaptador habla con la API `$JS.API.*` por petición/respuesta
- * usando solo `publish()` y `request()`, que son las primitivas más estables de cualquier
- * cliente de NATS. Hay una razón concreta: el runtime de flux necesita el **subject de
- * respuesta** de cada mensaje —es el canal de ack/nak/term/WIP y la única fuente del número
- * de entrega— y las abstracciones de alto nivel de la librería lo consumen por dentro y
- * hacen ack automático, que es justo lo que 03-delivery.md prohíbe ("ack explícito siempre,
- * nunca auto-ack").
+ * Lo estuvo sin verificar durante un tiempo y escondía un bug de raíz: `fetch()` usaba
+ * `Client::request()`, que registra el handler en un inbox `_REQS.n`, mientras JetStream
+ * entrega el mensaje extraído **en su subject original** con `reply-to` de `$JS.ACK…`.
+ * El servidor entregaba el mensaje —quedaba en `num_ack_pending`— y nunca llegaba al
+ * handler ni se confirmaba: un consumidor que consume sin procesar. Los tests con cliente
+ * falso no podían verlo, porque devolvían obedientemente lo que el adaptador esperaba.
+ *
+ * Decisión de diseño, actualizada tras ese hallazgo: la API `$JS.API.*` por
+ * petición/respuesta se usa para el **plano de control** (crear streams y consumidores,
+ * leer su config, sondear `num_pending`), donde `request()` sí encaja porque la respuesta
+ * llega al inbox. Para el **plano de datos** se usa `Consumer::handle()` con `ack: false`,
+ * que es la única primitiva de la librería que enruta correctamente los mensajes de un
+ * pull consumer y entrega el `reply-to` — el canal de ack/nak/term/WIP y la única fuente
+ * del número de entrega. El `false` es obligatorio: el auto-ack de la librería confirmaría
+ * antes de que corriese el handler, que es lo que 03-delivery.md prohíbe.
  *
  * Si tu cliente de NATS es otro, implementa `NatsTransport` y pásalo a `FluxBus::connect()`.
  * Es el motivo de que el puerto exista.
@@ -139,29 +141,50 @@ final class BasisNatsTransport implements NatsTransport
         return is_int($pending) ? $pending : null;
     }
 
+    /**
+     * Saca hasta `$batch` mensajes del pull consumer.
+     *
+     * ⚠️ Usa la API de consumidor de la librería, **NO `Client::request()`**. Esa fue la
+     * primera implementación y estaba mal de raíz: `request()` registra el handler en un
+     * inbox (`_REQS.n`) y espera la respuesta ahí, pero JetStream entrega el mensaje
+     * extraído **en su subject original** con un `reply-to` de `$JS.ACK…`. La librería no
+     * sabe enrutarlo y lanza `LogicException: No handler for message _REQS.1 or
+     * <subject>`.
+     *
+     * El síntoma en producción era el peor posible: el servidor SÍ entregaba el mensaje
+     * —quedaba como `num_ack_pending: 1`— pero nunca llegaba al handler ni se confirmaba.
+     * Un consumidor que consume sin procesar.
+     *
+     * No lo detectó ningún test porque todos usaban un cliente falso, que devolvía
+     * obedientemente lo que el adaptador esperaba. Solo apareció al ejecutarlo contra un
+     * broker real.
+     *
+     * `ack: false` es obligatorio: flux confirma explícitamente según el resultado del
+     * handler (03-delivery.md §2), y el auto-ack de la librería confirmaría antes de que
+     * el handler corriese.
+     */
     public function fetch(string $stream, string $durable, int $batch, int $timeoutMs): array
     {
-        // Petición de pull. `expires` en nanosegundos, un poco por debajo del timeout del
-        // cliente para que expire en el servidor y no en el socket: así el consumidor no
-        // deja peticiones colgando cada vez que la cola está vacía.
-        $request = [
-            'batch' => $batch,
-            'expires' => Protocol::nanos(max(100, $timeoutMs - 100)),
-            'no_wait' => false,
-        ];
-
         $messages = [];
 
         try {
-            $this->client->request(
-                self::API . '.CONSUMER.MSG.NEXT.' . $stream . '.' . $durable,
-                json_encode($request, JSON_THROW_ON_ERROR),
-                function (mixed $payload) use (&$messages, $stream): void {
-                    $message = $this->toRawMessage($payload, $stream);
+            $consumer = $this->client->getApi()->getStream($stream)->getConsumer($durable);
+            $consumer
+                ->setBatching($batch)
+                // Una sola ronda: el bucle de reintento y el ritmo los decide `FluxBus::run`,
+                // no el transporte.
+                ->setIterations(1)
+                ->setExpires(max(0.1, ($timeoutMs - 100) / 1000));
+
+            $consumer->handle(
+                function (mixed $payload, mixed $replyTo) use (&$messages, $stream): void {
+                    $message = $this->toRawMessage($payload, $stream, $replyTo);
                     if ($message !== null) {
                         $messages[] = $message;
                     }
                 },
+                null,
+                false,
             );
         } catch (MissingAckSubjectException $e) {
             // Este NO se traga: un mensaje sin subject de respuesta no se puede acusar, así
@@ -279,10 +302,17 @@ final class BasisNatsTransport implements NatsTransport
      * mensajes en silencio: sin `replyTo` no hay ack, no hay número de entrega y todo el
      * presupuesto de reintentos de 04-errors.md deja de funcionar.
      */
-    private function toRawMessage(mixed $payload, string $stream): ?RawMessage
+    /**
+     * @param mixed $replyToExplicito El `reply-to` que entrega `Consumer::handle()` como
+     *        segundo argumento. La librería lo pasa aparte porque el `Payload` no lo
+     *        lleva dentro: buscarlo solo en el payload devolvía siempre `null` y todo
+     *        mensaje acababa descartado como "cola vacía".
+     */
+    private function toRawMessage(mixed $payload, string $stream, mixed $replyToExplicito = null): ?RawMessage
     {
         $body = $this->bodyOf($payload);
-        $replyTo = is_object($payload) ? ($payload->replyTo ?? null) : null;
+        $replyTo = $replyToExplicito
+            ?? (is_object($payload) ? ($payload->replyTo ?? null) : null);
         $subject = is_object($payload) ? ($payload->subject ?? $stream) : $stream;
 
         // Los mensajes de estado (404 No Messages, 408 Request Timeout) llegan con cuerpo
