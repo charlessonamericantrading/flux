@@ -94,6 +94,105 @@ impl StateWriteOutcome {
     }
 }
 
+/// Valor de la etiqueta `outcome` de `flux_rpc_client_requests_total` — 08-observability.md §2.5,
+/// `protocol.json` → `rpc.metrics`. Uno por **llamada** (con reintentos, el resultado final).
+///
+/// Los errores de programación —`INVALID_RPC_CALL`, `RESERVED_DOMAIN`— **no** se cuentan: su valor
+/// sería una serie por cada error de tipeo.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RpcClientOutcome {
+    /// Llegó una respuesta válida.
+    Ok,
+    /// `RPC_UNAVAILABLE`: nadie escucha la operación.
+    Unavailable,
+    /// `RPC_TIMEOUT`.
+    Timeout,
+    /// Llegó un error con `class: retryable`.
+    Retryable,
+    /// Llegó un error con `class: permanent`, o `PERMISSION_DENIED`, `STALE_REQUEST`,
+    /// `RPC_MESSAGE_TOO_LARGE` o un fallo de firma.
+    Permanent,
+    /// `INVALID_SCHEMA`, al construir la petición o al validar la respuesta. También cuando la
+    /// llamada lanza.
+    InvalidSchema,
+    /// `RPC_INVALID_REPLY`: lo que llegó no es la respuesta a esta petición.
+    InvalidReply,
+}
+
+impl RpcClientOutcome {
+    /// El literal que va en la etiqueta.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Ok => "ok",
+            Self::Unavailable => "unavailable",
+            Self::Timeout => "timeout",
+            Self::Retryable => "retryable",
+            Self::Permanent => "permanent",
+            Self::InvalidSchema => "invalid_schema",
+            Self::InvalidReply => "invalid_reply",
+        }
+    }
+}
+
+/// Valor de la etiqueta `outcome` de `flux_rpc_server_requests_total` — 08-observability.md §2.5.
+/// Uno por petición **recibida**.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RpcServerOutcome {
+    /// El handler devolvió una respuesta.
+    Ok,
+    /// El handler falló con un error `retryable`.
+    Retryable,
+    /// El handler falló con un error `permanent`, o con uno **desconocido**; o la respuesta no cabía.
+    Permanent,
+    /// La petición no se pudo interpretar, o no traía subject de respuesta. **Es lo que debe
+    /// despertar a alguien**: alguien publica a mano, o hay un SDK roto.
+    Poison,
+    /// La petición no cumple su esquema, o la respuesta del handler no cumple el suyo.
+    InvalidSchema,
+    /// Firma ausente o inválida en modo `require`.
+    InvalidSignature,
+    /// `STALE_REQUEST`: `time` a más de 300 s del reloj.
+    StaleRequest,
+}
+
+impl RpcServerOutcome {
+    /// El literal que va en la etiqueta.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Ok => "ok",
+            Self::Retryable => "retryable",
+            Self::Permanent => "permanent",
+            Self::Poison => "poison",
+            Self::InvalidSchema => "invalid_schema",
+            Self::InvalidSignature => "invalid_signature",
+            Self::StaleRequest => "stale_request",
+        }
+    }
+}
+
+/// Valor de la etiqueta `role` de `flux_rpc_duration_seconds` — 08-observability.md §2.5.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RpcRole {
+    /// Desde que sale la petición hasta que llega la respuesta **o falla** (un timeout dura su
+    /// timeout).
+    Client,
+    /// Lo que tarda el handler, desde que se recibe la petición hasta que sale la respuesta.
+    Server,
+}
+
+impl RpcRole {
+    /// El literal que va en la etiqueta.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Client => "client",
+            Self::Server => "server",
+        }
+    }
+}
+
 /// Motivo por el que un evento acabó en la DLQ. Etiqueta `reason` — 04-errors.md §1.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DlqReasonLabel {
@@ -229,6 +328,29 @@ pub trait MetricsSink: Send + Sync {
     /// `metrics` u OpenTelemetry, y el estado es una extensión opcional.
     fn state_write(&self, contract: &str, outcome: StateWriteOutcome) {
         let _ = (contract, outcome);
+    }
+
+    /// `flux_rpc_client_requests_total{operation, outcome}` — solo en un SDK con la capacidad `rpc`
+    /// (08-observability.md §2.5).
+    ///
+    /// `operation` es el nombre de la operación (`clientes.cliente.v1.calcular-descuento`, sin
+    /// `rpc.`): tantas series como operaciones declaradas. **Nunca** el tenant, el `id`, el
+    /// `correlationid` ni quién llama: la firma no los admite. Implementación por defecto vacía, por
+    /// la misma razón que [`MetricsSink::state_write`].
+    fn rpc_client_request(&self, operation: &str, outcome: RpcClientOutcome) {
+        let _ = (operation, outcome);
+    }
+
+    /// `flux_rpc_server_requests_total{operation, outcome}` — solo en un SDK con la capacidad
+    /// `rpc`.
+    fn rpc_server_request(&self, operation: &str, outcome: RpcServerOutcome) {
+        let _ = (operation, outcome);
+    }
+
+    /// `flux_rpc_duration_seconds{operation, role}` — solo en un SDK con la capacidad `rpc`. Mismos
+    /// buckets que `flux_event_handler_duration_seconds`.
+    fn rpc_duration(&self, operation: &str, role: RpcRole, seconds: f64) {
+        let _ = (operation, role, seconds);
     }
 }
 
@@ -381,6 +503,8 @@ impl InMemoryMetrics {
             "flux_events_dlq_total",
             "flux_events_retried_total",
             "flux_state_writes_total",
+            "flux_rpc_client_requests_total",
+            "flux_rpc_server_requests_total",
         ] {
             let _ = writeln!(out, "# TYPE {name} counter");
         }
@@ -395,12 +519,20 @@ impl InMemoryMetrics {
             let _ = writeln!(out, "{k} {v}");
         }
 
+        // Una cabecera `# TYPE` por familia de histograma: la de los eventos y, con la capacidad
+        // `rpc`, `flux_rpc_duration_seconds`. Si no hay ninguna serie de una familia, tampoco
+        // cabecera: salvo la de siempre, que se emite aunque esté vacía.
         let _ = writeln!(out, "# TYPE flux_event_handler_duration_seconds histogram");
+        let mut familia_anterior = "flux_event_handler_duration_seconds";
         for (k, h) in &store.histograms {
             let (base, labels) = match k.find('{') {
                 Some(i) => (&k[..i], &k[i + 1..k.len() - 1]),
                 None => (k.as_str(), ""),
             };
+            if base != familia_anterior {
+                let _ = writeln!(out, "# TYPE {base} histogram");
+                familia_anterior = base;
+            }
             let sep = if labels.is_empty() { "" } else { "," };
             for (i, limit) in DURATION_BUCKETS.iter().enumerate() {
                 let _ = writeln!(
@@ -514,6 +646,28 @@ impl MetricsSink for InMemoryMetrics {
         self.inc(
             "flux_state_writes_total",
             &[("contract", contract), ("outcome", outcome.as_str())],
+        );
+    }
+
+    fn rpc_client_request(&self, operation: &str, outcome: RpcClientOutcome) {
+        self.inc(
+            "flux_rpc_client_requests_total",
+            &[("operation", operation), ("outcome", outcome.as_str())],
+        );
+    }
+
+    fn rpc_server_request(&self, operation: &str, outcome: RpcServerOutcome) {
+        self.inc(
+            "flux_rpc_server_requests_total",
+            &[("operation", operation), ("outcome", outcome.as_str())],
+        );
+    }
+
+    fn rpc_duration(&self, operation: &str, role: RpcRole, seconds: f64) {
+        self.observe(
+            "flux_rpc_duration_seconds",
+            &[("operation", operation), ("role", role.as_str())],
+            seconds,
         );
     }
 }
