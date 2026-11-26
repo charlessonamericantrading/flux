@@ -587,9 +587,11 @@ sale del stream *(A-34)*.
 
 #### 2.5 Errores y DLQ
 
-- Misma taxonomía que los eventos (`04-errors.md`), con los **seis códigos de estado** de §6 de ese
-  documento: `INVALID_TENANT_FOR_STATE`, `INVALID_STATE_KEY`, `MISSING_AGGREGATE_VERSION`,
-  `RESERVED_DOMAIN` (PERMANENT), `STATE_SUBJECT_MISMATCH` (POISON) y `STATE_CONFLICT` (RETRYABLE).
+- Misma taxonomía que los eventos (`04-errors.md`), con los **siete códigos de estado** de §6 de ese
+  documento: `INVALID_STATE_CONTRACT`, `INVALID_TENANT_FOR_STATE`, `INVALID_STATE_KEY`,
+  `MISSING_AGGREGATE_VERSION`, `RESERVED_DOMAIN` (PERMANENT), `STATE_SUBJECT_MISMATCH` (POISON) y
+  `STATE_CONFLICT` (RETRYABLE). *(Nacieron seis: el séptimo cierra el hueco de un contrato mal formado,
+  que Node lanzaba sin código y Rust como `InvalidSubject`.)*
 - Subject de DLQ: `dlq.state.<dom>.<agr>.v<M>` — sin tenant ni clave, para que no se multiplique. El
   stream `DLQ_<DOM>` de un dominio **con estado** captura `dlq.<dom>.>` **y** `dlq.state.<dom>.>`;
   uno sin estado no cambia. El dueño lee la DLQ de estado con `<servicio>__dlq_state_<dom>`.
@@ -627,14 +629,14 @@ await bus.state.watch("clientes.cliente.v1", async (entrada, ctx) => {
 | `specification/10-state.md` | Todo lo anterior, con el porqué de cada regla | **Hecho** |
 | `specification/06-security.md` §5.1 | Reescribir según §4.4 de este plan | **Hecho** (§2, §3, §4 y §7: de la fase 1) |
 | `specification/02-naming.md` | Nombres reservados; stream `STATE_`; durable de estado | **Hecho** |
-| `specification/04-errors.md` §6 | Los seis códigos de estado | **Hecho** |
+| `specification/04-errors.md` §6 | Los siete códigos de estado | **Hecho** (el séptimo, `INVALID_STATE_CONTRACT`, en la corrección de la Fase 2) |
 | `specification/08-observability.md` | `flux_state_writes_total{contract,outcome}` con `outcome = ok \| stale \| conflict \| invalid_schema`. Las métricas de consumo existentes se reutilizan con `subject="state.<contrato>"` y el `consumer` **sin el sufijo de tenant**. **Nunca** la clave ni el tenant como etiqueta | **Hecho** |
 | `protocol.json` | `version: "1.1.0"`; bloque `state`; `errors.codes`; definición de la capacidad `state` (sin ningún SDK que la declare); `security.piiInPayload` por primitiva | **Hecho** |
 | `scripts/check-protocol-json.mjs` | Casos que deben pasar y fallar para cada patrón nuevo, invariantes de estado y 56 mutaciones | **Hecho** |
 | `scripts/bundle-schemas.mjs`, `check-compat.mjs` | Recorrer `schemas/state/`; índice `state` en el bundle; error con pista si falta `aggregateVersion` | **Hecho** (reglas en `scripts/schema-rules.mjs`) |
 | `schemas/state/clientes/cliente/1.0.0.json`, `schemas/system/state/eliminado/1.0.0.json` | Esquema de ejemplo con `x-pii`, y la lápida | **Hecho** |
 | `conformance/cases/` | `state-broker.json` (A-31 … A-49), `state-semantics.json` (A-50) y `cross-sdk-state-envelope.json`; los ejecuta `conformance/state-broker.mjs` | **Hecho** |
-| `scripts/gen-acl.mjs` | Clave `watches`. Dueño: publica en `state.<dom>.>` y `DIRECT.GET` de su dominio. Observador: `CONSUMER.INFO`, `MSG.NEXT` y `ACK` de su durable, `DIRECT.GET` acotado a su tenant, `dlq.state.<contrato>` y `STREAM.INFO.DLQ_<DOM>`; **sin** `STREAM.INFO.STATE_<DOM>`. Patrones en `protocol.json` → `state.acl` | **Hecho** (`fase-2-acl`): `watches` es `"clientes.cliente.v1"` (todos los tenants) o `{ contract, tenants }` (confinado; un durable y un `DIRECT.GET` por tenant). **Difiere de `state.acl` en un punto**: el dueño tampoco recibe `STREAM.INFO.STATE_<DOM>` (el SDK no lo usa). Rechaza dominios reservados, `tenants: []`, claves desconocidas y observar el propio dominio. `06-security.md` §3.8 |
+| `scripts/gen-acl.mjs` | Clave `watches`. Dueño: publica en `state.<dom>.>` y `DIRECT.GET` de su dominio. Observador: `CONSUMER.INFO`, `MSG.NEXT` y `ACK` de su durable, `DIRECT.GET` acotado a su tenant, `dlq.state.<contrato>` y `STREAM.INFO.DLQ_<DOM>`; **sin** `STREAM.INFO.STATE_<DOM>`. Patrones en `protocol.json` → `state.acl` | **Hecho** (`fase-2-acl`): `watches` es `"clientes.cliente.v1"` (todos los tenants) o `{ contract, tenants }` (confinado; un durable y un `DIRECT.GET` por tenant). El dueño tampoco recibe `STREAM.INFO.STATE_<DOM>` (el SDK no lo usa): `state.acl` y la spec ya lo dicen igual. Rechaza dominios reservados, `tenants: []`, claves desconocidas y observar el propio dominio. `06-security.md` §3.8 |
 | `cli/` | `flux state ls \| get \| resync`; `provision` crea `STATE_` y amplía `DLQ_<DOM>`; `doctor` audita su config; `dlq replay` rechaza `dlq.state.>`; `tail` entiende `state.` | `provision`: **hecho** (`fase-2-acl`: `STATE_<DOM>`, durables `last_per_subject`, la DLQ de estado y la ampliación de `DLQ_<DOM>`, que es lo único que cambia en un recurso existente). Lo demás, pendiente (agente de CLI) |
 | `sdk-node/`, `sdk-rust/` | La API de 2.6, con tests contra NATS real y los escenarios de `state-semantics.json` | Pendiente |
 | `conformance/harness/` | Operaciones `state-build`, `state-tombstone`, `state-subject`, `state-dlq`, con los vectores de `cross-sdk-state-envelope.json` | Pendiente (integración) |
@@ -1001,9 +1003,13 @@ Reproducible: [`evidencia/ejecutar.sh`](evidencia/ejecutar.sh).
 | A-53 | `streams.update` de `STATE_<DOM>` con `max_age: 60s` y `duplicate_window` de 2 m | Err «duplicates window can not be larger then max age»: un `max_age` corto no es una forma de que el estado caduque con la ventana de la 1.0; el estado usa `max_age: 0` |
 | A-54 | La ACL generada ejecutada de extremo a extremo (S15 a S20): el dueño, un observador confinado a `acme` y uno sin confinar | Sin una sola violación en los ciclos positivos. Con `DIRECT.GET…v1.acme.*` se lee una clave de `acme` y un `…acme.>` (sigue siendo su tenant); se deniegan `globex`, `…v1.*.<clave>`, `state.<dom>.>` y la forma de cuerpo. Un `publish` de core a un subject de estado se deniega a todos menos al dueño. `STREAM.INFO.STATE_<DOM>`, `STREAM.MSG.GET`, `STREAM.PURGE` y el durable de otro: denegados a los cuatro roles. Quitar cualquiera de los permisos de estado rompe el ciclo (`verify-acl.mjs`, 5b) |
 | A-55 | Qué pide `@nats-io/jetstream` 3.4.0 bajo los permisos de estado generados (observador confinado y dueño) | `DirectStreamAPIImpl.getMessage(stream, { last_by_subj })` emite exactamente `$JS.API.DIRECT.GET.<stream>.<subject>`, sin cuerpo y **sin ninguna violación**; **no es público** (`jetstream(nc).direct` es `undefined`), así que un SDK pide `nc.request` a ese subject y mira `headers.code` (404 = no hay valor; las cabeceras traen `Nats-Sequence`). `jsm.streams.getMessage` usa `STREAM.MSG.GET` y `jsm.streams.info("STATE_…")` usa `STREAM.INFO`: **denegados**, también al dueño. `consumers.get` (CONSUMER.INFO) y `publish` con `expect: { lastSubjectSequence }` funcionan; el conflicto llega como `JetStreamApiError` con `code` 10071 |
+| A-56 | `ConnectOptions::servers` con varias direcciones separadas por coma, en el SDK de Rust (`async-nats` 0.50): `nats://a,nats://b` con las dos válidas, con la primera caída, con espacios y sin `nats://` | **Falla siempre y al instante** (~20 µs): «la lista de servidores no se entiende». `async-nats` interpreta un `&str` como UNA dirección (`impl ToServerAddrs for str`) y solo admite una lista como `Vec`/slice. Con `connect()` separando por comas: conecta al segundo con el primero caído; y al morir el servidor al que está conectado, se reconecta al otro (medido con `/connz`) |
+| A-57 | Un `watch` abierto y un `flux state resync` (borrar y recrear el durable), tiempo hasta la primera entrada de la foto nueva | `nats.js` 3.4.0: **43,0 s** (tres veces; el `consumer_deleted` llega al borrar, el pull no se repite hasta `heartbeats_missed`). `async-nats` 0.50: **nunca** (120 s, ni un `put` en vivo posterior): el flujo termina (`Err(ConsumerDeleted)` y `None`) y el bucle salía en silencio. Reabriendo el consumo (`CONSUMER.INFO` por nombre, sin `CONSUMER.CREATE`): 0,1 s y 0,2–0,3 s |
 A-19 a A-27 los reproduce `sdk-node/test/integration/` (`acl.test.ts`, `auth.test.ts`,
 `tls.test.ts`), contra nats-server 2.14.5 y `@nats-io/*` 3.4.0. A-28 a A-30 los reproduce
-`sdk-rust/tests/security.rs`, contra nats-server 2.14.5 y `async-nats` 0.50.
+`sdk-rust/tests/security.rs`, contra nats-server 2.14.5 y `async-nats` 0.50. A-56 y A-57 los reproducen
+`sdk-rust/tests/state.rs` (`varios_servidores_*`, `watch_vivo_sobrevive_a_un_resync`) y
+`sdk-node/test/integration/state.test.ts` (`un watch VIVO sobrevive a …`), contra los mismos.
 A-31 a A-50 los ejecuta [`conformance/state-broker.mjs`](../../conformance/state-broker.mjs) contra
 nats-server 2.14.5 y `@nats-io/*` 3.4.0 (`NATS_SERVER=… node conformance/state-broker.mjs`: 35 casos más 5 comprobaciones de los
 ejemplos byte a byte; un nodo, una ACL escrita a mano y un cluster de tres nodos).

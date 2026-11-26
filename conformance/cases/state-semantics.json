@@ -236,7 +236,7 @@
       "covers": [
         "A-41"
       ],
-      "rationale": "El broker acepta casi cualquier clave (A-41) y el esquema solo valida con L3: la comprobación es del protocolo y va siempre. Los casos de versión cubren lo que el nombre MISSING_AGGREGATE_VERSION no sugiere: un decimal, el 0 o un valor mayor que 2^53 − 1 también lo son. La clave `cli-1\\n` es la de la trampa de `$` en Python y PHP.",
+      "rationale": "El broker acepta casi cualquier clave (A-41) y el esquema solo valida con L3: la comprobación es del protocolo y va siempre. Los casos de versión cubren lo que el nombre MISSING_AGGREGATE_VERSION no sugiere: un decimal, el 0 o un valor mayor que 2^53 − 1 también lo son. La clave `cli-1\\n` es la de la trampa de `$` en Python y PHP. `7.0` NO está aquí y no puede estar: este fichero es JSON, y un SDK de número único (Node) lee `7.0` como el entero 7, indistinguible de `7` (10-state.md §3.4). Donde el parser distingue entero de flotante (Rust) `7.0` es MISSING_AGGREGATE_VERSION, y lo comprueba el test de ese SDK; en Node es un límite conocido del lenguaje, no un fallo.",
       "observed": {
         "server": "nats-server 2.14.5",
         "date": "2026-11-26",
@@ -1002,6 +1002,116 @@
           "expect": {
             "count": 1,
             "entries.0.tenantId": "acme"
+          }
+        }
+      ]
+    },
+    {
+      "id": "put-rejects-a-malformed-contract",
+      "title": "Un contrato que no es <dominio>.<agregado>.v<major> es INVALID_STATE_CONTRACT, y se evalúa antes que la clave",
+      "spec": "10-state.md §2.2, §3.6; 04-errors.md §6",
+      "covers": [],
+      "rationale": "La lista de seis códigos no tenía dónde poner un contrato mal formado: Node lanzaba un error sin código y Rust `InvalidSubject`, que no es de estado. El séptimo, INVALID_STATE_CONTRACT, lo cierra. Un dominio reservado sigue siendo RESERVED_DOMAIN (se evalúa antes). El contrato se evalúa ANTES que la clave: con las dos mal, gana el contrato. Falla antes de la red.",
+      "observed": {
+        "server": "nats-server 2.14.5",
+        "date": "2026-11-26",
+        "result": "La implementación de referencia rechaza `clientes.cliente` (2 tokens), `clientes.cliente.v1.creado` (4), `Clientes.cliente.v1` (mayúsculas) y `clientes.cliente.v0` con INVALID_STATE_CONTRACT, también con una clave inválida a la vez; acepta `clientes.cliente.v1`. El mutante `no-contract-check` lo deja pasar y el caso falla."
+      },
+      "steps": [
+        {
+          "op": "stream_add",
+          "name": "STATE_CLIENTES",
+          "subjects": [
+            "state.clientes.>"
+          ],
+          "state": true,
+          "expect": {
+            "outcome": "ok"
+          }
+        },
+        {
+          "op": "state_put",
+          "contract": "clientes.cliente",
+          "tenant": "acme",
+          "key": "cli-1",
+          "version": 1,
+          "title": "dos tokens: falta la versión",
+          "expect": {
+            "outcome": "error",
+            "errCode": "INVALID_STATE_CONTRACT"
+          }
+        },
+        {
+          "op": "state_put",
+          "contract": "clientes.cliente.v1.creado",
+          "tenant": "acme",
+          "key": "cli-1",
+          "version": 1,
+          "title": "cuatro tokens: es un subject de evento",
+          "expect": {
+            "outcome": "error",
+            "errCode": "INVALID_STATE_CONTRACT"
+          }
+        },
+        {
+          "op": "state_put",
+          "contract": "Clientes.cliente.v1",
+          "tenant": "acme",
+          "key": "cli-1",
+          "version": 1,
+          "title": "mayúsculas",
+          "expect": {
+            "outcome": "error",
+            "errCode": "INVALID_STATE_CONTRACT"
+          }
+        },
+        {
+          "op": "state_put",
+          "contract": "clientes.cliente.v0",
+          "tenant": "acme",
+          "key": "cli-1",
+          "version": 1,
+          "title": "la versión mayor mínima es v1",
+          "expect": {
+            "outcome": "error",
+            "errCode": "INVALID_STATE_CONTRACT"
+          }
+        },
+        {
+          "op": "state_put",
+          "contract": "clientes.cliente",
+          "tenant": "acme",
+          "key": "a.b",
+          "version": 1,
+          "title": "contrato Y clave mal: gana el contrato (§3.6)",
+          "expect": {
+            "outcome": "error",
+            "errCode": "INVALID_STATE_CONTRACT"
+          }
+        },
+        {
+          "op": "state_delete",
+          "contract": "clientes.cliente",
+          "tenant": "acme",
+          "key": "cli-1",
+          "version": 2,
+          "title": "delete: el mismo código",
+          "expect": {
+            "outcome": "error",
+            "errCode": "INVALID_STATE_CONTRACT"
+          }
+        },
+        {
+          "op": "state_put",
+          "contract": "clientes.cliente.v1",
+          "tenant": "acme",
+          "key": "cli-1",
+          "version": 1,
+          "title": "CONTROL: el contrato bien formado se escribe",
+          "control": true,
+          "expect": {
+            "outcome": "ok",
+            "applied": true
           }
         }
       ]

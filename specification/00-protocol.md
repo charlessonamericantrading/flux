@@ -187,7 +187,7 @@ se emita.
 
 Un SDK **declara** `state` solo si cumple **todo** lo de [10-state.md §10](10-state.md): las
 cuatro operaciones, **los mismos bytes** que los ejemplos de [10-state.md §2.6](10-state.md), el
-reconocimiento de **los dos** códigos de conflicto de secuencia, los **seis** códigos de
+reconocimiento de **los dos** códigos de conflicto de secuencia, los **siete** códigos de
 [04-errors.md §6](04-errors.md), el rechazo de los dominios reservados en `publish()` y un ciclo
 completo contra un broker real con los permisos exactos de estado, en los dos sentidos.
 `security` no es requisito, pero **sin ella el SDK no puede ejecutar** el ciclo bajo la
