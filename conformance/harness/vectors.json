@@ -1680,6 +1680,114 @@
         "key": "a.b"
       },
       "expect": "INVALID_STATE_KEY"
+    },
+    {
+      "id": "state-subject-contrato-malformado-1",
+      "spec": "10-state.md §2.2, §2.3, §3.6",
+      "why": "04-errors.md §6: un contrato mal formado tiene su código estable `INVALID_STATE_CONTRACT`.",
+      "op": "state-subject",
+      "input": {
+        "contract": "clientes.cliente",
+        "tenantId": "acme",
+        "key": "cli-1"
+      },
+      "expect": "INVALID_STATE_CONTRACT"
+    },
+    {
+      "id": "state-subject-contrato-malformado-2",
+      "spec": "10-state.md §2.2, §2.3, §3.6",
+      "why": "04-errors.md §6: un contrato mal formado tiene su código estable `INVALID_STATE_CONTRACT`.",
+      "op": "state-subject",
+      "input": {
+        "contract": "clientes.cliente.v1.creado",
+        "tenantId": "acme",
+        "key": "cli-1"
+      },
+      "expect": "INVALID_STATE_CONTRACT"
+    },
+    {
+      "id": "state-subject-contrato-malformado-3",
+      "spec": "10-state.md §2.2, §2.3, §3.6",
+      "why": "04-errors.md §6: un contrato mal formado tiene su código estable `INVALID_STATE_CONTRACT`.",
+      "op": "state-subject",
+      "input": {
+        "contract": "clientes.cliente.1",
+        "tenantId": "acme",
+        "key": "cli-1"
+      },
+      "expect": "INVALID_STATE_CONTRACT"
+    },
+    {
+      "id": "state-subject-contrato-malformado-4",
+      "spec": "10-state.md §2.2, §2.3, §3.6",
+      "why": "04-errors.md §6: un contrato mal formado tiene su código estable `INVALID_STATE_CONTRACT`.",
+      "op": "state-subject",
+      "input": {
+        "contract": "clientes.cliente.v0",
+        "tenantId": "acme",
+        "key": "cli-1"
+      },
+      "expect": "INVALID_STATE_CONTRACT"
+    },
+    {
+      "id": "state-subject-contrato-malformado-5",
+      "spec": "10-state.md §2.2, §2.3, §3.6",
+      "why": "04-errors.md §6: un contrato mal formado tiene su código estable `INVALID_STATE_CONTRACT`.",
+      "op": "state-subject",
+      "input": {
+        "contract": "Clientes.cliente.v1",
+        "tenantId": "acme",
+        "key": "cli-1"
+      },
+      "expect": "INVALID_STATE_CONTRACT"
+    },
+    {
+      "id": "state-subject-contrato-malformado-6",
+      "spec": "10-state.md §2.2, §2.3, §3.6",
+      "why": "04-errors.md §6: un contrato mal formado tiene su código estable `INVALID_STATE_CONTRACT`.",
+      "op": "state-subject",
+      "input": {
+        "contract": "clientes.Cliente.v1",
+        "tenantId": "acme",
+        "key": "cli-1"
+      },
+      "expect": "INVALID_STATE_CONTRACT"
+    },
+    {
+      "id": "state-subject-contrato-malformado-7",
+      "spec": "10-state.md §2.2, §2.3, §3.6",
+      "why": "04-errors.md §6: un contrato mal formado tiene su código estable `INVALID_STATE_CONTRACT`.",
+      "op": "state-subject",
+      "input": {
+        "contract": "",
+        "tenantId": "acme",
+        "key": "cli-1"
+      },
+      "expect": "INVALID_STATE_CONTRACT"
+    },
+    {
+      "id": "state-subject-contrato-malformado-8",
+      "spec": "10-state.md §2.2, §2.3, §3.6",
+      "why": "04-errors.md §6: un contrato mal formado tiene su código estable `INVALID_STATE_CONTRACT`; se valida antes que el tenant y la clave.",
+      "op": "state-subject",
+      "input": {
+        "contract": "clientes.cliente",
+        "tenantId": "ACME",
+        "key": "a.b"
+      },
+      "expect": "INVALID_STATE_CONTRACT"
+    },
+    {
+      "id": "state-subject-dominio-reservado-state",
+      "spec": "10-state.md §2.2, §2.3, §3.6",
+      "why": "§2.1: el dominio `state` está reservado; gana sobre cualquier otra validación.",
+      "op": "state-subject",
+      "input": {
+        "contract": "state.cliente",
+        "tenantId": "acme",
+        "key": "cli-1"
+      },
+      "expect": "RESERVED_DOMAIN"
     }
   ],
   "$commentState": "Los vectores de `stateVectors` los ejecutan SOLO los SDKs que declaran la capacidad `state` en protocol.json → capabilities; para los demás el runner imprime «N/A: no declara state». `input` es la entrada del arnés SIN el `op` (que va aparte), plana como el `input` de los fixtures de cross-sdk-state-envelope.json. Cada vector dice QUÉ espera: `sha256` (los bytes son los de la spec), `expectSubject` (el subject de NATS), `expect` (el código estable del rechazo) o nada (los bytes los fija el SDK de referencia). `differsFrom` es un control: los bytes DEBEN ser distintos de los de ese otro vector. `caseFixture` enlaza con un fixture del caso, y el runner comprueba que siguen coincidiendo."

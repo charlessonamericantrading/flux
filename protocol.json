@@ -959,7 +959,7 @@
       "state": {
         "spec": "specification/10-state.md",
         "evidence": "sdk-files",
-        "$commentEvidence": "Como `security`: cada SDK que la declara cita en `evidence` los ficheros que la ejecutan contra un nats-server real con los permisos exactos de estado que genera gen-acl.mjs; deben existir y, entre todos, nombrar cada codigo de la capacidad (check-sdk-codes.mjs). ADEMAS la integracion exigira que el SDK reproduzca los vectores de conformance/harness (state-build, state-tombstone, state-subject, state-dlq) y de conformance/cases/cross-sdk-state-envelope.json byte a byte: eso aun NO lo comprueba check-sdk-codes.mjs, que solo admite un tipo de evidencia por capacidad. NINGUN SDK declara `state` hasta que existan esos tests.",
+        "$commentEvidence": "Como `security`: cada SDK que la declara cita en `evidence` los ficheros que la ejecutan contra un nats-server real con los permisos exactos de estado que genera gen-acl.mjs; deben existir y, entre todos, nombrar cada codigo de la capacidad (check-sdk-codes.mjs). ADEMAS el arnes cruzado (conformance/cross-sdk.mjs) ejecuta las operaciones state-build, state-tombstone, state-subject y state-dlq contra los vectores de conformance/harness/vectors.json y compara los bytes de cada SDK que declara `state` con los de la referencia (Node); un SDK que la declara y no tiene la operacion FALLA (UNSUPPORTED_OP), y uno que no la declara sale como N/A. Hoy la declaran Node y Rust.",
         "requires": [
           "put-delete-get-watch",
           "byte-exact-envelope-tombstone-dlq",
