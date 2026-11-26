@@ -40,6 +40,7 @@ export type { Classification, ClassifiedError } from "./errors.js";
 export {
   classify,
   createClassifier,
+  createDetailedClassifier,
   RETRYABLE_HTTP_STATUS,
   TRANSIENT_SYSCALL_CODES,
 } from "./classify.js";
@@ -82,10 +83,11 @@ export {
   createValidator,
   schemaUriFor,
   stateSchemaUriFor,
+  rpcSchemaUriFor,
   SchemaValidationError,
   SchemaNotFoundError,
 } from "./validation.js";
-export type { ValidationOptions, ValidationMode, SchemaBundle } from "./validation.js";
+export type { ValidationOptions, ValidationMode, SchemaBundle, Validator } from "./validation.js";
 
 export {
   createSigner,
@@ -102,6 +104,8 @@ export type {
   ConsumeOutcome,
   ConnectionState,
   StateWriteOutcome,
+  RpcClientOutcome,
+  RpcServerOutcome,
 } from "./metrics.js";
 
 export { currentContext } from "./context.js";
@@ -177,3 +181,61 @@ export {
   InvalidDataClassificationError,
   RestrictedStateEntryError,
 } from "./state-errors.js";
+
+// ─── Petición/respuesta — la capacidad `rpc` (specification/11-request-reply.md) ─────────────────
+// `bus.request` y `bus.respond`; los seis códigos de 04-errors.md §7; y las funciones PURAS y deterministas
+// que construyen los bytes (el arnés cruzado las usa: sin reloj ni UUID).
+
+export {
+  // funciones puras
+  parseRpcOperation,
+  rpcSubject,
+  rpcRequestType,
+  rpcReplyType,
+  rpcDataschema,
+  resolveRpcTimeout,
+  buildRpcRequest,
+  buildRpcReply,
+  buildRpcError,
+  encodeRpcMessage,
+  rpcErrorDataProblem,
+  // constantes
+  RPC_TIMEOUT_DEFAULT_MS,
+  RPC_TIMEOUT_MIN_MS,
+  RPC_TIMEOUT_MAX_MS,
+  RPC_STALE_WINDOW_SECONDS,
+  RPC_MAX_CONCURRENT_HANDLERS,
+  RPC_STOP_TIMEOUT_MS,
+  RPC_ERROR_TYPE,
+  RPC_ERROR_DATASCHEMA,
+  RPC_SCHEMA_BASE,
+  RPC_OPERATION_PATTERN,
+  RPC_ERROR_CODE_PATTERN,
+  RpcSchemaError,
+} from "./rpc.js";
+export type {
+  // Solo como TIPO: su constructor recibe una conexión de NATS, y la API pública no expone ninguno.
+  RpcClient,
+  ParsedRpcOperation,
+  RequestOptions,
+  RespondOptions,
+  Responder,
+  RpcHandler,
+  RpcHandlerContext,
+  RpcRequestInput,
+  RpcRequestRef,
+  RpcReplyInput,
+  RpcErrorInput,
+  RpcErrorData,
+} from "./rpc.js";
+
+export {
+  RpcUnavailableError,
+  RpcTimeoutError,
+  StaleRequestError,
+  RpcInvalidReplyError,
+  RpcMessageTooLargeError,
+  InvalidRpcCallError,
+  RpcRetryableError,
+  RpcPermanentError,
+} from "./rpc-errors.js";
