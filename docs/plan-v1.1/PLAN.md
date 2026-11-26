@@ -305,9 +305,11 @@ Añade a `AGENTS.md` §8 dos trampas: «los permisos de subject no gobiernan Jet
   `schemas/bundle.json`**. Un patrón que no encaja con ningún subject declarado es un
   error. Motivo: el nombre del durable es un único token y NATS no permite comodines
   dentro de un token; hay que conocer el subject exacto.
-- Emite los permisos de 1.1. La forma objetivo está escrita a mano en
+- Emite los permisos de 1.1. La forma objetivo se escribió a mano en
   [`evidencia/candidata.conf`](evidencia/candidata.conf), con las dos diferencias de arriba
-  (la DLQ de los streams consumidos y la DLQ propia).
+  (la DLQ de los streams consumidos y la DLQ propia). Ese fichero ya no la contiene: tras la 1.5
+  la genera `gen-acl.mjs` y la ejecuta la suite, y solo quedan los usuarios de las Fases 2 y 3
+  (la versión anterior está en el historial de git).
 - `--nkeys <mapa.json>`: sustituye cada `<NKEY_DE_*>` por la clave pública real. Rechaza una
   **semilla** (es un secreto), una clave repetida entre servicios (credencial compartida) y un
   servicio sin clave.
@@ -381,9 +383,15 @@ inbox `_INBOX.>` común y el broker se lo denegaría). La tabla de capacidades d
 
 #### 1.5 Suite de seguridad — `conformance/security.mjs` + `conformance/cases/security-acl.json`
 
-Como `run.mjs`: habla NATS directamente, sin SDK. Pasos: genera claves nkey de prueba
-(`@nats-io/nkeys` ya es dependencia transitiva), genera la config con `gen-acl.mjs`,
-arranca un `nats-server` con TLS, aprovisiona con `flux provision`, y ejecuta la matriz:
+Como `run.mjs`: habla NATS directamente, sin SDK (salvo S10 y S11, que existen justo para lo
+contrario). Pasos: genera claves nkey de prueba (`@nats-io/nkeys`, dependencia directa de
+`conformance/`), genera la config con `gen-acl.mjs`, arranca un `nats-server` con TLS,
+aprovisiona con `flux provision`, y ejecuta la matriz.
+
+**Al revés que `run.mjs`: los casos son DATOS y el runner los ejecuta.**
+[`conformance/cases/security-acl.json`](../../conformance/cases/security-acl.json) define el
+vocabulario de operaciones y, por caso, `spec`, `rationale`, `observed` y `counterExample`;
+[`conformance/security.mjs`](../../conformance/security.mjs) no sabe qué es S1. La matriz:
 
 | Caso | Debe |
 |---|---|
@@ -399,20 +407,47 @@ arranca un `nats-server` con TLS, aprovisiona con `flux provision`, y ejecuta la
 | S10 | El SDK de Node pasa su test de integración bajo esta configuración |
 | S11 | El SDK de Rust pasa su test de integración bajo esta configuración |
 
-Job nuevo `security` en `.github/workflows/spec.yml`. Los jobs de integración que ya
-levantan NATS (Rust, PHP) pasan a usar la configuración segura.
+> **Hecho, y corregido tras medir** (nats-server 2.14.5, 2026-11-26). Además de S1–S11, la suite
+> lleva S12 (A-19, A-20: sin permiso de ack o de pull el fallo es silencioso), S13 (A-21: denegado,
+> «no existe» y «no hay respuesta» se distinguen) y S14 (A-25: una lista vacía no deniega). Lo que
+> la ejecución cambió respecto a lo escrito arriba:
+>
+> - **S8, texto plano.** La librería de NATS sube sola a TLS contra un servidor que lo exige
+>   (`nats://` acaba en `UNABLE_TO_VERIFY_LEAF_SIGNATURE`, no en texto plano), así que no prueba
+>   que una credencial en claro se rechace. Se habla el protocolo a mano por un socket: el
+>   servidor cierra sin contestar en cuanto llegan bytes que no son un ClientHello.
+> - **`flux provision` por TLS.** La CLI no tiene `--ca`: la CA de la PKI efímera le llega por
+>   `NODE_EXTRA_CA_CERTS`. Un operador con una CA privada tendría que hacer lo mismo.
+> - **S11: «info antes de crear» no se cumple en Rust.** §1.1 decide que los SDKs preguntan por el
+>   consumidor (`CONSUMER.INFO`) antes de crearlo, y Node lo hace (S10: cero violaciones en el log
+>   del servidor). El SDK de Rust intenta `CONSUMER.CREATE` primero: bajo la ACL generada, que no
+>   lo concede, cada `subscribe()` deja **una `Publish Violation`** en el log del servidor aunque el
+>   ciclo funcione. Una violación de permiso es una señal de alerta: una por arranque la vuelve
+>   ruido y tapa las reales. S11 lo fija como desviación conocida (`serverViolations: 1`, con el
+>   subject exacto); cuando Rust pregunte antes de crear, el caso fallará hasta pasarlo a 0.
+> - **Los jobs de integración de Rust y PHP siguen contra un NATS abierto.** Pasarlos a la
+>   configuración segura queda para la Fase 6, junto a la paridad de los SDKs.
+
+Job nuevo `security` en `.github/workflows/spec.yml`, justo después de `acl-verify`, que se queda:
+no es redundante (verifica el generador, `flux provision`, la minimalidad de cada permiso, `--dev` y
+el Modelo B). Que los jobs de integración que ya levantan NATS (Rust, PHP) pasen a usar la
+configuración segura queda pendiente (ver arriba).
 
 `docker-compose.yml`: perfil `secure` con TLS y la ACL generada, para desarrollo local.
+[`scripts/dev-secure.mjs`](../../scripts/dev-secure.mjs) genera en `.dev-secure/` (ignorado por git)
+la CA, las nkeys, la ACL y la configuración del servidor que el perfil monta. Verificado arrancando
+`nats-server` directamente con esa configuración y haciendo un ciclo con el SDK de Node; el perfil
+de compose en sí no se ha podido ejecutar (el contenedor de desarrollo no tiene Docker).
 
 **Aceptación**
 
 ```bash
-node conformance/security.mjs                      # S1–S10 en verde
-node conformance/security.mjs --acl fixtures/acl-v1.conf   # DEBE fallar en S1 y S6
+FLUX_REQUIRE_BROKER=1 node conformance/security.mjs                  # S1–S14 en verde
+node conformance/security.mjs --acl conformance/fixtures/acl-v1.conf # DEBE fallar en S1 y S6
 ```
 
 Borra de `docs/plan-v1.1/evidencia/` lo que ya sea un caso (`acl-generada.mjs` y la
-parte 3 de `diseno-candidato.mjs`).
+parte 3 de `diseno-candidato.mjs`). *(Hecho.)*
 
 ---
 
@@ -878,7 +913,17 @@ Reproducible: [`evidencia/ejecutar.sh`](evidencia/ejecutar.sh).
 | A-29 | SDK de Rust bajo permisos exactos: subjects que publica un consumidor y un dueño en un flujo completo (publicar, consumir, ack, WIP, nak, term, DLQ, sondeo) | `STREAM.INFO.EVT_<D>`, `STREAM.INFO.DLQ_<D>` (¡no estaba en la candidata!), `CONSUMER.CREATE.<S>.<d>.<subject>`, `CONSUMER.INFO.<S>.<d>`, `CONSUMER.MSG.NEXT.<S>.<d>`, `$JS.ACK.<S>.<d>.<…>`, `dlq.<subject>`; ninguno de `$JS.API.INFO`. Toda petición responde bajo `_INBOX.<servicio>.` incluida la del pull (`MSG.NEXT`) |
 | A-30 | Fallos de conexión inicial en `async-nats`: credencial rechazada, CA que no firmó, TLS exigido sin TLS en el broker, mTLS sin certificado de cliente | `AuthorizationViolation` el primero; **los tres de TLS llegan como `ConnectErrorKind::Io`** con un `io::Error InvalidData` dentro (`UnknownIssuer`, `InvalidContentType`, `CertificateRequired`), no como `Tls` |
 A-19 a A-27 los reproduce `sdk-node/test/integration/` (`acl.test.ts`, `auth.test.ts`,
-`tls.test.ts`), contra nats-server 2.14.5 y `@nats-io/*` 3.4.0. Les falta su caso en
-`conformance/cases/` (Fase 1.5): son observaciones del broker, no solo del SDK de Node.
-A-28 a A-30 los reproduce `sdk-rust/tests/security.rs`, contra nats-server 2.14.5 y
-`async-nats` 0.50. Tampoco tienen aún su caso en `conformance/cases/`.
+`tls.test.ts`), contra nats-server 2.14.5 y `@nats-io/*` 3.4.0. A-28 a A-30 los reproduce
+`sdk-rust/tests/security.rs`, contra nats-server 2.14.5 y `async-nats` 0.50.
+
+**Qué caso cubre cada una.** Las observaciones **del broker** ya son casos de
+[`conformance/cases/security-acl.json`](../../conformance/cases/security-acl.json) (el mapa
+completo es su bloque `brokerObservations`): A-1 → S9 · A-2 → S6, S9 · A-3 → S1 · A-4 → S2 ·
+A-5 → S3 · A-6 → S4 · A-7 → S6 · A-8 → S5 · A-8a → S1, S2 · A-8c → S10 · A-8f → S6, S13 ·
+A-19, A-20 → S12 · A-21 → S13 · A-22 → S6 · A-24 → S8 (la parte del broker) · A-25 → S14 ·
+A-27 → S10, S11 · A-29 → S11.
+**No tienen caso** porque son del SDK o de la librería (A-8b, A-26, A-28, A-30; los cubren
+`verify-acl.mjs` y los tests de los SDKs), de las Fases 2 y 3 (A-9 … A-18, aún en `evidencia/`) o
+necesitan otra forma de arrancar el servidor (A-8d, la misma nkey en dos accounts: no arranca;
+A-23, el modo operador/JWT; A-8e y A-24, la parte de `connect()` que se cuelga: son de la
+librería y de la CLI).

@@ -117,6 +117,48 @@ jobs:
       - name: Aplicar las ACLs generadas a un nats-server real
         run: node scripts/verify-acl.mjs
 
+  # La suite de seguridad (Fase 1.5): los casos son DATOS (conformance/cases/security-acl.json) y
+  # el runner los ejecuta contra un nats-server con TLS, con la ACL que genera gen-acl.mjs y con
+  # los SDKs de Node y de Rust de verdad. `acl-verify`, arriba, NO es redundante con ella: verifica
+  # el generador (sus errores y --nkeys), `flux provision`, la minimalidad de cada permiso, --dev y
+  # el Modelo B; esta verifica el contrato de seguridad de extremo a extremo.
+  security:
+    name: Suite de seguridad — ACLs, TLS y SDKs contra un NATS real
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      # nats-server 2.14.5 exige Go 1.25 (su go.mod): se compila la versión exacta que los casos
+      # dicen haber medido, igual que en `acl-verify`.
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+          cache: false
+      - name: Compilar nats-server 2.14.5
+        run: |
+          GOBIN="$PWD/bin" go install github.com/nats-io/nats-server/v2@v2.14.5
+          echo "NATS_SERVER=$PWD/bin/nats-server" >> "$GITHUB_ENV"
+      # S11 compila y lanza `cargo run --example acl_cycle` en sdk-rust.
+      - uses: dtolnay/rust-toolchain@stable
+      # La suite usa la CLI (`flux provision`) y el SDK de Node (S10, desde dist/).
+      - run: npm install --no-audit --no-fund
+        working-directory: conformance
+      - run: npm install --no-audit --no-fund
+        working-directory: cli
+      - run: npm install --no-audit --no-fund
+        working-directory: sdk-node
+      - run: npm run build
+        working-directory: sdk-node
+      # FLUX_REQUIRE_BROKER=1: la AUSENCIA de nats-server, openssl, sdk-node/dist o cargo es un
+      # FALLO y no un salto con aviso. Sin ella, un binario que no se compilara dejaría el job
+      # verde sin haber ejecutado nunca los permisos contra un broker: aparentaría cobertura.
+      - name: Ejecutar la suite de seguridad
+        env:
+          FLUX_REQUIRE_BROKER: '1'
+        run: node conformance/security.mjs
+
   protocol-json-valid:
     name: protocol.json coherente
     runs-on: ubuntu-latest

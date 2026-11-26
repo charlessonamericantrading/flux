@@ -3,12 +3,14 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "Suite de conformidad del Event Protocol v1. Habla NATS directamente, sin pasar por ningún SDK de flux: un runner construido sobre un SDK heredaría las suposiciones que debe verificar.",
+  "description": "Suite de conformidad del Event Protocol v1. Habla NATS directamente, sin pasar por ningún SDK de flux: un runner construido sobre un SDK heredaría las suposiciones que debe verificar. `npm test` ejecuta los invariantes del broker; `npm run security` la suite de seguridad (ACLs generadas, TLS y SDKs).",
   "scripts": {
-    "test": "node run.mjs"
+    "test": "node run.mjs",
+    "security": "node security.mjs"
   },
   "dependencies": {
     "@nats-io/jetstream": "^3.4.0",
+    "@nats-io/nkeys": "^2.0.3",
     "@nats-io/transport-node": "^3.4.0"
   },
   "engines": {

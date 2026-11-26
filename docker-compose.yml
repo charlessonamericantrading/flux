@@ -5,6 +5,15 @@
 #
 # Un solo nodo, sin réplicas: es para desarrollo y para la suite de conformidad.
 # La configuración de producción (replicas: 3) está en specification/02-naming.md §3.2.
+#
+# Perfil `secure`: el mismo broker con la configuración SEGURA —TLS, una nkey por servicio y las
+# ACLs que genera scripts/gen-acl.mjs—, para desarrollar contra lo que se va a desplegar y no
+# contra un NATS abierto donde todo funciona porque nada está confinado.
+#
+#   node scripts/dev-secure.mjs                         # genera .dev-secure/ (antes de arrancar)
+#   docker compose --profile secure up -d nats-secure   # solo este servicio: `nats` ya usa 4222
+#   NODE_EXTRA_CA_CERTS=.dev-secure/ca.pem node cli/src/index.mjs provision examples/services.json \
+#       --server tls://localhost:4223 --creds .dev-secure/ops.creds
 
 services:
   nats:
@@ -43,5 +52,27 @@ services:
       - ./schemas:/schemas:ro
     entrypoint: ["/bin/sh", "-c", "trap : TERM INT; sleep infinity & wait"]
 
+  # Perfil `secure`. No arranca con `docker compose up`: hay que pedirlo (`--profile secure`).
+  # `.dev-secure/` DEBE existir antes (node scripts/dev-secure.mjs): si no, Docker crea un
+  # directorio vacío del que `root` es dueño y el servidor no arranca.
+  nats-secure:
+    profiles: ["secure"]
+    image: nats:2.14-alpine
+    container_name: flux-nats-secure
+    command: ["-c", "/etc/flux/nats-compose.conf"]
+    ports:
+      - "4223:4222"           # cliente, por TLS
+      - "127.0.0.1:8223:8222" # monitorización: solo desde esta máquina (06-security.md §6)
+    volumes:
+      - ./.dev-secure:/etc/flux:ro
+      - nats-secure-data:/data
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O-", "http://localhost:8222/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+
 volumes:
   nats-data:
+  nats-secure-data:

@@ -7,6 +7,9 @@ build/
 *.creds
 *.nk
 *.jwt
+
+# scripts/dev-secure.mjs: CA, claves privadas y semillas de un NATS de desarrollo
+.dev-secure/
 .env
 .env.*
 !.env.example
