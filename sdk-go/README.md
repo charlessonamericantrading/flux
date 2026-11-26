@@ -789,6 +789,8 @@ servidor**, no solo sobre la solicitada.
 | `state.go`, `state_pure.go` | `State()`: `Put`, `Delete`, `Get`, `Watch` (`10-state.md`); la parte pura —subject, contrato, clave, `aggregateVersion`, sobre de estado y de DLQ— es lo que ejerce el arnés cruzado |
 | `validation.go` | también el mensaje de L3 **sin valores** de un estado |
 | `rpc.go`, `rpc_pure.go`, `errors_rpc.go` | `Bus.Request`, `Bus.Respond`, `Responder.Stop` (`11-request-reply.md`); la parte pura —operación, timeout, sobre de la petición, de la respuesta y del error— es lo que ejerce el arnés cruzado |
+| `cmd/conformance-harness` | El arnés de la conformidad cruzada (`conformance/harness/README.md`): `build`, `dlq`, `sign`, `verify`, `parse`, `state-*`, `rpc-*` y `external-id` |
+| `cmd/rpc-participant` | El participante del SDK de Go en `conformance/interop-rpc.mjs`: un proceso que el orquestador gobierna por stdin y que habla con el broker solo por la API pública |
 | `external_id.go` | `WithExternalKey`: el `id` determinista de un hecho importado (`01-envelope.md §2.6.1`) |
 
 ## Desarrollo

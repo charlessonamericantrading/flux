@@ -206,9 +206,9 @@ jobs:
             echo "✓ el mutante $m fue detectado"
           done
 
-  # Petición/respuesta entre los SDKs REALES de Node y de Rust (conformance/interop-rpc.mjs): el mismo entorno que la suite de
+  # Petición/respuesta entre los SDKs REALES de Node, de Rust y de Go (conformance/interop-rpc.mjs): el mismo entorno que la suite de
   # seguridad —nats-server con TLS, la ACL que genera gen-acl.mjs, `flux provision`— y cada instancia, un PROCESO con un SDK de
-  # verdad: Node llama a Rust y al revés (y los dos de control), con tenants distintos, firma `require`, errores retryable y
+  # verdad: cada uno llama a cada uno (nueve combinaciones, con las tres de control), con tenants distintos, firma `require`, errores retryable y
   # permanent, una respuesta que no cabe y un handler que lanza lo desconocido. Va en su propio job para no alargar el de seguridad
   # (~12 min): corre en paralelo. Los S30 a S34 (el ciclo de §12.9 y A-101 con cada SDK) corren en el de seguridad.
   interop-rpc:
@@ -227,7 +227,8 @@ jobs:
         run: |
           GOBIN="$PWD/bin" go install github.com/nats-io/nats-server/v2@v2.14.5
           echo "NATS_SERVER=$PWD/bin/nats-server" >> "$GITHUB_ENV"
-      # El participante de Rust (`--example rpc_participant --features signing`) lo compila el propio runner.
+      # Los participantes de Rust (`--example rpc_participant --features signing`) y de Go (`go build ./cmd/rpc-participant`) los compila el
+      # propio runner.
       - uses: dtolnay/rust-toolchain@stable
       - run: npm install --no-audit --no-fund
         working-directory: conformance
@@ -245,7 +246,7 @@ jobs:
       # Una prueba que solo se ha visto en verde no demuestra nada: se estropea el SDK a propósito —que abra una suscripción a su
       # inbox por la conexión con la que pide (A-101: `RPC_UNAVAILABLE` pasa a ser un timeout) en `connect()`, en el pull o en el
       # `watch`; una respuesta que no hereda el tenant; que reenvíe el texto de una excepción desconocida; un reintento con otro
-      # `id`; un responder que no verifica la firma— y los casos DEBEN fallar con cada uno de los 11 mutantes. Sin mutar, pasan.
+      # `id`; un responder que no verifica la firma— y los casos DEBEN fallar con cada uno de los 15 mutantes (11 de Node y Rust y 4 de Go). Sin mutar, pasan.
       - name: Los casos detectan un SDK estropeado (deben FALLAR)
         env:
           FLUX_REQUIRE_BROKER: '1'

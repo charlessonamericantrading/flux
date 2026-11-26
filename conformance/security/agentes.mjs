@@ -1,6 +1,7 @@
 /**
  * Los AGENTES de los escenarios con SDKs reales: procesos hijos que hablan con el broker SOLO por la API pública de un SDK
- * de flux (`security/participante-node.mjs` con el de Node; `sdk-rust/examples/rpc_participant.rs` con el de Rust) y que un
+ * de flux (`security/participante-node.mjs` con el de Node; `sdk-rust/examples/rpc_participant.rs` con el de Rust;
+ * `sdk-go/cmd/rpc-participant` con el de Go) y que un
  * orquestador gobierna por stdin/stdout con líneas JSON.
  *
  * Por qué procesos y no hilos o funciones: lo que mide un escenario es lo que el SDK hace con SU conexión (qué
@@ -8,13 +9,15 @@
  * conexiones independientes, con su reloj y su bucle de eventos. Un orquestador que ejecutara los SDKs en su propio
  * proceso mediría la carga del orquestador.
  *
- * El protocolo es el mismo para los dos SDKs, y el orquestador no sabe cuál es cuál:
+ * El protocolo es el mismo para los tres SDKs, y el orquestador no sabe cuál es cuál:
  *   entra  {"id": n, "cmd": "<orden>", …}             una línea por orden
  *   sale   {"id": 0, "ready": true, "sdk": …}          cuando ya está conectado (o {"ok": false, "error": …} si no pudo)
  *          {"id": n, …}                                una línea por orden, con el mismo `id`
  */
 
 import { spawn, spawnSync } from "node:child_process";
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -59,12 +62,30 @@ export function binarioDeRust() {
   return binarioRust;
 }
 
+/**
+ * El binario del participante de Go, compilado UNA vez por ejecución (como el de Rust: `go run` por agente gastaría segundos en cada
+ * arranque y mediría la compilación). `FLUX_SDK_GO_DIR` apunta a otra copia de `sdk-go` (una estropeada a propósito).
+ */
+let binarioGo;
+export function binarioDeGo() {
+  if (binarioGo) return binarioGo;
+  const dir = process.env.FLUX_SDK_GO_DIR ? path.resolve(process.env.FLUX_SDK_GO_DIR) : path.join(RAIZ, "sdk-go");
+  const salida = path.join(mkdtempSync(path.join(tmpdir(), "flux-participante-go-")), "rpc-participant");
+  const r = spawnSync("go", ["build", "-o", salida, "./cmd/rpc-participant"], { cwd: dir, encoding: "utf8", env: process.env });
+  if (r.status !== 0) {
+    const msg = (r.stderr || "").trim().split("\n").slice(-12).join("\n");
+    throw new Error(`no se pudo compilar el participante de Go (go build ./cmd/rpc-participant):\n${msg}`);
+  }
+  binarioGo = salida;
+  return binarioGo;
+}
+
 /** Un proceso participante y la conversación con él. */
 export class Agente {
   /**
    * @param {object} o
    * @param {string} o.id        cómo lo llama el escenario
-   * @param {"node"|"rust"} o.sdk
+   * @param {"node"|"rust"|"go"} o.sdk
    * @param {object} o.env       FLUX_P_*
    */
   constructor({ id, sdk, env }) {
@@ -85,7 +106,9 @@ export class Agente {
         ? [process.execPath, [path.join(AQUI, "participante-node.mjs")]]
         : this.sdk === "rust"
           ? [binarioDeRust(), []]
-          : (() => {
+          : this.sdk === "go"
+            ? [binarioDeGo(), []]
+            : (() => {
               throw new Error(`SDK desconocido «${this.sdk}»`);
             })();
     this.hijo = spawn(cmd, argv, { cwd: RAIZ, env: { ...process.env, ...this.env }, stdio: ["pipe", "pipe", "pipe"] });

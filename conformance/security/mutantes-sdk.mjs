@@ -8,10 +8,10 @@
  *   node conformance/security/mutantes-sdk.mjs --list
  *
  * `security/mutantes.mjs` estropea el GENERADOR de permisos y comprueba que los casos de seguridad lo notan. Esto estropea el
- * SDK: copia `sdk-node/dist` (o `sdk-rust`) a un temporal, le aplica UN cambio de texto —el que haría un error real: que el SDK
+ * SDK: copia `sdk-node/dist` (o `sdk-rust`, o `sdk-go`) a un temporal, le aplica UN cambio de texto —el que haría un error real: que el SDK
  * abra una suscripción al inbox por la conexión con la que pide, en `connect()`, en el pull de `subscribe()` o en `state.watch()`
  * (A-101: el broker deja de mandar `no responders` y `RPC_UNAVAILABLE` pasa a ser un timeout)— y ejecuta la suite con
- * `FLUX_SDK_NODE_DIST` / `FLUX_SDK_RUST_DIR` apuntando a la copia. Cada mutante declara qué casos DEBEN fallar. Antes, esos mismos
+ * `FLUX_SDK_NODE_DIST` / `FLUX_SDK_RUST_DIR` / `FLUX_SDK_GO_DIR` apuntando a la copia. Cada mutante declara qué casos DEBEN fallar. Antes, esos mismos
  * casos se ejecutan SIN mutar y tienen que pasar: si no, un fallo no probaría nada.
  *
  * El repo real no se toca: el mutante vive en `os.tmpdir()` y se borra al terminar. El de Rust se compila en una COPIA del `target/`
@@ -153,6 +153,46 @@ export const MUTANTES = [
     a: '            code: "UNKNOWN".to_string(),\n            message: describe(error),\n            retry_after_ms: None,\n        }\n    } else {',
     debenFallar: ["I2[node→rust]", "I2[rust→rust]"],
   },
+  {
+    nombre: "go-respuesta-sin-tenant",
+    sdk: "go",
+    runner: "interop",
+    que: "la respuesta del SDK de Go no hereda el `tenantid` de la petición (pone `system`)",
+    archivo: "rpc_pure.go",
+    de: "CorrelationID: in.Request.CorrelationID, TenantID: in.Request.TenantID, ProducerVersion: in.ProducerVersion,\n\t\tDataClassification: classification,",
+    a: 'CorrelationID: in.Request.CorrelationID, TenantID: "system", ProducerVersion: in.ProducerVersion,\n\t\tDataClassification: classification,',
+    debenFallar: ["I1[node→go]", "I1[go→go]"],
+  },
+  {
+    nombre: "go-error-desconocido-con-texto",
+    sdk: "go",
+    runner: "interop",
+    que: "el SDK de Go reenvía el TEXTO de una excepción desconocida a quien llama",
+    archivo: "rpc.go",
+    de: 'return RPCErrorData{Class: clase, Code: "UNKNOWN", Message: "error interno del servicio"}',
+    a: 'return RPCErrorData{Class: clase, Code: "UNKNOWN", Message: err.Error()}',
+    debenFallar: ["I2[node→go]", "I2[go→go]"],
+  },
+  {
+    nombre: "go-reintento-con-id-nuevo",
+    sdk: "go",
+    runner: "interop",
+    que: "un reintento del SDK de Go construye una petición NUEVA (otro `id`): quien responde no puede reconocer la orden repetida",
+    archivo: "rpc.go",
+    de: "out, err := c.attempt(ctx, prep)",
+    a: "if intento > 1 {\n\t\t\tif nueva, e := c.prepare(ctx, operation, data, opts); e == nil {\n\t\t\t\tprep = nueva\n\t\t\t}\n\t\t}\n\t\tout, err := c.attempt(ctx, prep)",
+    debenFallar: ["I5[go→node]", "I5[go→go]"],
+  },
+  {
+    nombre: "go-responder-no-verifica-la-firma",
+    sdk: "go",
+    runner: "interop",
+    que: "el SDK de Go, con la firma en `require`, atiende una petición SIN firma: ejecuta lo que debía rechazar",
+    archivo: "rpc.go",
+    de: 'if err := b.verifier.Check(event); err != nil {\n\t\t\tcode := "INVALID_SIGNATURE"\n\t\t\tvar pe *PoisonError\n\t\t\tif errors.As(err, &pe) && pe.Code != "" {\n\t\t\t\tcode = pe.Code\n\t\t\t}\n\t\t\tb.logf(',
+    a: 'if err := error(nil); err != nil {\n\t\t\tcode := "INVALID_SIGNATURE"\n\t\t\tvar pe *PoisonError\n\t\t\tif errors.As(err, &pe) && pe.Code != "" {\n\t\t\t\tcode = pe.Code\n\t\t\t}\n\t\t\tb.logf(',
+    debenFallar: ["I3[node→go]", "I3[go→go]"],
+  },
 ];
 
 // ─── Argumentos ──────────────────────────────────────────────────────────────
@@ -177,7 +217,7 @@ for (const n of o.only ?? []) {
   }
 }
 if (o.list) {
-  for (const m of MUTANTES) console.log(`${m.nombre.padEnd(36)} ${m.lento ? "[rust] " : "       "}${m.que}  → debe fallar ${m.debenFallar.join(", ")}`);
+  for (const m of MUTANTES) console.log(`${m.nombre.padEnd(36)} ${m.lento ? "[rust] " : m.sdk === "go" ? "[go]   " : "       "}${m.que}  → debe fallar ${m.debenFallar.join(", ")}`);
   process.exit(0);
 }
 const elegidos = MUTANTES.filter((m) => (o.only ? o.only.has(m.nombre) : !(o.noRust && m.sdk === "rust")));
@@ -239,6 +279,11 @@ async function prepararMutante(m) {
     await symlink(path.join(ROOT, "sdk-node", "node_modules"), path.join(dir, "sdk-node", "node_modules"));
     ruta = path.join(dir, "sdk-node", "dist", m.archivo);
     env = { FLUX_SDK_NODE_DIST: path.join(dir, "sdk-node", "dist") };
+  } else if (m.sdk === "go") {
+    // Una copia de `sdk-go` (sin binarios): el runner compila de ella el participante (`FLUX_SDK_GO_DIR`) con el caché de módulos real.
+    await cp(path.join(ROOT, "sdk-go"), path.join(dir, "sdk-go"), { recursive: true });
+    ruta = path.join(dir, "sdk-go", m.archivo);
+    env = { FLUX_SDK_GO_DIR: path.join(dir, "sdk-go") };
   } else {
     await cp(path.join(ROOT, "sdk-rust"), path.join(dir, "sdk-rust"), {
       recursive: true,

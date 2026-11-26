@@ -36,6 +36,8 @@ export function falta(que) {
         : "no existe sdk-node/dist: ejecuta (cd sdk-node && npm install && npm run build)";
     case "cargo":
       return spawnSync("cargo", ["--version"], { encoding: "utf8" }).status === 0 ? undefined : "no hay `cargo` en el PATH (el SDK de Rust no se puede compilar)";
+    case "go":
+      return spawnSync("go", ["version"], { encoding: "utf8" }).status === 0 ? undefined : "no hay `go` en el PATH (el SDK de Go no se puede compilar)";
     default:
       return `requisito desconocido «${que}»`;
   }
