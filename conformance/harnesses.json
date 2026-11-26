@@ -1,5 +1,5 @@
 {
-  "$comment": "Registro de arneses de conformidad cruzada. Un SDK listado en `pending` se reporta como NO VERIFICADO en cada ejecución — nunca se salta en silencio. Ver conformance/harness/README.md.",
+  "$comment": "Registro de arneses de conformidad cruzada. Un SDK listado en `pending` se reporta como NO VERIFICADO en cada ejecución — nunca se salta en silencio. Aquí NO se dice qué capacidades declara cada SDK: eso es protocol.json → capabilities, y de ahí el runner decide quién ejecuta las operaciones de estado (state-build, state-tombstone, state-subject, state-dlq): quien no declara `state` sale «N/A: no declara state»; quien lo declara y no las implementa, o no figura aquí, FALLA. Ver conformance/harness/README.md.",
   "harnesses": [
     {
       "sdk": "node",

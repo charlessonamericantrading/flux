@@ -32,7 +32,7 @@
     "data"
   ],
   "harness": {
-    "$comment": "Las operaciones que el arnés cruzado (conformance/harness/README.md) debe aprender; ahora no existen y NINGÚN SDK declara `state` hasta que las ejecute. Todas son deterministas: id, time y dlqtime vienen dados. `state-build` da `bytes` (base64) igual que `build`; `state-subject` da `{ok, subject}` o `{ok:false, code}`.",
+    "$comment": "Las operaciones del arnés cruzado (conformance/harness/README.md), implementadas en los arneses de Node (referencia) y de Rust. El runner (conformance/cross-sdk.mjs) las ejecuta con los vectores `stateVectors` de conformance/harness/vectors.json, que repiten los fixtures y los subjectVectors de este caso —y aborta si dejan de coincidir—, y solo en los SDKs que declaran `state` en protocol.json: para los demás imprime «N/A: no declara state». Todas son deterministas: id, time y dlqtime vienen dados; `dataschema` no, lo deriva el SDK. La entrada de cada op es la de `input` más el `op`, PLANA. `state-build` da `bytes` (base64) igual que `build`; `state-subject` da `{ok, subject}` o `{ok:false, code}`.",
     "ops": {
       "state-build": "entrada: { contract, tenantId, key, id, source, time, correlationid, producerversion, classification, data } → bytes del evento de estado",
       "state-tombstone": "entrada: { contract, tenantId, key, id, source, time, correlationid, producerversion, aggregateVersion } → bytes de la lápida",
