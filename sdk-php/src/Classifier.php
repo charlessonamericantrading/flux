@@ -52,6 +52,8 @@ final class Classifier
         'Symfony\\Component\\HttpClient\\Exception\\TransportException',
         'Symfony\\Contracts\\HttpClient\\Exception\\TransportExceptionInterface',
         'Amp\\Socket\\SocketException',
+        // Nuestro cliente de NATS: se perdió la conexión con el broker, o una petición no obtuvo respuesta a tiempo.
+        'Flux\\Nats\\ConnectionException',
         'React\\Socket\\ConnectionException',
     ];
 
@@ -122,12 +124,34 @@ final class Classifier
      */
     public function classify(\Throwable $e): Classification
     {
+        $recognized = true;
+
+        return $this->resolve($e, $recognized);
+    }
+
+    /**
+     * Lo mismo que `classify`, y además si el clasificador RECONOCIÓ el error (una excepción de flux, una regla, un HTTP 503, `ECONNRESET`)
+     * o cayó en la política de lo desconocido. Quien responde una petición lo necesita: de un error reconocido cuenta su clase y su código;
+     * de uno desconocido NO se reenvía ni el texto (11-request-reply.md §5.3).
+     *
+     * @return array{0:Classification,1:bool}
+     */
+    public function classifyRecognized(\Throwable $e): array
+    {
+        $recognized = true;
+        $c = $this->resolve($e, $recognized);
+
+        return [$c, $recognized];
+    }
+
+    private function resolve(\Throwable $e, bool &$recognized): Classification
+    {
         // 1. Una excepción tipada de flux siempre gana: la aplicación sabe más que el SDK.
         if ($e instanceof FluxError) {
             return new Classification(
                 errorClass: $e->fluxClass(),
                 code: $e->errorCode ?? self::shortName($e),
-                retryAfterMs: $e instanceof RetryableError ? $e->retryAfterMs : null,
+                retryAfterMs: $e instanceof RetryableError || $e instanceof CodedError ? $e->retryAfterMs : null,
             );
         }
 
@@ -188,6 +212,8 @@ final class Classifier
         //    regalarle 51 minutos de cola al sistemático — y el tope va en la clasificación,
         //    no en `max_deliver`, para no recortar los reintentos de los RETRYABLE
         //    reconocidos — 04-errors.md §2.1.
+        $recognized = false;
+
         return new Classification(
             errorClass: $this->unknownClass,
             code: $socket ?? 'UNKNOWN',

@@ -20,7 +20,7 @@ use Flux\ErrorClass;
  * compartido (APCu, Redis) implementando `MetricsSink` contra él — es la contrapartida del
  * modelo de ejecución de PHP, no una limitación de esta clase.
  */
-final class InMemoryMetrics implements MetricsSink
+final class InMemoryMetrics implements MetricsSink, StateRpcMetrics
 {
     /** @var array<string,int> */
     private array $counters = [];
@@ -94,6 +94,28 @@ final class InMemoryMetrics implements MetricsSink
         $this->set('flux_connection_state', [], (float) $state->value);
     }
 
+    // ─── state y rpc (fuera de las siete: 08-observability.md §2.4 y §2.5) ─────
+
+    public function stateWrite(string $contract, string $outcome): void
+    {
+        $this->inc('flux_state_writes_total', ['contract' => $contract, 'outcome' => $outcome]);
+    }
+
+    public function rpcClientRequest(string $operation, string $outcome): void
+    {
+        $this->inc('flux_rpc_client_requests_total', ['operation' => $operation, 'outcome' => $outcome]);
+    }
+
+    public function rpcServerRequest(string $operation, string $outcome): void
+    {
+        $this->inc('flux_rpc_server_requests_total', ['operation' => $operation, 'outcome' => $outcome]);
+    }
+
+    public function rpcDuration(string $operation, string $role, float $seconds): void
+    {
+        $this->observe('flux_rpc_duration_seconds', ['operation' => $operation, 'role' => $role], $seconds);
+    }
+
     // ─── Exposición ───────────────────────────────────────────────────────────
 
     /**
@@ -112,6 +134,9 @@ final class InMemoryMetrics implements MetricsSink
             'flux_events_consumed_total',
             'flux_events_dlq_total',
             'flux_events_retried_total',
+            'flux_state_writes_total',
+            'flux_rpc_client_requests_total',
+            'flux_rpc_server_requests_total',
         ] as $name) {
             $out[] = "# TYPE {$name} counter";
         }
@@ -129,6 +154,7 @@ final class InMemoryMetrics implements MetricsSink
         }
 
         $out[] = '# TYPE flux_event_handler_duration_seconds histogram';
+        $out[] = '# TYPE flux_rpc_duration_seconds histogram';
         ksort($this->histograms);
         foreach ($this->histograms as $key => $h) {
             $brace = strpos($key, '{');

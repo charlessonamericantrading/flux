@@ -168,33 +168,55 @@ final class Validator
      */
     public function validate(FluxEvent $event, string $subject): void
     {
-        if (!isset($this->known[$event->dataschema])) {
-            $error = new SchemaNotFoundError($subject, $event->dataschema);
-
-            if ($this->mode === ValidationMode::Strict) {
-                throw $error;
-            }
-
-            $this->logger?->warning('[flux] ' . $error->getMessage());
-
+        $error = $this->check($event, $subject);
+        if ($error === null) {
             return;
         }
-
-        $result = $this->opis->validate(self::payloadOf($event), $event->dataschema);
-
-        if ($result->isValid()) {
-            return;
-        }
-
-        /** @var \Opis\JsonSchema\Errors\ValidationError $rootError */
-        $rootError = $result->error();
-        $error = new SchemaValidationError($subject, $event->dataschema, self::flatten($rootError));
-
         if ($this->mode === ValidationMode::Strict) {
             throw $error;
         }
 
         $this->logger?->warning('[flux] ' . $error->getMessage());
+    }
+
+    /**
+     * Lo mismo sin lanzar ni registrar: el incumplimiento, o `null` si el payload cumple. Lo usa quien decide qué hacer con él —quien
+     * responde una petición, que en lugar de lanzar contesta un error `INVALID_SCHEMA` con **todas** las rutas, y cuenta la métrica
+     * también en modo `Warn`—.
+     */
+    public function check(FluxEvent $event, string $subject): SchemaValidationError|SchemaNotFoundError|null
+    {
+        return $this->checkData($event->dataschema, $event->data, $subject);
+    }
+
+    /**
+     * Un `data` contra un esquema concreto, sin un sobre que lo lleve. Es lo que necesita quien valida algo que NO es el `dataschema` del sobre
+     * recibido: la respuesta de un handler contra el esquema de la respuesta de su operación.
+     *
+     * @param array<string,mixed> $data
+     */
+    public function checkData(string $dataschema, array $data, string $subject): SchemaValidationError|SchemaNotFoundError|null
+    {
+        if (!isset($this->known[$dataschema])) {
+            return new SchemaNotFoundError($subject, $dataschema);
+        }
+
+        $payload = $data === [] ? new \stdClass() : Helper::toJSON($data);
+        $result = $this->opis->validate($payload, $dataschema);
+
+        if ($result->isValid()) {
+            return null;
+        }
+
+        /** @var \Opis\JsonSchema\Errors\ValidationError $rootError */
+        $rootError = $result->error();
+
+        return new SchemaValidationError($subject, $dataschema, self::flatten($rootError));
+    }
+
+    public function isStrict(): bool
+    {
+        return $this->mode === ValidationMode::Strict;
     }
 
     /**

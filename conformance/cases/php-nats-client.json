@@ -1,0 +1,32 @@
+{
+  "case": "php-nats-client",
+  "title": "Qué ofrece `basis-company/nats` bajo la configuración segura y por qué el SDK de PHP trae su propio cliente de NATS",
+  "spec": "docs/plan-v1.1/PLAN.md Fase 6 (a) y (b); specification/03-delivery.md §6.1; specification/06-security.md §2, §3.3, §3.7; specification/04-errors.md §5",
+  "verifiedAgainst": "nats-server 2.14.5 con TLS, una nkey por servicio y las ACLs que genera scripts/gen-acl.mjs (sdk-php/tests/Integration/entorno.mjs); basis-company/nats 1.2.9; PHP 8.3 + OpenSSL 3",
+  "verifiedOn": "2026-11-26",
+  "rationale": "El plan v1.1 pidió medir, en cada SDK que aún no la tenía, si la primera conexión de su librería se cuelga, falla rápido o se queda muda ante una credencial rechazada, una CA que no firmó el certificado, un host fuera de los SAN y TLS exigido sin TLS en el broker, y si entrega las denegaciones de permisos. La librería de NATS más usada en PHP falla rápido (no se cuelga) pero no puede cumplir la configuración segura: se suscribe a un inbox escrito a fuego, no verifica el host ni nada sin CA, baja a texto plano y no anuncia `no_responders`. Es la justificación de `Flux\\Nats\\Connection`, el cliente propio del SDK. Cada hallazgo es un test que se ejecuta: si una versión futura de la librería lo arregla, el test falla y dice que la decisión se puede revisar.",
+  "evidence": "sdk-php/tests/Integration/BasisCompanyNatsMeasurementsTest.php",
+  "observations": [
+    { "id": "A-220", "what": "request() se suscribe a `_REQS.<hex>.*`, escrito a fuego; `inboxPrefix` no lo toca: con la ACL `_INBOX.<servicio>.>` toda petición falla (también el acuse de un publish por JetStream y la API de JetStream)", "test": "testA220LaPeticionSeSuscribeAUnInboxEscritoAFuego…" },
+    { "id": "A-221", "what": "verify_peer_name=false (el host no se verifica), sin tlsCaFile verify_peer=false, y pidiendo TLS contra un broker sin TLS baja a texto plano", "test": "testA221…, testA222…, testA223…" },
+    { "id": "A-222", "what": "credencial rechazada → LogicException «Authorization Violation» en 3-11 ms; CA ajena → Exception «Failed to connect: Error enabling TLS» en 2-5 ms; con reconnect por defecto NO se cuelga, pero sin código ni motivo", "test": "testA224UnaCredencialRechazadaYUnaCaAjenaFallanRapido…" },
+    { "id": "A-224", "what": "el CONNECT no lleva `no_responders`; una denegación llega como LogicException en la lectura siguiente, sin decir de qué operación", "test": "testA225…, testA226…" },
+    { "id": "A-225", "what": "contra un broker abierto la librería sí hace HPUB con cabeceras, el 404 de DIRECT.GET como Status-Code y el error 10071 del chequeo de secuencia como cuerpo del acuse", "test": "testA227ConUnBrokerAbierto…" }
+  ],
+  "ownClient": {
+    "$comment": "Lo que mide el cliente propio (A-223, A-226 a A-228) lo ejecutan sdk-php/tests/Integration/SecurityIntegrationTest.php y NotProvisionedIntegrationTest.php: cada código de la capacidad `security` en los dos sentidos, contra el broker de arriba.",
+    "firstConnectionMs": {
+      "control con la CA correcta": "conecta (~95)",
+      "credencial bien formada pero desconocida": "CONNECTION_REJECTED auth (~48)",
+      "sin CA (tls: [])": "CONNECTION_REJECTED tls (~24)",
+      "CA ajena": "CONNECTION_REJECTED tls (~3)",
+      "host fuera de los SAN": "CONNECTION_REJECTED tls (~3)",
+      "tls pedido y broker sin TLS": "CONNECTION_REJECTED tls (~1)",
+      "mTLS exigido sin certificado de cliente": "CONNECTION_REJECTED tls (~3)",
+      "mTLS con certificado de cliente": "conecta (~47)",
+      "credencial mal formada": "INVALID_CREDENTIALS (<1, sin socket)",
+      "tls mal formado": "INVALID_TLS_OPTIONS (<1, sin socket)",
+      "broker que aún no ha arrancado": "espera con jitter hasta waitForBrokerMs; ninguno de los tres códigos"
+    }
+  }
+}

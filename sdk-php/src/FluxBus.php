@@ -42,12 +42,21 @@ use Flux\Validation\Validator;
  */
 final class FluxBus
 {
+    /** Lo que espera cada fuente a un mensaje cuando el bucle de `run()` atiende a más de una. */
+    private const SLICE_MS = 200;
+
     private readonly Classifier $classifier;
     private readonly string $source;
     private readonly MetricsSink $metrics;
     private readonly ?Signer $signer;
     private readonly ?Verifier $verifier;
     private readonly ?Validator $validator;
+
+    /**
+     * El estado replicado (`put`, `delete`, `get`, `watch`) — specification/10-state.md. Solo con el transporte por defecto
+     * (`SocketTransport`): con otro, usarlo lanza un error que lo explica.
+     */
+    public readonly State\StateClient $state;
 
     /** @var list<Subscription> */
     private array $subscriptions = [];
@@ -87,6 +96,17 @@ final class FluxBus
         $this->metrics->connectionState(
             $transport->isConnected() ? ConnectionState::Connected : ConnectionState::Disconnected
         );
+
+        $this->state = new State\StateClient(
+            $transport instanceof Transport\StateTransport ? $transport : null,
+            $options,
+            $this->source,
+            $this->metrics,
+            $this->classifier,
+            $this->validator,
+            $this->signer,
+            $this->verifier,
+        );
     }
 
     /**
@@ -110,7 +130,7 @@ final class FluxBus
      *
      * @throws \InvalidArgumentException si el nombre de servicio no es kebab-case
      */
-    public static function connect(ConnectOptions $options, NatsTransport $transport): self
+    public static function connect(ConnectOptions $options, ?NatsTransport $transport = null): self
     {
         Protocol::assertServiceName($options->service);
 
@@ -121,7 +141,9 @@ final class FluxBus
             );
         }
 
-        return new self($transport, $options);
+        // Sin transporte, el de por defecto: `SocketTransport` (el protocolo de NATS sobre un socket, sin dependencias). Valida
+        // `credentials` y `tls` SIN abrir ningún socket y falla pronto ante lo que reintentar no arregla (03-delivery.md §6.1).
+        return new self($transport ?? Transport\SocketTransport::connect($options), $options);
     }
 
     /**
@@ -156,6 +178,9 @@ final class FluxBus
      *
      * @param array<string,mixed> $data Objeto JSON, claves en camelCase, importes como
      *        entero en la unidad mínima, sin PII y sin `null` para "ausente".
+     * @param string|null $externalKey La clave del hecho en el sistema externo (`evt_1Nx…`), para un hecho
+     *        **importado**: el `id` pasa a derivarse de `source`, esta clave y `time`, y el mismo hecho reenviado
+     *        da siempre el mismo (01-envelope.md §2.6.1). Exige `$time`: el instante del hecho externo.
      *
      * @throws InvalidSubjectException|EnvelopeException
      */
@@ -167,11 +192,26 @@ final class FluxBus
         ?string $classification = null,
         \DateTimeInterface|string|null $time = null,
         ?string $partitionKey = null,
+        ?string $externalKey = null,
     ): FluxEvent {
         $parsed = Protocol::parseSubject($subject); // falla temprano y con un mensaje útil
         $this->ensureEventStream($parsed->domain);
 
-        $id = Protocol::uuid7();
+        // Un hecho importado de un sistema externo tiene un `id` DETERMINISTA (01-envelope.md §2.6.1): el
+        // mismo hecho reenviado por el proveedor da el mismo `id` y los consumidores lo deduplican.
+        if ($externalKey !== null) {
+            if ($time === null) {
+                throw new EnvelopeException(
+                    '`externalKey` exige `time`: el instante del hecho EXTERNO, que es lo que hace estable el `id`. Con «ahora» cada '
+                    . 'reenvío del proveedor tendría su propio `id` y nadie podría deduplicarlo (01-envelope.md §2.6.1). Si el '
+                    . 'proveedor no da un instante, no hay `id` determinista: omite `externalKey` y deduplica por una clave de '
+                    . 'negocio de `data`'
+                );
+            }
+            $id = ExternalId::derive($this->source, $externalKey, $time);
+        } else {
+            $id = Protocol::uuid7();
+        }
         $inherited = EventContext::current();
 
         $event = Envelope::build(
@@ -182,7 +222,7 @@ final class FluxBus
             producerversion: $this->options->version,
             // El contexto heredado gana sobre el default de conexión: un evento derivado
             // pertenece al tenant del evento que lo causó, no al del servicio.
-            tenantid: $tenantId ?? $inherited?->tenantid ?? $this->options->tenantId,
+            tenantid: $tenantId ?? $inherited?->tenantid ?? $this->options->tenantId ?? 'system',
             dataclassification: $classification ?? $this->options->classification,
             dataschema: $this->schemaFor($subject),
             // Si el evento no nace de otro, `correlationid` se inicializa con su propio
@@ -304,7 +344,7 @@ final class FluxBus
         if ($this->options->tenantIsolation === TenantIsolation::Strict && $tenantFilter === null) {
             throw new TenantIsolationException(
                 $subject,
-                self::tenantIsolationReason($this->options->tenantId),
+                self::tenantIsolationReason($this->options->tenantId ?? 'system'),
             );
         }
 
@@ -331,6 +371,12 @@ final class FluxBus
 
         $effective = $this->transport->createDurableConsumer($stream, $durable, $requested);
         $this->assertConfigHonored($durable, $requested, $effective);
+
+        // Un pull denegado no da error y deja un consumidor inerte que parece sano: `subscribe()` DEBE fallar con PERMISSION_DENIED
+        // antes de devolver (06-security.md §3.7). No se registra nada si falla.
+        if ($this->transport instanceof Transport\ProbesPull) {
+            $this->transport->assertPullAllowed($stream, $durable);
+        }
 
         $subscription = new Subscription(
             subject: $subject,
@@ -474,11 +520,18 @@ final class FluxBus
                 $this->subscriptions,
                 static fn (Subscription $s): bool => $s->active,
             ));
-            if ($active === []) {
+            $watching = $this->state->hasActiveWatches();
+            if ($active === [] && !$watching) {
                 return $processed;
             }
 
             $gotSomething = false;
+
+            // Con varias fuentes (suscripciones y `watch` de estado) cada una espera una rodaja corta, no el `idleTimeoutMs` entero: el
+            // bucle es SERIE —no hay hilos ni bucle de eventos—, y una fuente que espera cinco segundos a un mensaje que no llega dejaría
+            // sin atender a las demás y haría lenta la parada ordenada. Con una sola, el `idleTimeoutMs` completo, como siempre.
+            $sources = count($active) + ($watching ? 1 : 0);
+            $sliceMs = $sources > 1 ? min($idleTimeoutMs, self::SLICE_MS) : $idleTimeoutMs;
 
             foreach ($active as $subscription) {
                 // Antes de pedir mensajes, no después: si `fetch` se queda bloqueado el
@@ -498,12 +551,15 @@ final class FluxBus
                         $subscription->stream,
                         $subscription->durable,
                         1,
-                        $idleTimeoutMs,
+                        $sliceMs,
                     );
                 } catch (\Throwable $e) {
                     // Fallo transitorio del broker o de la conexión. No mata el bucle.
                     $this->log('warning', "[flux] fallo al recibir de {$subscription->subject}: "
                         . $e->getMessage());
+                    // Un fallo que no espera (un consumidor borrado, la conexión caída) haría girar el bucle a toda velocidad y llenaría el
+                    // log: una pausa corta, que `shouldStop` ve en la vuelta siguiente.
+                    usleep(200_000);
                     continue;
                 }
 
@@ -521,6 +577,14 @@ final class FluxBus
                             . $e->getMessage());
                     }
                     $processed++;
+                }
+            }
+
+            if ($watching) {
+                $fromState = $this->state->poll($sliceMs);
+                if ($fromState > 0) {
+                    $gotSomething = true;
+                    $processed += $fromState;
                 }
             }
 
@@ -928,7 +992,8 @@ final class FluxBus
             'dlqreason' => ErrorClass::Poison->value,
             'dlqattempts' => 1,
             'dlqconsumer' => $consumer,
-            'dlqerror' => substr(($error->errorCode ?? 'POISON') . ': ' . $error->getMessage(), 0, 1024),
+            // 1024 BYTES UTF-8 sin partir un carácter (04-errors.md §3): un `substr` cortaría un emoji por la mitad.
+            'dlqerror' => Text::truncateUtf8Bytes(($error->errorCode ?? 'POISON') . ': ' . $error->getMessage(), 1024),
             'dlqtime' => $now,
             'data' => [
                 'originalSubject' => $subject,
@@ -941,7 +1006,7 @@ final class FluxBus
         try {
             $this->transport->publish(
                 Protocol::dlqSubject($subject),
-                json_encode($envelope, Envelope::JSON_FLAGS),
+                Json::encode($envelope),
                 [Protocol::MSG_ID_HEADER => "poison-{$id}"],
             );
 
@@ -1011,6 +1076,7 @@ final class FluxBus
         foreach ($this->subscriptions as $subscription) {
             $subscription->cancel();
         }
+        $this->state->stopAll();
 
         $this->transport->close();
 

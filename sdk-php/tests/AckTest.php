@@ -67,6 +67,21 @@ final class AckTest extends TestCase
     }
 
     /** `null` y no `0`: un cero se dibujaría como "no hay nada pendiente". */
+    public function testLaSecuenciaDelStreamYLaDelConsumidorSeLeenEnLosDosFormatos(): void
+    {
+        // v1: $JS.ACK.<stream>.<consumer>.<entregas>.<sseq>.<cseq>.<tm>.<pending>
+        $v1 = '$JS.ACK.STATE_CLIENTES.svc__x.1.42.7.1700000000000.3';
+        self::assertSame(42, Ack::streamSequence($v1));
+        self::assertSame(7, Ack::consumerSequence($v1));
+        // v2: $JS.ACK.<dominio>.<hash>.<stream>.<consumer>.<entregas>.<sseq>.<cseq>.<tm>.<pending>.<aleatorio>
+        $v2 = '$JS.ACK._.HASH.STATE_CLIENTES.svc__x.2.99.12.1700000000000.0.abc';
+        self::assertSame(99, Ack::streamSequence($v2));
+        self::assertSame(12, Ack::consumerSequence($v2));
+        self::assertNull(Ack::consumerSequence(null));
+        self::assertNull(Ack::consumerSequence('esto.no.es.un.ack'));
+        self::assertNull(Ack::streamSequence(null));
+    }
+
     public function testSinSubjectDeRespuestaLosPendientesSonDesconocidos(): void
     {
         self::assertNull(Ack::pending(null));

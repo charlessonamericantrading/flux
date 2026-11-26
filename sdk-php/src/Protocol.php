@@ -96,6 +96,17 @@ final class Protocol
     /** Cabecera obligatoria al publicar — 03-delivery.md §3. */
     public const MSG_ID_HEADER = 'Nats-Msg-Id';
 
+    /**
+     * Dominios que NO son dominios — 02-naming.md §1.3, protocol.json `naming.reservedDomains`.
+     *
+     * Cada uno es un espacio de nombres del protocolo (`dlq.`, `state.`, `rpc.`), y un dominio con ese
+     * nombre colisionaría con él **en el broker**: con `STATE_CLIENTES` (`state.clientes.>`) creado, un
+     * `EVT_STATE` (`state.>`) falla con `subjects overlap with an existing stream` (err 10065, A-43).
+     * Peor: un evento publicado en `state.` no pasaría por el chequeo de secuencia del estado, y uno de
+     * core sobrescribe sin acuse (A-45).
+     */
+    public const RESERVED_DOMAINS = ['dlq', 'state', 'rpc', 'system'];
+
     private function __construct()
     {
     }
@@ -109,6 +120,10 @@ final class Protocol
      */
     public static function parseSubject(string $subject): ParsedSubject
     {
+        // Todo lo que recibe un subject —publish, subscribe, durableName…— pasa por aquí: un dominio
+        // reservado se rechaza antes de tocar la red y ANTES que la forma (10-state.md §2.7).
+        self::assertNotReservedDomain($subject);
+
         if ($subject !== strtolower($subject)) {
             // Se comprueba ANTES que el patrón para poder dar este mensaje concreto: los
             // subjects de NATS son case-sensitive y `Pedidos.` ≠ `pedidos.`. Un publish
@@ -136,13 +151,30 @@ final class Protocol
         return new ParsedSubject($domain, $aggregate, (int) substr($version, 1), $event);
     }
 
+    /**
+     * Lanza `RESERVED_DOMAIN` si el primer token de un subject, un contrato o una operación es un
+     * dominio reservado. Se comprueba ANTES que la forma: `dlq.pedidos.pedido.v1.creado` tiene cinco
+     * tokens y «debe tener cuatro» no diría qué pasa de verdad.
+     *
+     * @param 'subject'|'contrato'|'operación' $what
+     *
+     * @throws ReservedDomainException
+     */
+    public static function assertNotReservedDomain(string $subjectOrContract, string $what = 'subject'): void
+    {
+        $domain = explode('.', $subjectOrContract, 2)[0];
+        if (in_array($domain, self::RESERVED_DOMAINS, true)) {
+            throw new ReservedDomainException($domain, self::RESERVED_DOMAINS, $what);
+        }
+    }
+
     public static function isValidSubject(string $subject): bool
     {
         try {
             self::parseSubject($subject);
 
             return true;
-        } catch (InvalidSubjectException) {
+        } catch (InvalidSubjectException|ReservedDomainException) {
             return false;
         }
     }

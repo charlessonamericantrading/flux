@@ -13,8 +13,24 @@ use Flux\ErrorClass;
  * por `FluxBus` porque un `null` obliga a poner `?->` en cada punto de instrumentación, y
  * el día que alguien olvide uno la métrica desaparece en silencio.
  */
-final class NoMetrics implements MetricsSink
+final class NoMetrics implements MetricsSink, StateRpcMetrics
 {
+    public function stateWrite(string $contract, string $outcome): void
+    {
+    }
+
+    public function rpcClientRequest(string $operation, string $outcome): void
+    {
+    }
+
+    public function rpcServerRequest(string $operation, string $outcome): void
+    {
+    }
+
+    public function rpcDuration(string $operation, string $role, float $seconds): void
+    {
+    }
+
     public function eventPublished(string $subject, PublishOutcome $outcome): void
     {
     }

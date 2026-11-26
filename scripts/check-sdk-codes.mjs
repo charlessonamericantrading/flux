@@ -251,6 +251,10 @@ function mutaciones(real) {
   const noDeclaradas = (sdk) => Object.keys(protocol.capabilities.definitions).filter((c) => !protocol.capabilities.sdks[sdk].capabilities.includes(c));
   for (const sdk of Object.keys(protocol.capabilities.sdks)) {
     for (const cap of noDeclaradas(sdk)) {
+      // Un SDK puede llevar los códigos de una capacidad ANTES de declararla —los de `state` y `rpc` viven en los constructores del
+      // sobre, que el arnés cruzado ejecuta antes de que haya un broker contra el que ejecutarla—: declararla no sería «sin tener su
+      // código», y esta mutación solo tiene sentido si al SDK le falta alguno. La evidencia ejecutada sigue siendo lo que la hace declarable.
+      if ((codigosPorCapacidad(protocol).get(cap) ?? []).every(({ codigo }) => conLiteral(real.fuentes[sdk], codigo))) continue;
       caso(`${sdk} declara «${cap}» sin tener su código`, (m) => {
         const decl = m.protocol.capabilities.sdks[sdk];
         decl.capabilities.push(cap);

@@ -7,6 +7,8 @@ namespace Flux\Tests;
 use Flux\Envelope;
 use Flux\EnvelopeException;
 use Flux\ErrorClass;
+use Flux\InvalidDataClassificationException;
+use Flux\InvalidEnvelopeInputException;
 use Flux\PoisonError;
 use Flux\Protocol;
 use PHPUnit\Framework\Attributes\DataProvider;
@@ -60,14 +62,24 @@ final class EnvelopeTest extends TestCase
     }
 
     #[DataProvider('timesInvalidos')]
-    public function testUnTimeMalFormateadoSeRechazaEnElProductor(string $time): void
+    public function testUnTimeQueNoEsUnInstanteSeRechazaEnElProductor(string $time): void
     {
-        // Diferencia deliberada con Node y Python, que dejan pasar cualquier cadena: es más
-        // barato fallar aquí que descubrir en el replay que un servicio lleva meses
-        // emitiendo `…39.41Z`.
-        $this->expectException(EnvelopeException::class);
+        // Es más barato fallar aquí que descubrir en el replay que un servicio lleva meses emitiendo
+        // un `time` que no es un instante. Con el código del parser: CloudEvents lo tipa `Timestamp`
+        // (01-envelope.md §2.2, «Ajustes»).
+        try {
+            ProtocolFixture::event(['time' => $time]);
+            self::fail('debía rechazar el time');
+        } catch (InvalidEnvelopeInputException $e) {
+            self::assertSame('WRONG_ATTRIBUTE_TYPE', $e->errorCode);
+        }
+    }
 
-        ProtocolFixture::event(['time' => $time]);
+    #[DataProvider('timesNormalizables')]
+    public function testUnTimeQueEsUnInstanteSeNormalizaALaFormaCanonica(string $time, string $esperado): void
+    {
+        // 01-envelope.md §2.2: copiarlo tal cual dejaría pasar `…39Z` o `…+02:00`, que NO son los mismos bytes.
+        self::assertSame($esperado, ProtocolFixture::event(['time' => $time])->time);
     }
 
     public function testAggregateIdVaAlSubjectDeCloudEvents(): void
@@ -98,7 +110,7 @@ final class EnvelopeTest extends TestCase
     {
         // Publicarla produciría un POISON en CADA consumidor del subject y el productor no
         // se enteraría nunca.
-        $this->expectException(EnvelopeException::class);
+        $this->expectException(InvalidDataClassificationException::class);
 
         ProtocolFixture::event(['dataclassification' => 'secreto']);
     }
@@ -269,10 +281,11 @@ final class EnvelopeTest extends TestCase
     public function testUnDlqattemptsDeTipoIncorrectoNoTumbaElConsumidor(): void
     {
         // Con `strict_types=1` el constructor lanzaría `TypeError` y, sin capturarlo, el
-        // proceso del consumidor se caería en vez de mandar el mensaje a la DLQ.
+        // proceso del consumidor se caería en vez de mandar el mensaje a la DLQ. Los tipos de lo
+        // no obligatorio también son exactos: `INVALID_ATTRIBUTE_TYPE` (01-envelope.md §2.4).
         $raw = ProtocolFixture::rawEvent(['dlqattempts' => 'tres']);
 
-        self::assertSame('WRONG_ATTRIBUTE_TYPE', $this->poison(ProtocolFixture::encode($raw))->errorCode);
+        self::assertSame('INVALID_ATTRIBUTE_TYPE', $this->poison(ProtocolFixture::encode($raw))->errorCode);
     }
 
     #[DataProvider('datosQueNoSonObjeto')]
@@ -424,10 +437,28 @@ final class EnvelopeTest extends TestCase
     /** @return iterable<string,array{string}> */
     public static function timesInvalidos(): iterable
     {
-        yield 'ceros recortados' => ['2026-08-20T10:25:39.41Z'];
-        yield 'microsegundos y offset' => ['2026-08-20T10:25:39.410000+00:00'];
-        yield 'sin decimales' => ['2026-08-20T10:25:39Z'];
         yield 'sin zona' => ['2026-08-20T10:25:39.410'];
+        yield 'no es un instante' => ['ayer'];
+        yield 'mes 13' => ['2026-13-20T10:25:39.410Z'];
+        yield '30 de febrero' => ['2026-02-30T10:25:39.410Z'];
+        yield 'segundo 60' => ['2026-08-20T10:25:60.000Z'];
+        yield 'desfase de 24 horas' => ['2026-08-20T10:25:39.410+24:00'];
+        yield 'año fuera de 0000–9999' => ['9999-12-31T23:59:59.999-00:01'];
+        yield 'solo fecha' => ['2026-08-20'];
+        yield 'con un salto de línea final' => ["2026-08-20T10:25:39.410Z\n"];
+    }
+
+    /** @return iterable<string,array{string,string}> */
+    public static function timesNormalizables(): iterable
+    {
+        yield 'ceros recortados' => ['2026-08-20T10:25:39.41Z', '2026-08-20T10:25:39.410Z'];
+        yield 'microsegundos y offset cero' => ['2026-08-20T10:25:39.410000+00:00', '2026-08-20T10:25:39.410Z'];
+        yield 'sin decimales' => ['2026-08-20T10:25:39Z', '2026-08-20T10:25:39.000Z'];
+        yield 'cuatro decimales (se truncan, no se redondean)' => ['2026-08-20T10:25:39.9999Z', '2026-08-20T10:25:39.999Z'];
+        yield 'desfase local' => ['2026-08-20T12:25:39.412+02:00', '2026-08-20T10:25:39.412Z'];
+        yield 'desfase negativo con minutos' => ['2026-08-20T05:55:39.412-04:30', '2026-08-20T10:25:39.412Z'];
+        yield 'z minúscula' => ['2026-08-20T10:25:39.412z', '2026-08-20T10:25:39.412Z'];
+        yield 'espacio en lugar de T' => ['2026-08-20 10:25:39.412Z', '2026-08-20T10:25:39.412Z'];
     }
 
     /** @return iterable<string,array{string}> */

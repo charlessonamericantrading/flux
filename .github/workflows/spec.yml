@@ -514,7 +514,7 @@ jobs:
       - run: dotnet test sdk-dotnet/Flux.sln
 
   sdk-php:
-    name: SDK PHP — lint y tests
+    name: SDK PHP — lint, tests e integración contra NATS real con permisos generados
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -527,7 +527,9 @@ jobs:
           # `sodium` es tan obligatoria como `sockets`: sin ella los ~38 tests de firma
           # se SALTAN y el CI daría verde sin haberlos ejecutado nunca. Un test que se
           # salta en silencio es peor que uno que no existe: aparenta cobertura.
-          extensions: json, sockets, sodium
+          # `openssl` es el TLS del cliente de NATS propio (`Flux\Nats\Connection`), y `mbstring`, el
+          # `maxLength` en puntos de código.
+          extensions: json, sockets, sodium, openssl, mbstring
           coverage: none
       - run: composer validate --no-check-lock
       - run: composer install --no-interaction --prefer-dist
@@ -546,10 +548,30 @@ jobs:
       # fallo. Se ejecutan mas abajo, con NATS ya en pie.
       - run: vendor/bin/phpunit --exclude-group integration,sin-libreria-nats --fail-on-skipped
 
-      # El adaptador de NATS contra un broker REAL. Estuvo sin verificar y escondia un
-      # bug de raiz que los tests con cliente falso no podian ver: el mensaje se
-      # entregaba y nunca llegaba al handler. Sin este paso, vuelve a pudrirse.
-      - name: Levantar NATS con JetStream
+      # El broker REAL, con los permisos que genera gen-acl.mjs: nats-server 2.14.5 (exige Go 1.25 en su
+      # go.mod) compilado de la fuente, y `entorno.mjs` —que reutiliza lo que usa la suite de seguridad del
+      # repo— lo arranca con TLS, una nkey por servicio, `flux provision` y los usuarios a los que se les quita
+      # UN permiso. Un broker abierto no prueba nada de seguridad.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+          cache: false
+      - name: Compilar nats-server 2.14.5
+        run: |
+          GOBIN="$GITHUB_WORKSPACE/bin" go install github.com/nats-io/nats-server/v2@v2.14.5
+          echo "NATS_SERVER=$GITHUB_WORKSPACE/bin/nats-server" >> "$GITHUB_ENV"
+      - run: npm install --no-audit --no-fund
+        working-directory: conformance
+      - run: npm install --no-audit --no-fund
+        working-directory: cli
+
+      # El adaptador de `basis-company/nats` contra un broker abierto: estuvo sin verificar y escondia un bug
+      # de raiz que los tests con cliente falso no podian ver (el mensaje se entregaba y nunca llegaba al
+      # handler). Sin este paso, vuelve a pudrirse.
+      - name: Levantar NATS con JetStream abierto (solo para BasisNatsTransport)
         run: |
           docker run -d --name flux-nats-php -p 4222:4222 -p 8222:8222             nats:2.14-alpine --jetstream --http_port=8222
           for i in $(seq 1 30); do
@@ -566,7 +588,13 @@ jobs:
       # Asi se prueban las DOS configuraciones en la misma ejecucion: sin la libreria (el
       # camino de reserva) y con ella (la integracion real).
       - run: composer require --dev --no-interaction --no-progress basis-company/nats
-      - run: vendor/bin/phpunit --group integration --fail-on-skipped
+      # FLUX_REQUIRE_BROKER=1: la AUSENCIA de nats-server, node, openssl o las dependencias de la suite es un
+      # FALLO y no un salto con aviso. Con `--fail-on-skipped` además ningún test de integración puede saltarse.
+      - name: Integración (seguridad, estado y rpc contra un nats-server con permisos generados)
+        env:
+          FLUX_REQUIRE_BROKER: '1'
+          FLUX_TEST_PORTS: '7600-7699'
+        run: vendor/bin/phpunit --group integration --fail-on-skipped
 
   sdk-rust:
     name: SDK Rust — fmt, clippy, MSRV y tests
