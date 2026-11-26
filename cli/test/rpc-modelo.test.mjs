@@ -242,6 +242,15 @@ describe("el tamaño (11-request-reply.md §4.4)", () => {
 
 // ─── Lo que se comprueba de lo que llega (§4.3) ─────────────────────────────────────────────────
 
+describe("la versión mayor de una operación son de 1 a 4 dígitos (02-naming.md §1)", () => {
+  test("v1…v9999 sí; v10000, lo enorme, v0 y los ceros a la izquierda → INVALID_RPC_CALL, y el mensaje dice el tope", () => {
+    for (const v of ["v1", "v9", "v10", "v9999"]) assert.equal(validarOperacion(`clientes.cliente.${v}.obtener`).major, Number(v.slice(1)));
+    for (const v of ["v10000", "v99999", "v4294967296", "v99999999999999999999", "v0", "v01"]) {
+      assert.throws(() => validarOperacion(`clientes.cliente.${v}.obtener`), (e) => e instanceof ErrorRpc && e.code === "INVALID_RPC_CALL" && /`v1`…`v9999`/.test(e.message), v);
+    }
+  });
+});
+
 describe("validarRespuesta: las cinco comprobaciones (11-request-reply.md §4.3)", () => {
   const peticion = { operacion: "clientes.cliente.v1.calcular-descuento", id: "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10", correlationid: "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10", tenantid: "acme" };
   const buena = () => structuredClone(fixture("rpc-reply").event);
@@ -358,6 +367,16 @@ describe("validarRespuesta: las cinco comprobaciones (11-request-reply.md §4.3)
     malError((d) => { d.code = "A".repeat(65); }, /\/code no puede pasar de 64/);
     malError((d) => { d.message = "x".repeat(1001); }, /\/message no puede pasar de 1000/);
     assert.deepEqual(erroresDatosError({ class: "permanent", code: "X", message: "m" }), []);
+  });
+
+  test("`message` del error se cuenta en CARACTERES UNICODE (puntos de código), no en unidades UTF-16: mil emojis caben, 1001 no", () => {
+    const e = (message) => ({ class: "permanent", code: "X", message });
+    assert.deepEqual(erroresDatosError(e("😀".repeat(1000))), []);
+    assert.match(erroresDatosError(e("😀".repeat(1001))).join(), /\/message no puede pasar de 1000/);
+    assert.deepEqual(erroresDatosError(e(`${"😀".repeat(999)}ñ`)), []);
+    assert.deepEqual(erroresDatosError(e("ñ".repeat(1000))), []);
+    assert.match(erroresDatosError(e("ñ".repeat(1001))).join(), /\/message no puede pasar de 1000/);
+    assert.equal("😀".repeat(1000).length, 2000, "CONTROL: `length` de JavaScript cuenta 2000 y la CLI lo rechazaba");
   });
 
   test("EL ACUSE DE UN STREAM (A-18, A-67): RPC_INVALID_REPLY que nombra el stream, apunta a `flux doctor` y lleva el acuse", () => {

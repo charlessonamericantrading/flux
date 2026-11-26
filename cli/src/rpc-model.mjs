@@ -160,7 +160,7 @@ function mensajeOperacion(t) {
   if (t.includes("_")) problemas.push("tiene un guion bajo: solo `kebab-case` ([a-z0-9-])");
   if (tokens.includes("")) problemas.push("tiene un token vacío (dos puntos seguidos, o uno al final)");
   if (tokens.length !== 4) problemas.push(`tiene ${tokens.length} tokens y deben ser 4 (dominio, agregado, versión, operación)`);
-  else if (!/^v[1-9][0-9]*$/.test(tokens[2])) problemas.push("el tercer token es la versión mayor: `v1`, `v2`… (`v0` no existe)");
+  else if (!/^v[1-9][0-9]{0,3}$/.test(tokens[2])) problemas.push("el tercer token es la versión mayor: `v1`…`v9999` (de 1 a 4 dígitos, sin ceros a la izquierda: `v0` no existe)");
   if (!problemas.length) problemas.push("no encaja con el patrón del protocolo");
   return (
     `la operación no es válida: ${problemas.join("; ")}. ` +
@@ -475,7 +475,8 @@ export function erroresDatosError(d) {
   }
   if ("message" in d) {
     if (typeof d.message !== "string" || d.message === "") m.push("/message debe ser un texto no vacío");
-    else if (k.maxMensaje && d.message.length > k.maxMensaje) m.push(`/message no puede pasar de ${k.maxMensaje} caracteres`);
+    // `maxLength` de JSON Schema cuenta caracteres Unicode (puntos de código), no unidades UTF-16: mil emojis caben.
+    else if (k.maxMensaje && [...d.message].length > k.maxMensaje) m.push(`/message no puede pasar de ${k.maxMensaje} caracteres`);
   }
   if ("retryAfterMs" in d) {
     if (!Number.isInteger(d.retryAfterMs) || d.retryAfterMs < 0) m.push("/retryAfterMs debe ser un entero ≥ 0");
