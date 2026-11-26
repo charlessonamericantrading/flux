@@ -17,9 +17,10 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_nats::jetstream::consumer::{AckPolicy, DeliverPolicy, ReplayPolicy};
+use async_nats::jetstream::context::{ConsumerInfoErrorKind, GetStreamErrorKind};
 use async_nats::jetstream::message::PublishMessage;
 use async_nats::jetstream::stream::{DiscardPolicy, RetentionPolicy, StorageType};
-use async_nats::jetstream::{consumer, stream, AckKind};
+use async_nats::jetstream::{consumer, stream, AckKind, ErrorCode};
 use chrono::{DateTime, Utc};
 use futures::{FutureExt, StreamExt};
 use serde::Serialize;
@@ -35,15 +36,19 @@ use crate::envelope::{
 };
 use crate::errors::{
     describe, Classification, ConfigDifference, ErrorClass, FluxError, HandlerError, HandlerResult,
+    ResourceKind,
 };
 use crate::metrics::{
     ConnectionState, ConsumeOutcome, DlqReasonLabel, MetricsSink, NoMetrics, PublishOutcome,
 };
 use crate::protocol::{
-    dlq_stream_name, dlq_subject, durable_name, parse_subject, source_uri, stream_name,
-    validate_service_name, ParsedSubject, CANONICAL_BACKOFF, DEFAULT_ACK_WAIT,
+    dlq_stream_name, dlq_subject, durable_name, inbox_prefix, parse_subject, source_uri,
+    stream_name, validate_service_name, ParsedSubject, CANONICAL_BACKOFF, DEFAULT_ACK_WAIT,
     DEFAULT_MAX_ACK_PENDING, DEFAULT_MAX_DELIVER, DLQ_STREAM_MAX_AGE, DUPLICATE_WINDOW,
     STREAM_MAX_AGE,
+};
+use crate::security::{
+    is_fatal_connect_error, parse_violation, validate_nkey_seed, Denial, DenialLog, TlsOptions,
 };
 
 // ─── Observabilidad ──────────────────────────────────────────────────────────
@@ -127,13 +132,25 @@ pub enum TenantIsolation {
 // ─── Opciones de conexión ────────────────────────────────────────────────────
 
 /// Credenciales de NATS. **NUNCA versionadas** — 06-security.md §2.
-#[derive(Debug, Clone, Default)]
+///
+/// Un valor mal formado (un `.creds` ilegible o sin JWT, una semilla que no es `SU…`) falla
+/// **en [`connect`]**, antes de tocar la red. Una credencial bien formada pero rechazada por
+/// el broker también devuelve el error en `connect()`: reintentarla no la arregla.
+///
+/// `Debug` **no imprime secretos**: un `{:?}` de la configuración acaba en un log.
+#[derive(Clone, Default)]
 pub enum Credentials {
     /// Sin autenticación. Solo para el docker-compose de desarrollo.
     #[default]
     None,
-    /// Ruta a un fichero `.creds`. Es la forma recomendada.
+    /// Ruta a un fichero `.creds` (JWT de usuario + semilla nkey). Es la forma recomendada
+    /// con un operador/JWT.
     CredsFile(PathBuf),
+    /// Semilla nkey de usuario (`SU…`), con las cuentas definidas en la configuración del
+    /// broker. Pensada para inyectarla desde un gestor de secretos.
+    NkeySeed(String),
+    /// Ruta a un fichero con una semilla nkey de usuario (`.nk`).
+    NkeyFile(PathBuf),
     /// Token estático.
     Token(String),
     /// Usuario y contraseña.
@@ -143,6 +160,24 @@ pub enum Credentials {
         /// Contraseña.
         password: String,
     },
+}
+
+impl fmt::Debug for Credentials {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::None => f.write_str("None"),
+            // La ruta no es un secreto; lo que hay dentro, sí.
+            Self::CredsFile(p) => f.debug_tuple("CredsFile").field(p).finish(),
+            Self::NkeyFile(p) => f.debug_tuple("NkeyFile").field(p).finish(),
+            Self::NkeySeed(_) => f.write_str("NkeySeed(<oculto>)"),
+            Self::Token(_) => f.write_str("Token(<oculto>)"),
+            Self::UserPassword { user, .. } => f
+                .debug_struct("UserPassword")
+                .field("user", user)
+                .field("password", &"<oculto>")
+                .finish(),
+        }
+    }
 }
 
 /// Configuración de la conexión al bus.
@@ -217,6 +252,10 @@ pub struct ConnectOptions {
     /// Credenciales.
     pub credentials: Credentials,
 
+    /// TLS: CA propia, certificado de cliente y exigir TLS — 06-security.md §2.
+    /// `None` deja que decida la URL (`tls://`) o el broker.
+    pub tls: Option<TlsOptions>,
+
     /// Extractor de `traceparent`.
     pub traceparent: Option<TraceparentFn>,
 
@@ -246,6 +285,7 @@ impl fmt::Debug for ConnectOptions {
             .field("classifier", &self.classifier)
             // Las credenciales NUNCA se imprimen: un Debug acaba en un log.
             .field("credentials", &"<oculto>")
+            .field("tls", &self.tls)
             .finish_non_exhaustive()
     }
 }
@@ -277,6 +317,7 @@ impl ConnectOptions {
             pending_poll: DEFAULT_PENDING_POLL,
             classifier: ClassifierOptions::default(),
             credentials: Credentials::None,
+            tls: None,
             traceparent: None,
             on_poison: None,
             on_dlq: None,
@@ -365,6 +406,15 @@ impl ConnectOptions {
     #[must_use]
     pub fn with_credentials(mut self, credentials: Credentials) -> Self {
         self.credentials = credentials;
+        self
+    }
+
+    /// TLS: CA propia, certificado de cliente y exigir TLS — 06-security.md §2.
+    ///
+    /// Los ficheros se comprueban en [`connect`], antes de tocar la red.
+    #[must_use]
+    pub fn with_tls(mut self, tls: TlsOptions) -> Self {
+        self.tls = Some(tls);
         self
     }
 
@@ -598,6 +648,11 @@ struct BusInner {
     validator: Option<crate::validation::Validator>,
     ensured: Mutex<HashSet<String>>,
     stops: Mutex<Vec<watch::Sender<bool>>>,
+    /// Denegaciones de permisos que el broker comunica por la conexión. Ver
+    /// [`crate::security`]: sin esto, un permiso que falta es un timeout mudo.
+    denials: Arc<DenialLog>,
+    /// `_INBOX.<servicio>`. Siempre; no es una opción — 06-security.md §3.
+    inbox_prefix: String,
 }
 
 /// El cliente de flux: publica y consume eventos.
@@ -638,16 +693,22 @@ fn transport(context: impl Into<String>, source: impl Into<HandlerError>) -> Flu
 
 /// Abre la conexión al bus.
 ///
-/// Reconecta indefinidamente con backoff **y jitter**: sin jitter, mil servicios
-/// reconectan en el mismo milisegundo y tiran el cluster que acaba de levantarse
-/// — 03-delivery.md §6. `async-nats` aplica el jitter por defecto en su
-/// `reconnect_delay_callback`, así que aquí solo se quita el techo de reintentos.
+/// Espera al broker con backoff **y jitter** —un servicio que arranca antes que el broker no
+/// debe morir en el primer intento; sin jitter, mil servicios reconectan en el mismo
+/// milisegundo y tiran el cluster que acaba de levantarse (03-delivery.md §6)— y, una vez
+/// conectado, reconecta indefinidamente. Lo que reintentar no arregla (credencial rechazada,
+/// TLS que no encaja) **no se reintenta**: devuelve el error aquí.
+///
+/// El inbox es siempre `_INBOX.<servicio>` (06-security.md §3): no es una opción.
 ///
 /// # Errores
 ///
-/// [`FluxError::Config`] si falta alguno de los cuatro campos obligatorios,
+/// [`FluxError::Config`] si falta alguno de los cuatro campos obligatorios o si un valor de
+/// [`Credentials`] / [`TlsOptions`] está mal formado (un `.creds` ilegible, una semilla que
+/// no es `SU…`, una CA que no es PEM) —se comprueba **antes** de tocar la red—,
 /// [`FluxError::InvalidServiceName`] si el servicio no es kebab-case —lo que produciría
-/// durables no parseables— y [`FluxError::Transport`] si no se puede conectar.
+/// durables no parseables— y [`FluxError::Transport`] si el broker rechaza la credencial o
+/// el TLS no se puede establecer.
 pub async fn connect(mut opts: ConnectOptions) -> Result<Bus, FluxError> {
     if opts.service.is_empty() || opts.environment.is_empty() || opts.version.is_empty() {
         return Err(FluxError::Config(
@@ -677,30 +738,65 @@ pub async fn connect(mut opts: ConnectOptions) -> Result<Bus, FluxError> {
     #[cfg(feature = "validation")]
     let validator = crate::validation::Validator::new(&opts.validation, opts.logger.clone())?;
 
+    let denials = Arc::new(DenialLog::new());
+    let inbox = inbox_prefix(&opts.service);
+
     let mut nats = async_nats::ConnectOptions::new()
         .name(format!("{}@{}", opts.service, opts.environment))
         // -1 en Go, None aquí: reconexión indefinida.
         .max_reconnects(None)
-        // Equivale al waitOnFirstConnect de Node: un servicio que arranca antes que el
-        // broker no debe morir en el primer intento.
-        .retry_on_initial_connect();
+        // Inbox PRIVADO del servicio, siempre — 06-security.md §3. async-nats lo usa para
+        // TODO lo que viaja por un inbox: las peticiones a la API de JetStream (la
+        // multiplexión de `request`), las entregas de los consumidores pull y el acuse de
+        // cada publicación. Los acks, en cambio, son un publish a `$JS.ACK.…` y no pasan
+        // por él. Con el inbox común `_INBOX.>` cualquiera con permiso de suscripción lee
+        // las entregas de los demás (plan v1.1, evidencia A-2).
+        .custom_inbox_prefix(inbox.clone())
+        // El broker no devuelve un error cuando una ACL deniega algo: descarta el mensaje y
+        // manda un `-ERR` aparte. Sin escucharlo, el síntoma es un timeout de 5-30 s.
+        .event_callback({
+            let denials = Arc::clone(&denials);
+            let logger = opts.logger.clone();
+            move |event| {
+                let denials = Arc::clone(&denials);
+                let logger = logger.clone();
+                async move {
+                    let async_nats::Event::ServerError(async_nats::ServerError::Other(text)) =
+                        event
+                    else {
+                        return;
+                    };
+                    if let Some(denial) = parse_violation(&text) {
+                        if let Some(log) = &logger {
+                            log(
+                                LogLevel::Error,
+                                &format!(
+                                    "[flux] el broker denegó {}: la ACL del servicio no lo \
+                                     concede (06-security.md §3)",
+                                    denial.describe()
+                                ),
+                            );
+                        }
+                        denials.record(denial);
+                    }
+                }
+            }
+        });
 
-    nats = match &opts.credentials {
-        Credentials::None => nats,
-        Credentials::CredsFile(path) => nats
-            .credentials_file(path)
-            .await
-            .map_err(|e| transport(format!("no se pudo leer el .creds {}", path.display()), e))?,
-        Credentials::Token(t) => nats.token(t.clone()),
-        Credentials::UserPassword { user, password } => {
-            nats.user_and_password(user.clone(), password.clone())
+    nats = apply_credentials(nats, &opts.credentials).await?;
+
+    if let Some(tls) = &opts.tls {
+        tls.validate()?;
+        nats = nats.require_tls(tls.required);
+        if let Some(ca) = &tls.ca_file {
+            nats = nats.add_root_certificates(ca.clone());
         }
-    };
+        if let (Some(cert), Some(key)) = (&tls.client_cert, &tls.client_key) {
+            nats = nats.add_client_certificate(cert.clone(), key.clone());
+        }
+    }
 
-    let client = nats
-        .connect(opts.servers.clone())
-        .await
-        .map_err(|e| transport(format!("no se pudo conectar a `{}`", opts.servers), e))?;
+    let client = open_connection(&nats, &opts).await?;
 
     let js = async_nats::jetstream::new(client.clone());
     let source = source_uri(&opts.environment, &opts.service);
@@ -731,8 +827,122 @@ pub async fn connect(mut opts: ConnectOptions) -> Result<Bus, FluxError> {
             validator,
             ensured: Mutex::new(HashSet::new()),
             stops: Mutex::new(Vec::new()),
+            denials,
+            inbox_prefix: inbox,
         }),
     })
+}
+
+/// Traduce [`Credentials`] a las del cliente de NATS, validando antes de tocar la red.
+async fn apply_credentials(
+    nats: async_nats::ConnectOptions,
+    credentials: &Credentials,
+) -> Result<async_nats::ConnectOptions, FluxError> {
+    Ok(match credentials {
+        Credentials::None => nats,
+        Credentials::CredsFile(path) => {
+            // `credentials_file` lee Y parsea (JWT + semilla): un fichero ilegible o sin
+            // las dos secciones falla aquí. Es un error de CONFIGURACIÓN, no de transporte.
+            nats.credentials_file(path).await.map_err(|e| {
+                FluxError::Config(format!(
+                    "el fichero .creds `{}` no se puede usar: {e}. Debe llevar el JWT de \
+                     usuario y la semilla `SU…`",
+                    path.display()
+                ))
+            })?
+        }
+        Credentials::NkeySeed(seed) => {
+            let seed = seed.trim();
+            validate_nkey_seed(seed)?;
+            nats.nkey(seed.to_string())
+        }
+        Credentials::NkeyFile(path) => {
+            let seed = std::fs::read_to_string(path).map_err(|e| {
+                FluxError::Config(format!(
+                    "no se puede leer el fichero de semilla nkey `{}`: {e}",
+                    path.display()
+                ))
+            })?;
+            let seed = seed.trim();
+            validate_nkey_seed(seed)?;
+            nats.nkey(seed.to_string())
+        }
+        Credentials::Token(t) => nats.token(t.clone()),
+        Credentials::UserPassword { user, password } => {
+            nats.user_and_password(user.clone(), password.clone())
+        }
+    })
+}
+
+/// Abre la conexión inicial: espera al broker, pero no reintenta lo que no se arregla.
+///
+/// `async-nats` ofrece `retry_on_initial_connect`, y es lo que este SDK usaba: `connect()`
+/// vuelve al instante y el cliente sigue intentándolo en segundo plano, **para siempre y sin
+/// distinguir causas**. Una contraseña equivocada, una semilla rechazada o una CA que no
+/// encaja se convierten en un servicio que arranca, pasa el healthcheck y se queda mudo: la
+/// primera publicación espera 5-30 s y falla con un timeout que no dice nada.
+///
+/// Aquí el reintento es propio y filtra: el broker que aún no ha arrancado se espera con
+/// backoff y jitter —03-delivery.md §6— y lo que reintentar no arregla se devuelve al
+/// instante ([`is_fatal_connect_error`]).
+async fn open_connection(
+    nats: &async_nats::ConnectOptions,
+    opts: &ConnectOptions,
+) -> Result<async_nats::Client, FluxError> {
+    let mut attempt: u32 = 0;
+    loop {
+        let err = match nats.clone().connect(opts.servers.clone()).await {
+            Ok(client) => return Ok(client),
+            Err(e) => e,
+        };
+        if is_fatal_connect_error(&err) {
+            return Err(fatal_connect_error(opts, err));
+        }
+        attempt = attempt.saturating_add(1);
+        let wait = connect_backoff(attempt);
+        if let Some(log) = &opts.logger {
+            log(
+                LogLevel::Warn,
+                &format!(
+                    "[flux] el broker `{}` aún no responde ({err}). Reintento en {wait:?}",
+                    opts.servers
+                ),
+            );
+        }
+        tokio::time::sleep(wait).await;
+    }
+}
+
+/// 100 ms, 200 ms, … hasta 5 s, más hasta 250 ms de jitter: sin él, mil servicios que
+/// arrancan a la vez reintentan en el mismo milisegundo y tiran el broker que acaba de
+/// levantarse — 03-delivery.md §6.
+fn connect_backoff(attempt: u32) -> Duration {
+    let exp = attempt.saturating_sub(1).min(6);
+    let base = Duration::from_millis(100u64 << exp).min(Duration::from_secs(5));
+    // Los bits bajos de un UUIDv7 son aleatorios: no hace falta una dependencia más para
+    // desincronizar reintentos.
+    let jitter = u64::try_from(Uuid::now_v7().as_u128() % 250).unwrap_or(0);
+    base + Duration::from_millis(jitter)
+}
+
+/// El error de `connect()` para un fallo que reintentar no arregla, con la causa dicha.
+fn fatal_connect_error(opts: &ConnectOptions, err: async_nats::ConnectError) -> FluxError {
+    use async_nats::ConnectErrorKind as K;
+    let why = match err.kind() {
+        K::AuthorizationViolation | K::Authentication => {
+            "el broker rechazó la credencial de este servicio: revisa `Credentials` y que el \
+             usuario exista en la account"
+        }
+        K::ServerParse => "la lista de servidores no se entiende (`nats://host:4222`)",
+        _ => {
+            "falló el handshake TLS: ¿el broker ofrece TLS?, ¿la CA de `TlsOptions` es la que \
+             firma su certificado?, ¿exige certificado de cliente?"
+        }
+    };
+    transport(
+        format!("no se pudo conectar a `{}`: {why}", opts.servers),
+        err,
+    )
 }
 
 impl Bus {
@@ -959,24 +1169,41 @@ impl Bus {
         payload: Vec<u8>,
         message_id: &str,
     ) -> Result<(), FluxError> {
-        let ack = self
-            .inner
-            .js
-            .send_publish(
-                subject.to_string(),
-                PublishMessage::build()
-                    .payload(payload.into())
-                    .message_id(message_id),
-            )
-            .await
-            .map_err(|e| transport(format!("fallo al publicar en `{subject}`"), e))?;
-        ack.await.map_err(|e| {
-            transport(
-                format!("el stream no confirmó la publicación en `{subject}`"),
-                e,
-            )
-        })?;
-        Ok(())
+        // Sin permiso de publicación sobre `subject` el broker descarta el mensaje y el
+        // acuse nunca llega: el síntoma sería un timeout de hasta 30 s. La carrera con la
+        // denegación lo convierte en un error que nombra el subject y la regla.
+        let sent = self
+            .guarded(&[subject.to_string()], async {
+                let ack = self
+                    .inner
+                    .js
+                    .send_publish(
+                        subject.to_string(),
+                        PublishMessage::build()
+                            .payload(payload.into())
+                            .message_id(message_id),
+                    )
+                    .await
+                    .map_err(|e| transport(format!("fallo al publicar en `{subject}`"), e))?;
+                ack.await.map_err(|e| {
+                    transport(
+                        format!("el stream no confirmó la publicación en `{subject}`"),
+                        e,
+                    )
+                })?;
+                Ok::<(), FluxError>(())
+            })
+            .await;
+        match sent {
+            Ok(result) => result,
+            Err(denial) => Err(permission_denied(
+                format!(
+                    "publicar en `{subject}`: solo el servicio dueño del dominio publica en él \
+                     y `dlq.<subject>` solo en lo que consume"
+                ),
+                &denial,
+            )),
+        }
     }
 
     /// Resuelve la URI de `dataschema` del subject.
@@ -1095,22 +1322,10 @@ impl Bus {
         };
 
         let stream_name = stream_name(&parsed.domain);
-        let js_stream = self
-            .inner
-            .js
-            .get_stream(&stream_name)
-            .await
-            .map_err(|e| transport(format!("no se pudo abrir el stream `{stream_name}`"), e))?;
-
-        let consumer = js_stream
-            .create_consumer(requested.clone())
-            .await
-            .map_err(|e| {
-                transport(
-                    format!("no se pudo crear el consumidor `{durable}` en `{stream_name}`"),
-                    e,
-                )
-            })?;
+        let js_stream = self.open_stream(&stream_name).await?;
+        let consumer = self
+            .obtain_consumer(&js_stream, &stream_name, &durable, requested.clone())
+            .await?;
 
         // El servidor no siempre devuelve lo que se le pide. Requisito L2.
         assert_config_honored(&durable, &requested, &consumer.cached_info().config)?;
@@ -1738,19 +1953,179 @@ impl Bus {
     /// (réplicas, límites, mirrors). En producción los streams los provisiona
     /// infraestructura; esto es una comodidad de desarrollo — 02-naming.md §3.2.
     ///
+    /// Por eso la ACL de producción **no** concede `$JS.API.STREAM.CREATE.*` a un servicio
+    /// (06-security.md §3), y por eso se hace en dos pasos —consultar y, solo si no existe,
+    /// crear— y no con `get_or_create_stream`: hay que saber en cuál se deniega. Sin
+    /// permiso para consultar es [`FluxError::PermissionDenied`]; sin permiso para crear
+    /// lo que falta, [`FluxError::NotProvisioned`], con el nombre del stream y el remedio.
+    ///
     /// `num_replicas` se deja sin fijar: la spec pide 3, pero un cluster de un solo nodo
     /// —el docker-compose de desarrollo— rechazaría la creación.
     async fn ensure(&self, name: &str, cfg: stream::Config) -> Result<(), FluxError> {
         if lock(&self.inner.ensured).contains(name) {
             return Ok(());
         }
-        self.inner
-            .js
-            .get_or_create_stream(cfg)
-            .await
-            .map_err(|e| transport(format!("no se pudo crear el stream `{name}`"), e))?;
+
+        let info = format!("$JS.API.STREAM.INFO.{name}");
+        match self.guarded(&[info], self.inner.js.get_stream(name)).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) if is_stream_not_found(&e) => {
+                let create = format!("$JS.API.STREAM.CREATE.{name}");
+                match self
+                    .guarded(&[create], self.inner.js.create_stream(cfg))
+                    .await
+                {
+                    Ok(Ok(_)) => {}
+                    Ok(Err(e)) => {
+                        return Err(transport(format!("no se pudo crear el stream `{name}`"), e))
+                    }
+                    Err(denial) => {
+                        return Err(FluxError::NotProvisioned {
+                            kind: ResourceKind::Stream,
+                            name: name.to_string(),
+                            denied: denial.describe(),
+                        })
+                    }
+                }
+            }
+            Ok(Err(e)) => {
+                return Err(transport(
+                    format!("no se pudo consultar el stream `{name}`"),
+                    e,
+                ))
+            }
+            Err(denial) => {
+                return Err(permission_denied(
+                    format!("consultar el stream `{name}`"),
+                    &denial,
+                ))
+            }
+        }
+
         lock(&self.inner.ensured).insert(name.to_string());
         Ok(())
+    }
+
+    /// Abre un stream que ya existe.
+    async fn open_stream(&self, name: &str) -> Result<stream::Stream, FluxError> {
+        let info = format!("$JS.API.STREAM.INFO.{name}");
+        match self.guarded(&[info], self.inner.js.get_stream(name)).await {
+            Ok(Ok(stream)) => Ok(stream),
+            Ok(Err(e)) => Err(transport(format!("no se pudo abrir el stream `{name}`"), e)),
+            Err(denial) => Err(permission_denied(
+                format!("abrir el stream `{name}`"),
+                &denial,
+            )),
+        }
+    }
+
+    /// Ejecuta una petición al broker vigilando las denegaciones de permisos — ver
+    /// [`crate::security`].
+    ///
+    /// `subjects` son los subjects **exactos** a los que publica la petición: una
+    /// denegación de cualquier otro no es culpa de esta operación.
+    async fn guarded<T, F>(&self, subjects: &[String], fut: F) -> Result<T, Denial>
+    where
+        F: Future<Output = T>,
+    {
+        self.inner
+            .denials
+            .guard(&self.inner.inbox_prefix, subjects, fut)
+            .await
+    }
+
+    /// El consumidor durable: lo crea (o lo reconcilia) y, si la ACL no se lo permite, usa
+    /// el que **ya existe** porque lo aprovisionó infraestructura.
+    ///
+    /// ```text
+    /// CONSUMER.CREATE concedido           → crea / reconcilia (desarrollo, o ACL amplia)
+    /// CONSUMER.CREATE denegado + existe   → lo usa tal cual; `assert_config_honored`
+    ///                                       sigue comparando su config con la canónica
+    /// CONSUMER.CREATE denegado + no existe → NotProvisioned (nombra el consumidor)
+    /// ni crear ni consultar               → PermissionDenied
+    /// ```
+    ///
+    /// El segundo caso es el de producción con `flux provision`: la ACL de un servicio puede
+    /// omitir `CONSUMER.CREATE` y conservar `CONSUMER.INFO`, `MSG.NEXT` y los acks.
+    async fn obtain_consumer(
+        &self,
+        js_stream: &stream::Stream,
+        stream_name: &str,
+        durable: &str,
+        requested: consumer::pull::Config,
+    ) -> Result<consumer::Consumer<consumer::pull::Config>, FluxError> {
+        let create = format!(
+            "$JS.API.CONSUMER.CREATE.{stream_name}.{durable}.{}",
+            requested.filter_subject
+        );
+        let denial = match self
+            .guarded(&[create], js_stream.create_consumer(requested))
+            .await
+        {
+            Ok(Ok(consumer)) => return Ok(consumer),
+            Ok(Err(e)) => {
+                return Err(transport(
+                    format!("no se pudo crear el consumidor `{durable}` en `{stream_name}`"),
+                    e,
+                ))
+            }
+            Err(denial) => denial,
+        };
+
+        // No puede crearlo. ¿Existe ya?
+        let info = format!("$JS.API.CONSUMER.INFO.{stream_name}.{durable}");
+        match self
+            .guarded(&[info], js_stream.consumer_info(durable))
+            .await
+        {
+            Ok(Ok(info)) => {
+                let config =
+                    <consumer::pull::Config as consumer::FromConsumer>::try_from_consumer_config(
+                        info.config.clone(),
+                    )
+                    .map_err(|e| {
+                        transport(
+                            format!("el consumidor `{durable}` de `{stream_name}` no es un pull"),
+                            e,
+                        )
+                    })?;
+                Ok(consumer::Consumer::new(config, info, self.inner.js.clone()))
+            }
+            Ok(Err(e)) if matches!(e.kind(), ConsumerInfoErrorKind::NotFound) => {
+                Err(FluxError::NotProvisioned {
+                    kind: ResourceKind::Consumer,
+                    name: durable.to_string(),
+                    denied: denial.describe(),
+                })
+            }
+            Ok(Err(e)) => Err(transport(
+                format!("no se pudo consultar el consumidor `{durable}` en `{stream_name}`"),
+                e,
+            )),
+            Err(_) => Err(permission_denied(
+                format!(
+                    "crear ni consultar el consumidor `{durable}` en `{stream_name}` \
+                     (la ACL debe conceder CONSUMER.CREATE o, si lo aprovisiona \
+                     infraestructura, CONSUMER.INFO)"
+                ),
+                &denial,
+            )),
+        }
+    }
+}
+
+/// `true` si el servidor contestó «stream no encontrado» (error 10059).
+fn is_stream_not_found(e: &async_nats::jetstream::context::GetStreamError) -> bool {
+    matches!(
+        e.kind(),
+        GetStreamErrorKind::JetStream(je) if je.error_code() == ErrorCode::STREAM_NOT_FOUND
+    )
+}
+
+fn permission_denied(operation: String, denial: &Denial) -> FluxError {
+    FluxError::PermissionDenied {
+        operation,
+        denied: denial.describe(),
     }
 }
 
@@ -2278,6 +2653,160 @@ mod tests {
         assert_eq!(base64(b"fooba"), "Zm9vYmE=");
         assert_eq!(base64(b"foobar"), "Zm9vYmFy");
         assert_eq!(base64(&[0xFF, 0xFE, 0xFD]), "//79");
+    }
+
+    // ── credenciales — 06-security.md §2 ──────────────────────────────────────
+
+    use crate::security::TmpDir;
+
+    /// Un `.creds` con la forma que escribe `nsc`: JWT de usuario + semilla `SU…`.
+    fn creds_validas() -> String {
+        let seed = nkeys::KeyPair::new_user().seed().unwrap();
+        format!(
+            "-----BEGIN NATS USER JWT-----\neyJ0eXAiOiJKV1QiLCJhbGciOiJlZDI1NTE5LW5rZXkifQ.e30.AAAA\n\
+             ------END NATS USER JWT------\n\n\
+             ************************* IMPORTANT *************************\n\
+             -----BEGIN USER NKEY SEED-----\n{seed}\n------END USER NKEY SEED------\n"
+        )
+    }
+
+    /// **Verificado a nivel unitario, NO contra un broker en modo operador/JWT**: el `.creds`
+    /// se lee, se parsea y se cablea al cliente sin tocar la red. Que el broker acepte el JWT
+    /// y la firma del nonce es lo que un test de integración con un operador real probaría.
+    #[tokio::test]
+    async fn un_creds_bien_formado_se_cablea_sin_tocar_la_red() {
+        let dir = TmpDir::new();
+        let ok = dir.file("ok.creds", &creds_validas());
+        let r = apply_credentials(
+            async_nats::ConnectOptions::new(),
+            &Credentials::CredsFile(ok),
+        )
+        .await;
+        assert!(r.is_ok(), "{:?}", r.err());
+    }
+
+    #[tokio::test]
+    async fn un_creds_mal_formado_es_un_error_de_configuracion() {
+        let dir = TmpDir::new();
+        for (nombre, contenido) in [
+            ("vacio.creds", ""),
+            ("basura.creds", "esto no es un .creds"),
+            (
+                "sin-semilla.creds",
+                "-----BEGIN NATS USER JWT-----\neyJ.e30.AAAA\n------END NATS USER JWT------\n",
+            ),
+        ] {
+            let p = dir.file(nombre, contenido);
+            let err = apply_credentials(
+                async_nats::ConnectOptions::new(),
+                &Credentials::CredsFile(p),
+            )
+            .await
+            .unwrap_err();
+            assert!(matches!(err, FluxError::Config(_)), "{nombre}: {err:?}");
+            assert!(err.to_string().contains(".creds"), "{err}");
+        }
+        let err = apply_credentials(
+            async_nats::ConnectOptions::new(),
+            &Credentials::CredsFile("/no/existe.creds".into()),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(err, FluxError::Config(_)), "{err:?}");
+    }
+
+    /// Las cinco formas se cablean; las dos de nkey validan la semilla antes de aceptarla.
+    #[tokio::test]
+    async fn las_credenciales_simples_se_cablean() {
+        let seed = nkeys::KeyPair::new_user().seed().unwrap();
+        let dir = TmpDir::new();
+        let fichero = dir.file("seed.nk", &format!("{seed}\n"));
+        for c in [
+            Credentials::None,
+            Credentials::Token("t".into()),
+            Credentials::UserPassword {
+                user: "u".into(),
+                password: "p".into(),
+            },
+            Credentials::NkeySeed(format!("  {seed}  ")),
+            Credentials::NkeyFile(fichero),
+        ] {
+            assert!(
+                apply_credentials(async_nats::ConnectOptions::new(), &c)
+                    .await
+                    .is_ok(),
+                "{c:?}"
+            );
+        }
+        let cuenta = nkeys::KeyPair::new_account().seed().unwrap();
+        for malo in [
+            Credentials::NkeySeed("SUMAL".into()),
+            Credentials::NkeySeed(cuenta),
+            Credentials::NkeyFile(dir.file("malo.nk", "basura")),
+            Credentials::NkeyFile("/no/existe.nk".into()),
+        ] {
+            let err = apply_credentials(async_nats::ConnectOptions::new(), &malo)
+                .await
+                .unwrap_err();
+            assert!(matches!(err, FluxError::Config(_)), "{malo:?}: {err:?}");
+        }
+    }
+
+    /// Un `{:?}` de la configuración acaba en un log: ningún secreto puede salir en él.
+    #[test]
+    fn el_debug_de_las_credenciales_no_imprime_secretos() {
+        let seed = nkeys::KeyPair::new_user().seed().unwrap();
+        for c in [
+            Credentials::Token("tok-secreto".into()),
+            Credentials::NkeySeed(seed.clone()),
+            Credentials::UserPassword {
+                user: "ana".into(),
+                password: "pw-secreta".into(),
+            },
+        ] {
+            let texto = format!("{c:?}");
+            for secreto in ["tok-secreto", "pw-secreta", seed.as_str()] {
+                assert!(!texto.contains(secreto), "{texto}");
+            }
+            assert!(texto.contains("oculto"), "{texto}");
+        }
+        // El usuario no es un secreto y ayuda a depurar.
+        let texto = format!(
+            "{:?}",
+            Credentials::UserPassword {
+                user: "ana".into(),
+                password: "x".into()
+            }
+        );
+        assert!(texto.contains("ana"));
+    }
+
+    #[test]
+    fn el_backoff_de_conexion_crece_con_jitter_y_tiene_techo() {
+        let primero = connect_backoff(1);
+        assert!(primero >= Duration::from_millis(100) && primero < Duration::from_millis(350));
+        // El techo: 5 s de base + hasta 250 ms de jitter, por muchos intentos que lleve.
+        for intento in [7, 20, u32::MAX] {
+            let d = connect_backoff(intento);
+            assert!(
+                d >= Duration::from_secs(5) && d < Duration::from_millis(5250),
+                "{d:?}"
+            );
+        }
+        // Sin jitter, mil servicios reconectarían en el mismo milisegundo.
+        let distintos: std::collections::HashSet<_> = (0..50).map(|_| connect_backoff(3)).collect();
+        assert!(distintos.len() > 1, "el jitter no varía");
+    }
+
+    /// `with_tls` y las credenciales no se imprimen enteras ni arrastran secretos al `Debug`.
+    #[test]
+    fn la_config_con_tls_se_describe_sin_secretos() {
+        let o = ConnectOptions::new("nats://x", "svc", "produccion", "1.0.0")
+            .with_credentials(Credentials::Token("tok-secreto".into()))
+            .with_tls(TlsOptions::new().with_ca_file("/etc/ca.pem"));
+        let texto = format!("{o:?}");
+        assert!(!texto.contains("tok-secreto"), "{texto}");
+        assert!(texto.contains("/etc/ca.pem"), "{texto}");
     }
 
     #[tokio::test]

@@ -24,6 +24,7 @@ import {
   ReplayPolicy,
   RetentionPolicy,
   StorageType,
+  type ConsumerConfig,
   type JetStreamClient,
   type JetStreamManager,
   type JsMsg,
@@ -71,6 +72,19 @@ import {
   sourceUri,
   streamName,
 } from "./protocol.js";
+import {
+  NotProvisionedError,
+  PermissionDeniedError,
+  buildAuthenticator,
+  buildTls,
+  inboxPrefixFor,
+  isNotFound,
+  normalizeDeniedSubject,
+  permanentConnectError,
+  permissionViolation,
+  type Credentials,
+  type TlsOptions,
+} from "./security.js";
 
 // ─── Opciones ────────────────────────────────────────────────────────────────
 
@@ -133,8 +147,19 @@ export interface ConnectOptions {
    * configuración que le apetezca es una carrera esperando a ocurrir.
    */
   streamReplicas?: number;
-  /** Credenciales NATS. NUNCA versionadas — 06-security.md §2. */
-  credentials?: { creds?: string; token?: string; user?: string; pass?: string };
+  /**
+   * Credenciales NATS. NUNCA versionadas — 06-security.md §2. Un solo método: `.creds`
+   * (ruta o contenido), nkey, token, o usuario y contraseña. Ver `Credentials`.
+   *
+   * Un valor mal formado, o una clave que no existe, lanza `InvalidCredentialsError` en
+   * `connect()`: nunca se ignora.
+   */
+  credentials?: Credentials;
+  /**
+   * TLS contra el listener de NATS, con CA propia y certificado de cliente opcionales.
+   * Obligatorio en producción — 06-security.md §2. Ver `TlsOptions`.
+   */
+  tls?: TlsOptions;
   /** Se invoca ante un POISON. Es el único caso que debe despertar a alguien. */
   onPoison?: (info: { subject: string; error: Error; raw: Uint8Array }) => void;
   /** Se invoca al enrutar cualquier evento a la DLQ. */
@@ -244,6 +269,11 @@ export class FluxBus {
   #verifier: Verifier | null = null;
   /** Código del último fallo de firma, para que #dispatch sepa clasificar. */
   #pendingSignatureFailure: string | null = null;
+  /**
+   * Denegaciones de permisos que el broker notificó DE FORMA ASÍNCRONA, por subject
+   * normalizado. Ver #watchPermissionViolations.
+   */
+  readonly #denied = new Map<string, "publish" | "subscribe">();
 
   constructor(
     nc: NatsConnection,
@@ -259,6 +289,47 @@ export class FluxBus {
     this.#source = sourceUri(opts.environment, opts.service);
     this.#metrics = opts.metrics ?? NO_METRICS;
     this.#metrics.connectionState(1);
+    this.#watchPermissionViolations();
+  }
+
+  /**
+   * Un `ack`, un WIP o la petición de mensajes de un pull NO son peticiones con
+   * respuesta: son publicaciones sueltas. Si el broker las deniega no hay excepción
+   * ni timeout que las delate; solo un `-ERR` asíncrono que el cliente reparte como
+   * evento de estado (medido contra NATS 2.14.5).
+   *
+   * Consecuencia sin esta vigilancia: sin permiso de ack, cada evento se procesa bien y
+   * se REENTREGA cada `ack_wait` para siempre, sin ningún error; sin permiso de pull, el
+   * consumidor no recibe nada y parece sano. Dos fallos de configuración que se
+   * manifiestan como «no pasa nada».
+   */
+  #watchPermissionViolations(): void {
+    void (async () => {
+      try {
+        for await (const s of this.#nc.status()) {
+          if (s.type !== "error") continue;
+          const v = permissionViolation(s.error);
+          if (!v) continue;
+          const subject = normalizeDeniedSubject(v.subject);
+          if (this.#denied.has(subject)) continue; // se avisa una vez por subject
+          this.#denied.set(subject, v.operation);
+          // Las peticiones denegadas ya lanzan su propia excepción; aquí importa el
+          // efecto de las dos que NO lo hacen.
+          const efecto = subject.startsWith("$JS.ACK.")
+            ? " Sin permiso de ack, cada evento se procesa y se REENTREGA cada ack_wait, sin fin y sin error."
+            : subject.startsWith("$JS.API.CONSUMER.MSG.NEXT.")
+              ? " Sin permiso de pull, el consumidor no recibe nada y parece sano."
+              : "";
+          this.#opts.logger?.error(
+            `[flux] el broker denegó ${v.operation === "publish" ? "publicar en" : "suscribirse a"} ` +
+              `"${subject}" a "${this.#opts.service}": falta ese permiso en su ACL.${efecto} ` +
+              `(06-security.md §3)`,
+          );
+        }
+      } catch {
+        // El iterador termina con la conexión; no hay nada que vigilar después.
+      }
+    })();
   }
 
   // ─── publish ───────────────────────────────────────────────────────────────
@@ -321,7 +392,14 @@ export class FluxBus {
 
     // msgID pone la cabecera Nats-Msg-Id: deduplica reintentos de PUBLICACIÓN dentro
     // de duplicate_window. NO deduplica reentregas de consumo — 03-delivery.md §3.
-    await this.#js.publish(subject, serialize(publicado), { msgID: publicado.id });
+    try {
+      await this.#js.publish(subject, serialize(publicado), { msgID: publicado.id });
+    } catch (e) {
+      // Un publish a un dominio ajeno lo deniega el broker, no este código — 06-security.md
+      // §3. Sin envolverlo llegaría como un `RequestError` genérico, que el clasificador
+      // trata como DESCONOCIDO y reintenta; una denegación es PERMANENT, como un 403.
+      throw this.#asPermissionDenied(e) ?? e;
+    }
     this.#metrics.eventPublished(subject, "ok");
     return publicado as FluxEvent<T>;
   }
@@ -398,12 +476,7 @@ export class FluxBus {
       replay_policy: ReplayPolicy.Instant,
     };
 
-    let effective;
-    try {
-      effective = (await this.#jsm.consumers.add(stream, requested)).config;
-    } catch {
-      effective = (await this.#jsm.consumers.info(stream, durable)).config;
-    }
+    const effective = await this.#ensureConsumer(stream, durable, requested);
 
     this.#assertConfigHonored(
       durable,
@@ -412,6 +485,9 @@ export class FluxBus {
     );
 
     const consumer = await this.#js.consumers.get(stream, durable);
+    // Una denegación de un intento anterior sobre este durable no debe condenar a este.
+    const pull = `$JS.API.CONSUMER.MSG.NEXT.${stream}.${durable}`;
+    this.#denied.delete(pull);
     const messages = await consumer.consume();
 
     // Sondeo de num_pending. Sin esto, `flux_consumer_pending` nunca se emite y el
@@ -460,6 +536,25 @@ export class FluxBus {
       }
     })();
 
+    // La petición de mensajes es un publish sin respuesta: si el broker la deniega, no
+    // hay excepción y el consumidor se queda inerte, aparentemente sano. Es mejor fallar
+    // aquí que descubrirlo por la ausencia de eventos semanas después.
+    //
+    // Se comprueba DESPUÉS de arrancar el bucle porque la librería encola el primer pull
+    // y no lo publica hasta que alguien itera (medido). Un turno de event loop deja que
+    // salga, y el `-ERR` llega antes que el PONG de este flush —el protocolo es
+    // ordenado—, así que ya está registrado cuando vuelve.
+    await new Promise<void>((r) => setImmediate(r));
+    await this.#nc.flush();
+    // El estado llega al vigilante por un iterador asíncrono: tras el `-ERR` aún le faltan
+    // unos microturnos para anotarlo, y un turno más de event loop los agota todos.
+    await new Promise<void>((r) => setImmediate(r));
+    if (this.#denied.has(pull)) {
+      entry.stop();
+      this.#subscriptions.delete(entry);
+      throw new PermissionDeniedError(this.#opts.service, "publish", pull);
+    }
+
     return {
       subject,
       durable,
@@ -468,6 +563,59 @@ export class FluxBus {
         this.#subscriptions.delete(entry);
       },
     };
+  }
+
+  /**
+   * Toma el consumidor durable si existe y, solo si no existe, lo crea.
+   *
+   * Se pregunta ANTES de crear: en producción lo aprovisiona `flux provision`, y
+   * entonces el SDK no necesita permiso de creación. Intentar crear primero provocaba
+   * una denegación espuria en cada arranque y obligaba a conceder `CONSUMER.CREATE` a
+   * quien no lo usa nunca. Que el consumidor ya exista con otra config no es un error
+   * de aquí: lo decide `#assertConfigHonored`.
+   *
+   * Si no existe y crearlo está DENEGADO, no es un fallo de red ni un timeout: es que
+   * nadie lo aprovisionó — `NotProvisionedError`.
+   */
+  async #ensureConsumer(
+    stream: string,
+    durable: string,
+    requested: Partial<ConsumerConfig>,
+  ): Promise<ConsumerConfig> {
+    try {
+      return (await this.#jsm.consumers.info(stream, durable)).config;
+    } catch (infoError) {
+      if (!isNotFound(infoError, "consumer")) {
+        throw this.#asPermissionDenied(infoError) ?? infoError;
+      }
+    }
+    try {
+      return (await this.#jsm.consumers.add(stream, requested)).config;
+    } catch (addError) {
+      const denied = permissionViolation(addError);
+      if (denied) {
+        throw new NotProvisionedError(
+          { kind: "consumer", name: durable, stream },
+          this.#opts.service,
+          denied.subject,
+          { cause: addError },
+        );
+      }
+      // Otra instancia del servicio pudo crearlo entre la pregunta y la creación.
+      try {
+        return (await this.#jsm.consumers.info(stream, durable)).config;
+      } catch {
+        throw addError;
+      }
+    }
+  }
+
+  /** Convierte una denegación de la librería en el error accionable del SDK. */
+  #asPermissionDenied(e: unknown): PermissionDeniedError | undefined {
+    const v = permissionViolation(e);
+    return v
+      ? new PermissionDeniedError(this.#opts.service, v.operation, v.subject, { cause: e })
+      : undefined;
   }
 
   /**
@@ -736,7 +884,16 @@ export class FluxBus {
   ): Promise<void> {
     try {
       await this.#jsm.streams.info(name);
-    } catch {
+      return;
+    } catch (infoError) {
+      // Solo «no existe» autoriza a crearlo. Antes cualquier fallo de `info` —un permiso
+      // denegado, un JetStream apagado— caía en `add`, y el error que llegaba era el de
+      // crear, que no explicaba nada de lo que había pasado de verdad.
+      if (!isNotFound(infoError, "stream")) {
+        throw this.#asPermissionDenied(infoError) ?? infoError;
+      }
+    }
+    try {
       await this.#jsm.streams.add({
         name,
         subjects,
@@ -746,6 +903,17 @@ export class FluxBus {
         num_replicas: this.#opts.streamReplicas ?? 1,
         ...extra,
       });
+    } catch (addError) {
+      const denied = permissionViolation(addError);
+      if (denied) {
+        throw new NotProvisionedError(
+          { kind: "stream", name },
+          this.#opts.service,
+          denied.subject,
+          { cause: addError },
+        );
+      }
+      throw addError;
     }
   }
 
@@ -786,6 +954,13 @@ export class FluxBus {
  * levantarse — 03-delivery.md §6.
  */
 export async function connect(options: ConnectOptions): Promise<FluxBus> {
+  // Todo lo que se puede comprobar sin red se comprueba ANTES de dialar: un valor mal
+  // formado debe fallar aquí, con su nombre, y no degradarse a «sin credenciales» o a
+  // «sin TLS» — que es lo que pasaba con `credentials.creds`.
+  const inboxPrefix = inboxPrefixFor(options.service);
+  const authenticator = buildAuthenticator(options.credentials);
+  const tls = buildTls(options.tls);
+
   const natsOptions: ConnectionOptions = {
     servers: options.servers,
     name: `${options.service}@${options.environment}`,
@@ -793,16 +968,51 @@ export async function connect(options: ConnectOptions): Promise<FluxBus> {
     reconnectTimeWait: 1000,
     reconnectJitter: 500,
     reconnectJitterTLS: 1000,
-    waitOnFirstConnect: true,
-    ...options.credentials,
+    // Inbox PRIVADO, siempre y no configurable: ver inboxPrefixFor().
+    inboxPrefix,
+    ...(authenticator && { authenticator }),
+    ...(tls && { tls }),
   };
 
-  const nc = await natsConnect(natsOptions);
-  const jsm = await jetstreamManager(nc);
-  const js = jetstream(nc);
-  const bus = new FluxBus(nc, js, jsm, options);
-  // Compilar los esquemas UNA vez en connect(), no por evento: ajv compila a
-  // función y hacerlo en la ruta caliente tiraría el throughput.
-  await bus.initValidation();
-  return bus;
+  const nc = await connectWhenAvailable(natsOptions);
+  try {
+    const jsm = await jetstreamManager(nc);
+    const js = jetstream(nc);
+    const bus = new FluxBus(nc, js, jsm, options);
+    // Compilar los esquemas UNA vez en connect(), no por evento: ajv compila a
+    // función y hacerlo en la ruta caliente tiraría el throughput.
+    await bus.initValidation();
+    return bus;
+  } catch (e) {
+    // `jetstreamManager` consulta `$JS.API.INFO`. Con una ACL anterior a la v1.1 el
+    // broker lo deniega, y sin este cierre la conexión queda abierta tras el fallo.
+    await nc.close().catch(() => {});
+    const v = permissionViolation(e);
+    throw v ? new PermissionDeniedError(options.service, v.operation, v.subject, { cause: e }) : e;
+  }
+}
+
+/**
+ * Espera a que el broker esté disponible —un servicio que arranca antes que NATS es lo
+ * normal en un compose— pero NO espera lo que no va a cambiar.
+ *
+ * `waitOnFirstConnect: true` de la librería reintenta cualquier error, sin límite y sin
+ * avisar. Medido contra NATS 2.14.5: con un certificado de servidor que no verifica,
+ * `connect()` no falla, se cuelga. Aquí el bucle es nuestro para poder distinguir.
+ * Las reconexiones posteriores siguen siendo de la librería (`maxReconnectAttempts: -1`).
+ */
+async function connectWhenAvailable(natsOptions: ConnectionOptions): Promise<NatsConnection> {
+  const wait = natsOptions.reconnectTimeWait ?? 1000;
+  const jitter = natsOptions.reconnectJitter ?? 0;
+  for (;;) {
+    try {
+      return await natsConnect({ ...natsOptions, waitOnFirstConnect: false });
+    } catch (e) {
+      const permanent = permanentConnectError(e);
+      if (permanent) throw permanent;
+      // Con jitter: mil servicios que esperan a un NATS que arranca no deben llamar a
+      // la vez — 03-delivery.md §6.
+      await new Promise((r) => setTimeout(r, wait + Math.random() * jitter));
+    }
+  }
 }

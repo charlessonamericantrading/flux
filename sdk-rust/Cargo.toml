@@ -39,6 +39,13 @@ futures = "0.3"
 
 async-nats = "0.50"
 
+# Ya está en el árbol: `async-nats` lo trae con su feature por defecto `nkeys`. Se declara
+# aquí porque el SDK valida la semilla nkey en `connect()` —un valor mal formado debe fallar
+# en alto en el arranque— y `async-nats` solo la parsea cuando intenta autenticarse, es
+# decir, dentro de su bucle de reconexión, donde un error de configuración se vuelve un
+# reintento infinito y silencioso. Misma versión resuelta, cero coste añadido.
+nkeys = "0.4"
+
 # ─── Firma Ed25519 — extensión OPCIONAL de v1 (07-signing.md) ────────────────
 #
 # Va detrás de la feature `signing` y NO se activa por defecto a propósito: la firma es
@@ -97,3 +104,8 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
 # Los tests de integración leen la DLQ con la API CRUDA de NATS a propósito: comprueban
 # los BYTES que el SDK escribió, no su propia interpretación de ellos.
 async-nats = "0.50"
+# Certificados efímeros para los tests de TLS (`tests/security.rs`): una CA propia, un
+# certificado de servidor y otro de cliente, generados en el propio test. Sin esto habría que
+# commitear una clave privada de prueba —que caduca y que un escáner de secretos marca— o
+# depender de que `openssl` esté instalado.
+rcgen = "0.13"

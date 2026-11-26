@@ -1,11 +1,200 @@
 {
   "$comment": "GENERADO por scripts/bundle-schemas.mjs — no editar a mano. Indexa los JSON Schema por la URI que aparece en el atributo dataschema del CloudEvent.",
   "generatedFrom": "schemas/",
-  "count": 1,
+  "count": 4,
   "subjects": {
+    "facturacion.factura.v2.emitida": "https://schemas.internal/facturacion/factura/emitida/2.0.0.json",
+    "inventario.stock.v1.ajustado": "https://schemas.internal/inventario/stock/ajustado/1.0.0.json",
+    "pedidos.pedido.v1.cancelado": "https://schemas.internal/pedidos/pedido/cancelado/1.0.0.json",
     "pedidos.pedido.v1.creado": "https://schemas.internal/pedidos/pedido/creado/1.0.0.json"
   },
   "schemas": {
+    "https://schemas.internal/facturacion/factura/emitida/2.0.0.json": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "$id": "https://schemas.internal/facturacion/factura/emitida/2.0.0.json",
+      "title": "facturacion.factura.v2.emitida",
+      "description": "Una factura ha sido emitida a partir de un pedido. Emitido por facturacion-api, dueño del agregado. Todos los importes son enteros en la unidad mínima de `moneda`.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "facturaId",
+        "pedidoId",
+        "clienteId",
+        "aggregateVersion",
+        "numero",
+        "baseImponibleCents",
+        "impuestosCents",
+        "totalCents",
+        "moneda"
+      ],
+      "properties": {
+        "facturaId": {
+          "type": "string",
+          "pattern": "^fac-[0-9a-z]{3,32}$",
+          "description": "Identificador del agregado. Coincide con el atributo `subject` del CloudEvent."
+        },
+        "pedidoId": {
+          "type": "string",
+          "pattern": "^ped-[0-9a-z]{3,32}$",
+          "description": "Pedido que originó la factura. Referencia al agregado de pedidos.pedido.v1.creado."
+        },
+        "clienteId": {
+          "type": "string",
+          "pattern": "^cli-[0-9a-z]{3,32}$",
+          "description": "Referencia al cliente. Los datos fiscales (nombre, NIF, dirección) son PII y viven en el servicio de clientes, no en el bus — ver 06-security.md §5.1."
+        },
+        "aggregateVersion": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Contador monotónico del agregado. El consumidor descarta eventos con versión menor o igual a la ya aplicada."
+        },
+        "numero": {
+          "type": "string",
+          "pattern": "^[A-Z0-9][A-Z0-9-]{2,31}$",
+          "description": "Número legal de la factura, único y correlativo dentro de su serie."
+        },
+        "baseImponibleCents": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Base imponible en la unidad mínima de `moneda`."
+        },
+        "impuestosCents": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Impuestos en la unidad mínima de `moneda`."
+        },
+        "totalCents": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Total de la factura (base + impuestos) en la unidad mínima de `moneda`. Entero, nunca float."
+        },
+        "moneda": {
+          "type": "string",
+          "pattern": "^[A-Z]{3}$",
+          "description": "Código ISO 4217."
+        }
+      }
+    },
+    "https://schemas.internal/inventario/stock/ajustado/1.0.0.json": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "$id": "https://schemas.internal/inventario/stock/ajustado/1.0.0.json",
+      "title": "inventario.stock.v1.ajustado",
+      "description": "La existencia de un SKU en un almacén ha cambiado por un ajuste (recuento, merma, recepción, devolución). Emitido por inventario-api, dueño del agregado. Lleva la cantidad antes y después para que el consumidor no tenga que llamar de vuelta a inventario-api para conocer el nuevo valor.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "stockId",
+        "sku",
+        "aggregateVersion",
+        "cantidadAnterior",
+        "cantidadNueva",
+        "motivo"
+      ],
+      "properties": {
+        "stockId": {
+          "type": "string",
+          "pattern": "^stk-[0-9a-z]{3,32}$",
+          "description": "Identificador del agregado (un SKU en un almacén). Coincide con el atributo `subject` del CloudEvent."
+        },
+        "sku": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64,
+          "description": "Artículo ajustado. Mismo `sku` que usan las líneas de pedidos.pedido.v1.creado."
+        },
+        "almacenId": {
+          "type": "string",
+          "pattern": "^alm-[0-9a-z]{2,32}$",
+          "description": "Referencia al almacén."
+        },
+        "aggregateVersion": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Contador monotónico del agregado. El consumidor descarta eventos con versión menor o igual a la ya aplicada."
+        },
+        "cantidadAnterior": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Unidades en existencia antes del ajuste."
+        },
+        "cantidadNueva": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Unidades en existencia tras el ajuste. Es el valor, no el delta: un consumidor que pierde un evento no acumula el error."
+        },
+        "motivo": {
+          "type": "string",
+          "enum": [
+            "recuento",
+            "merma",
+            "recepcion",
+            "devolucion"
+          ],
+          "x-extensible-enum": true,
+          "description": "Causa del ajuste. Enum EXTENSIBLE: pueden añadirse valores en un MINOR, así que el consumidor DEBE tener una rama por defecto no destructiva — ver 05-compatibility.md §2.3."
+        }
+      }
+    },
+    "https://schemas.internal/pedidos/pedido/cancelado/1.0.0.json": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "$id": "https://schemas.internal/pedidos/pedido/cancelado/1.0.0.json",
+      "title": "pedidos.pedido.v1.cancelado",
+      "description": "Un pedido ha sido cancelado, por el cliente o por el sistema. Emitido por pedidos-api, dueño del agregado. Un consumidor que ya había reservado stock o emitido factura debe deshacerlo de forma idempotente: este evento puede llegar repetido.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "pedidoId",
+        "clienteId",
+        "aggregateVersion",
+        "motivo",
+        "reembolsoCents",
+        "moneda"
+      ],
+      "properties": {
+        "pedidoId": {
+          "type": "string",
+          "pattern": "^ped-[0-9a-z]{3,32}$",
+          "description": "Identificador del agregado. Coincide con el atributo `subject` del CloudEvent."
+        },
+        "clienteId": {
+          "type": "string",
+          "pattern": "^cli-[0-9a-z]{3,32}$",
+          "description": "Referencia al cliente. NO se incluye PII del cliente aquí — ver 06-security.md §5.1."
+        },
+        "aggregateVersion": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Contador monotónico del agregado. El consumidor descarta eventos con versión menor o igual a la ya aplicada."
+        },
+        "motivo": {
+          "type": "string",
+          "enum": [
+            "cliente",
+            "sin-stock",
+            "fraude",
+            "pago-fallido"
+          ],
+          "x-extensible-enum": true,
+          "description": "Causa de la cancelación. Enum EXTENSIBLE: pueden añadirse valores en un MINOR, así que el consumidor DEBE tener una rama por defecto no destructiva — ver 05-compatibility.md §2.3."
+        },
+        "reembolsoCents": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Importe a reembolsar en la unidad mínima de `moneda`. Entero, nunca float. Cero si el pedido no llegó a cobrarse."
+        },
+        "moneda": {
+          "type": "string",
+          "pattern": "^[A-Z]{3}$",
+          "description": "Código ISO 4217."
+        },
+        "comentarioCliente": {
+          "type": "string",
+          "maxLength": 500,
+          "x-pii": true,
+          "description": "Texto libre del cliente al cancelar. Marcado x-pii: el SDK lo redacta en logs y fuerza dataclassification >= confidential."
+        }
+      }
+    },
     "https://schemas.internal/pedidos/pedido/creado/1.0.0.json": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "$id": "https://schemas.internal/pedidos/pedido/creado/1.0.0.json",

@@ -58,11 +58,15 @@ jobs:
 
       # 05-compatibility.md §4: los esquemas publicados son inmutables.
       # Editar 1.0.0 in situ invalida todos los eventos ya emitidos que lo referencian.
+      #
+      # `schemas/bundle.json` se EXCLUYE: no es un esquema publicado sino un índice GENERADO, y
+      # añadir cualquier esquema lo regenera (su estado en el diff es `M`). Sin la exclusión,
+      # este paso fallaba en todo PR que añadiera un esquema, aunque solo hubiera adiciones.
       - name: Ningún schema existente modificado
         if: github.event_name == 'pull_request'
         run: |
           changed=$(git diff --name-status \
-            origin/${{ github.base_ref }}...HEAD -- schemas/ \
+            origin/${{ github.base_ref }}...HEAD -- schemas/ ':(exclude)schemas/bundle.json' \
             | awk '$1 == "M" || $1 ~ /^R/ { print $2 }')
           if [ -n "$changed" ]; then
             echo "✗ Schemas publicados modificados (son inmutables — añade una versión nueva):"
@@ -83,6 +87,36 @@ jobs:
       # del agregado publica sus eventos, y nadie puede confiar ya en el .
       - run: node scripts/gen-acl.mjs examples/services.json --check
 
+  acl-verify:
+    name: ACLs generadas, contra un NATS real
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      # nats-server 2.14.5 exige Go 1.25 (su go.mod). Sin Docker y sin descargar un binario
+      # de origen dudoso: se compila la versión exacta que la spec dice haber medido.
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+      - name: Compilar nats-server 2.14.5
+        run: |
+          GOBIN="$PWD/bin" go install github.com/nats-io/nats-server/v2@v2.14.5
+          echo "NATS_SERVER=$PWD/bin/nats-server" >> "$GITHUB_ENV"
+      # Las dependencias de NATS las usan la suite (conformance/) y la CLI (cli/, para
+      # `flux provision`); verify-acl no añade ninguna.
+      - run: npm install --no-audit --no-fund
+        working-directory: conformance
+      - run: npm install --no-audit --no-fund
+        working-directory: cli
+      # H3 del plan v1.1: hasta ahora nada aplicaba los permisos generados a un broker, y por
+      # eso «funcionaban» en el papel mientras un servicio no podía consumir (H1) y leía
+      # dominios ajenos (H2). Termina con exit 0 solo si lo permitido funciona, lo denegado se
+      # deniega, cada permiso es necesario y las sondas DETECTAN una ACL rota.
+      - name: Aplicar las ACLs generadas a un nats-server real
+        run: node scripts/verify-acl.mjs
+
   protocol-json-valid:
     name: protocol.json coherente
     runs-on: ubuntu-latest
@@ -96,7 +130,7 @@ jobs:
       - run: node scripts/check-protocol-json.mjs
 
   sdk-node:
-    name: SDK Node — typecheck y tests
+    name: SDK Node — typecheck, tests e integración contra NATS real
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -106,9 +140,30 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
+      # nats-server 2.14.5 exige Go 1.25 en su go.mod: se fija aquí en vez de depender de
+      # que `go` descargue un toolchain por su cuenta. Sin docker, a diferencia del job
+      # `conformance`: los tests de integración arrancan su PROPIO servidor, con la config
+      # (usuarios, permisos, TLS, modo operador) que cada caso escribe.
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+          cache: false
+      - name: Compilar nats-server 2.14.5
+        env:
+          GOBIN: ${{ runner.temp }}/bin
+        run: |
+          go install github.com/nats-io/nats-server/v2@v2.14.5
+          "$GOBIN/nats-server" --version
       - run: npm install --no-audit --no-fund
       - run: npm run typecheck
-      - run: npm test
+      # FLUX_REQUIRE_BROKER hace que la AUSENCIA del broker sea un fallo y no un salto con
+      # aviso: sin ella, un binario que no se compilara dejaría el CI verde sin haber
+      # ejecutado nunca los tests que prueban los permisos.
+      - name: Tests (unitarios + integración contra nats-server)
+        env:
+          NATS_SERVER: ${{ runner.temp }}/bin/nats-server
+          FLUX_REQUIRE_BROKER: '1'
+        run: npm test
       - run: npm run build
 
   # Los tests de estos SDKs LEEN protocol.json para no divergir de la spec. Eso es
@@ -243,6 +298,21 @@ jobs:
           components: rustfmt, clippy
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
+      # `signing` y `validation` van detrás de feature: sin esto el README llama L3 a Rust y
+      # CI nunca compilaría —ni probaría— el código que lo hace L3.
+      - run: cargo clippy --all-targets --all-features -- -D warnings
+      # `tests/security.rs` arranca su PROPIO nats-server con ACLs (no sirve el contenedor de
+      # abajo, que no tiene usuarios ni TLS). Se compila desde la fuente porque no hay Docker
+      # en todos los entornos donde se desarrolla, y fijar la versión es fijar la semántica del
+      # broker que las ACLs asumen. v2.14.5 exige Go 1.25 en su go.mod.
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+          cache: false
+      - name: Compilar nats-server 2.14.5
+        run: |
+          GOBIN="$GITHUB_WORKSPACE/bin" go install github.com/nats-io/nats-server/v2@v2.14.5
+          "$GITHUB_WORKSPACE/bin/nats-server" --version
       # Los tests de integración necesitan un NATS con JetStream.
       - name: Levantar NATS con JetStream
         run: |
@@ -252,7 +322,18 @@ jobs:
             sleep 1
           done
           echo "NATS no arrancó"; docker logs flux-nats-rust; exit 1
-      - run: cargo test
+      # FLUX_REQUIRE_BROKER=1: sin broker los tests de integración y de seguridad FALLAN en vez
+      # de saltarse con un aviso. Un job verde que no ejecutó nada aparenta cobertura.
+      - name: Tests (sin features)
+        env:
+          NATS_SERVER: ${{ github.workspace }}/bin/nats-server
+          FLUX_REQUIRE_BROKER: '1'
+        run: cargo test
+      - name: Tests (--all-features)
+        env:
+          NATS_SERVER: ${{ github.workspace }}/bin/nats-server
+          FLUX_REQUIRE_BROKER: '1'
+        run: cargo test --all-features
 
   cross-sdk:
     name: Conformidad cruzada entre SDKs
