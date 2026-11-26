@@ -101,6 +101,13 @@ pub mod metrics;
 pub mod protocol;
 pub mod security;
 
+/// Estado replicado — **extensión OPCIONAL** de v1.1 (capacidad `state`): `put`, `delete`,
+/// `get` y `watch` sobre el valor **actual** de un agregado — `specification/10-state.md`.
+///
+/// No va detrás de una feature: no arrastra ninguna dependencia nueva y un servicio que no lo
+/// use no paga nada por él.
+pub mod state;
+
 /// Firma Ed25519 de eventos — **extensión OPCIONAL**, detrás de la feature `signing`.
 ///
 /// No se activa por defecto: un evento sin firma sigue siendo válido (07-signing.md), así
@@ -141,22 +148,32 @@ pub use errors::{
     as_classified, describe, Classification, ConfigDifference, ErrorClass, Failure, FluxError,
     HandlerError, HandlerResult, RejectionReason, ResourceKind, SchemaNotFoundError,
     SchemaValidationError, CONNECTION_REJECTED_CODE, INVALID_CREDENTIALS_CODE, INVALID_SCHEMA_CODE,
-    INVALID_TLS_OPTIONS_CODE, NOT_PROVISIONED_CODE, PERMISSION_DENIED_CODE, SCHEMA_NOT_FOUND_CODE,
+    INVALID_STATE_KEY_CODE, INVALID_TENANT_FOR_STATE_CODE, INVALID_TLS_OPTIONS_CODE,
+    MISSING_AGGREGATE_VERSION_CODE, NOT_PROVISIONED_CODE, PERMISSION_DENIED_CODE,
+    RESERVED_DOMAIN_CODE, SCHEMA_NOT_FOUND_CODE, STATE_CONFLICT_CODE, STATE_SUBJECT_MISMATCH_CODE,
 };
 pub use metrics::{
     ConnectionState, ConsumeOutcome, DlqReasonLabel, InMemoryMetrics, MetricsSink, NoMetrics,
-    PublishOutcome, DURATION_BUCKETS,
+    PublishOutcome, StateWriteOutcome, DURATION_BUCKETS,
 };
 pub use protocol::{
-    dlq_stream_name, dlq_subject, durable_name, inbox_prefix, is_dlq_subject, is_valid_subject,
-    parse_subject, source_uri, stream_name, subject_to_type, total_time_to_dlq,
-    validate_service_name, ParsedSubject, CANONICAL_BACKOFF, CONFORMANCE_LEVEL, DATA_CONTENT_TYPE,
-    DEFAULT_ACK_WAIT, DEFAULT_MAX_ACK_PENDING, DEFAULT_MAX_DELIVER, DLQ_STREAM_MAX_AGE,
-    DUPLICATE_WINDOW, MAX_MESSAGE_BYTES, PROTOCOL_NAME, PROTOCOL_VERSION, SPEC_VERSION,
-    STREAM_MAX_AGE,
+    dlq_stream_name, dlq_subject, durable_name, inbox_prefix, is_dlq_subject, is_reserved_domain,
+    is_valid_subject, parse_subject, source_uri, state_stream_name, stream_name, subject_to_type,
+    total_time_to_dlq, validate_service_name, ParsedSubject, CANONICAL_BACKOFF, CONFORMANCE_LEVEL,
+    DATA_CONTENT_TYPE, DEFAULT_ACK_WAIT, DEFAULT_MAX_ACK_PENDING, DEFAULT_MAX_DELIVER,
+    DLQ_STREAM_MAX_AGE, DUPLICATE_WINDOW, MAX_MESSAGE_BYTES, PROTOCOL_NAME, PROTOCOL_VERSION,
+    RESERVED_DOMAINS, SPEC_VERSION, STREAM_MAX_AGE,
 };
 pub use security::TlsOptions;
 #[cfg(feature = "signing")]
 pub use signing::{generate_key_pair, Signer, SigningOptions, VerificationMode, Verifier};
+pub use state::{
+    aggregate_version_of, build_state_event, build_state_tombstone, state_dataschema,
+    state_durable_name, state_subject, to_state_dlq_event, validate_state_key,
+    validate_state_tenant, DeleteOptions, GetOptions, PutOptions, State, StateContract, StateEntry,
+    StateEventInput, StateHandler, StateTombstoneInput, StateWatch, StateWrite, WatchOptions,
+    WriteOutcome, MAX_AGGREGATE_VERSION, SEQUENCE_CONFLICT_CODES, STATE_KEY_MAX_LEN,
+    STATE_MAX_ATTEMPTS, STATE_TENANT_MAX_LEN, TOMBSTONE_DATASCHEMA,
+};
 #[cfg(feature = "validation")]
 pub use validation::{SchemaBundle, ValidationMode, ValidationOptions, Validator};

@@ -455,6 +455,149 @@ comprometido que lee el subject entero—. Para eso hace falta el Modelo B (una 
 NATS por tenant). Lo que sí añade la firma es que alterar el `tenantid` en tránsito o en
 reposo **invalida la firma** (§4).
 
+## Estado replicado
+
+[10-state.md](../specification/10-state.md). Extensión **opcional** de v1.1 (capacidad `state`):
+el **valor actual** de un agregado, que su dueño publica y los demás observan. Un evento dice
+*qué pasó*; el estado lleva *el dato*. Sustituye a `GET /clientes/123` (`get`), a la carga
+inicial (`watch` entrega una foto completa) y al polling de cambios (`watch` sigue entregándolos),
+sin recrear la API que flux quiere eliminar. No va detrás de una feature: no añade ninguna
+dependencia y un servicio que no lo use no paga nada por él.
+
+```rust
+use serde_json::json;
+
+// El dueño escribe. `aggregateVersion` lo pone él: es el contador monotónico de SU agregado.
+let r = bus.state()
+    .put_with(
+        "clientes.cliente.v1", "cli-1",
+        &json!({ "clienteId": "cli-1", "nombre": "Ana", "email": "ana@example.com", "aggregateVersion": 7 }),
+        flux::PutOptions::default().with_tenant_id("acme"),
+    )
+    .await?;                                   // StateWrite { applied, outcome, revision, … }
+
+bus.state().delete("clientes.cliente.v1", "cli-1", 8).await?;      // una lápida, con su versión
+
+// Quien observa: una foto completa y después los cambios, por el mismo canal.
+let vigilante = bus.state()
+    .watch_with(
+        "clientes.cliente.v1",
+        |entrada: flux::StateEntry, _entrega| async move {
+            if entrada.deleted {
+                // El derecho de supresión se cumple AQUÍ: borra o anonimiza tu copia local.
+                return Ok(());
+            }
+            // UPDATE … WHERE aggregate_version < entrada.aggregate_version
+            Ok(())
+        },
+        flux::WatchOptions::default().with_tenant_id("acme").on_synced(|| println!("réplica lista")),
+    )
+    .await?;
+vigilante.wait_synced().await;                 // `on_synced` como Future
+
+let actual = bus.state().get_with("clientes.cliente.v1", "cli-1",
+    flux::GetOptions::default().with_tenant_id("acme")).await?;    // Option<StateEntry>
+```
+
+| Operación | Devuelve | Qué hace |
+|---|---|---|
+| `put` / `put_with` | `StateWrite { applied, outcome: ok \| stale, revision, attempts, own_write }` | Escritura **condicional**: lee la secuencia (`DIRECT.GET`), no escribe si la versión no avanza y publica con `Nats-Expected-Last-Subject-Sequence` |
+| `delete` / `delete_with` | `StateWrite` | `put` de una **lápida** con su `aggregate_version`; el valor anterior **sale del stream** |
+| `get` / `get_with` | `Option<StateEntry>` | Lectura puntual por `DIRECT.GET`. `None` si no existe **y** si hay lápida |
+| `watch` / `watch_with` | `StateWatch` | Durable `last_per_subject`: foto + cambios. `wait_synced()`, `is_synced()`, `unsubscribe()` |
+
+Lo que el SDK hace y no te dice:
+
+- **`stale` no es un error**, y una versión **igual** tampoco avanza. Sí lo es ignorarlo: un dueño
+  que necesita su valor en el estado y recibe `stale` tiene un contador que retrocede. **La
+  trampa:** borrar la fila y recrearla con `aggregateVersion: 1` da `stale` y la clave **sigue
+  borrada**, sin ningún error: una clave borrada solo se recrea con una versión **estrictamente
+  mayor** que la de su lápida.
+- **Reconoce su propia escritura** (paso 1b): si el acuse se pierde y el reintento relee su
+  propio `id`, el resultado es `ok` con `own_write: true`, no un `stale` con su propio dato. Por
+  eso el `id` y los bytes son **los mismos en todos los intentos**.
+- **Reconoce los dos códigos de conflicto de secuencia**: `10071` (un nodo) y `10164` (un cluster
+  bajo carrera, **sin número**). Un SDK que solo vea el 10071 pasa todo contra un NATS de un nodo y
+  no reintenta en producción. Tres intentos; agotados, [`FluxError::StateConflict`] (RETRYABLE).
+- **Todo se valida antes de la red**, en este orden: dominio reservado, clave, tenant,
+  `aggregateVersion`, clasificación, y con L3 el esquema. El broker **no** valida la clave
+  (acepta `*`, `a.b` —dos tokens: la entrada queda fuera de todo filtro— y 2000 caracteres).
+- **El tenant se resuelve** de la opción de la llamada, del evento en curso (un estado derivado en
+  un handler pertenece al tenant del evento que lo causó) y de `ConnectOptions::with_tenant_id`.
+  **No hay tenant por defecto**: sin ninguno, `INVALID_TENANT_FOR_STATE`, no `system`.
+- **Sin `classification`, un `put` usa `confidential`**, no el valor por defecto de la conexión; `restricted` se rechaza.
+- **Siempre por JetStream**: un `publish` de core a un subject de estado sobrescribe sin chequeo ni acuse.
+- **Sin `STREAM.INFO` del stream de estado**: lista todas las claves y todos los tenants. El stream
+  y el durable los aprovisiona `flux provision`; sin ellos, `NOT_PROVISIONED`, y para el stream el
+  mensaje nombra **las dos causas** (no existe, o existe sin `allow_direct`: se ven igual).
+- **`on_synced` se invoca una vez por `watch`**, con la foto ya procesada; con el contrato vacío, de
+  inmediato. Las entradas se procesan **una a una**, así que cuando llega la que lleva `pending == 0`
+  todas las anteriores han terminado.
+- Una entrada que el handler rechaza para siempre va a `dlq.state.<contrato>` **sin el dato**
+  (`data` es `{ key, revision }`) y **sin la firma**; un mensaje ilegible no se copia en ninguna
+  forma. El estado **no se reproduce** desde la DLQ: la recuperación es `flux state resync`. **El
+  mensaje de un error de tu handler no debe contener valores de la entrada**: acaba en `dlqerror`.
+
+### Los seis códigos
+
+| Código | Clase | Variante |
+|---|---|---|
+| `INVALID_TENANT_FOR_STATE` | PERMANENT | `FluxError::InvalidTenantForState` |
+| `INVALID_STATE_KEY` | PERMANENT | `FluxError::InvalidStateKey` |
+| `MISSING_AGGREGATE_VERSION` | PERMANENT (también al consumir) | `FluxError::MissingAggregateVersion` |
+| `STATE_SUBJECT_MISMATCH` | **POISON** | `FluxError::StateSubjectMismatch` |
+| `STATE_CONFLICT` | RETRYABLE | `FluxError::StateConflict` |
+| `RESERVED_DOMAIN` | PERMANENT | `FluxError::ReservedDomain` — también en `publish()` y `subscribe()` |
+
+Cada uno con `code()` y `class()` como `NotProvisioned`; la aplicación no puede sustituir el
+código. Un contrato mal formado (`clientes.cliente`) no es uno de los seis —la lista es
+**cerrada**— y es un `FluxError::InvalidSubject`.
+
+### Permisos exactos por rol
+
+Escritos a mano en [`tests/state.rs`](tests/state.rs) a partir de `protocol.json` → `state.acl` y
+**ejecutados**: el ciclo de aceptación (100 claves → observador nuevo → lápida → `get` = `None`)
+pasa con ellos **sin una sola violación del broker**, y quitar cada permiso falla con un error que
+nombra el subject. Un test cruza cada permiso con los patrones de `protocol.json`.
+
+| Rol | `publish` | `subscribe` |
+|---|---|---|
+| **Dueño** de `<dom>` | `state.<dom>.>` · `$JS.API.DIRECT.GET.STATE_<DOM>.state.<dom>.>` | `_INBOX.<servicio>.>` |
+| **Observador** de `<contrato>` y `<tenant>` (durable `<d>` = `flux::state_durable_name(servicio, contrato, Some(tenant))`) | `$JS.API.CONSUMER.INFO.STATE_<DOM>.<d>` · `$JS.API.CONSUMER.MSG.NEXT.STATE_<DOM>.<d>` · `$JS.ACK.STATE_<DOM>.<d>.>` · `$JS.API.DIRECT.GET.STATE_<DOM>.state.<dom>.<agr>.v<M>.<tenant>.*` · `dlq.state.<dom>.<agr>.v<M>` · `$JS.API.STREAM.INFO.DLQ_<DOM>` | `_INBOX.<servicio>.>` |
+
+- **Nunca `STREAM.INFO.STATE_<DOM>`** a un observador: con un `subjects_filter` lista todas las
+  claves y todos los tenants (A-39). Este SDK no lo usa.
+- `CONSUMER.CREATE.STATE_<DOM>.<d>.<filtro>` es **solo de desarrollo**: en producción el durable lo
+  crea `flux provision`, y el SDK lo encuentra con `CONSUMER.INFO` y compara su config con la pedida
+  (canónica + `last_per_subject` + el filtro): uno distinto es `ConsumerConfigMismatch`.
+- Los tres permisos del durable `<servicio>__dlq_state_<dom>` que `protocol.json` da al **dueño**
+  son para **leer** su DLQ de estado: este SDK no implementa ese lector y no los pide.
+- Un `ack` denegado no lanza (06-security.md §3.7): la entrada se reentrega para siempre. No puede
+  ser un `Result`, pero **no** pasa en silencio: el `logger` recibe la denegación.
+
+### Funciones puras, para el arnés cruzado
+
+`state_subject`, `build_state_event`, `build_state_tombstone` y `to_state_dlq_event` construyen los
+**bytes** exactos de `10-state.md` §2.6 **sin reloj ni UUID propios** (`id`, `time` y `dlqtime`
+vienen dados): los tests las comparan con el texto de la spec, con el fixture
+`cross-sdk-state-envelope.json` y con sus SHA-256, y comprueban que cambiar el `tenantid` cambia el
+hash. `state_dataschema(base, contrato)` deriva el `dataschema` de la URL base de esquemas.
+
+### Diferencias con Node
+
+- **`StateWrite` lleva dos campos más**, `attempts` y `own_write`: diagnóstico, no están en la spec.
+- **`StateEntry::data` es `Option<Box<RawValue>>`**, no un valor ya interpretado: conserva el orden
+  de claves y la fidelidad numérica, y se tipa con `StateEntry::data_as::<T>()`.
+- **El handler recibe `(StateEntry, Delivery)`**, no un `ctx` con control de ack: devolver `Ok(())`
+  es el ack explícito, como en los eventos.
+- **`delete` toma la versión como `u64`**: `-1` o `7.5` no se pueden expresar. `0` y `> 2^53 − 1`
+  siguen siendo `MISSING_AGGREGATE_VERSION`. En `put`, que recibe `data` serializable, se comprueban
+  todos los casos de la spec.
+- `ConnectOptions::servers` **no admite varias direcciones separadas por coma** con `async-nats`
+  0.50: lo documenta, pero un `&str` es **una** dirección y `connect()` responde «la lista de
+  servidores no se entiende». Los tests de cluster conectan a un nodo. No es del estado, pero lo
+  destapó, y está **sin arreglar**: no era del alcance de esta fase.
+
 ## Seguridad: permisos, inbox, TLS y credenciales
 
 [06-security.md §2 y §3](../specification/06-security.md). Lo que sigue **está ejecutado
@@ -957,7 +1100,7 @@ reintentaría 51 minutos lo que nunca se va a arreglar.
 |---|---|
 | `protocol.rs` | Constantes verificadas y naming (`parse_subject`, `subject_to_type`, `stream_name`, `durable_name`, `dlq_subject`, `source_uri`, `validate_service_name`, `inbox_prefix`) |
 | `envelope.rs` | `Event`, `build_event`, `serialize`, `parse_event`, `Event::data_as`, `to_dlq_event`, `strip_dlq_extensions` |
-| `errors.rs` | `ErrorClass`, `FluxError`, `Failure`, `Classification`, `as_classified`, `describe`, `SchemaValidationError`, `SchemaNotFoundError`, `ResourceKind` (y las variantes `NotProvisioned`, `PermissionDenied`) |
+| `errors.rs` | `ErrorClass`, `FluxError`, `Failure`, `Classification`, `as_classified`, `describe`, `SchemaValidationError`, `SchemaNotFoundError`, `ResourceKind` (y las variantes `NotProvisioned`, `PermissionDenied` y los seis códigos de estado) |
 | `classify.rs` | `Classifier`, `ClassifierOptions`, `UnknownPolicy`, `HttpError` |
 | `context.rs` | Propagación por task-local con override explícito |
 | `metrics.rs` | `MetricsSink`, `NoMetrics`, `InMemoryMetrics`, `DURATION_BUCKETS` y los enums de etiqueta |
@@ -965,26 +1108,29 @@ reintentaría 51 minutos lo que nunca se va a arreglar.
 | `validation.rs` | `Validator`, `SchemaBundle`, `ValidationOptions`, `ValidationMode` — feature `validation` |
 | `client.rs` | `connect`, `Bus::publish`, `Bus::subscribe`, `Bus::close`, `Bus::replay_from_dlq`, `TenantIsolation`, `Credentials` |
 | `security.rs` | `TlsOptions`; el registro de denegaciones del broker y la validación de credenciales y de errores de conexión |
+| `state.rs` | Estado replicado: `Bus::state()`, `State::{put, delete, get, watch}`, `StateEntry`, `StateWrite`, los constructores puros (`state_subject`, `build_state_event`, `build_state_tombstone`, `to_state_dlq_event`) y sus tests unitarios |
 | `tests/cross_sdk.rs` | Los fixtures compartidos de `conformance/cases/`, sin broker |
 | `tests/integration.rs` | Conformidad contra un NATS real |
 | `tests/security.rs` | Seguridad contra un `nats-server` real con ACLs, TLS, nkey y modo operador/JWT |
+| `tests/state.rs` | Estado replicado contra un `nats-server` real: los escenarios de `state-semantics.json` como datos (un nodo y un cluster de tres), permisos exactos por rol, DLQ de estado, validación L3 y firma |
 
 ## Desarrollo
 
 ```bash
 cargo fmt --check
 cargo clippy --all-targets --all-features -- -D warnings
-cargo test --all-features        # 248 tests
+cargo test --all-features        # 358 tests
 ```
 
 | Suite | Tests (`--all-features`) | Sin features | Requiere broker |
 |---|--:|--:|---|
-| Unitarios (en cada módulo) | 194 | 146 | no |
+| Unitarios (en cada módulo) | 270 | 218 | no |
 | `tests/cross_sdk.rs` | 3 | 3 | no |
 | `tests/integration.rs` | 17 | 13 | **sí** (NATS en `FLUX_NATS_URL`) |
-| `tests/security.rs` | 23 | 23 | **sí** (binario `nats-server`, `NATS_SERVER`) |
-| Doctests | 11 | 9 | no |
-| **Total** | **248** | **194** | |
+| `tests/security.rs` | 30 | 30 | **sí** (binario `nats-server`, `NATS_SERVER`) |
+| `tests/state.rs` | 26 | 24 | **sí** (binario `nats-server`, `NATS_SERVER`) |
+| Doctests | 12 | 10 | no |
+| **Total** | **358** | **298** | |
 
 La diferencia entre las dos columnas son los tests de `signing` y `validation`, que solo
 existen con su feature activa. **Conviene ejecutar las dos formas en CI**: sin ellas se
@@ -1007,8 +1153,11 @@ docker compose up -d                             # en la raíz del repo
 cargo test --all-features --test integration     # 17 tests contra NATS real
 ```
 
-Los de seguridad no necesitan Docker: arrancan su propio `nats-server` (ver
-[Seguridad](#seguridad-permisos-inbox-tls-y-credenciales)).
+Los de seguridad y los de estado no necesitan Docker: arrancan su propio `nats-server` (ver
+[Seguridad](#seguridad-permisos-inbox-tls-y-credenciales) y
+[Estado replicado](#estado-replicado)). Los de estado usan los puertos de `FLUX_TEST_PORT_BASE`
+(por defecto 4500) más 50, hasta 6 a la vez —el cluster de tres nodos—. `tests/state.rs` ejecuta,
+además de sus propios casos, **`conformance/cases/state-semantics.json` como datos** con la API del SDK.
 
 ```bash
 GOBIN=$PWD/bin go install github.com/nats-io/nats-server/v2@v2.14.5      # Go 1.25
