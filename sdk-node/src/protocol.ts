@@ -53,7 +53,10 @@ export const RESERVED_DOMAINS: readonly string[] = ["dlq", "state", "rpc", "syst
  * reservado. Se comprueba ANTES que la forma: `dlq.pedidos.pedido.v1.creado` tiene cinco tokens
  * y «debe tener cuatro» no diría qué pasa de verdad.
  */
-export function assertNotReservedDomain(subjectOrContract: string, what: "subject" | "contrato" = "subject"): void {
+export function assertNotReservedDomain(
+  subjectOrContract: string,
+  what: "subject" | "contrato" | "operación" = "subject",
+): void {
   const domain = String(subjectOrContract).split(".")[0];
   if (RESERVED_DOMAINS.includes(domain)) throw new ReservedDomainError(domain, RESERVED_DOMAINS, what);
 }

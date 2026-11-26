@@ -168,13 +168,19 @@ export class ReservedDomainError extends PermanentError {
   constructor(
     readonly domain: string,
     readonly reserved: readonly string[],
-    readonly what: "subject" | "contrato" = "subject",
+    readonly what: "subject" | "contrato" | "operación" = "subject",
   ) {
     super(
       `el dominio "${domain}" está reservado al protocolo (reservados: ${reserved.join(", ")}) y no ` +
-        `puede usarse en un ${what}. Cada uno es un espacio de nombres propio —\`state.\`, \`dlq.\`, ` +
-        `\`rpc.\`—, y un evento publicado ahí no pasaría por el chequeo de secuencia del estado ` +
-        `(10-state.md §2.7). Elige otro dominio.`,
+        `puede usarse en ${what === "operación" ? "una" : "un"} ${what}. Cada uno es un ` +
+        `espacio de nombres propio —\`state.\`, \`dlq.\`, \`rpc.\`—, y un evento publicado ahí no pasaría por el ` +
+        `chequeo de secuencia del estado (10-state.md §2.7). Elige otro dominio.` +
+        // El nombre de una operación NO lleva el prefijo: el SDK lo pone (11-request-reply.md §2.2).
+        (what === "operación" && domain === "rpc"
+          ? ` Si lo que escribiste es el subject de NATS (\`rpc.clientes.cliente.v1.obtener\`), quita el prefijo ` +
+            `\`rpc.\`: lo pone el SDK, y el nombre de la operación es \`clientes.cliente.v1.obtener\` ` +
+            `(11-request-reply.md §2.2).`
+          : ""),
       { code: "RESERVED_DOMAIN" },
     );
     this.name = "ReservedDomainError";
@@ -188,12 +194,19 @@ export class ReservedDomainError extends PermanentError {
  */
 export class InvalidDataClassificationError extends PermanentError {
   readonly code = "INVALID_DATACLASSIFICATION";
-  constructor(readonly classification: unknown) {
+  constructor(
+    readonly classification: unknown,
+    /** `rpc`: una petición admite las cuatro (`restricted` incluida); lo único inválido es salirse del enum. */
+    readonly ambito: "estado" | "rpc" = "estado",
+  ) {
     super(
-      `la clasificación ${citar(classification)} no se admite en estado: solo public, internal o ` +
-        `confidential. \`restricted\` (credenciales, salud, financiero: 24 h de retención) no cabe ` +
-        `en un almacén que no caduca, y no es una decisión que deba tomarse por omisión ` +
-        `(10-state.md §7).`,
+      ambito === "rpc"
+        ? `la clasificación ${citar(classification)} no es válida: public, internal, confidential o restricted ` +
+            `(01-envelope.md §3.1). El error de una petición/respuesta es siempre \`internal\` y no se elige.`
+        : `la clasificación ${citar(classification)} no se admite en estado: solo public, internal o ` +
+            `confidential. \`restricted\` (credenciales, salud, financiero: 24 h de retención) no cabe ` +
+            `en un almacén que no caduca, y no es una decisión que deba tomarse por omisión ` +
+            `(10-state.md §7).`,
       { code: "INVALID_DATACLASSIFICATION" },
     );
     this.name = "InvalidDataClassificationError";

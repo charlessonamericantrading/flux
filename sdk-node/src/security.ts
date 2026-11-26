@@ -110,17 +110,20 @@ export class PermissionDeniedError extends PermanentError {
     readonly service: string,
     readonly operation: "publish" | "subscribe",
     readonly subject: string,
-    opts: { cause?: unknown } = {},
+    /** `hint`: cómo se arregla ESTA denegación, si el SDK lo sabe (la petición/respuesta lo sabe). */
+    opts: { cause?: unknown; hint?: string } = {},
   ) {
     super(
       `el broker denegó ${operation === "publish" ? "publicar en" : "suscribirse a"} ` +
         `"${subject}" a "${service}": su ACL no concede ese permiso. ` +
-        (subject.startsWith("$JS.")
-          ? `Es un permiso de JetStream, y se concede exacto por durable: una ACL generada ` +
-            `antes de la v1.1 (que solo habla de subjects de dominio) no los incluye. ` +
-            `Ver «Seguridad: permisos, inbox, TLS y credenciales» en sdk-node/README.md ` +
-            `(06-security.md §3).`
-          : `Ver 06-security.md §3.`),
+        (opts.hint
+          ? `${opts.hint} `
+          : subject.startsWith("$JS.")
+            ? `Es un permiso de JetStream, y se concede exacto por durable: una ACL generada ` +
+              `antes de la v1.1 (que solo habla de subjects de dominio) no los incluye. ` +
+              `Ver «Seguridad: permisos, inbox, TLS y credenciales» en sdk-node/README.md ` +
+              `(06-security.md §3).`
+            : `Ver 06-security.md §3.`),
       { code: "PERMISSION_DENIED", cause: opts.cause },
     );
     this.name = "PermissionDeniedError";
@@ -374,10 +377,18 @@ export function isNotFound(e: unknown, kind: "stream" | "consumer"): boolean {
   return enCadena(e, (x) => (x.code === code ? true : undefined)) === true;
 }
 
-/** Normaliza el subject de un ack (lleva secuencia y marca de tiempo) a `…<durable>.>`. */
+/**
+ * Normaliza el subject de un ack (lleva secuencia y marca de tiempo) a `…<durable>.>`, y el de una
+ * respuesta a una petición (`_INBOX.<servicio>.<nuid>.<token>`, distinto en cada petición) a
+ * `_INBOX.<servicio>.>`: sin ello, un dueño sin `allow_responses` registraría una línea por cada
+ * respuesta denegada, y el aviso de «una vez por subject» no avisaría de nada.
+ */
 export function normalizeDeniedSubject(subject: string): string {
-  if (!subject.startsWith("$JS.ACK.")) return subject;
-  return subject.split(".").slice(0, 4).join(".") + ".>";
+  if (subject.startsWith("$JS.ACK.")) return subject.split(".").slice(0, 4).join(".") + ".>";
+  if (subject.startsWith("_INBOX.") && subject.split(".").length > 3) {
+    return subject.split(".").slice(0, 2).join(".") + ".>";
+  }
+  return subject;
 }
 
 // Verificación de certificados de `node:tls`. Un servidor cuyo certificado no encaja con

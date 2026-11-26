@@ -24,6 +24,13 @@ export interface SchemaBundle {
    * un bundle generado antes de la capacidad `state` no lo trae.
    */
   state?: Record<string, string>;
+  /**
+   * operación (`clientes.cliente.v1.calcular-descuento`, sin `rpc.`) → URI del esquema de la petición y de
+   * la respuesta, cada uno de la versión más alta de su mayor (11-request-reply.md §11.1). Es lo que
+   * resuelve el `dataschema` de una petición sin ir a la red. Opcional: un bundle generado antes de la
+   * capacidad `rpc` no lo trae.
+   */
+  rpc?: Record<string, { request: string; reply: string }>;
   /** URI → JSON Schema. */
   schemas: Record<string, object>;
 }
@@ -64,6 +71,7 @@ export interface ValidationOptions {
  * clasificación con la de esta referencia.
  */
 export class SchemaValidationError extends PermanentError {
+  readonly code: string = "INVALID_SCHEMA";
   constructor(
     readonly subject: string,
     readonly dataschema: string,
@@ -80,6 +88,7 @@ export class SchemaValidationError extends PermanentError {
 
 /** También PERMANENT: si el esquema no está en el bundle, reintentar no lo traerá. */
 export class SchemaNotFoundError extends PermanentError {
+  readonly code: string = "SCHEMA_NOT_FOUND";
   constructor(readonly subject: string, readonly dataschema: string) {
     super(
       `no hay esquema para "${subject}" (${dataschema}) en el bundle. ` +
@@ -93,15 +102,25 @@ export class SchemaNotFoundError extends PermanentError {
 type ValidateFn = (data: unknown) => string[] | null;
 
 /**
+ * El validador que devuelve `createValidator`. Se invoca como siempre —`strict` lanza, `warn` registra y
+ * sigue—, y además expone **`check`**: el mismo resultado como valor, sin lanzar ni registrar. La
+ * petición/respuesta lo necesita porque en `warn` hay que *contar* el fallo (`invalid_schema`) y seguir, y
+ * en `strict` hay que reescribir el mensaje («la petición no cumple…» / «la respuesta no cumple…»): con
+ * solo «lanza o no», un fallo en `warn` es indistinguible de un éxito.
+ */
+export type Validator = ((event: FluxEvent, subject: string) => void) & {
+  readonly mode: "warn" | "strict";
+  check(event: FluxEvent, subject: string): SchemaValidationError | SchemaNotFoundError | null;
+};
+
+/**
  * Compila los validadores del bundle.
  *
  * `ajv` se resuelve por importación dinámica y es una dependencia OPCIONAL: L3 es
  * opt-in, así que su coste también debe serlo. Un servicio en L2 no debería arrastrar
  * un validador de JSON Schema que no va a ejecutar.
  */
-export async function createValidator(
-  options: ValidationOptions,
-): Promise<((event: FluxEvent, subject: string) => void) | null> {
+export async function createValidator(options: ValidationOptions): Promise<Validator | null> {
   const mode = options.mode ?? "off";
   if (mode === "off") return null;
 
@@ -147,19 +166,24 @@ export async function createValidator(
     });
   }
 
-  return (event, subject) => {
+  const check: Validator["check"] = (event, subject) => {
     const validate = compiled.get(event.dataschema);
-    if (!validate) {
-      if (mode === "strict") throw new SchemaNotFoundError(subject, event.dataschema);
-      console.warn(`[flux] sin esquema para ${subject} (${event.dataschema})`);
-      return;
-    }
+    if (!validate) return new SchemaNotFoundError(subject, event.dataschema);
     const errors = validate(event.data);
-    if (!errors) return;
-    const err = new SchemaValidationError(subject, event.dataschema, errors);
-    if (mode === "strict") throw err;
-    console.warn(`[flux] ${err.message}`);
+    return errors ? new SchemaValidationError(subject, event.dataschema, errors) : null;
   };
+
+  const validar = (event: FluxEvent, subject: string): void => {
+    const err = check(event, subject);
+    if (!err) return;
+    if (mode === "strict") throw err;
+    console.warn(
+      err instanceof SchemaNotFoundError
+        ? `[flux] sin esquema para ${subject} (${event.dataschema})`
+        : `[flux] ${err.message}`,
+    );
+  };
+  return Object.assign(validar, { mode, check }) as Validator;
 }
 
 /** Resuelve el `dataschema` de un subject desde el bundle. */
@@ -170,4 +194,16 @@ export function schemaUriFor(bundle: SchemaBundle, subject: string): string | un
 /** Resuelve el `dataschema` de un CONTRATO DE ESTADO desde el índice `state` del bundle. */
 export function stateSchemaUriFor(bundle: SchemaBundle, contract: string): string | undefined {
   return bundle.state?.[contract];
+}
+
+/**
+ * Resuelve el `dataschema` de una OPERACIÓN (`request` o `reply`) desde el índice `rpc` del bundle
+ * (11-request-reply.md §11.1): **sin red**, y con la versión más alta de su mayor.
+ */
+export function rpcSchemaUriFor(
+  bundle: SchemaBundle,
+  operation: string,
+  lado: "request" | "reply",
+): string | undefined {
+  return bundle.rpc?.[operation]?.[lado];
 }
