@@ -63,6 +63,7 @@ import {
   type RpcErrorData,
 } from "../src/index.js";
 import { contextFromEvent, runWithContext } from "../src/context.js";
+import { esErrorDeUnaPeticionIlegible } from "../src/rpc.js";
 import { normalizeDeniedSubject } from "../src/security.js";
 import { ConexionFalsa, RedEnMemoria, sleep, type MensajeFalso } from "./rpc-fakes.js";
 
@@ -890,6 +891,84 @@ describe("request() — las cinco comprobaciones de la respuesta (§4.3) → RPC
     ]) {
       await conRespuesta((_r, req) => ({ ...error(req, {}), data: malo }));
     }
+  });
+
+  describe("la excepción única de la comprobación 4 (§4.3): el error de una petición que quien responde no pudo leer", () => {
+    const ID_ERROR = "01924f91-5d13-7b85-a3e1-6a7b8c9d0e22";
+    /** Lo que contesta un responder EN BRUTO a una petición ilegible (§5.2): `correlationid` = su propio `id` y `tenantid: system`. */
+    const errorIlegible = (req: FluxEvent & Record<string, unknown>, data: object = { class: "permanent", code: "MALFORMED_JSON", message: "la petición no es un CloudEvent válido" }, muta: (e: Record<string, unknown>) => void = () => {}) => {
+      const e = {
+        specversion: "1.0", id: ID_ERROR, source: "/produccion/crm-api", type: "com.flux.rpc.error.v1",
+        time: "2026-08-20T10:41:07.333Z", datacontenttype: "application/json",
+        dataschema: "https://schemas.internal/system/rpc/error/1.0.0.json",
+        correlationid: ID_ERROR, tenantid: "system", producerversion: "2.1.0", dataclassification: "internal",
+        causationid: req.id, data,
+      } as Record<string, unknown>;
+      muta(e);
+      return JSON.stringify(e);
+    };
+
+    test("SÍ pasa: quien llama ve el código del sobre (MALFORMED_JSON, INVALID_RPC_CALL…) como PermanentError, no RPC_INVALID_REPLY", async () => {
+      for (const code of ["MALFORMED_JSON", "MISSING_REQUIRED_EXTENSION", "INVALID_RPC_CALL", "WRONG_ATTRIBUTE_TYPE"]) {
+        const red = new RedEnMemoria();
+        responderCon(red, (req) => errorIlegible(req, { class: "permanent", code, message: "la petición no se pudo leer" }));
+        const { bus, metricas } = await servicio(red);
+        await assert.rejects(bus.request(OP, PETICION, { timeoutMs: 1000 }), (e: RpcPermanentError) => {
+          assert.ok(e instanceof RpcPermanentError, `${e.name}: ${e.message}`);
+          assert.equal(e.code, code);
+          assert.equal(e.fluxClass, ErrorClass.PERMANENT);
+          return true;
+        });
+        // es un error del que responde, no un incidente de respuesta ajena: cuenta como `permanent`, no `invalid_reply`
+        assert.equal(metricas.snapshot().counters.get(`flux_rpc_client_requests_total{operation="${OP}",outcome="permanent"}`), 1);
+        assert.equal(metricas.snapshot().counters.get(`flux_rpc_client_requests_total{operation="${OP}",outcome="invalid_reply"}`), undefined);
+      }
+    });
+
+    /** Debe dar RPC_INVALID_REPLY: la excepción es ESTRECHA. */
+    async function noPasa(contesta: (req: FluxEvent & Record<string, unknown>) => string) {
+      const red = new RedEnMemoria();
+      responderCon(red, contesta);
+      const { bus } = await servicio(red);
+      await assert.rejects(bus.request(OP, PETICION, { timeoutMs: 1000 }), (e: Error & { code?: string }) => {
+        assert.equal(e.code, "RPC_INVALID_REPLY", `${e.name}: ${e.message}`);
+        return true;
+      });
+    }
+
+    test("la comprobación 3 SIGUE en pie: sin `causationid`, o con el de otra petición, es RPC_INVALID_REPLY", async () => {
+      await noPasa((req) => errorIlegible(req, undefined, (e) => { delete e.causationid; }));
+      await noPasa((req) => errorIlegible(req, undefined, (e) => { e.causationid = "01924f91-0000-7000-8000-000000000000"; }));
+    });
+
+    test("es ESTRECHA: solo un ERROR con `tenantid: system` Y `correlationid` igual a su propio `id`", async () => {
+      // `tenantid: system` pero con un `correlationid` que no es el suyo ni el de la petición
+      await noPasa((req) => errorIlegible(req, undefined, (e) => { e.correlationid = "otro-flujo"; }));
+      // `correlationid` propio pero con un tenant que no es `system` ni el de la petición
+      await noPasa((req) => errorIlegible(req, undefined, (e) => { e.tenantid = "globex"; }));
+      // una RESPUESTA (no un error) con la misma forma: no es lo que la excepción cubre
+      await noPasa((req) => JSON.stringify({
+        ...JSON.parse(texto(encodeRpcMessage(respuestaBuena(req)))), id: ID_ERROR, correlationid: ID_ERROR, tenantid: "system",
+      }));
+    });
+
+    test("la quinta comprobación SIGUE en pie: el `data` del error ilegible debe cumplir el esquema del error", async () => {
+      await noPasa((req) => errorIlegible(req, { class: "poison", code: "MALFORMED_JSON", message: "m" }));
+      await noPasa((req) => errorIlegible(req, { class: "permanent", code: "malformed_json", message: "m" }));
+    });
+
+    test("CONTROL: un error legítimo de una petición LEÍDA sigue exigiendo heredar `correlationid` y `tenantid`", async () => {
+      await noPasa((req) => errorIlegible(req, undefined, (e) => { e.correlationid = req.correlationid; e.tenantid = "globex"; }));
+      await noPasa((req) => errorIlegible(req, undefined, (e) => { e.correlationid = "otra-cadena"; e.tenantid = req.tenantid; }));
+    });
+
+    test("el predicado: la forma exacta, y solo para un error", () => {
+      const e = { id: ID_ERROR, correlationid: ID_ERROR, tenantid: "system" } as unknown as FluxEvent;
+      assert.equal(esErrorDeUnaPeticionIlegible(e, true), true);
+      assert.equal(esErrorDeUnaPeticionIlegible(e, false), false, "una respuesta no es un error");
+      assert.equal(esErrorDeUnaPeticionIlegible({ ...e, tenantid: "acme" } as FluxEvent, true), false);
+      assert.equal(esErrorDeUnaPeticionIlegible({ ...e, correlationid: "x" } as FluxEvent, true), false);
+    });
   });
 
   test("el acuse de un stream (`{\"stream\":…,\"seq\":…}`, A-18/A-67) es RPC_INVALID_REPLY y APUNTA a `flux doctor`", async () => {

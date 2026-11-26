@@ -425,14 +425,18 @@ export function validarRespuesta(peticion, bytes, { showData = false } = {}) {
         "Una respuesta DEBE llevar como `causationid` el `id` de la petición (11-request-reply.md §3.2).",
     );
   }
-  // 4. hereda `correlationid` y `tenantid`
-  if (e.correlationid !== peticion.correlationid) {
-    throw invalida("su `correlationid` no es el de la petición: una respuesta lo HEREDA sin modificar (11-request-reply.md §3.2).");
-  }
-  if (e.tenantid !== peticion.tenantid) {
-    throw invalida(
-      "su `tenantid` no es el de la petición: una respuesta lo hereda sin modificar. Un responder que cambia de tenant mezcla datos de dos (09-multitenancy.md).",
-    );
+  // 4. hereda `correlationid` y `tenantid`. EXCEPCIÓN ÚNICA (§4.3.4): el error de una petición que quien responde no pudo
+  // leer (§5.2) no tiene nada que heredar y lleva `correlationid` propio y `tenantid: system`; a quien llama le basta la
+  // comprobación 3 para atribuirlo y ver el código del sobre (`MALFORMED_JSON`, `INVALID_RPC_CALL`…) en vez de RPC_INVALID_REPLY.
+  if (!esErrorDeUnaPeticionIlegible(e, esError)) {
+    if (e.correlationid !== peticion.correlationid) {
+      throw invalida("su `correlationid` no es el de la petición: una respuesta lo HEREDA sin modificar (11-request-reply.md §3.2).");
+    }
+    if (e.tenantid !== peticion.tenantid) {
+      throw invalida(
+        "su `tenantid` no es el de la petición: una respuesta lo hereda sin modificar. Un responder que cambia de tenant mezcla datos de dos (09-multitenancy.md).",
+      );
+    }
   }
 
   // 5. si es un error, su `data` cumple el esquema del error
@@ -445,6 +449,15 @@ export function validarRespuesta(peticion, bytes, { showData = false } = {}) {
   }
   return { clase: "reply", evento: e };
 }
+
+/**
+ * ¿Es el error que contesta quien responde a una petición que NO pudo leer (§5.2)? Sin sobre no hay `correlationid` ni
+ * `tenantid` que heredar: el error lleva `correlationid` igual a su PROPIO `id` y `tenantid: system`. Es la única respuesta a la
+ * que quien llama no le exige heredar los dos (§4.3, comprobación 4). La forma es estrecha a propósito —un `tenantid: system`
+ * cualquiera, o un `correlationid` cualquiera, no basta— y la comprobación 3 sigue en pie: es la que la atribuye.
+ */
+export const esErrorDeUnaPeticionIlegible = (e, esError) =>
+  esError && e.tenantid === "system" && e.correlationid === e.id;
 
 /** Lo que incumple `data` del esquema del error (`schemas/system/rpc/error/1.0.0.json`): solo rutas y reglas, nunca valores. */
 export function erroresDatosError(d) {

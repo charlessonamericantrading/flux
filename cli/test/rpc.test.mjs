@@ -641,6 +641,30 @@ conBroker("flux call: una petición a mano, con el sobre de un SDK y los código
       assert.match(j.error.message, esperado);
     });
   }
+  // EXCEPCIÓN ÚNICA de la comprobación 4 (§4.3): el error de una petición que quien responde no pudo leer lleva `correlationid`
+  // propio y `tenantid: system` (§5.2). Un responder en bruto contra un broker real lo contesta.
+  const ILEGIBLE = ({ error, ...ev }) => ({ ...ev, correlationid: ev.id, tenantid: "system", data: { class: "permanent", code: "MALFORMED_JSON", message: "la petición no es un CloudEvent válido de flux" } });
+  test("EL ERROR DE UNA PETICIÓN ILEGIBLE pasa la comprobación 4: la CLI da el código del sobre (MALFORMED_JSON), PERMANENT, no RPC_INVALID_REPLY", async () => {
+    descuento({ handler: async () => ({ error: { class: "permanent", code: "X", message: "m" }, cambios: ILEGIBLE }) });
+    const h = await llama([DESCUENTO, ...BASE, "--data", PETICION, "--json"]);
+    assert.equal(h.code, 1);
+    const j = json(h);
+    assert.deepEqual([j.error.code, j.error.class, j.error.origin], ["MALFORMED_JSON", "permanent", "remote"]);
+    assert.equal(j.reply.type, "com.flux.rpc.error.v1");
+    assert.match((await llama([DESCUENTO, ...BASE, "--data", PETICION])).err, /^✗ MALFORMED_JSON \[PERMANENT\]/);
+  });
+  test("CONTROL: la excepción es estrecha (un `correlationid` que no es el propio, un tenant ajeno, sin `causationid`) → RPC_INVALID_REPLY", async () => {
+    for (const cambia of [
+      (ev) => ({ ...ILEGIBLE(ev), correlationid: "otro-flujo" }),
+      (ev) => ({ ...ILEGIBLE(ev), tenantid: "globex" }),
+      (ev) => { const { causationid, ...sin } = ILEGIBLE(ev); return sin; },
+    ]) {
+      const r = descuento({ handler: async () => ({ error: { class: "permanent", code: "X", message: "m" }, cambios: cambia }) });
+      const j = json(await llama([DESCUENTO, ...BASE, "--data", PETICION, "--json"]));
+      assert.equal(j.error.code, "RPC_INVALID_REPLY");
+      await parado(r);
+    }
+  });
   test("una «respuesta» que es basura (no JSON), o un error con `class: poison` o sin `code`, es RPC_INVALID_REPLY", async () => {
     const basura = sirvo({ operacion: DESCUENTO, handler: async () => ({ crudo: new TextEncoder().encode("tarjeta 4111-1111") }) });
     const h = await llama([DESCUENTO, ...BASE, "--data", PETICION, "--json"]);

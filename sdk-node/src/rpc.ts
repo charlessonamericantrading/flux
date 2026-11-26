@@ -809,15 +809,20 @@ export class RpcClient {
           `${typeof event.causationid === "string" ? JSON.stringify(truncar(event.causationid, 80)) : "no lo trae"}`,
       );
     }
-    // 4. Su `correlationid` y su `tenantid` son los de la petición.
-    if (event.correlationid !== p.event.correlationid) {
-      throw invalida("su `correlationid` no es el de la petición: una respuesta hereda el de la petición");
-    }
-    if (event.tenantid !== p.event.tenantid) {
-      throw invalida("su `tenantid` no es el de la petición: una respuesta hereda el de la petición, sin modificar");
+    // 4. Su `correlationid` y su `tenantid` son los de la petición. EXCEPCIÓN ÚNICA (§4.3.4): el error de una petición que
+    // quien responde no pudo leer (§5.2) no tiene nada que heredar y lleva `correlationid` propio y `tenantid: system`; a
+    // quien llama le basta la comprobación 3 (su `causationid` es el `id` de la petición, que solo él conoce) para
+    // atribuirlo y ver el código del sobre (`INVALID_RPC_CALL`, `MALFORMED_JSON`…) en vez de `RPC_INVALID_REPLY`.
+    const esError = event.type === RPC_ERROR_TYPE;
+    if (!esErrorDeUnaPeticionIlegible(event, esError)) {
+      if (event.correlationid !== p.event.correlationid) {
+        throw invalida("su `correlationid` no es el de la petición: una respuesta hereda el de la petición");
+      }
+      if (event.tenantid !== p.event.tenantid) {
+        throw invalida("su `tenantid` no es el de la petición: una respuesta hereda el de la petición, sin modificar");
+      }
     }
     // 5. Si es un error, su `data` cumple el esquema del error.
-    const esError = event.type === RPC_ERROR_TYPE;
     if (esError) {
       const problema = rpcErrorDataProblem(event.data);
       if (problema) throw invalida(`el error no cumple su esquema (${problema})`);
@@ -1416,6 +1421,17 @@ export class RpcClient {
     const tp = await activeTraceparent();
     return tp ? { traceparent: tp } : {};
   }
+}
+
+/**
+ * ¿Es el error que contesta quien responde a una petición que **no pudo leer** (11-request-reply.md §5.2)? Sin sobre no hay
+ * `correlationid` ni `tenantid` que heredar: el error lleva `correlationid` igual a **su propio `id`** y `tenantid: system`.
+ * Es la única respuesta a la que quien llama no le exige heredar los dos (§4.3, comprobación 4): la forma es estrecha a
+ * propósito —un `tenantid: system` cualquiera, o un `correlationid` cualquiera, no basta—, y la comprobación 3 (`causationid`
+ * = el `id` de la petición) sigue en pie y es la que la atribuye.
+ */
+export function esErrorDeUnaPeticionIlegible(event: FluxEvent, esError: boolean): boolean {
+  return esError && event.tenantid === "system" && event.correlationid === event.id;
 }
 
 /** Lo que la respuesta hereda de un sobre de petición ya leído. */

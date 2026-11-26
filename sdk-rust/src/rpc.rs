@@ -1223,12 +1223,23 @@ pub(crate) enum Checked {
     Failure(RpcErrorBody, Event),
 }
 
+/// ¿Es el error que contesta quien responde a una petición que **no pudo leer** (§5.2)? Sin sobre no
+/// hay `correlationid` ni `tenantid` que heredar: el error lleva `correlationid` igual a **su propio
+/// `id`** y `tenantid: system`. Es la única respuesta a la que quien llama no le exige heredar los dos
+/// (§4.3, comprobación 4). La forma es estrecha a propósito —un `tenantid: system` cualquiera, o un
+/// `correlationid` cualquiera, no basta—, y la comprobación 3 (`causationid` = el `id` de la
+/// petición) sigue en pie y es la que la atribuye.
+pub(crate) fn is_error_of_unreadable_request(event: &Event, is_error: bool) -> bool {
+    is_error && event.tenantid == "system" && event.correlationid == event.id
+}
+
 /// Las comprobaciones de §4.3: **si falla cualquiera, `RPC_INVALID_REPLY`** (PERMANENT).
 ///
 /// 1. Es un **CloudEvent válido**.
 /// 2. Su `type` es el de la respuesta de esa operación o `com.flux.rpc.error.v1`.
 /// 3. Su `causationid` es el `id` de la petición.
-/// 4. Su `correlationid` y su `tenantid` son los de la petición.
+/// 4. Su `correlationid` y su `tenantid` son los de la petición. **Excepción única**: el error de una
+///    petición ilegible ([`is_error_of_unreadable_request`]) no hereda ninguno de los dos.
 /// 5. Si es un error, su `data` cumple el esquema del error.
 ///
 /// Una respuesta que no es de esta petición es **un incidente** —un productor roto, un stream mal
@@ -1272,17 +1283,23 @@ pub(crate) fn check_reply(
                 .into(),
         ));
     }
-    // 4. `correlationid` y `tenantid` heredados, sin modificar.
-    if event.correlationid != expect.request.correlationid {
-        return Err(invalid(
-            "su `correlationid` no es el de la petición: una respuesta lo hereda sin modificar"
-                .into(),
-        ));
-    }
-    if event.tenantid != expect.request.tenantid {
-        return Err(invalid(
-            "su `tenantid` no es el de la petición: una respuesta lo hereda sin modificar".into(),
-        ));
+    // 4. `correlationid` y `tenantid` heredados, sin modificar. EXCEPCIÓN ÚNICA (§4.3.4): el error de
+    // una petición que quien responde no pudo leer (§5.2) no tiene nada que heredar, y a quien llama le
+    // basta la comprobación 3 para atribuirlo y ver el código del sobre (`MALFORMED_JSON`,
+    // `INVALID_RPC_CALL`…) en vez de `RPC_INVALID_REPLY`.
+    if !is_error_of_unreadable_request(&event, is_error) {
+        if event.correlationid != expect.request.correlationid {
+            return Err(invalid(
+                "su `correlationid` no es el de la petición: una respuesta lo hereda sin modificar"
+                    .into(),
+            ));
+        }
+        if event.tenantid != expect.request.tenantid {
+            return Err(invalid(
+                "su `tenantid` no es el de la petición: una respuesta lo hereda sin modificar"
+                    .into(),
+            ));
+        }
     }
     // 5. Un error cumple el esquema del error.
     if is_error {
@@ -3722,6 +3739,94 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(comprueba(&llega(&e)), Ok(Checked::Failure(_, _))));
+    }
+
+    /// El error que contesta quien responde a una petición que **no pudo leer** (§5.2): el que construye
+    /// `build_rpc_error` con `ReplyTo::Unreadable`.
+    fn error_de_una_peticion_ilegible(request_id: Option<&str>, code: &str) -> Event {
+        let mut input = error_input("rpc-error-handler");
+        input.reply_to = ReplyTo::Unreadable {
+            request_id: request_id.map(str::to_string),
+        };
+        input.error = RpcErrorBody {
+            class: ErrorClass::Permanent,
+            code: code.into(),
+            message: "la petición no es un CloudEvent válido de flux".into(),
+            retry_after_ms: None,
+        };
+        build_rpc_error(input).unwrap()
+    }
+
+    /// EXCEPCIÓN ÚNICA de la comprobación 4 (§4.3): el error de una petición ilegible lleva `correlationid`
+    /// propio y `tenantid: system`, y a quien llama le basta la comprobación 3 para atribuirlo.
+    #[test]
+    fn el_error_de_una_peticion_ilegible_pasa_y_quien_llama_ve_el_codigo_del_sobre() {
+        let (_, request) = peticion_de_ejemplo();
+        for code in [
+            "MALFORMED_JSON",
+            "MISSING_REQUIRED_EXTENSION",
+            "INVALID_RPC_CALL",
+        ] {
+            let e = error_de_una_peticion_ilegible(Some(&request.id), code);
+            assert_eq!(e.tenantid, "system");
+            assert_eq!(e.correlationid, e.id, "correlationid propio");
+            match comprueba(&llega(&e)) {
+                Ok(Checked::Failure(body, _)) => {
+                    assert_eq!(body.code, code);
+                    let flux = body.into_flux_error();
+                    assert_eq!(flux.class(), Some(ErrorClass::Permanent));
+                    assert_eq!(
+                        flux.code(),
+                        Some(code),
+                        "el código del sobre, no RPC_INVALID_REPLY"
+                    );
+                }
+                other => panic!("{code}: se esperaba el error del sobre y fue {other:?}"),
+            }
+        }
+    }
+
+    /// La excepción es ESTRECHA, y las demás comprobaciones siguen en pie.
+    #[test]
+    fn la_excepcion_de_la_peticion_ilegible_es_estrecha() {
+        let (_, request) = peticion_de_ejemplo();
+        // Sin `causationid` (o con el de otra petición): la comprobación 3 sigue en pie.
+        let sin_causa = error_de_una_peticion_ilegible(None, "MALFORMED_JSON");
+        assert_eq!(
+            code_of(&comprueba(&llega(&sin_causa))).as_deref(),
+            Some(RPC_INVALID_REPLY_CODE)
+        );
+        let de_otra = error_de_una_peticion_ilegible(Some("otra-peticion"), "MALFORMED_JSON");
+        assert!(motivo(&comprueba(&llega(&de_otra))).contains("causationid"));
+        // `tenantid: system` pero con un `correlationid` que no es el suyo.
+        let mut e = error_de_una_peticion_ilegible(Some(&request.id), "MALFORMED_JSON");
+        e.correlationid = "otro-flujo".into();
+        assert!(motivo(&comprueba(&llega(&e))).contains("correlationid"));
+        // `correlationid` propio pero con un tenant que no es `system` ni el de la petición.
+        let mut e = error_de_una_peticion_ilegible(Some(&request.id), "MALFORMED_JSON");
+        e.tenantid = "globex".into();
+        assert_eq!(
+            code_of(&comprueba(&llega(&e))).as_deref(),
+            Some(RPC_INVALID_REPLY_CODE)
+        );
+        // Una RESPUESTA (no un error) con esa forma no es lo que la excepción cubre.
+        let mut r = build_rpc_reply(reply_input()).unwrap();
+        r.tenantid = "system".into();
+        r.correlationid = r.id.clone();
+        assert!(
+            motivo(&comprueba(&llega(&r))).contains("tenantid")
+                || motivo(&comprueba(&llega(&r))).contains("correlationid")
+        );
+        // La quinta comprobación sigue en pie para ese error: su `data` debe cumplir el esquema.
+        let mut e = error_de_una_peticion_ilegible(Some(&request.id), "MALFORMED_JSON");
+        e.data = serde_json::from_str(r#"{"class":"poison","code":"X","message":"m"}"#).unwrap();
+        assert!(motivo(&comprueba(&llega(&e))).contains("esquema"));
+        // CONTROL: un error de una petición LEÍDA sigue heredando.
+        let ok = build_rpc_error(error_input("rpc-error-handler")).unwrap();
+        assert!(matches!(comprueba(&llega(&ok)), Ok(Checked::Failure(_, _))));
+        let mut raro = ok.clone();
+        raro.correlationid = "otra-cadena".into();
+        assert!(motivo(&comprueba(&llega(&raro))).contains("correlationid"));
     }
 
     #[test]
