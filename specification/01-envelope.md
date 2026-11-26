@@ -144,6 +144,62 @@ deduplicación del ecosistema entero. Como `id` es UUIDv7 (monotónico en el tie
 ordenar por `id` dentro de un mismo `source` equivale a ordenar por instante de
 generación — útil al reconstruir historiales desde la DLQ.
 
+#### 2.6.1 El `id` de un hecho importado es determinista
+
+Un sistema externo —una pasarela de pagos, un proveedor, el sistema de un tercero— **reenvía el mismo aviso** durante horas: porque
+no recibió el `2xx`, porque reintenta con su propio calendario, porque alguien pulsó «reenviar». Si cada reenvío recibe un `id`
+nuevo, **ningún consumidor puede deduplicarlo**: para el ecosistema son tres hechos distintos. Y la dedupe por `id` es la única
+que sobrevive a todo (`duplicate_window` dura 2 minutos y solo cubre publicaciones: [03-delivery.md §3](03-delivery.md)).
+
+Para un **hecho importado**, el `id` **se deriva** de lo que identifica al hecho en lugar de generarse:
+
+```
+id = UUIDv7(
+  unix_ts_ms = los milisegundos del `time` del hecho EXTERNO,
+  rand_a     = los bits  0..11 de H,
+  rand_b     = los bits 12..73 de H
+)          con  H = SHA-256( <source> "|" <clave externa> )   (los bits se numeran desde el más significativo)
+```
+
+- **Es un UUIDv7 válido** ([RFC 9562](https://www.rfc-editor.org/rfc/rfc9562) §5.7): versión `7`, variante `10`, 48 bits de tiempo, y
+  **74 bits** (12 de `rand_a` y 62 de `rand_b`) tomados de `H` en vez de un generador de azar. Cualquier consumidor que valide el
+  formato del `id` (§2) lo acepta, y la ordenación por `id` dentro de un `source` sigue siendo la del instante del hecho.
+- **Es siempre el mismo** para la misma terna `(source, clave externa, milisegundos)`. Es una función pura: no usa el reloj ni
+  ninguna fuente de azar, y **todos los SDKs la calculan igual** (vectores en
+  [`conformance/cases/cross-sdk-external-id.json`](../conformance/cases/cross-sdk-external-id.json)).
+- **`source`** es el del que publica (`/<entorno>/<servicio>`, §2). No contiene `|`, así que el separador no es ambiguo: la
+  derivación es inyectiva en `(source, clave externa)`. La clave externa es una cadena UTF-8 **no vacía** de **como máximo 512
+  bytes**: el identificador del hecho **en el sistema externo** (`evt_1Nx…`), no un documento.
+- **`time` es el instante del hecho externo**, el que da el sistema de origen, **no «ahora»**: es lo que hace estable el `id`
+  (con «ahora» cada reenvío tendría milisegundos distintos y, por tanto, un `id` distinto) y es lo que §2 ya exige de `time`.
+  Un SDK que ofrezca la clave externa **DEBE exigir `time`** y rechazar su ausencia con un error accionable, que explique que
+  **si el sistema externo no da un instante no hay `id` determinista**. Los milisegundos han de caber en 48 bits (0 a 2^48 − 1).
+- **Dos hechos distintos con la misma clave y distinto instante tienen `id` distinto**: la clave externa **debe ser única por
+  hecho** dentro del `source` (un proveedor que reutiliza una clave para eventos distintos no es compatible con esta regla, y para
+  él hay que **prefijar** la clave con lo que la distingue). Dos productores distintos con la misma clave no chocan: su `source`
+  difiere.
+- **No sustituye a la deduplicación del consumidor** ([03-delivery.md §4](03-delivery.md)): la hace posible. Dentro de
+  `duplicate_window` JetStream ni siquiera guarda el duplicado; fuera, guarda los dos y los consumidores aplican **un** efecto por
+  `id`.
+
+API: `publish(subject, data, { externalKey, time })` en el SDK ([§5](#5-reglas-de-relleno-automático): `id` lo sigue generando el
+SDK, aquí con esta derivación; el desarrollador sigue sin escribirlo). Quien reciba webhooks de terceros lo usa a través del
+gateway ([12-edge.md §5](12-edge.md)).
+
+Ejemplos (los comprobó Node y, de forma independiente, Python con `hashlib`):
+
+| `source` | clave externa | `time` | `id` |
+|---|---|---|---|
+| `/produccion/pasarela-web` | `pasarela:evt_1Nx` | `2026-08-20T10:25:39.412Z` | `01a01eb4-7a54-7325-ac9b-67da707ec1d4` |
+| `/produccion/pasarela-web` | `pasarela:evt_1Ny` | `2026-08-20T10:25:39.412Z` | `01a01eb4-7a54-7923-9653-1de6ff56d23a` |
+| `/produccion/otra-web` | `pasarela:evt_1Nx` | `2026-08-20T10:25:39.412Z` | `01a01eb4-7a54-7b72-9f1e-b64778eeb41f` |
+| `/produccion/pasarela-web` | `pasarela:evt_1Nx` | `2026-08-20T10:25:39.413Z` | `01a01eb4-7a55-7325-ac9b-67da707ec1d4` |
+| `/dev/tienda-web` | `pedido-ñandú-ß-日本` | `2024-02-29T23:59:59.999Z` | `018df74f-83ff-72cc-9c87-4843a505450d` |
+| `/dev/a` | `k` | `1970-01-01T00:00:00.000Z` | `00000000-0000-7fdc-8906-90c15f53aa90` |
+
+Las filas 2, 3 y 4 difieren de la primera en **una sola cosa** cada una: la clave, el `source` o un milisegundo. Las tres dan un
+`id` distinto, y los 74 bits de las filas 1 y 4 son **los mismos** (`7325-ac9b-67da707ec1d4`): solo cambia el tiempo.
+
 ## 3. Extensiones — perfil flux
 
 CloudEvents restringe los nombres de extensión a **minúsculas y dígitos ASCII, sin

@@ -1,0 +1,104 @@
+{
+  "case": "cross-sdk-external-id",
+  "title": "Todos los SDKs derivan el mismo `id` determinista para un hecho importado de un sistema externo",
+  "spec": "specification/01-envelope.md §2.6.1; specification/12-edge.md §5",
+  "verifiedAgainst": "Node (sdk-node/src/external-id.ts) y, de forma INDEPENDIENTE, Python con hashlib e int.from_bytes (7 vectores coinciden). Los ids de los vectores válidos no se calcularon con el SDK que los ejecuta: salen de la fórmula de la spec.",
+  "verifiedOn": "2026-11-26",
+  "rationale": "El `id` de un evento es la clave de deduplicación del ecosistema, y un hecho importado (el aviso de una pasarela de pagos, que el proveedor reenvía durante horas) solo se deduplica si TODOS los productores le calculan el MISMO `id`. La regla —UUIDv7 con los milisegundos del hecho externo y los 74 bits restantes de los 74 primeros de SHA-256(<source> \"|\" <clave externa>)— tiene tres trampas de las que ningún SDK está a salvo sin vector: qué bits de qué byte (los 74 primeros del digest, `rand_a` = los 12 más significativos, `rand_b` = los 62 siguientes), que el separador sea el byte `|` y no otro, y que la clave se codifique en UTF-8 (`pedido-ñandú-ß-日本`: .NET y Java usan UTF-16 por dentro, y un SDK que haga el hash sobre otra codificación da otro `id` sin ningún error). El vector del instante 0 comprueba que los 48 bits de tiempo van en los primeros 6 bytes, y los inválidos, que un SDK rechaza lo que la regla manda rechazar en vez de producir un `id` que no es el de los demás.",
+  "harness": {
+    "$comment": "La operación que el arnés cruzado (conformance/harness/README.md) debe aprender. Hoy solo la implementa el arnés de Node (sdk-node/conformance-harness.mjs): NO está en conformance/harness/vectors.json ni en conformance/harnesses.json, y el cruzado con Rust se integra después. Es determinista: no usa reloj ni azar. Devuelve `{ ok: true, id }`, o `{ ok: false }` cuando la entrada es de las que la regla manda rechazar.",
+    "ops": {
+      "external-id": "entrada: { source, externalKey, time } (time: RFC 3339 UTC) → { ok: true, id } | { ok: false }"
+    }
+  },
+  "fixtures": [
+    {
+      "id": "pasarela-evento-1",
+      "title": "el primer evento de la pasarela de un servicio de borde",
+      "harnessOp": "external-id",
+      "input": { "source": "/produccion/pasarela-web", "externalKey": "pasarela:evt_1Nx", "time": "2026-08-20T10:25:39.412Z" },
+      "expected": { "ok": true, "id": "01a01eb4-7a54-7325-ac9b-67da707ec1d4" }
+    },
+    {
+      "id": "otra-clave",
+      "title": "otra clave, mismo source y mismo instante: otro id (solo cambian los 74 bits)",
+      "harnessOp": "external-id",
+      "input": { "source": "/produccion/pasarela-web", "externalKey": "pasarela:evt_1Ny", "time": "2026-08-20T10:25:39.412Z" },
+      "expected": { "ok": true, "id": "01a01eb4-7a54-7923-9653-1de6ff56d23a" }
+    },
+    {
+      "id": "otro-source",
+      "title": "otro source, misma clave y mismo instante: otro id (dos productores no chocan)",
+      "harnessOp": "external-id",
+      "input": { "source": "/produccion/otra-web", "externalKey": "pasarela:evt_1Nx", "time": "2026-08-20T10:25:39.412Z" },
+      "expected": { "ok": true, "id": "01a01eb4-7a54-7b72-9f1e-b64778eeb41f" }
+    },
+    {
+      "id": "otro-milisegundo",
+      "title": "un milisegundo después: cambian los 48 bits de tiempo y NO los 74 bits restantes",
+      "harnessOp": "external-id",
+      "input": { "source": "/produccion/pasarela-web", "externalKey": "pasarela:evt_1Nx", "time": "2026-08-20T10:25:39.413Z" },
+      "expected": { "ok": true, "id": "01a01eb4-7a55-7325-ac9b-67da707ec1d4" }
+    },
+    {
+      "id": "clave-no-ascii",
+      "title": "una clave con ñ, ß y CJK: el hash es sobre UTF-8 literal",
+      "harnessOp": "external-id",
+      "input": { "source": "/dev/tienda-web", "externalKey": "pedido-ñandú-ß-日本", "time": "2024-02-29T23:59:59.999Z" },
+      "expected": { "ok": true, "id": "018df74f-83ff-72cc-9c87-4843a505450d" }
+    },
+    {
+      "id": "instante-cero",
+      "title": "el instante 0: los 48 bits de tiempo son cero y el id sigue siendo un UUIDv7 válido",
+      "harnessOp": "external-id",
+      "input": { "source": "/dev/a", "externalKey": "k", "time": "1970-01-01T00:00:00.000Z" },
+      "expected": { "ok": true, "id": "00000000-0000-7fdc-8906-90c15f53aa90" }
+    }
+  ],
+  "invalid": [
+    {
+      "id": "clave-vacia",
+      "title": "una clave externa vacía no es un identificador",
+      "harnessOp": "external-id",
+      "input": { "source": "/dev/a", "externalKey": "", "time": "2026-08-20T10:25:39.412Z" },
+      "expected": { "ok": false }
+    },
+    {
+      "id": "sin-instante",
+      "title": "sin `time` no hay id determinista: es lo que lo hace estable (con «ahora», cada reenvío tendría el suyo)",
+      "harnessOp": "external-id",
+      "input": { "source": "/dev/a", "externalKey": "k" },
+      "expected": { "ok": false }
+    },
+    {
+      "id": "instante-invalido",
+      "title": "un instante que no es un instante",
+      "harnessOp": "external-id",
+      "input": { "source": "/dev/a", "externalKey": "k", "time": "ayer por la tarde" },
+      "expected": { "ok": false }
+    },
+    {
+      "id": "source-con-separador",
+      "title": "un `source` con `|` haría ambigua la derivación",
+      "harnessOp": "external-id",
+      "input": { "source": "/dev/a|b", "externalKey": "k", "time": "2026-08-20T10:25:39.412Z" },
+      "expected": { "ok": false }
+    },
+    {
+      "id": "clave-demasiado-larga",
+      "title": "513 bytes: una clave es un identificador, no un documento (máximo 512 bytes UTF-8)",
+      "harnessOp": "external-id",
+      "input": { "source": "/dev/a", "externalKey": { "repeat": "k", "times": 513 }, "time": "2026-08-20T10:25:39.412Z" },
+      "expected": { "ok": false },
+      "$comment": "`externalKey` con `repeat` y `times` se expande a una cadena de `times` repeticiones (para no pegar 513 caracteres en este fichero)."
+    }
+  ],
+  "properties": {
+    "$comment": "Lo que se debe cumplir para CUALQUIER entrada válida, además de los vectores. Las comprueba el test del SDK de Node con 100 000 claves; un SDK nuevo debería hacer igual.",
+    "validUuidV7": "el `id` casa con ^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+    "timeBits": "los 12 primeros dígitos hexadecimales (sin guion) son los milisegundos de `time`",
+    "deterministic": "la misma entrada da el mismo id",
+    "injectiveInSourceAndKey": "100 000 claves distintas del mismo source dan 100 000 ids distintos (74 bits)",
+    "orderedByTime": "dos ids con la misma clave y source y distinto instante ordenan como los instantes"
+  }
+}

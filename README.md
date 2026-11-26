@@ -108,12 +108,14 @@ protocolo a v2.
 │   ├── 08-observability.md ← métricas, trazas y alertas
 │   ├── 09-multitenancy.md  ← modelos de aislamiento entre tenants
 │   ├── 10-state.md         ← estado replicado (extensión opcional)
-│   └── 11-request-reply.md ← petición/respuesta por core NATS (extensión opcional)
+│   ├── 11-request-reply.md ← petición/respuesta por core NATS (extensión opcional)
+│   └── 12-edge.md          ← el borde HTTP: entrega saliente firmada e `id` determinista (extensión opcional)
 ├── schemas/                ← JSON Schemas versionados por evento
 │   ├── <dominio>/<agregado>/<evento>/<semver>.json
 │   ├── state/<dominio>/<agregado>/<semver>.json
 │   └── rpc/<dominio>/<agregado>/<operacion>/{request,reply}/<semver>.json
 ├── cli/                    ← flux doctor · tail · dlq · validate
+├── gateway/                ← gateway HTTP de borde (Node, `node:http`): webhooks y sistemas sin conexión NATS
 ├── conformance/            ← el contrato, ejecutable contra NATS real
 ├── docker-compose.yml      ← NATS JetStream local
 ├── examples/services.json  ← manifiesto de ownership → ACLs
@@ -160,6 +162,10 @@ aparte, contra un NATS real: **14/14**.
 | `security` | Inbox privado `_INBOX.<servicio>`, TLS con CA propia, credenciales `.creds`/nkey, `NOT_PROVISIONED`/`PERMISSION_DENIED`, primera conexión que falla rápido y denegaciones visibles — [`06-security.md`](specification/06-security.md) | **No es compatible con la configuración segura**: con el inbox por defecto el broker le deniega su propio inbox y su primera petición falla |
 | `state` | Estado replicado: `put`/`get`/`delete`/`watch` de un valor por clave, con CAS, lápidas y DLQ de estado — [`10-state.md`](specification/10-state.md) | No replica estado; sigue siendo conforme |
 | `rpc` | Petición/respuesta: `request` y `respond` por core NATS, con `no responders`, grupo de cola, error clasificado y sin stream — [`11-request-reply.md`](specification/11-request-reply.md) | No hace ni atiende peticiones; sigue siendo conforme |
+
+El **gateway de borde** ([`gateway/`](gateway/), [`12-edge.md`](specification/12-edge.md)) **no es una capacidad de SDK**: es un servicio que aloja
+clientes HTTP como servicios flux normales (`"via": "gateway"` en el manifiesto, con sus propios permisos). Es normativo solo el formato de la
+entrega saliente (`Flux-Signature`, `Idempotency-Key`) y el `id` determinista de un hecho importado ([`01-envelope.md` §2.6.1](specification/01-envelope.md)).
 
 Hoy solo Node y Rust declaran `security` y `state`, y **ningún SDK declara `rpc` todavía**: la especificación y sus casos medidos
 llegan antes que las implementaciones. Un SDK no anuncia una capacidad hasta que la ha ejecutado contra un broker real.

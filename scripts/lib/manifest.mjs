@@ -35,7 +35,17 @@ export const STATE_TENANT_MAX = 64;
  */
 export const RESERVED_DOMAINS = ["dlq", "state", "rpc", "system"];
 /** Las claves que admite un servicio del manifiesto. Una errata (`watch`) no puede ser «sin permisos». */
-export const SERVICE_KEYS = ["name", "owns", "consumes", "watches", "calls", "serves"];
+export const SERVICE_KEYS = ["name", "owns", "consumes", "watches", "calls", "serves", "via"];
+/**
+ * Por dónde se conecta un servicio. Ausente: es un servicio NATIVO, con su propio proceso y su conexión. `"gateway"`:
+ * es un CLIENTE DE BORDE (specification/12-edge.md §2), un sistema que no puede mantener una conexión NATS (hosting
+ * compartido, cron, serverless, el sistema de un tercero) y cuya conexión vive DENTRO del gateway. Es una ANOTACIÓN:
+ * sus permisos son los de cualquier servicio con lo mismo declarado (`owns`, `consumes`, `watches`, `calls`) y el
+ * gateway no necesita ninguno especial. Lo único que cambia es lo que el gateway no puede alojar: un `serves`, porque
+ * el que atiende una operación necesita una suscripción viva y HTTP no la sostiene.
+ * Lo fija `protocol.json` → `edge.manifest.via`.
+ */
+export const VIA_VALUES = Object.freeze(["gateway"]);
 /**
  * El NOMBRE de una operación (`clientes.cliente.v1.obtener`, lo que reciben `request` y `respond`): cuatro tokens, la
  * misma sintaxis que el subject de un evento — 11-request-reply.md §2.2. Lo que separa una operación de un evento es
@@ -52,7 +62,7 @@ export const OPERATION_RE = SUBJECT_RE;
  */
 export const RPC_ALLOW_RESPONSES = Object.freeze({ max: 1, expires: "30s" });
 /** Las erratas de clave más probables, para que el aviso diga cuál era la buena. */
-const ERRATAS_DE_CLAVE = { watch: "watches", call: "calls", serve: "serves" };
+const ERRATAS_DE_CLAVE = { watch: "watches", call: "calls", serve: "serves", vía: "via", gateway: "via" };
 /** Clave PÚBLICA de usuario de NATS: `U` + 55 caracteres base32. Una semilla empieza por `S`. */
 export const NKEY_USER_RE = /^U[A-Z2-7]{55}$/;
 
@@ -383,6 +393,23 @@ export function analizarManifiesto(manifiesto, bundle) {
       }
     }
 
+    // `via`: un cliente de borde. Un valor desconocido no puede degradar a «nativo» en silencio, y un cliente de
+    // borde no atiende operaciones: el gateway no puede sostener la suscripción viva que exige `respond()`.
+    if (svc?.via !== undefined) {
+      if (!VIA_VALUES.includes(svc.via)) {
+        err(
+          `${svc?.name}: \`via\` vale ${JSON.stringify(svc.via)}`,
+          `El único valor es ${VIA_VALUES.map((v) => JSON.stringify(v)).join(", ")} (un cliente de borde, alojado en el gateway — 12-edge.md §2). Sin \`via\`, el servicio es nativo`,
+        );
+      } else if (Array.isArray(svc.serves) && svc.serves.length > 0) {
+        err(
+          `${svc.name} es un cliente de borde (\`via: "gateway"\") y atiende operaciones (\`serves\`)`,
+          "El que atiende una operación necesita una suscripción VIVA al subject de cada una (11-request-reply.md §2.3), y un cliente HTTP no la sostiene. " +
+            "Atiéndela con un servicio nativo, o quita `serves`",
+        );
+      }
+    }
+
     for (const d of Array.isArray(svc?.owns) ? svc.owns : []) {
       if (!DOMAIN_RE.test(d)) err(`dominio inválido "${d}" en ${svc.name}`, "kebab-case en minúsculas");
       if (RESERVED_DOMAINS.includes(d)) {
@@ -614,6 +641,7 @@ export function analizarManifiesto(manifiesto, bundle) {
     const owns = Array.isArray(svc?.owns) ? [...svc.owns] : [];
     servicios.push({
       name: svc.name,
+      via: svc.via === "gateway" ? "gateway" : null,
       owns,
       consumes: [...escritos],
       subjects: [...consumidos].sort(),

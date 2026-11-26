@@ -128,6 +128,8 @@ Reglas:
 - Solo el **servicio dueño del agregado** publica en su dominio. El broker lo aplica
   por ACL: publicar en un dominio ajeno es rechazado en el servidor, no en tu código.
 - Payload > **1 MiB** → claim-check: publica `{ uri, sha256, bytes }`, no el contenido.
+- Un hecho que llega de un **sistema externo** (un webhook de un tercero) se publica con `{ externalKey, time }`: el `id` es entonces
+  **determinista** y el mismo aviso reenviado no se duplica ([01-envelope.md §2.6.1](specification/01-envelope.md)). Lo hace el gateway de borde.
 - `data` **DEBE** ser un objeto JSON en la raíz. Ni array ni escalar.
 - Claves en `camelCase`. Sin `null` para "ausente" — se omite el campo.
 
@@ -353,6 +355,16 @@ Los nombres y etiquetas son **contrato**, no decisión de cada servicio. Siete m
   crear series temporales nuevas. En **trazas** sí.
 - `code` es un identificador estable (`HTTP_503`), **nunca** el mensaje de error: su
   cardinalidad es infinita y tumba el almacenamiento.
+
+### Borde HTTP — [12-edge.md](specification/12-edge.md)
+
+- El **gateway** (`gateway/`) aloja clientes que no pueden mantener una conexión NATS como servicios flux normales (`"via": "gateway"`
+  en el manifiesto: **mismos permisos que cualquier servicio**, ninguno especial). HTTP queda en el borde; dentro, nada lo usa.
+- **Recibir** un evento por webhook propio: verifica `Flux-Signature` (`t=<unix>,v1=<hmac-sha256(secreto, t + "." + cuerpo)>`)
+  **sobre los bytes en bruto**, con comparación en tiempo constante y tolerancia simétrica de 300 s, y **deduplica por `Idempotency-Key`**.
+  Un `4xx` es PERMANENT (a la DLQ sin reintentos); `429`/`502`/`503`/`504` se reintentan.
+- El **cuerpo de un webhook de un tercero no está libre de PII** por construcción: se clasifica `confidential` y se publican solo los
+  campos necesarios. Y el gateway **no registra nunca `data`**.
 
 ### Multi-tenant — [09-multitenancy.md](specification/09-multitenancy.md)
 
