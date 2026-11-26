@@ -4,6 +4,7 @@
  *
  *   node conformance/security/mutantes.mjs                 # todos los mutantes
  *   node conformance/security/mutantes.mjs --fast          # sin los lentos (los de `expires`, ~1 min cada uno)
+ *   node conformance/security/mutantes.mjs --sdk           # los casos que deben fallar son los de los SDKs REALES (S30 y S34)
  *   node conformance/security/mutantes.mjs --only caller-domain-wildcard,no-allow-responses
  *   node conformance/security/mutantes.mjs --list
  *
@@ -15,6 +16,10 @@
  * ejecuta `conformance/security.mjs` con `FLUX_GEN_ACL` apuntando a esa copia. Cada mutante declara qué casos DEBEN
  * fallar: la suite tiene que salir con 1 y esos casos tienen que estar entre los que fallan. Antes, el mismo
  * subconjunto de casos se ejecuta SIN mutar y tiene que pasar (si no, un fallo no probaría nada).
+ *
+ * `--sdk` hace lo mismo con los casos de los SDKs REALES (S30, el ciclo de §12.9 con el SDK de Node, y S34, `allow_responses` con
+ * un responder tramposo): un generador estropeado también tiene que romper al SDK de verdad, no solo a los clientes en bruto. Va
+ * aparte para no alargar el job de seguridad: lo ejecuta el de interoperabilidad, en paralelo.
  *
  * El repo real no se toca: el mutante vive en `os.tmpdir()` y se borra al terminar.
  *
@@ -46,7 +51,8 @@ export const MUTANTES = [
     archivo: MANIFEST,
     de: "grupo(`Llama a ${op}: publica en el subject EXACTO de la operación`, [`rpc.${op}`]);",
     a: "grupo(`Llama a ${op}: publica en el subject EXACTO de la operación`, [`rpc.${domainOf(op)}.>`]);",
-    debenFallar: ["S21", "S30"],
+    debenFallar: ["S21"],
+    sdk: ["S30"],
   },
   {
     nombre: "caller-rpc-all",
@@ -54,7 +60,8 @@ export const MUTANTES = [
     archivo: MANIFEST,
     de: "grupo(`Llama a ${op}: publica en el subject EXACTO de la operación`, [`rpc.${op}`]);",
     a: "grupo(`Llama a ${op}: publica en el subject EXACTO de la operación`, [`rpc.>`]);",
-    debenFallar: ["S21", "S30"],
+    debenFallar: ["S21"],
+    sdk: ["S30"],
   },
   {
     nombre: "caller-without-permission",
@@ -62,7 +69,8 @@ export const MUTANTES = [
     archivo: MANIFEST,
     de: "grupo(`Llama a ${op}: publica en el subject EXACTO de la operación`, [`rpc.${op}`]);",
     a: "void op;",
-    debenFallar: ["S21", "S27", "S30"],
+    debenFallar: ["S21", "S27"],
+    sdk: ["S30"],
   },
   {
     nombre: "owner-rpc-all",
@@ -70,7 +78,8 @@ export const MUTANTES = [
     archivo: MANIFEST,
     de: "const subscribe = [`_INBOX.${servicio.name}.>`, ...dominiosRpc.map((d) => `rpc.${d}.>`)];",
     a: "const subscribe = [`_INBOX.${servicio.name}.>`, ...(dominiosRpc.length ? [\"rpc.>\"] : [])];",
-    debenFallar: ["S22", "S30"],
+    debenFallar: ["S22"],
+    sdk: ["S30"],
   },
   {
     nombre: "owner-without-subscribe",
@@ -78,7 +87,8 @@ export const MUTANTES = [
     archivo: MANIFEST,
     de: "const subscribe = [`_INBOX.${servicio.name}.>`, ...dominiosRpc.map((d) => `rpc.${d}.>`)];",
     a: "const subscribe = [`_INBOX.${servicio.name}.>`];",
-    debenFallar: ["S21", "S26", "S27", "S30"],
+    debenFallar: ["S21", "S26", "S27"],
+    sdk: ["S30"],
   },
   {
     nombre: "caller-gets-domain-subscription",
@@ -86,7 +96,8 @@ export const MUTANTES = [
     archivo: MANIFEST,
     de: "const subscribe = [`_INBOX.${servicio.name}.>`, ...dominiosRpc.map((d) => `rpc.${d}.>`)];",
     a: "const subscribe = [`_INBOX.${servicio.name}.>`, ...[...new Set([...atendidas, ...llamadas].map(domainOf))].sort().map((d) => `rpc.${d}.>`)];",
-    debenFallar: ["S22", "S30"],
+    debenFallar: ["S22"],
+    sdk: ["S30"],
   },
   {
     nombre: "shared-inbox",
@@ -94,7 +105,8 @@ export const MUTANTES = [
     archivo: MANIFEST,
     de: "const subscribe = [`_INBOX.${servicio.name}.>`, ...dominiosRpc.map((d) => `rpc.${d}.>`)];",
     a: "const subscribe = [`_INBOX.>`, ...dominiosRpc.map((d) => `rpc.${d}.>`)];",
-    debenFallar: ["S23", "S30"],
+    debenFallar: ["S23"],
+    sdk: ["S30"],
   },
   {
     nombre: "no-allow-responses",
@@ -102,7 +114,8 @@ export const MUTANTES = [
     archivo: MANIFEST,
     de: "const allowResponses = atendidas.length ? { ...RPC_ALLOW_RESPONSES } : null;",
     a: "const allowResponses = null;",
-    debenFallar: ["S21", "S24", "S27", "S28", "S30"],
+    debenFallar: ["S21", "S24", "S27", "S28"],
+    sdk: ["S30"],
   },
   {
     nombre: "no-allow-responses-in-conf",
@@ -110,7 +123,8 @@ export const MUTANTES = [
     archivo: GEN,
     de: "  if (perm.allowResponses) {",
     a: "  if (false) {",
-    debenFallar: ["S21", "S24", "S27", "S28", "S30"],
+    debenFallar: ["S21", "S24", "S27", "S28"],
+    sdk: ["S30"],
   },
   {
     nombre: "allow-responses-max-3",
@@ -118,7 +132,8 @@ export const MUTANTES = [
     archivo: MANIFEST,
     de: 'export const RPC_ALLOW_RESPONSES = Object.freeze({ max: 1, expires: "30s" });',
     a: 'export const RPC_ALLOW_RESPONSES = Object.freeze({ max: 3, expires: "30s" });',
-    debenFallar: ["S24", "S34"],
+    debenFallar: ["S24"],
+    sdk: ["S34"],
   },
   {
     nombre: "owner-publishes-on-inboxes",
@@ -126,7 +141,8 @@ export const MUTANTES = [
     archivo: MANIFEST,
     de: "  const dominiosRpc = [...new Set(atendidas.map(domainOf))].sort();",
     a: '  const dominiosRpc = [...new Set(atendidas.map(domainOf))].sort();\n  if (atendidas.length) grupo("mutante: publicar en cualquier inbox", ["_INBOX.>"]);',
-    debenFallar: ["S24", "S34"],
+    debenFallar: ["S24"],
+    sdk: ["S34"],
   },
   {
     nombre: "no-expires",
@@ -151,15 +167,16 @@ export const MUTANTES = [
 // ─── Argumentos ──────────────────────────────────────────────────────────────
 
 const argv = process.argv.slice(2);
-const o = { fast: false, only: undefined, list: false, verbose: false };
+const o = { fast: false, sdk: false, only: undefined, list: false, verbose: false };
 for (let i = 0; i < argv.length; i++) {
   const a = argv[i];
   if (a === "--fast") o.fast = true;
+  else if (a === "--sdk") o.sdk = true;
   else if (a === "--list") o.list = true;
   else if (a === "-v" || a === "--verbose") o.verbose = true;
   else if (a === "--only") o.only = new Set((argv[++i] ?? "").split(",").map((s) => s.trim()).filter(Boolean));
   else {
-    console.error(`argumento desconocido: ${a}\nuso: node conformance/security/mutantes.mjs [--fast] [--only a,b] [--list] [-v]`);
+    console.error(`argumento desconocido: ${a}\nuso: node conformance/security/mutantes.mjs [--fast] [--sdk] [--only a,b] [--list] [-v]`);
     process.exit(2);
   }
 }
@@ -170,10 +187,12 @@ for (const n of o.only ?? []) {
   }
 }
 if (o.list) {
-  for (const m of MUTANTES) console.log(`${m.nombre.padEnd(34)} ${m.lento ? "[lento] " : "        "}${m.que}  → debe fallar ${m.debenFallar.join(", ")}`);
+  for (const m of MUTANTES) console.log(`${m.nombre.padEnd(34)} ${m.lento ? "[lento] " : "        "}${m.que}  → debe fallar ${m.debenFallar.join(", ")}${m.sdk ? `; con --sdk, ${m.sdk.join(", ")}` : ""}`);
   process.exit(0);
 }
-const elegidos = MUTANTES.filter((m) => (o.only ? o.only.has(m.nombre) : !(o.fast && m.lento)));
+// Con `--sdk` los casos que deben fallar son los de los SDKs REALES (`sdk`, S30 y S34), y solo se ejecutan los mutantes que los tienen.
+const casosDe = (m) => (o.sdk ? m.sdk : m.debenFallar);
+const elegidos = MUTANTES.filter((m) => (o.only ? o.only.has(m.nombre) : !(o.fast && m.lento)) && (!o.sdk || m.sdk));
 
 // ─── Ejecución ───────────────────────────────────────────────────────────────
 
@@ -226,7 +245,7 @@ console.log(`flux — mutantes del generador de ACL: la suite de seguridad debe 
 console.log(`  ${v.stdout.trim()} · ${o.fast ? "sin los lentos" : "todos"}`);
 
 // Sin mutar: el subconjunto debe pasar. Si no, un fallo con un mutante no probaría nada.
-const todosLosCasos = [...new Set(elegidos.flatMap((m) => m.debenFallar))].sort((a, b) => Number(a.slice(1)) - Number(b.slice(1)));
+const todosLosCasos = [...new Set(elegidos.flatMap(casosDe))].sort((a, b) => Number(a.slice(1)) - Number(b.slice(1)));
 console.log(`\nSin mutar: ${todosLosCasos.join(", ")}`);
 const base = await ejecutarSuite(todosLosCasos, {});
 const baseOk = base.codigo === 0 && todosLosCasos.every((c) => base.casos.get(c) === true);
@@ -248,14 +267,15 @@ for (const m of elegidos) {
   }
   try {
     console.log(`\n${m.nombre}: ${m.que}`);
-    const r = await ejecutarSuite(m.debenFallar, { FLUX_GEN_ACL: prep.gen });
-    const fallan = m.debenFallar.filter((c) => r.casos.get(c) === false);
-    const noFallan = m.debenFallar.filter((c) => r.casos.get(c) !== false);
+    const deben = casosDe(m);
+    const r = await ejecutarSuite(deben, { FLUX_GEN_ACL: prep.gen });
+    const fallan = deben.filter((c) => r.casos.get(c) === false);
+    const noFallan = deben.filter((c) => r.casos.get(c) !== false);
     const detectado = r.codigo === 1 && noFallan.length === 0;
     if (detectado) R.detectados++;
     else R.escapan.push(m.nombre);
     console.log(
-      `  ${detectado ? "✓ DETECTADO" : "✗ NO DETECTADO"}: fallan ${fallan.length ? fallan.join(", ") : "ninguno"} de los esperados (${m.debenFallar.join(", ")}); salida ${r.codigo}` +
+      `  ${detectado ? "✓ DETECTADO" : "✗ NO DETECTADO"}: fallan ${fallan.length ? fallan.join(", ") : "ninguno"} de los esperados (${deben.join(", ")}); salida ${r.codigo}` +
         (noFallan.length ? `; NO fallan: ${noFallan.join(", ")}` : ""),
     );
     if (!detectado || o.verbose) console.log(r.salida.split("\n").filter((l) => /✗|✓ \d+\/|se interrumpió|Error/.test(l)).slice(0, 14).join("\n"));

@@ -184,6 +184,7 @@ node conformance/interop-rpc.mjs --only "I2[node→rust]" -v                   #
 node conformance/security.mjs --only S30,S31,S32,S33,S34 -v
 node conformance/security/mutantes-sdk.mjs                                   # 11 mutantes de SDK: los casos DEBEN fallar con cada uno
 node conformance/security/mutantes-sdk.mjs --no-rust                         # sin los que compilan Rust (~1 min cada uno)
+node conformance/security/mutantes.mjs --sdk                                 # un GENERADOR estropeado también debe romper S30 y S34
 ```
 
 `mutantes-sdk.mjs` es el equivalente de `mutantes.mjs` para el **SDK**: copia `sdk-node/dist` (o `sdk-rust`) a un temporal, le aplica UN

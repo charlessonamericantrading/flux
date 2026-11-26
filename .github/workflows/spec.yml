@@ -167,8 +167,8 @@ jobs:
         run: node conformance/security.mjs
       # Una prueba que solo se ha visto en verde no demuestra nada: se estropea el GENERADOR de ACL a propósito (`rpc.<dominio>.>` a
       # quien llama, `rpc.>` o un permiso de publicación sobre inboxes al dueño, sin `allow_responses` o sin su `expires`, el inbox
-      # común…) y los casos S21 a S30 y S34 DEBEN fallar con cada uno de los 13 mutantes (S30 y S34 son los de los SDKs reales). Sin
-      # mutar, el subconjunto pasa.
+      # común…) y los casos S21 a S29 DEBEN fallar con cada uno de los 13 mutantes. Sin mutar, el subconjunto pasa. (Los casos con
+      # SDKs reales, S30 y S34, hacen lo mismo con `--sdk` en el job `interop-rpc`: en paralelo, para no alargar este.)
       - name: Los casos detectan un generador de ACL estropeado (deben FALLAR)
         env:
           FLUX_REQUIRE_BROKER: '1'
@@ -251,6 +251,14 @@ jobs:
           FLUX_REQUIRE_BROKER: '1'
           FLUX_TEST_PORTS: '4650-4699'
         run: node conformance/security/mutantes-sdk.mjs
+      # Y al revés: un GENERADOR de ACL estropeado (a quien llama `rpc.<dominio>.>`, sin `allow_responses`, el inbox común, un permiso de
+      # publicación sobre inboxes, `max: 3`…) también tiene que romper a los SDKs reales: S30 (el ciclo de §12.9 con el de Node) y
+      # S34 (`allow_responses` con un responder tramposo) DEBEN fallar con cada uno de los 11 mutantes.
+      - name: Los casos con SDKs reales detectan un generador de ACL estropeado (deben FALLAR)
+        env:
+          FLUX_REQUIRE_BROKER: '1'
+          FLUX_TEST_PORTS: '4650-4699'
+        run: node conformance/security/mutantes.mjs --sdk
 
   protocol-json-valid:
     name: protocol.json coherente
