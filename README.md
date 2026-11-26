@@ -113,6 +113,7 @@ protocolo a v2.
 │   ├── <dominio>/<agregado>/<evento>/<semver>.json
 │   ├── state/<dominio>/<agregado>/<semver>.json
 │   └── rpc/<dominio>/<agregado>/<operacion>/{request,reply}/<semver>.json
+├── bench/                  ← HTTP frente a flux, medido: node bench/run.mjs
 ├── cli/                    ← flux doctor · tail · dlq · validate
 ├── conformance/            ← el contrato, ejecutable contra NATS real
 ├── docker-compose.yml      ← NATS JetStream local
@@ -125,6 +126,22 @@ protocolo a v2.
 ├── sdk-dotnet/             ← fase 2
 └── sdk-php/                ← fase 2
 ```
+
+---
+
+## Rendimiento
+
+flux se mide frente a lo que sustituye —APIs HTTP, sondeo y webhooks entre servicios de un mismo ecosistema— con una línea base HTTP **justa** (keep-alive, sondeo con `ETag`),
+sobre un `nats-server` real con la configuración segura. Se publica lo que sale, favorezca o no. Cifras de [`bench/RESULTS.md`](bench/RESULTS.md) (corrida completa en una máquina de 4 núcleos,
+**cargada por otros procesos** —la CPU, los bytes y los mensajes son robustos a eso; las latencias, orientativas—; todo en `127.0.0.1`, un solo nodo):
+
+- **Enterarse de un cambio:** con 100 consumidores de un dato que cambia 12 veces por minuto, `state.watch` tarda **~12 ms** en avisar (p50) y el sondeo cada 5 s, **2.5 s**; y gasta **la mitad de CPU** (1.7 % frente a 3.2 % de un núcleo).
+  Con 1 cambio/min gasta 6× menos; con 60 cambios/min, **~2× más** que sondear, y con 600, 11×: el sondeo cuesta lo mismo pase lo que pase, flux cuesta por cambio.
+- **Avisar a 1 000 receptores:** el productor gasta **1.4 ms de CPU por hecho** publicando un evento y **72 ms** haciendo 1 000 webhooks. Pero la CPU **total** por hecho de flux es **~2.8×** la de los webhooks
+  (~2/3 de la CPU del broker se va en persistir el estado de cada consumidor durable) y la entrega es más lenta: flux mueve el coste del productor al broker, no lo reduce.
+- **Una llamada puntual con respuesta:** HTTP con keep-alive **gana**: con el SDK de Node de hoy, `request`/`respond` hace entre 5.6× y 19× menos llamadas por segundo y gasta 6–21× más CPU por llamada. Casi todo es del SDK
+  (un `import()` que falla en cada llamada explica entre 2/3 y 5/6 del exceso); el transporte NATS sin SDK iguala a HTTP. Migrar solo por rendimiento una llamada que ya funciona sobre HTTP **no compensa**.
+- **Cuándo no compensa migrar, y lo que no se mide** (red real, cluster, fallos): en `bench/RESULTS.md`. Reproducirlo: `node bench/run.mjs` (completo, ~1,5 h) o `node bench/run.mjs --rapido` (< 2 min); ver [`bench/README.md`](bench/README.md).
 
 ---
 
