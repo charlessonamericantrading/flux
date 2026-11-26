@@ -57,7 +57,7 @@ await bus.subscribe("pedidos.pedido.v1.creado", async (evento, ctx) => {
 | Envelope | Rellena `id` (UUIDv7), `source`, `time`, `type`, `dataschema`, `specversion` |
 | Contexto | Propaga `correlationid`, `causationid` y `traceparent` vía `AsyncLocalStorage` — un `publish()` dentro de un handler los hereda solo |
 | Naming | Deriva `type`, nombres de stream y de durable consumer desde el subject |
-| Streams | Crea `EVT_<DOMINIO>` y `DLQ_<DOMINIO>` si no existen, con la config canónica |
+| Streams | En desarrollo, crea `EVT_<DOMINIO>` y `DLQ_<DOMINIO>` si no existen, con la config canónica. **En producción no puede**: se aprovisionan con `flux provision` y el SDK falla con `NotProvisionedError` — ver [Seguridad](#seguridad-permisos-inbox-tls-y-credenciales) |
 | Entrega | Ack explícito, WIP automático, backoff canónico, enrutado a DLQ |
 | Errores | Clasifica en RETRYABLE / PERMANENT / POISON y actúa en consecuencia |
 | Validación | Rechaza subjects inválidos, atributos raíz desconocidos y payloads > 1 MiB |
@@ -215,12 +215,156 @@ fallo, no es para nosotros.
 > esa garantía, es account de NATS por tenant — ver
 > [09-multitenancy.md §2](../specification/09-multitenancy.md), que lista el coste real.
 
+## Seguridad: permisos, inbox, TLS y credenciales
+
+Lo que [06-security.md](../specification/06-security.md) §2 y §3 exigen del SDK, y lo que
+este hace. Todo lo de esta sección está **ejecutado contra un `nats-server` real** en
+`test/integration/`: un permiso que solo se ha leído no es un permiso comprobado.
+
+```ts
+const bus = await connect({
+  servers: "nats://nats.interno:4222",   // con `tls` el cliente exige el upgrade a TLS
+  service: "facturacion-api",
+  // …
+  tls: { caFile: "/etc/flux/ca.pem" },                      // CA propia; + certFile/keyFile para mTLS
+  credentials: { creds: "/run/secrets/facturacion.creds" }, // o credsContent, nkeySeed, token, user+pass
+});
+```
+
+### Inbox privado — no es una opción
+
+El SDK usa siempre `_INBOX.<servicio>` (derivado de `service`, que ya se valida como
+`[a-z0-9-]`). Las respuestas de la API de JetStream y las **entregas de un pull consumer**
+viajan por el inbox: con el `_INBOX.>` común, un servicio que se suscribe ahí lee los
+eventos de dominios que no tiene concedidos. Es el hallazgo H2 del
+[plan v1.1](../docs/plan-v1.1/PLAN.md), y se vio con claridad al probarlo: lo que llega al
+espía es el evento completo, con su subject original.
+
+> Que el SDK use inbox privado **no basta**: lo que confina es la ACL. Con la ACL antigua
+> (`_INBOX.>`) un servicio sigue pudiendo espiar el inbox ajeno, aunque el SDK no use el
+> común. `test/integration/acl.test.ts` (d) lo demuestra con un espía de control.
+
+### Permisos que el SDK necesita
+
+Mientras el generador de ACL v2 (`scripts/gen-acl.mjs`) no esté en `main`, la lista de
+permisos requeridos es la del informe del PR de esta fase. La tabla es la que ejecutan los
+tests (`test/integration/acl.ts`), y cada fila se probó **quitándola**: sin ella el SDK
+falla de forma visible (`acl.test.ts`, «cada permiso de la lista es NECESARIO»).
+
+`<DOM>` = dominio en mayúsculas con `_` (`EVT_PEDIDOS`); `<durable>` =
+`<servicio>__<subject con . y - → _>`.
+
+| Rol | `publish` | `subscribe` |
+|---|---|---|
+| Todo servicio | `$JS.API.INFO` | `_INBOX.<servicio>.>` |
+| Dueño del dominio `<dom>` | `<dom>.>` · `$JS.API.STREAM.INFO.EVT_<DOM>` | — |
+| Consumidor del subject `<S>` (dominio `<dom>`) | `dlq.<S>` · `$JS.API.STREAM.INFO.EVT_<DOM>` · `$JS.API.STREAM.INFO.DLQ_<DOM>` · `$JS.API.CONSUMER.INFO.EVT_<DOM>.<durable>` · `$JS.API.CONSUMER.MSG.NEXT.EVT_<DOM>.<durable>` · `$JS.ACK.EVT_<DOM>.<durable>.>` | — |
+| Solo si el SDK ha de **crear** el consumidor (desarrollo) | `$JS.API.CONSUMER.CREATE.EVT_<DOM>.<durable>.<S>` | — |
+
+- **Ningún permiso de suscripción sobre subjects de dominio**: el SDK consume por pull.
+- `$JS.API.STREAM.INFO.DLQ_<DOM>` es el que la ACL «candidata» del plan no tenía: `subscribe()`
+  comprueba que la DLQ existe **al arrancar**, no cuando llega el primer evento envenenado.
+- `CONSUMER.CREATE` no hace falta con el consumidor aprovisionado: el SDK pregunta
+  (`CONSUMER.INFO`) antes de crear. Si no existe y no puede crearlo → `NotProvisionedError`.
+- Un `durable` propio en `subscribe({ durable })` debe llevar sus permisos con **ese** nombre.
+- **Nunca** a un servicio: `$JS.API.CONSUMER.DURABLE.CREATE.*`, `$JS.API.STREAM.MSG.GET.*`, ni
+  crear, modificar, borrar o purgar streams.
+- ⚠️ En NATS, **`allow: []` no deniega nada: significa «sin restricción»**. Quitar el único
+  permiso de suscripción de un usuario le da, de hecho, todos.
+
+### Cómo llega cada denegación
+
+El broker no siempre contesta. Medido contra NATS 2.14.5:
+
+| Operación denegada | Qué ocurre | Qué hace el SDK |
+|---|---|---|
+| Cualquier petición de la API de JetStream (`connect()`, comprobar un stream, un consumidor) | Llega en ~1 ms como `RequestError` con `cause: PermissionViolationError`. **No es un timeout** | `PermissionDeniedError` (`PERMISSION_DENIED`), **PERMANENT** |
+| `publish()` a un dominio ajeno | Lo mismo | `PermissionDeniedError` |
+| Falta el stream o el consumidor y crearlo está denegado | Lo mismo, tras un «no existe» | `NotProvisionedError` (`NOT_PROVISIONED`), **PERMANENT** |
+| Petición de mensajes de un pull (`CONSUMER.MSG.NEXT`) | **Silencio**: el consumidor queda inerte, parece sano | `subscribe()` lanza `PermissionDeniedError` |
+| `ack` (`nak`, `term` y WIP publican en el mismo `$JS.ACK.…`; el denegado que se midió fue el ack) | **Silencio**: el evento se procesa y se **reentrega cada `ack_wait`, para siempre**, sin error | Solo un aviso en `logger.error` — **configura un `logger`** |
+| Publicar en la DLQ (`dlq.<S>`) | La publicación falla | Se registra y no se termina el mensaje: se reentrega |
+
+Las dos filas silenciosas existen porque `ack` y el pull son publicaciones sueltas, sin
+respuesta que fallar; el broker solo manda un `-ERR` asíncrono. Por eso el SDK lo vigila, y
+por eso la matriz de tests comprueba que cada permiso quitado se *nota*.
+
+PERMANENT importa: un handler que provoque cualquiera de estos errores —por ejemplo
+publicando en un dominio sin aprovisionar— va a la DLQ en la **primera** entrega
+(04-errors.md) y no atasca la cola con reintentos que darían la misma respuesta.
+
+### Aprovisionamiento: `flux provision`
+
+Streams y consumidores se crean **fuera del SDK** en producción, con credenciales de
+operación. Dejar que cualquier servicio cree el stream compartido de su dominio es una
+carrera esperando a ocurrir, y su permiso de creación es justo el que la ACL exacta quita.
+
+```
+NotProvisionedError: el stream "EVT_NUEVOS" no existe y "fx-mixto" no tiene permiso para
+crearlo (el broker denegó publicar en "$JS.API.STREAM.CREATE.EVT_NUEVOS"). En producción se
+aprovisiona con `flux provision <services.json>`, usando credenciales de operación, no las
+del servicio (06-security.md §3).
+```
+
+Con permiso de creación (desarrollo), el SDK sigue creándolos con la config canónica.
+
+### TLS
+
+```ts
+tls: { caFile: "/etc/flux/ca.pem" }                                   // CA propia
+tls: { caFile, certFile: "/etc/flux/cliente.pem", keyFile: "/etc/flux/cliente.key" }  // mTLS
+tls: {}                                                                // TLS con las CA del sistema
+```
+
+Son **rutas**; las lee el cliente en cada (re)conexión. Una ruta ilegible, un `certFile` sin
+`keyFile`, una clave desconocida o `tls: null` lanzan `InvalidTlsOptionsError` en `connect()`.
+
+- Un certificado que no verifica (CA que falta o equivocada, host que no está en los SAN) hace
+  fallar `connect()` en milisegundos con `ConnectionRejectedError` (`reason: "tls"`) y apunta a
+  `tls.caFile`. La librería de NATS, con `waitOnFirstConnect`, **reintentaba para siempre sin
+  decir nada**; el SDK distingue «el servidor no está» (se espera) de «esto no se arregla
+  esperando» (se falla).
+- Si se pide `tls` y el servidor no lo ofrece, falla: **nunca baja a texto plano**.
+- mTLS sin certificado de cliente **no** da un error de TLS en el cliente: el servidor corta el
+  handshake y el cliente solo ve un timeout. El motivo está en el log del servidor.
+
+### Credenciales
+
+Un **solo** método:
+
+| Método | Opción |
+|---|---|
+| `.creds` por ruta (el recomendado) | `credentials: { creds: "/ruta/svc.creds" }` |
+| `.creds` por contenido (gestor de secretos) | `credentials: { credsContent: "-----BEGIN NATS USER JWT-----…" }` |
+| nkey | `credentials: { nkeySeed: "SU…" }` |
+| token | `credentials: { token: "…" }` |
+| usuario y contraseña | `credentials: { user: "…", pass: "…" }` |
+
+- **`creds` es una ruta**, como `CredsFile` en Go y Rust. En v0.1 la opción existía pero el
+  cliente NATS no tiene ninguna llamada `creds`: se **ignoraba en silencio** (H4) y el servicio
+  conectaba sin autenticar o fallaba sin explicación.
+- Todo lo mal formado lanza `InvalidCredentialsError` en `connect()`, antes de tocar la red: una
+  clave que no existe (`password`, `credsFile`…), dos métodos a la vez, valores vacíos, una ruta
+  ilegible, un `.creds` o una semilla que no se pueden usar. Los mensajes **nunca** incluyen el
+  valor de la credencial.
+- Credenciales que el broker rechaza → `ConnectionRejectedError` (`reason: "auth"`), sin
+  reintentar.
+- `connect()` **sí** espera a un broker que aún no ha arrancado (un servicio que levanta antes
+  que NATS es lo normal en un compose).
+
 ## Desarrollo
 
 ```bash
 npm run typecheck
-npm test          # 105 tests, sin broker
+npm test          # unitarios, y los de integración si hay nats-server (ver abajo)
 npm run build
+
+# Tests de integración: arrancan su PROPIO nats-server, con la config que cada caso escribe
+GOBIN=$PWD/bin go install github.com/nats-io/nats-server/v2@v2.14.5
+NATS_SERVER=$PWD/bin/nats-server npm test
+# FLUX_REQUIRE_BROKER=1 hace que la ausencia del binario sea un FALLO y no un salto con aviso.
+# Es lo que usa el CI: sin ella un binario que no compilara daría verde sin ejecutar nada.
+# Puertos: 4400-4449 por defecto (FLUX_TEST_PORTS=desde-hasta). TLS necesita `openssl`.
 
 # Suite de conformidad contra NATS real
 docker compose up -d          # desde la raíz del repo

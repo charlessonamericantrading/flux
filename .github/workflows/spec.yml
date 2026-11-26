@@ -130,7 +130,7 @@ jobs:
       - run: node scripts/check-protocol-json.mjs
 
   sdk-node:
-    name: SDK Node — typecheck y tests
+    name: SDK Node — typecheck, tests e integración contra NATS real
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -140,9 +140,30 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
+      # nats-server 2.14.5 exige Go 1.25 en su go.mod: se fija aquí en vez de depender de
+      # que `go` descargue un toolchain por su cuenta. Sin docker, a diferencia del job
+      # `conformance`: los tests de integración arrancan su PROPIO servidor, con la config
+      # (usuarios, permisos, TLS, modo operador) que cada caso escribe.
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+          cache: false
+      - name: Compilar nats-server 2.14.5
+        env:
+          GOBIN: ${{ runner.temp }}/bin
+        run: |
+          go install github.com/nats-io/nats-server/v2@v2.14.5
+          "$GOBIN/nats-server" --version
       - run: npm install --no-audit --no-fund
       - run: npm run typecheck
-      - run: npm test
+      # FLUX_REQUIRE_BROKER hace que la AUSENCIA del broker sea un fallo y no un salto con
+      # aviso: sin ella, un binario que no se compilara dejaría el CI verde sin haber
+      # ejecutado nunca los tests que prueban los permisos.
+      - name: Tests (unitarios + integración contra nats-server)
+        env:
+          NATS_SERVER: ${{ runner.temp }}/bin/nats-server
+          FLUX_REQUIRE_BROKER: '1'
+        run: npm test
       - run: npm run build
 
   # Los tests de estos SDKs LEEN protocol.json para no divergir de la spec. Eso es
