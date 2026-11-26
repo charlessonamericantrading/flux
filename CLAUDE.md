@@ -46,6 +46,13 @@ Al responder preguntas de diseño, la spec manda sobre cualquier código.
 - Un `publish` de **core NATS** a un subject que ningún stream captura no da error: el
   evento se evapora. Publica siempre por JetStream.
 
+## Trabajo en curso
+
+El camino a v1.1 —estado replicado, petición/respuesta, gateway y seguridad verificada—
+está en [`docs/plan-v1.1/PLAN.md`](docs/plan-v1.1/PLAN.md). Si te piden ejecutar una
+fase, léelo entero antes: fija el orden, las decisiones de diseño ya cerradas y los
+criterios de aceptación.
+
 ## Al terminar una tarea
 
 Repasa la checklist de [`AGENTS.md` §11](AGENTS.md).
