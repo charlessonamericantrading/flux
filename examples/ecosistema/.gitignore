@@ -1,0 +1,3 @@
+# Lo que genera `node run.mjs`: claves privadas (nkeys, CA), los datos de cada servicio y los registros.
+.run/
+node_modules/

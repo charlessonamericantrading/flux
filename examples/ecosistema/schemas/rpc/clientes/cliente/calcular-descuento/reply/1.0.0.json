@@ -1,0 +1,34 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.internal/rpc/clientes/cliente/calcular-descuento/reply/1.0.0.json",
+  "title": "rpc clientes.cliente.v1.calcular-descuento — respuesta",
+  "description": "La RESPUESTA de `clientes.cliente.v1.calcular-descuento`. Escribe el dueño y leen los llamantes: añadir un valor a un enum exigiría `x-extensible-enum` (11-request-reply.md §11).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "descuentoCents",
+    "moneda"
+  ],
+  "properties": {
+    "descuentoCents": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Descuento en la unidad mínima de la moneda. Entero."
+    },
+    "moneda": {
+      "type": "string",
+      "pattern": "^[A-Z]{3}$",
+      "description": "Moneda, ISO 4217: la de la petición."
+    },
+    "plan": {
+      "type": "string",
+      "enum": [
+        "bronce",
+        "plata",
+        "oro"
+      ],
+      "x-extensible-enum": true,
+      "description": "El plan con el que se ha calculado. Opcional."
+    }
+  }
+}

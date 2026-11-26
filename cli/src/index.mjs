@@ -18,6 +18,7 @@ import { tail } from "./tail.mjs";
 import { comandoProvision } from "./provision.mjs";
 import { comandoState } from "./state.mjs";
 import { comandoCall, INBOX } from "./call.mjs";
+import { comandoNew } from "./new.mjs";
 
 const SUBJECT_RE =
   /^[a-z0-9]+(-[a-z0-9]+)*\.[a-z0-9]+(-[a-z0-9]+)*\.v[1-9][0-9]*\.[a-z0-9]+(-[a-z0-9]+)*$/;
@@ -43,6 +44,10 @@ ${c.bold("COMANDOS")}
   ${c.cyan("call")} <operacion>          Una petición a mano, para depurar: construye el sobre como un SDK
                               y muestra la respuesta o el error con su código estable
   ${c.cyan("validate")} <subject>        Comprueba un subject contra el protocolo
+  ${c.cyan("new")} event|state|rpc <nombre>
+                              Crea el esquema de un contrato nuevo (con su \`$id\` y lo obligatorio) y regenera el bundle:
+                              event clientes.cliente.v1.registrado · state clientes.cliente.v1 ·
+                              rpc clientes.cliente.v1.calcular-descuento (el PAR request/reply). No necesita broker
   ${c.cyan("provision")} <services.json> Crea los streams y durables que exige el manifiesto
                               (idempotente, informa de diferencias, nunca borra)
   ${c.cyan("keygen")} <servicio> <n>     Genera un par Ed25519 para firmar eventos
@@ -73,6 +78,12 @@ ${c.bold("OPCIONES DE call")}
       --json                Salida para máquinas (también en doctor)
       --show-data           Imprime el data de una respuesta confidential o restricted
 
+${c.bold("OPCIONES DE new")}
+      --schemas <dir>       El \`schemas/\` donde se crea (por defecto ./schemas; se crea si no existe)
+      --description <texto> La \`description\` del esquema (por defecto, un TODO que rellenar)
+      --no-bundle           No regenera schemas/bundle.json
+      --dry-run             Muestra lo que crearía; no escribe nada
+
 ${c.bold("OPCIONES DE provision")}
       --dry-run             Muestra qué se crearía; no crea nada
       --replicas <n>        Réplicas de los streams (por defecto 1; producción: 3)
@@ -91,6 +102,8 @@ ${c.bold("EJEMPLOS")}
   flux state ls clientes.cliente.v1 --tenant acme
   flux state get clientes.cliente.v1 acme cli-1
   flux state resync tienda-web clientes.cliente.v1 --tenant acme --confirm
+  flux new event clientes.cliente.v1.registrado
+  flux new rpc clientes.cliente.v1.calcular-descuento --schemas examples/ecosistema/schemas
   flux provision examples/services.json --dry-run --creds ops.creds
   flux provision examples/services.json --replicas 3 --creds ops.creds
 
@@ -133,6 +146,10 @@ function parseArgs(argv) {
     else if (a === "--aggregate-id") opts.aggregateId = argv[++i];
     else if (a === "--classification") opts.classification = argv[++i];
     else if (a === "--no-validate") opts.validate = false;
+    else if (a === "--schemas" || a === "--description") {
+      opts[a.slice(2)] = argv[++i];
+      if (!opts[a.slice(2)] || opts[a.slice(2)].startsWith("--")) die(`${a} necesita un valor`);
+    } else if (a === "--no-bundle") opts.sinBundle = true;
     else if (a.startsWith("-")) die(`opción desconocida: ${a}`);
     else opts._.push(a);
   }
@@ -242,6 +259,11 @@ if (cmd === "keygen") {
 if (cmd === "validate") {
   if (!sub) die("uso: flux validate <subject>");
   process.exit(validate(sub));
+}
+
+// `new` es trabajo sobre ficheros: ni conecta ni necesita broker.
+if (cmd === "new") {
+  process.exit(comandoNew(sub, rest[0], opts));
 }
 
 if (cmd === "provision") {

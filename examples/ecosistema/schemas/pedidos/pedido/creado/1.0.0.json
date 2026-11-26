@@ -1,0 +1,73 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.internal/pedidos/pedido/creado/1.0.0.json",
+  "title": "pedidos.pedido.v1.creado",
+  "description": "Un pedido ha sido creado. Emitido por `tienda-web`, dueño del agregado. Autocontenido: lleva las líneas y el total, para que quien lo consuma no tenga que llamar de vuelta. El cliente va por REFERENCIA (`clienteId`): su nombre y su correo son PII y viven en el estado `clientes.cliente.v1`. Importes en enteros de la unidad mínima más moneda ISO 4217.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "pedidoId",
+    "clienteId",
+    "aggregateVersion",
+    "totalCents",
+    "moneda",
+    "lineas"
+  ],
+  "properties": {
+    "pedidoId": {
+      "type": "string",
+      "pattern": "^ped-[0-9a-z]{3,32}$",
+      "description": "Identificador del agregado; el atributo `subject` del CloudEvent."
+    },
+    "clienteId": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$",
+      "description": "Referencia al cliente. NO se incluye PII."
+    },
+    "aggregateVersion": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Contador monotónico del pedido (1 en la creación)."
+    },
+    "totalCents": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Total del pedido, antes de descuentos, en la unidad mínima de `moneda`. Entero."
+    },
+    "moneda": {
+      "type": "string",
+      "pattern": "^[A-Z]{3}$",
+      "description": "Moneda, ISO 4217."
+    },
+    "lineas": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 500,
+      "description": "Líneas del pedido.",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "sku",
+          "cantidad",
+          "precioUnitarioCents"
+        ],
+        "properties": {
+          "sku": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 64
+          },
+          "cantidad": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "precioUnitarioCents": {
+            "type": "integer",
+            "minimum": 0
+          }
+        }
+      }
+    }
+  }
+}

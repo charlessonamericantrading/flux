@@ -1,0 +1,32 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.internal/rpc/clientes/cliente/sumar-puntos/request/1.0.0.json",
+  "title": "rpc clientes.cliente.v1.sumar-puntos — petición",
+  "description": "La PETICIÓN de `clientes.cliente.v1.sumar-puntos`: una ORDEN (cambia datos del CRM y necesita la respuesta ya), y NO es idempotente por naturaleza (`puntos = puntos + n`). Por eso lleva una clave de negocio, `referencia`: quien la atiende deduplica por ella y por el `id` de la petición — 11-request-reply.md §4.5.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "clienteId",
+    "puntos",
+    "referencia"
+  ],
+  "properties": {
+    "clienteId": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$",
+      "description": "Referencia al cliente: la clave de su estado."
+    },
+    "puntos": {
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 100000,
+      "description": "Puntos a sumar. Entero."
+    },
+    "referencia": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 128,
+      "description": "Clave de negocio de la operación (el pedido que los genera). La MISMA referencia, otra vez, no suma de nuevo: sobrevive a un reintento con otro `id` (una reentrega del evento que la provoca)."
+    }
+  }
+}

@@ -35,6 +35,11 @@ jobs:
       - name: Verificar que el agregado está regenerado
         run: node scripts/build-llms.mjs --check
 
+      # Los resúmenes que un agente lee EN LUGAR de AGENTS.md (`.cursor/rules/flux.mdc`, `.github/copilot-instructions.md`) estuvieron meses diciendo
+      # cosas que AGENTS.md ya había desmentido. Cada regla dura, con su titular, tiene que estar en los dos.
+      - name: Los resúmenes de AGENTS.md no divergen de él
+        run: node scripts/check-agent-docs.mjs
+
   schemas-valid:
     name: Schemas válidos e inmutables
     runs-on: ubuntu-latest
@@ -56,6 +61,17 @@ jobs:
       - name: bundle.json al día
         run: node scripts/bundle-schemas.mjs --check
 
+      # Los contratos del ecosistema de ejemplo (examples/ecosistema/schemas): mismas reglas, mismo bundle, otro árbol.
+      - name: Los esquemas del ecosistema de ejemplo, conformes y con su bundle al día
+        run: |
+          node scripts/check-compat.mjs --schemas examples/ecosistema/schemas
+          node scripts/bundle-schemas.mjs --check --schemas examples/ecosistema/schemas
+
+      # «Un fragmento de documentación que no compila es peor que ninguno»: cada bloque de código de la guía de migración es un extracto
+      # LITERAL de un fichero real (que ejecutan las pruebas del ejemplo). Si cambias el código, `node scripts/check-migracion.mjs --rellenar`.
+      - name: La guía de migración no tiene código escrito a mano
+        run: node scripts/check-migracion.mjs
+
       # Una comprobación que solo se ha visto en verde no demuestra nada: esto escribe esquemas rpc ROTOS (una
       # petición sin su respuesta, un data que no es un objeto…) en una copia y exige que cada uno falle por su razón,
       # y que la compatibilidad se invierta donde toca (11-request-reply.md §11).
@@ -72,7 +88,7 @@ jobs:
         if: github.event_name == 'pull_request'
         run: |
           changed=$(git diff --name-status \
-            origin/${{ github.base_ref }}...HEAD -- schemas/ ':(exclude)schemas/bundle.json' \
+            origin/${{ github.base_ref }}...HEAD -- schemas/ examples/ecosistema/schemas/ ':(exclude)schemas/bundle.json' ':(exclude)examples/ecosistema/schemas/bundle.json' \
             | awk '$1 == "M" || $1 ~ /^R/ { print $2 }')
           if [ -n "$changed" ]; then
             echo "✗ Schemas publicados modificados (son inmutables — añade una versión nueva):"
@@ -92,6 +108,8 @@ jobs:
       # Un dominio con dos dueños destruye la premisa de que solo el propietario
       # del agregado publica sus eventos, y nadie puede confiar ya en el .
       - run: node scripts/gen-acl.mjs examples/services.json --check
+      # …y el del ecosistema de ejemplo, contra SUS contratos.
+      - run: node scripts/gen-acl.mjs examples/ecosistema/services.json --bundle examples/ecosistema/schemas/bundle.json --check
 
   acl-verify:
     name: ACLs generadas, contra un NATS real
@@ -318,6 +336,13 @@ jobs:
             exit 1
           fi
           echo "✓ sin nats-server las pruebas de la CLI fallan"
+      # «Una prueba que pasa con el código roto no vale»: cada garantía de `flux new` (no pisar un esquema publicado, deshacer lo escrito si algo
+      # falla, `aggregateVersion` obligatoria, el par request/reply, los dominios reservados…) se ROMPE en una copia y la prueba DEBE fallar.
+      - name: Los mutantes de `flux new` DEBEN hacer fallar las pruebas
+        working-directory: cli
+        env:
+          FLUX_REQUIRE_BROKER: '1'
+        run: node test/mutantes-new.mjs
 
   sdk-node:
     name: SDK Node — typecheck, tests e integración contra NATS real
@@ -448,6 +473,115 @@ jobs:
           FLUX_REQUIRE_BROKER: '1'
           FLUX_TEST_PORTS: 6900-6999
         run: node test/mutantes.mjs --parte ${{ matrix.parte }}/3
+
+  # El ecosistema de ejemplo (examples/ecosistema): un CRM, una tienda, facturación y una web en PHP, BAJO LA CONFIGURACIÓN SEGURA (TLS, una nkey por
+  # servicio, las ACLs que genera gen-acl.mjs, `flux provision`, nada de --dev), de extremo a extremo contra un nats-server real, el gateway y PHP.
+  # Recorre lo que un desarrollador necesita para sustituir sus APIs y webhooks, y las NEGATIVAS de seguridad: un servicio no puede leer lo que no se
+  # le concedió. Sin `php` con curl o sin nats-server el job FALLA (FLUX_REQUIRE_*): un verde que no ejecutó nada aparenta cobertura.
+  ecosistema:
+    name: Ecosistema de ejemplo — extremo a extremo bajo la configuración segura
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+          cache: false
+      - name: Compilar nats-server 2.14.5
+        run: |
+          GOBIN="$PWD/bin" go install github.com/nats-io/nats-server/v2@v2.14.5
+          echo "NATS_SERVER=$PWD/bin/nats-server" >> "$GITHUB_ENV"
+      # El «hosting compartido» del ejemplo: PHP con curl. `sodium` no hace falta.
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.3'
+          extensions: json, curl
+          coverage: none
+      - run: npm ci --no-audit --no-fund && npm run build
+        working-directory: sdk-node
+      - run: npm ci --no-audit --no-fund
+        working-directory: conformance
+      - run: npm ci --no-audit --no-fund
+        working-directory: cli
+      - run: npm ci --no-audit --no-fund
+        working-directory: gateway
+      - run: npm ci --no-audit --no-fund
+        working-directory: examples/ecosistema
+      - name: El ejemplo, de principio a fin (permisos generados, NATS real, el gateway, PHP y tres servicios)
+        working-directory: examples/ecosistema
+        env:
+          FLUX_REQUIRE_BROKER: '1'
+          FLUX_REQUIRE_PHP: '1'
+          FLUX_TEST_PORTS: 7200-7299
+        run: npm test
+      - name: Sin nats-server, la prueba FALLA (no se salta)
+        working-directory: examples/ecosistema
+        run: |
+          if NATS_SERVER=/no/existe/nats-server FLUX_REQUIRE_BROKER=1 FLUX_REQUIRE_PHP=1 node --test --test-force-exit test/ecosistema.test.mjs > /dev/null 2>&1; then
+            echo "✗ la prueba del ecosistema pasó SIN nats-server con FLUX_REQUIRE_BROKER=1: la comprobación no vigila nada"
+            exit 1
+          fi
+          echo "✓ sin nats-server la prueba del ecosistema falla"
+      # Lo que dice el README: UN comando, y el guion recorre el ecosistema entero.
+      - name: «Un comando» — run.mjs recorre el guion
+        working-directory: examples/ecosistema
+        env:
+          FLUX_TEST_PORTS: 7300-7399
+        run: node run.mjs --una-vez
+      # La configuración del gateway del ejemplo es válida (sin secretos: solo nombres de variables).
+      - name: gateway.json del ejemplo es válido
+        working-directory: gateway
+        env:
+          WEB_PHP_NKEY_SEED: x
+          WEB_PHP_ENTREGA_SECRETO: x
+          PASARELA_HOOK_SECRETO: x
+        run: node src/index.mjs --check --config ../examples/ecosistema/gateway.json
+
+  # «Una prueba que pasa con el código roto no vale»: se ROMPE a propósito lo importante del ejemplo (quitar la idempotencia de facturación, conceder de más
+  # a un servicio en el manifiesto, un receptor PHP sin firma…) y la prueba DEBE fallar por la razón correcta.
+  ecosistema-mutantes:
+    name: Los mutantes del ecosistema DEBEN hacer fallar la prueba
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+          cache: false
+      - name: Compilar nats-server 2.14.5
+        run: |
+          GOBIN="$PWD/bin" go install github.com/nats-io/nats-server/v2@v2.14.5
+          echo "NATS_SERVER=$PWD/bin/nats-server" >> "$GITHUB_ENV"
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.3'
+          extensions: json, curl
+          coverage: none
+      - run: npm ci --no-audit --no-fund && npm run build
+        working-directory: sdk-node
+      - run: npm ci --no-audit --no-fund
+        working-directory: conformance
+      - run: npm ci --no-audit --no-fund
+        working-directory: cli
+      - run: npm ci --no-audit --no-fund
+        working-directory: gateway
+      - run: npm ci --no-audit --no-fund
+        working-directory: examples/ecosistema
+      - name: Mutantes
+        working-directory: examples/ecosistema
+        env:
+          FLUX_REQUIRE_BROKER: '1'
+          FLUX_REQUIRE_PHP: '1'
+          FLUX_TEST_PORTS: 7200-7299
+        run: node test/mutantes.mjs
 
   # Los tests de estos SDKs LEEN protocol.json para no divergir de la spec. Eso es
   # deliberado, pero significa que un cambio en protocol.json puede romperlos — y

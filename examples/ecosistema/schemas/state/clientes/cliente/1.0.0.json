@@ -1,0 +1,58 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.internal/state/clientes/cliente/1.0.0.json",
+  "title": "state clientes.cliente.v1",
+  "description": "El valor ACTUAL de un cliente, publicado por `crm`, dueño del agregado, en `state.clientes.cliente.v1.<tenant>.<clienteId>`. Es el ÚNICO sitio donde viaja el dato personal: va clasificado `confidential`, los campos con PII llevan `x-pii` y se puede borrar con `state.delete` (el valor sale del stream; queda una lápida). Los EVENTOS del dominio llevan solo la referencia `clienteId`. Ver 10-state.md.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "clienteId",
+    "nombre",
+    "email",
+    "plan",
+    "puntos",
+    "aggregateVersion"
+  ],
+  "properties": {
+    "clienteId": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$",
+      "description": "Identificador del agregado: la CLAVE del estado y el atributo `subject` del CloudEvent. Un identificador opaco, nunca PII."
+    },
+    "aggregateVersion": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Contador monotónico del agregado, el que lleva el `crm` en su base de datos y SOBREVIVE a los borrados. `put` no escribe una versión que no avanza (`stale`); el consumidor aplica `WHERE aggregate_version < $n` — 10-state.md §3.4."
+    },
+    "nombre": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 200,
+      "x-pii": true,
+      "description": "Nombre completo. Dato personal: se redacta en los logs y desaparece con la lápida."
+    },
+    "email": {
+      "type": "string",
+      "minLength": 3,
+      "maxLength": 254,
+      "pattern": "^[^@\\s]+@[^@\\s]+$",
+      "x-pii": true,
+      "description": "Correo electrónico. Dato personal: se redacta en los logs y desaparece con la lápida."
+    },
+    "plan": {
+      "type": "string",
+      "enum": [
+        "bronce",
+        "plata",
+        "oro"
+      ],
+      "x-extensible-enum": true,
+      "description": "Plan comercial del cliente. Enum EXTENSIBLE: pueden añadirse planes en un MINOR, así que quien lo lee DEBE tener una rama por defecto no destructiva (05-compatibility.md §2.3)."
+    },
+    "puntos": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Puntos de fidelidad acumulados. Entero."
+    }
+  }
+}

@@ -1,0 +1,30 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.internal/rpc/clientes/cliente/sumar-puntos/reply/1.0.0.json",
+  "title": "rpc clientes.cliente.v1.sumar-puntos — respuesta",
+  "description": "La RESPUESTA de `clientes.cliente.v1.sumar-puntos`: cómo queda el cliente. Repetir la petición devuelve esta misma respuesta, no una nueva.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "clienteId",
+    "puntos",
+    "aggregateVersion"
+  ],
+  "properties": {
+    "clienteId": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$",
+      "description": "Referencia al cliente."
+    },
+    "puntos": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Puntos totales tras la operación."
+    },
+    "aggregateVersion": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Versión del agregado tras la operación."
+    }
+  }
+}

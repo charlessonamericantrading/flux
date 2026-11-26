@@ -6,7 +6,11 @@
  * abierto donde todo funciona porque nada está confinado.
  *
  *   (cd conformance && npm install)
- *   node scripts/dev-secure.mjs [services.json] [--out .dev-secure] [--port 4223] [--dev] [--force]
+ *   node scripts/dev-secure.mjs [services.json] [--bundle <bundle.json>] [--out .dev-secure] [--port 4223] [--dev] [--force]
+ *
+ * `services.json` es TU manifiesto y `--bundle` el índice de contratos de TUS esquemas (por defecto, los de este repo:
+ * `examples/services.json` y `schemas/bundle.json`). Hasta la v1.1 el script ignoraba el manifiesto que se le daba al
+ * calcular las claves, y solo servía para el ecosistema de este repo.
  *
  * Escribe en `.dev-secure/` (ignorado por git: lleva claves privadas):
  *
@@ -28,12 +32,14 @@
  * servicio: ese permiso no se concede ni con `--dev`, así que hay que aprovisionar siempre.
  */
 
+import { spawnSync } from "node:child_process";
 import { chmod, mkdir, readFile, readdir, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
 
 import { crearPki, opensslDisponible } from "./lib/pki.mjs";
 import {
   EJEMPLO,
+  GEN,
   ROOT,
   conUsuarios,
   credsDe,
@@ -42,20 +48,20 @@ import {
   gen,
   nkeys,
   nuevaClave,
-  permisosJson,
   usuarioOpsConf,
 } from "./lib/nats-harness.mjs";
 
-const USO = "uso: node scripts/dev-secure.mjs [services.json] [--out <dir>] [--port <n>] [--dev] [--force]";
+const USO = "uso: node scripts/dev-secure.mjs [services.json] [--bundle <bundle.json>] [--out <dir>] [--port <n>] [--dev] [--force]";
 
 function leerArgumentos(argv) {
-  const o = { manifiesto: EJEMPLO, out: path.join(ROOT, ".dev-secure"), port: 4223, dev: false, force: false };
+  const o = { manifiesto: EJEMPLO, bundle: undefined, out: path.join(ROOT, ".dev-secure"), port: 4223, dev: false, force: false };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
-    if (a === "--out" || a === "--port") {
+    if (a === "--out" || a === "--port" || a === "--bundle") {
       const v = argv[++i];
       if (!v || v.startsWith("--")) fallar(`${a} necesita un valor`);
       if (a === "--out") o.out = path.resolve(v);
+      else if (a === "--bundle") o.bundle = path.resolve(v);
       else o.port = Number(v);
     } else if (a === "--dev") o.dev = true;
     else if (a === "--force") o.force = true;
@@ -106,7 +112,11 @@ if (!(await existe(path.join(args.out, "ca.pem"))) || !(await existe(path.join(a
 
 // ─── Claves: una por servicio y la de operación, solo las que faltan ─────────
 
-const permisos = permisosJson(...(args.dev ? ["--dev"] : []));
+// Los servicios son los de TU manifiesto (y su bundle): con `permisosJson()` salían siempre los de examples/services.json.
+const opcionesGen = [...(args.bundle ? ["--bundle", args.bundle] : []), ...(args.dev ? ["--dev"] : [])];
+const lista = spawnSync(process.execPath, [GEN, args.manifiesto, "--json", ...opcionesGen], { encoding: "utf8", cwd: ROOT });
+if (lista.status !== 0) fallar(`gen-acl.mjs falló:\n${lista.stderr || lista.stdout}`, 1);
+const permisos = JSON.parse(lista.stdout);
 const publicas = {};
 const semillas = new Map();
 const nuevas = [];
@@ -135,7 +145,7 @@ await writeFile(path.join(args.out, "ops.creds"), credsDe(semillas.get("ops")), 
 
 // ─── ACL generada + usuario de operación ─────────────────────────────────────
 
-const g = gen(args.manifiesto, "--nkeys", path.join(args.out, "nkeys.json"), ...(args.dev ? ["--dev"] : []));
+const g = gen(args.manifiesto, "--nkeys", path.join(args.out, "nkeys.json"), ...opcionesGen);
 if (g.codigo !== 0) fallar(`gen-acl.mjs falló:\n${g.errores || g.salida}`, 1);
 await writeFile(
   path.join(args.out, "acl.conf"),
@@ -205,7 +215,7 @@ Arrancarlo, con el binario:
 
 Aprovisionar los streams y los durables (con las credenciales de OPERACIÓN y la CA de desarrollo):
 
-  NODE_EXTRA_CA_CERTS=${rel("ca.pem")} node cli/src/index.mjs provision ${path.relative(ROOT, args.manifiesto)} \\
+  NODE_EXTRA_CA_CERTS=${rel("ca.pem")} node cli/src/index.mjs provision ${path.relative(ROOT, args.manifiesto)}${args.bundle ? ` --bundle ${path.relative(ROOT, args.bundle)}` : ""} \\
       --server tls://localhost:${args.port} --creds ${rel("ops.creds")}
 
 Conectar un servicio con su SDK (Node): su semilla, la CA y el inbox privado, que el SDK fija solo:

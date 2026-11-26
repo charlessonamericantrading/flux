@@ -1,5 +1,5 @@
 <h1 align="center">flux</h1>
-<p align="center"><em>Event Protocol v1 — el contrato de eventos polyglot del ecosistema.</em></p>
+<p align="center"><em>Protocolo de integración polyglot: eventos, estado y petición/respuesta — en lugar de APIs, webhooks y polling.</em></p>
 
 ---
 
@@ -7,6 +7,35 @@
 delgados e intercambiables; la especificación es el source of truth. Un servicio
 escrito en cualquier lenguaje que hable este protocolo es un ciudadano de primera
 clase del ecosistema, tenga o no un SDK oficial.
+
+flux es un **protocolo de integración**: lo que hoy se resuelve con una API, un webhook o un polling entre tus sistemas tiene una primitiva —**evento**, **estado** o
+**petición/respuesta**— y lo que no puede mantener una conexión NATS (un PHP de hosting compartido, un `cron`, el sistema de un tercero) habla con un **gateway** HTTP.
+El dato llega solo cuando cambia, y los permisos de cada servicio se **generan** de un manifiesto en vez de escribirse a mano.
+
+### ¿Qué primitiva uso?
+
+| Hoy haces… | Con flux | Primitiva |
+|---|---|---|
+| Un webhook («te aviso de que pasó algo») · un polling `GET /cambios?desde=` | Publicas un **hecho** en pasado; cada interesado se suscribe | **Evento** (`publish` / `subscribe`) |
+| `GET /clientes/123` · la carga inicial `GET /clientes?page=` | El dueño publica el **valor actual**; los demás lo observan (foto + cambios) | **Estado** (`state.put` / `watch` / `get`) |
+| `POST /accion` que necesita respuesta ya · `GET /precio?…` (un cálculo) | Una **operación** que atiende el dueño del dominio | **Petición/respuesta** (`request` / `respond`) |
+| `POST /accion` asíncrona (encolar trabajo) | Un evento de quien pide y otro de resultado, unidos por `correlationid` | **Evento** + evento |
+| El webhook de un tercero · un webhook saliente · un PHP de hosting compartido · un `cron` | El **gateway** (HTTP solo en el borde) con los mismos permisos que un servicio | **Gateway** (`gateway/`) |
+
+La regla que evita recrear el problema: si lo que pides es *un dato que otro sistema guarda*, es **estado**, no una petición. El árbol de decisión completo está en
+[`AGENTS.md`](AGENTS.md), y **cómo migrar** —fila a fila, con el antes (HTTP) y el después (flux) en código que se ejecuta, el patrón gradual, cuándo no migrar y una lista
+de comprobación de seguridad— en [`docs/migracion.md`](docs/migracion.md).
+
+### Un ecosistema que funciona, con un comando
+
+[`examples/ecosistema/`](examples/ecosistema/) es un CRM, una tienda, facturación y una web en PHP, **bajo la configuración segura** (TLS, una nkey por servicio, ACLs generadas, `flux provision`;
+nada de `--dev`), con una prueba de extremo a extremo que recorre el camino completo y comprueba que **un servicio no puede leer lo que no se le concedió**:
+
+```bash
+NATS_SERVER=/ruta/a/nats-server node examples/ecosistema/run.mjs
+```
+
+Un contrato nuevo se crea con `flux new event|state|rpc <nombre>` (con su `$id` y lo obligatorio, y el bundle regenerado), no a mano.
 
 ```
    Node · Python · Go · Java · .NET · Rust · PHP
@@ -34,10 +63,10 @@ sola descarga**, sin auth y sin clonar.
 
 | Recurso | Qué es | Tamaño |
 |---|---|---|
-| [`llms-full.txt`](https://raw.githubusercontent.com/charlessonamericantrading/flux/main/llms-full.txt) | **La spec completa en un fichero.** Si solo cargas uno, es este. | ~55 KB |
-| [`llms.txt`](https://raw.githubusercontent.com/charlessonamericantrading/flux/main/llms.txt) | Índice curado con enlaces raw, por si prefieres cargar solo una parte | ~4 KB |
-| [`AGENTS.md`](AGENTS.md) | Reglas accionables: cómo publicar, cómo consumir, qué nunca hacer | ~9 KB |
-| [`protocol.json`](https://raw.githubusercontent.com/charlessonamericantrading/flux/main/protocol.json) | Constantes verificables — regex de naming, defaults, taxonomía de errores. Para **validar**, no para recordar | ~8 KB |
+| [`llms-full.txt`](https://raw.githubusercontent.com/charlessonamericantrading/flux/main/llms-full.txt) | **La spec completa en un fichero.** Si solo cargas uno, es este. | ~400 KB |
+| [`llms.txt`](https://raw.githubusercontent.com/charlessonamericantrading/flux/main/llms.txt) | Índice curado con enlaces raw, por si prefieres cargar solo una parte | ~10 KB |
+| [`AGENTS.md`](AGENTS.md) | Reglas accionables: qué primitiva usar, cómo publicar y consumir eventos, estado y peticiones, qué nunca hacer | ~38 KB |
+| [`protocol.json`](https://raw.githubusercontent.com/charlessonamericantrading/flux/main/protocol.json) | Constantes verificables — regex de naming, defaults, taxonomía de errores. Para **validar**, no para recordar | ~160 KB |
 
 **Pégale esto a tu agente:**
 
@@ -62,7 +91,7 @@ curl -sL https://raw.githubusercontent.com/charlessonamericantrading/flux/main/l
 | [`.github/copilot-instructions.md`](.github/copilot-instructions.md) | GitHub Copilot |
 | [`llms.txt`](llms.txt) / [`llms-full.txt`](llms-full.txt) | Cualquier agente con acceso web — Grok, ChatGPT, Replit, Gemini, Perplexity |
 
-Los tres últimos son **punteros finos** a `AGENTS.md`, no copias. La fuente es una.
+`.cursor/rules/flux.mdc` y `.github/copilot-instructions.md` son **resúmenes** de `AGENTS.md`, y `node scripts/check-agent-docs.mjs` (CI) comprueba que **no divergen** de él (cada regla dura, con su titular, está en los dos). La fuente es una.
 
 > `llms-full.txt` está **generado**. Tras editar `AGENTS.md` o `specification/*.md`:
 > `node scripts/build-llms.mjs`. CI rechaza el PR si diverge.
@@ -114,12 +143,14 @@ protocolo a v2.
 │   ├── <dominio>/<agregado>/<evento>/<semver>.json
 │   ├── state/<dominio>/<agregado>/<semver>.json
 │   └── rpc/<dominio>/<agregado>/<operacion>/{request,reply}/<semver>.json
-├── cli/                    ← flux doctor · tail · dlq · validate
+├── cli/                    ← flux doctor · tail · dlq · validate · new · provision · state · call
 ├── gateway/                ← gateway HTTP de borde (Node, `node:http`): webhooks y sistemas sin conexión NATS
+├── docs/migracion.md       ← guía de migración de APIs y webhooks a flux, fila a fila
+├── examples/ecosistema/    ← un CRM, una tienda, facturación y una web en PHP, de extremo a extremo y bajo la configuración segura
 ├── conformance/            ← el contrato, ejecutable contra NATS real
 ├── docker-compose.yml      ← NATS JetStream local
 ├── examples/services.json  ← manifiesto de ownership → ACLs
-├── scripts/                ← build-llms · check-compat · bundle-schemas · gen-acl
+├── scripts/                ← build-llms · check-compat · bundle-schemas · gen-acl · dev-secure · check-migracion
 ├── sdk-node/               ← fase 1
 ├── sdk-python/             ← fase 1
 ├── sdk-go/                 ← fase 1
@@ -141,7 +172,6 @@ protocolo a v2.
 | [.NET](sdk-dotnet/) | **L3** | 189 | ✅ | `signing` |
 | [Rust](sdk-rust/) | L2 | 175 | ✅ (incl. 14 contra NATS real) | `signing` `security` `state` `rpc` |
 | [PHP](sdk-php/) | **L3** | 304 | ✅ incl. 3 de integración contra NATS real | `signing` |
-| [PHP](sdk-php/) | L2 | 201 | ✅ (transporte no — ver abajo) | `signing` |
 
 Los cinco primeros se compilan y ejecutan en CI en cada push. La suite de conformidad corre
 aparte, contra un NATS real: **14/14**.
@@ -223,3 +253,4 @@ propaga `correlationid` / `traceparent`. El desarrollador nunca los escribe a ma
 | **3 — Operación** | CLI `flux`: doctor, tail, triaje y replay de DLQ | ✅ |
 | **4 — Gobierno** | Validación L3, verificador de compatibilidad, generador de ACLs | ✅ |
 | **5 — Confianza** | Firma Ed25519 ✅ · observabilidad ✅ · multi-tenant ✅ | ✅ |
+| **v1.1 — Integración** | Seguridad ejecutada contra un broker real ✅ · estado replicado ✅ · petición/respuesta ✅ · gateway de borde ✅ · ejemplo de ecosistema, guía de migración y `flux new` ✅ · medición reproducible (`bench/`) — en curso · paridad de los otros cinco SDKs (Fase 6) — pendiente | ✅ / ⏳ |
