@@ -127,7 +127,7 @@ export function recibirCobro({ secreto, yaVistos, guardar }) {
 // /fragmento:antes-fila-8
 
 // fragmento:antes-fila-9
-// Webhook saliente a quien no puede conectarse: el bucle de reintentos, el backoff y qué hacer con lo que no se pudo entregar es tuyo.
+// Webhook saliente a quien no puede conectarse: el bucle de reintentos, el backoff y qué hacer con lo que no se pudo entregar son cosa tuya.
 export async function entregarConReintentos(url, evento, { intentos = 3, esperaMs = 100 } = {}) {
   for (let i = 1; ; i++) {
     let estado;

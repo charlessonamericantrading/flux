@@ -464,7 +464,7 @@ Un proveedor que **no** da el instante del hecho no tiene `id` determinista: dec
 
 <!-- fuente: examples/ecosistema/antes-http/http.mjs#antes-fila-9 -->
 ```js
-// Webhook saliente a quien no puede conectarse: el bucle de reintentos, el backoff y qué hacer con lo que no se pudo entregar es tuyo.
+// Webhook saliente a quien no puede conectarse: el bucle de reintentos, el backoff y qué hacer con lo que no se pudo entregar son cosa tuya.
 export async function entregarConReintentos(url, evento, { intentos = 3, esperaMs = 100 } = {}) {
   for (let i = 1; ; i++) {
     let estado;
