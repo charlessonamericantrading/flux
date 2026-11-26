@@ -3,9 +3,12 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "CLI operativa del flux Event Protocol v1: doctor, tail, triaje/replay de DLQ y aprovisionamiento de streams y durables.",
+  "description": "CLI operativa del flux Event Protocol v1: doctor, tail, triaje/replay de DLQ, estado replicado (ls, get, resync) y aprovisionamiento de streams y durables.",
   "bin": { "flux": "./src/index.mjs" },
-  "scripts": { "start": "node src/index.mjs" },
+  "scripts": {
+    "start": "node src/index.mjs",
+    "test": "node --test --test-concurrency=1 test/*.test.mjs"
+  },
   "dependencies": {
     "@nats-io/jetstream": "^3.4.0",
     "@nats-io/transport-node": "^3.4.0"

@@ -190,6 +190,49 @@ jobs:
       # con mutaciones (quitar un código de un SDK debe hacerlo fallar).
       - run: node scripts/check-sdk-codes.mjs
 
+  # La CLI (cli/) contra un nats-server real: `flux state ls|get|resync`, `flux doctor` sobre estado,
+  # `flux tail` y `flux dlq replay` (que DEBE rechazar `dlq.state.>`). Es el equivalente, para el
+  # estado, del paso «flux doctor detecta un cluster roto» del job `conformance`: el doctor se prueba
+  # en los dos sentidos (verde con la configuración buena, rojo con cada una de las doce rotas), y
+  # la simulación de `resync` no cambia nada mientras `--confirm` sí. Un broker PROPIO por suite en
+  # lugar del compartido de `conformance`: ese acaba el job con un cluster roto a propósito.
+  cli:
+    name: CLI contra NATS real — estado, doctor, tail y dlq
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      # nats-server 2.14.5 exige Go 1.25 (su go.mod): se compila la versión exacta que la spec dice
+      # haber medido, igual que en `acl-verify` y `security`.
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+          cache: false
+      - name: Compilar nats-server 2.14.5
+        run: |
+          GOBIN="$PWD/bin" go install github.com/nats-io/nats-server/v2@v2.14.5
+          echo "NATS_SERVER=$PWD/bin/nats-server" >> "$GITHUB_ENV"
+      - run: npm install --no-audit --no-fund
+        working-directory: cli
+      # FLUX_REQUIRE_BROKER=1: que falte nats-server es un FALLO y no un salto con aviso. Sin ella, un
+      # binario que no se compilara dejaría el job verde sin haber ejecutado nunca la CLI contra un broker.
+      - name: Pruebas de la CLI (modelo de estado sin broker; ls, get, resync, doctor, tail y dlq con él)
+        working-directory: cli
+        env:
+          FLUX_REQUIRE_BROKER: '1'
+        run: npm test
+      # En los dos sentidos también aquí: sin broker, las pruebas con broker DEBEN fallar.
+      - name: Sin nats-server, las pruebas con broker FALLAN (no se saltan)
+        working-directory: cli
+        run: |
+          if NATS_SERVER=/no/existe/nats-server FLUX_REQUIRE_BROKER=1 npm test > /dev/null 2>&1; then
+            echo "✗ las pruebas de la CLI pasaron SIN nats-server con FLUX_REQUIRE_BROKER=1: la comprobación no vigila nada"
+            exit 1
+          fi
+          echo "✓ sin nats-server las pruebas de la CLI fallan"
+
   sdk-node:
     name: SDK Node — typecheck, tests e integración contra NATS real
     runs-on: ubuntu-latest
