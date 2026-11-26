@@ -71,6 +71,8 @@ nombre, sus credenciales NATS y sus permisos, cuya conexión vive **dentro del g
   `PERMISSION_DENIED` **del broker** en 1 ms; en un solo proceso conviven 3 identidades sin que se mezclen sus inboxes).
 - **Un cliente de borde no atiende operaciones** (no puede llevar `serves`): atender exige una suscripción viva al subject
   de cada operación ([11-request-reply.md §2.3](11-request-reply.md)) y un cliente HTTP no la sostiene. `gen-acl.mjs` lo rechaza.
+- **El gateway no puede ser más permisivo que el broker**: aunque su configuración admita un tenant que el manifiesto no concede, lo deniega el broker
+  (A-165), y cada denegación queda en el log del servidor con el nombre del servicio (A-164).
 - Todo lo que el gateway hace por un cliente lo hace con **la API del SDK** (`publish`, `state.put`, `request`,
   `subscribe`): el desarrollador no escribe el sobre y el gateway tampoco.
 
@@ -413,7 +415,8 @@ La conexión **del gateway a NATS** es otra cosa: `nats.tls` con la CA propia y,
 El gateway **no registra nunca `data`**, de ningún evento: ni el cuerpo de una petición ni el de una entrega ni el de una respuesta
 (en particular, **nunca el de un `confidential`**: lo que entra a un `log` acaba en sistemas con otra retención y otros lectores).
 Tampoco el token ni `Authorization` ni los secretos. Registra **qué pasó**: cliente, ruta, estado, duración, `id` del evento,
-subject u operación, `code`. El `message` de un error, como exige [04-errors.md §5.2](04-errors.md), no cita valores de `data`.
+subject u operación, `code`, con una **lista blanca** de campos —no una lista negra— para que un campo nuevo no se cuele por olvido (A-163: un canario en el
+`data` de un evento, un estado, una llamada y un webhook no aparece en ninguna línea ni en el cuerpo de un error). El `message` de un error, como exige [04-errors.md §5.2](04-errors.md), no cita valores de `data`.
 
 ### 7.4 Parada ordenada
 
@@ -432,7 +435,7 @@ variables que nombra, **diciendo cuál**.
 
 ## 8. Lo medido
 
-Observado el 2026-11-26 contra **nats-server 2.14.5** y **Node 22.23.5**. A-150 a A-162 están en el
+Observado el 2026-11-26 contra **nats-server 2.14.5** y **Node 22.23.5**. A-150 a A-166 están en el
 [Apéndice A](../docs/plan-v1.1/PLAN.md#apéndice-a--evidencia):
 
 | | Qué | Dónde se reproduce |
@@ -444,10 +447,14 @@ Observado el 2026-11-26 contra **nats-server 2.14.5** y **Node 22.23.5**. A-150 
 | A-154 | `timingSafeEqual` y el hexadecimal impar | ídem |
 | A-155 | HMAC: GitHub, `openssl` y Python | `gateway/test/firma.test.mjs` |
 | A-156 | El `id` determinista es un UUIDv7 válido | `sdk-node/test/external-id.test.ts` |
-| A-157 | `duplicate_window` y la deduplicación por `id` | `gateway/test/e2e.test.mjs` |
-| A-158 a A-160 | Reintentos, DLQ y el presupuesto acotado de la entrega | ídem |
+| A-157 | `duplicate_window` y la deduplicación por `id` | `gateway/test/e2e-hooks.test.mjs`, `sdk-node/test/integration/external-id.test.ts` |
+| A-158 a A-160 | Reintentos, DLQ y el presupuesto acotado de la entrega | `gateway/test/e2e-salida.test.mjs` |
 | A-161 | El cliente HTTP de salida | `gateway/test/medidas.test.mjs` |
 | A-162 | La parada ordenada | ídem |
+| A-163 | `data` no aparece en ningún registro (lista blanca de campos) | `gateway/test/e2e-entrada.test.mjs` |
+| A-164 | Una denegación queda en el log del servidor con el nombre del servicio: lo deniega el broker | ídem |
+| A-165 | El tenant: el gateway no puede ser más permisivo que el broker | ídem |
+| A-166 | `Promise.all` fuga conexiones al fallar el arranque | `gateway/test/e2e-ciclo.test.mjs` |
 
 ## 9. Lo que el gateway NO resuelve
 

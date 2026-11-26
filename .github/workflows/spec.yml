@@ -300,6 +300,68 @@ jobs:
         run: npm test
       - run: npm run build
 
+  gateway:
+    name: Gateway de borde — extremo a extremo contra NATS real (ACLs generadas), mutantes e imagen
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      # Como `cli` y `sdk-node`: se compila la versión EXACTA de nats-server que la spec dice haber medido.
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+          cache: false
+      - name: Compilar nats-server 2.14.5
+        run: |
+          GOBIN="$PWD/bin" go install github.com/nats-io/nats-server/v2@v2.14.5
+          echo "NATS_SERVER=$PWD/bin/nats-server" >> "$GITHUB_ENV"
+      # El gateway depende del SDK de Node (`file:../sdk-node`, ya compilado), y sus pruebas aplican las ACLs que genera
+      # scripts/gen-acl.mjs (dependencias de NATS en `conformance/`) y aprovisionan con `flux provision` (`cli/`).
+      - run: npm ci --no-audit --no-fund && npm run build
+        working-directory: sdk-node
+      - run: npm ci --no-audit --no-fund
+        working-directory: conformance
+      - run: npm ci --no-audit --no-fund
+        working-directory: cli
+      - run: npm ci --no-audit --no-fund
+        working-directory: gateway
+      # FLUX_REQUIRE_BROKER=1: que falte nats-server es un FALLO y no un salto con aviso.
+      - name: Pruebas de extremo a extremo (permisos generados, NATS real, un receptor HTTP que verifica la firma)
+        working-directory: gateway
+        env:
+          FLUX_REQUIRE_BROKER: '1'
+          FLUX_TEST_PORTS: 6900-6999
+        run: npm test
+      - name: Sin nats-server, las pruebas con broker FALLAN (no se saltan)
+        working-directory: gateway
+        run: |
+          if NATS_SERVER=/no/existe/nats-server FLUX_REQUIRE_BROKER=1 node --test --test-force-exit test/e2e-entrada.test.mjs > /dev/null 2>&1; then
+            echo "✗ las pruebas del gateway pasaron SIN nats-server con FLUX_REQUIRE_BROKER=1: la comprobación no vigila nada"
+            exit 1
+          fi
+          echo "✓ sin nats-server las pruebas del gateway fallan"
+      # «Una prueba que pasa con el código roto no vale»: cada garantía importante (comparar el token con ===, no verificar el HMAC,
+      # id aleatorio en el webhook, firmar sin el instante, no renovarlo en los reintentos, un 4xx que se reintenta, `data` en los
+      # registros…) se ROMPE en una copia de src/ y sus pruebas DEBEN fallar.
+      - name: Los mutantes del gateway DEBEN hacer fallar las pruebas
+        working-directory: gateway
+        env:
+          FLUX_REQUIRE_BROKER: '1'
+          FLUX_TEST_PORTS: 6900-6999
+        run: node test/mutantes.mjs
+      # La imagen se construye con la raíz como contexto (depende de sdk-node) y arranca con la configuración de ejemplo validada.
+      - name: La imagen del gateway se construye y valida una configuración
+        run: |
+          docker build -f gateway/Dockerfile -t flux-gateway .
+          docker run --rm \
+            -v "$PWD/gateway/examples/gateway.json:/etc/flux/gateway.json:ro" \
+            -e TIENDA_WEB_NKEY_SEED=x -e CATALOGO_WEB_NKEY_SEED=x -e PASARELA_WEB_NKEY_SEED=x \
+            -e TIENDA_WEB_ENTREGA_SECRETO=x -e PASARELA_HOOK_SECRETO=x -e GITHUB_HOOK_SECRETO=x \
+            flux-gateway --check --config /etc/flux/gateway.json
+
   # Los tests de estos SDKs LEEN protocol.json para no divergir de la spec. Eso es
   # deliberado, pero significa que un cambio en protocol.json puede romperlos — y
   # pasó: renombrar `syscallCodes` a `syscallCodesExample` tumbó tres tests de Python

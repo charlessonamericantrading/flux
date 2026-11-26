@@ -1,0 +1,137 @@
+{
+  "$comment": "Un gateway.json de ejemplo: NO contiene ningún secreto. Todo lo secreto es el NOMBRE de una variable de entorno (`nkeySeedEnv`, `secretEnv`) y los tokens de entrada son SHA-256 (los de aquí son de ejemplo: genera los tuyos con `flux-gateway token`). Es el que ejecutan las pruebas de extremo a extremo contra el manifiesto `services.json` (cada cliente de `clients` es un servicio de ese manifiesto con `\"via\": \"gateway\"`), con la URL del broker, el puerto y los tokens sustituidos. Ver gateway/README.md.",
+  "listen": {
+    "host": "0.0.0.0",
+    "port": 8080
+  },
+  "nats": {
+    "servers": [
+      "nats://nats:4222"
+    ]
+  },
+  "environment": "produccion",
+  "version": "1.0.0",
+  "schemaBaseUrl": "https://schemas.internal",
+  "limits": {
+    "rateLimit": {
+      "requests": 120,
+      "perSeconds": 60
+    }
+  },
+  "clients": [
+    {
+      "service": "tienda-web",
+      "$comment": "Una tienda en un hosting compartido: publica pedidos, llama a precios-api, lee el catálogo de su tenant y recibe por HTTP los ajustes de inventario.",
+      "tenantId": "acme",
+      "credentials": {
+        "nkeySeedEnv": "TIENDA_WEB_NKEY_SEED"
+      },
+      "tokens": [
+        {
+          "id": "tienda-web-1",
+          "sha256": "2743c9e6d739e261d7714589d7fd1053aef2f9ac9ec7831b19f33cf39446fd82"
+        }
+      ],
+      "deliveries": [
+        {
+          "subject": "inventario.stock.v1.ajustado",
+          "url": "https://tienda.example.com/hooks/flux",
+          "secretEnv": "TIENDA_WEB_ENTREGA_SECRETO",
+          "timeoutMs": 10000
+        }
+      ]
+    },
+    {
+      "service": "catalogo-web",
+      "$comment": "El dueño del estado del catálogo (PUT y DELETE). Acepta dos tenants en `Flux-Tenant`; lo que el broker no le conceda, lo deniega el broker.",
+      "tenantId": "acme",
+      "tenants": [
+        "acme",
+        "globex"
+      ],
+      "credentials": {
+        "nkeySeedEnv": "CATALOGO_WEB_NKEY_SEED"
+      },
+      "tokens": [
+        {
+          "id": "catalogo-web-1",
+          "sha256": "387ada6b842eefbef6d86aab2fe6de094ee52832a913500c45c8a8f4791d8941"
+        }
+      ]
+    },
+    {
+      "service": "pasarela-web",
+      "$comment": "Recibe los webhooks de la pasarela de pagos de un tercero y los publica en el dominio `pagos`.",
+      "tenantId": "acme",
+      "credentials": {
+        "nkeySeedEnv": "PASARELA_WEB_NKEY_SEED"
+      },
+      "tokens": [
+        {
+          "id": "pasarela-web-1",
+          "sha256": "292bc84d7f7e8b89c4eecccc9a5b6c65555a6b5d29084b2684334a004c320626"
+        }
+      ],
+      "hooks": {
+        "pasarela": {
+          "$comment": "Firma `t=<unix>,v1=<hmac-sha256(secreto, t.cuerpo)>` (como Stripe y como Flux-Signature). El id del hecho y su instante salen del cuerpo: es lo que hace determinista el id. `pick`: el email del pagador NO pasa (regla 5: sin PII en data).",
+          "subject": "pagos.cobro.v1.recibido",
+          "verify": {
+            "scheme": "hmac-sha256",
+            "secretEnv": "PASARELA_HOOK_SECRETO",
+            "signature": {
+              "header": "X-Pasarela-Firma",
+              "format": "t-v1"
+            },
+            "toleranceSeconds": 300
+          },
+          "externalKey": {
+            "from": "body",
+            "pointer": "/id"
+          },
+          "time": {
+            "from": "body",
+            "pointer": "/created",
+            "unit": "seconds"
+          },
+          "aggregateId": {
+            "from": "body",
+            "pointer": "/id"
+          },
+          "classification": "confidential",
+          "data": {
+            "pick": {
+              "pagoId": "/id",
+              "importeCents": "/amount",
+              "moneda": "/currency"
+            }
+          }
+        },
+        "github": {
+          "$comment": "Un proveedor al estilo GitHub: `sha256=<hmac>` sobre el cuerpo, la clave en una cabecera y el instante en el cuerpo, en ISO. El cuerpo entero se guarda bajo `payload`.",
+          "subject": "pagos.cobro.v1.recibido",
+          "verify": {
+            "scheme": "hmac-sha256",
+            "secretEnv": "GITHUB_HOOK_SECRETO",
+            "signature": {
+              "header": "X-Hub-Signature-256",
+              "format": "sha256-prefix"
+            }
+          },
+          "externalKey": {
+            "from": "header",
+            "name": "X-GitHub-Delivery"
+          },
+          "time": {
+            "from": "body",
+            "pointer": "/hook/updated_at",
+            "unit": "iso"
+          },
+          "data": {
+            "wrapAs": "payload"
+          }
+        }
+      }
+    }
+  ]
+}

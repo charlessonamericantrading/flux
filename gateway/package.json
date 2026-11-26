@@ -1,0 +1,17 @@
+{
+  "name": "@flux/gateway",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Gateway HTTP de borde de flux: HTTP→flux (eventos, estado, peticiones, webhooks de terceros) y flux→HTTP (entregas firmadas). Sobre el SDK de Node, sin framework web (node:http). Ver specification/12-edge.md.",
+  "bin": { "flux-gateway": "./src/index.mjs" },
+  "scripts": {
+    "start": "node src/index.mjs",
+    "check": "node src/index.mjs --check",
+    "test": "node --test --test-force-exit --test-concurrency=1 test/*.test.mjs"
+  },
+  "dependencies": {
+    "@flux/sdk": "file:../sdk-node"
+  },
+  "engines": { "node": ">=20" }
+}
