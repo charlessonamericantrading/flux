@@ -519,29 +519,47 @@ Lo que el SDK hace y no te dice:
 - **Reconoce los dos códigos de conflicto de secuencia**: `10071` (un nodo) y `10164` (un cluster
   bajo carrera, **sin número**). Un SDK que solo vea el 10071 pasa todo contra un NATS de un nodo y
   no reintenta en producción. Tres intentos; agotados, [`FluxError::StateConflict`] (RETRYABLE).
-- **Todo se valida antes de la red**, en este orden: dominio reservado, clave, tenant,
-  `aggregateVersion`, clasificación, y con L3 el esquema. El broker **no** valida la clave
+- **Todo se valida antes de la red**, en este orden: dominio reservado, forma del contrato, clave,
+  tenant, `aggregateVersion`, clasificación, y con L3 el esquema. El broker **no** valida la clave
   (acepta `*`, `a.b` —dos tokens: la entrada queda fuera de todo filtro— y 2000 caracteres).
 - **El tenant se resuelve** de la opción de la llamada, del evento en curso (un estado derivado en
   un handler pertenece al tenant del evento que lo causó) y de `ConnectOptions::with_tenant_id`.
-  **No hay tenant por defecto**: sin ninguno, `INVALID_TENANT_FOR_STATE`, no `system`.
+  **No hay tenant por defecto**: sin ninguno, `INVALID_TENANT_FOR_STATE`, no `system`. **Un `watch`
+  solo usa la opción y `connect()`, nunca el evento en curso**: no corre dentro de un handler, y
+  heredar el tenant del evento que se esté procesando haría depender su filtro de qué evento llegó
+  primero (10-state.md §2.4).
+- **`7.0` no vale como `aggregateVersion`** (`serde_json` lo lee como `f64`): `MISSING_AGGREGATE_VERSION`.
+  En Node es indistinguible de `7` (un límite del lenguaje, 10-state.md §3.4).
 - **Sin `classification`, un `put` usa `confidential`**, no el valor por defecto de la conexión; `restricted` se rechaza.
 - **Siempre por JetStream**: un `publish` de core a un subject de estado sobrescribe sin chequeo ni acuse.
 - **Sin `STREAM.INFO` del stream de estado**: lista todas las claves y todos los tenants. El stream
   y el durable los aprovisiona `flux provision`; sin ellos, `NOT_PROVISIONED`, y para el stream el
   mensaje nombra **las dos causas** (no existe, o existe sin `allow_direct`: se ven igual).
-- **`on_synced` se invoca una vez por `watch`**, con la foto ya procesada; con el contrato vacío, de
-  inmediato. Las entradas se procesan **una a una**, así que cuando llega la que lleva `pending == 0`
-  todas las anteriores han terminado.
+- **`on_synced` se invoca una vez por `watch`** (ni por reconexión ni tras un `resync`), con la foto ya
+  procesada; con el contrato vacío, de inmediato. Las entradas se procesan **una a una**, así que
+  cuando llega la que lleva `pending == 0` todas las anteriores han terminado. **`watch` toma un
+  tenant** (`WatchOptions::with_tenant_id`): un servicio que observa N tenants hace N llamadas y
+  recibe N `on_synced`; combinarlas es de la aplicación.
+- **Un `watch` vivo sobrevive a `flux state resync`** (borrar y recrear su durable). `async-nats` 0.50
+  da por terminado el flujo de mensajes al recibir `409 Consumer Deleted` (`Err` y después `None`), y
+  el bucle del SDK **salía en silencio**: un `watch` muerto con la conexión sana. Medido: **tras el
+  `resync` no llegaba nada nunca** (120 s, ni un `put` en vivo). Ahora **reabre el consumo**
+  (`CONSUMER.INFO` por nombre con backoff, **sin `CONSUMER.CREATE`**, comprobando la configuración:
+  un durable recreado con otro filtro no se consume), avisa por el `logger` y `close()` lo detiene.
+  Tarda **0,2–0,3 s** en entregar la foto otra vez.
 - Una entrada que el handler rechaza para siempre va a `dlq.state.<contrato>` **sin el dato**
   (`data` es `{ key, revision }`) y **sin la firma**; un mensaje ilegible no se copia en ninguna
-  forma. El estado **no se reproduce** desde la DLQ: la recuperación es `flux state resync`. **El
-  mensaje de un error de tu handler no debe contener valores de la entrada**: acaba en `dlqerror`.
+  forma. El estado **no se reproduce** desde la DLQ: la recuperación es `flux state resync`. Un error
+  que **no es de flux** (un `sqlx::Error`, un `HttpError`, un `io::Error`) deja en `dlqerror` solo su
+  código y una frase fija (`UNKNOWN: error sin clasificar de la aplicación; el mensaje se omite…`):
+  el mensaje de un driver puede citar la fila entera. **Un error de flux** (`FluxError::permanent(…)`)
+  conserva su mensaje, **sin su cadena de causas**: no debe contener valores de la entrada.
 
-### Los seis códigos
+### Los siete códigos
 
 | Código | Clase | Variante |
 |---|---|---|
+| `INVALID_STATE_CONTRACT` | PERMANENT | `FluxError::InvalidStateContract` |
 | `INVALID_TENANT_FOR_STATE` | PERMANENT | `FluxError::InvalidTenantForState` |
 | `INVALID_STATE_KEY` | PERMANENT | `FluxError::InvalidStateKey` |
 | `MISSING_AGGREGATE_VERSION` | PERMANENT (también al consumir) | `FluxError::MissingAggregateVersion` |
@@ -550,8 +568,9 @@ Lo que el SDK hace y no te dice:
 | `RESERVED_DOMAIN` | PERMANENT | `FluxError::ReservedDomain` — también en `publish()` y `subscribe()` |
 
 Cada uno con `code()` y `class()` como `NotProvisioned`; la aplicación no puede sustituir el
-código. Un contrato mal formado (`clientes.cliente`) no es uno de los seis —la lista es
-**cerrada**— y es un `FluxError::InvalidSubject`.
+código. Un contrato mal formado (`clientes.cliente`) es `INVALID_STATE_CONTRACT`, el séptimo (antes
+era un `FluxError::InvalidSubject` sin código de estado); un dominio reservado, `RESERVED_DOMAIN`, que
+se evalúa antes.
 
 ### Permisos exactos por rol
 
@@ -593,10 +612,12 @@ hash. `state_dataschema(base, contrato)` deriva el `dataschema` de la URL base d
 - **`delete` toma la versión como `u64`**: `-1` o `7.5` no se pueden expresar. `0` y `> 2^53 − 1`
   siguen siendo `MISSING_AGGREGATE_VERSION`. En `put`, que recibe `data` serializable, se comprueban
   todos los casos de la spec.
-- `ConnectOptions::servers` **no admite varias direcciones separadas por coma** con `async-nats`
-  0.50: lo documenta, pero un `&str` es **una** dirección y `connect()` responde «la lista de
-  servidores no se entiende». Los tests de cluster conectan a un nodo. No es del estado, pero lo
-  destapó, y está **sin arreglar**: no era del alcance de esta fase.
+- **`ConnectOptions::servers` admite varias direcciones separadas por coma** (o `with_servers([…])`, el
+  `string[]` de Node). Con `async-nats` 0.50 un `&str` es **una** dirección y una lista daba «la lista
+  de servidores no se entiende» (medido, también con todas las direcciones válidas): `connect()` la
+  separa antes de dárselo. Se prueba con un `nats-server` real: el primero caído conecta al siguiente,
+  y al morir el servidor al que está conectado el cliente se reconecta al otro **por la lista**. Los
+  tests de cluster ya se conectan a los tres nodos.
 
 ## Seguridad: permisos, inbox, TLS y credenciales
 
@@ -1100,7 +1121,7 @@ reintentaría 51 minutos lo que nunca se va a arreglar.
 |---|---|
 | `protocol.rs` | Constantes verificadas y naming (`parse_subject`, `subject_to_type`, `stream_name`, `durable_name`, `dlq_subject`, `source_uri`, `validate_service_name`, `inbox_prefix`) |
 | `envelope.rs` | `Event`, `build_event`, `serialize`, `parse_event`, `Event::data_as`, `to_dlq_event`, `strip_dlq_extensions` |
-| `errors.rs` | `ErrorClass`, `FluxError`, `Failure`, `Classification`, `as_classified`, `describe`, `SchemaValidationError`, `SchemaNotFoundError`, `ResourceKind` (y las variantes `NotProvisioned`, `PermissionDenied` y los seis códigos de estado) |
+| `errors.rs` | `ErrorClass`, `FluxError`, `Failure`, `Classification`, `as_classified`, `describe`, `SchemaValidationError`, `SchemaNotFoundError`, `ResourceKind` (y las variantes `NotProvisioned`, `PermissionDenied` y los siete códigos de estado) |
 | `classify.rs` | `Classifier`, `ClassifierOptions`, `UnknownPolicy`, `HttpError` |
 | `context.rs` | Propagación por task-local con override explícito |
 | `metrics.rs` | `MetricsSink`, `NoMetrics`, `InMemoryMetrics`, `DURATION_BUCKETS` y los enums de etiqueta |

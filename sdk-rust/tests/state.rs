@@ -25,10 +25,10 @@
 //! Los puertos salen del rango `FLUX_TEST_PORT_BASE` (default 4500) + 50. Se usan hasta 6 a la
 //! vez (el cluster de tres nodos).
 //!
-//! Los seis códigos de estado —`INVALID_TENANT_FOR_STATE`, `INVALID_STATE_KEY`,
-//! `MISSING_AGGREGATE_VERSION`, `STATE_SUBJECT_MISMATCH`, `STATE_CONFLICT` y `RESERVED_DOMAIN`—
-//! se comprueban por su literal en `codigos_estables`, que es lo que `scripts/check-sdk-codes.mjs`
-//! exige de la evidencia de la capacidad.
+//! Los siete códigos de estado —`INVALID_STATE_CONTRACT`, `INVALID_TENANT_FOR_STATE`,
+//! `INVALID_STATE_KEY`, `MISSING_AGGREGATE_VERSION`, `STATE_SUBJECT_MISMATCH`, `STATE_CONFLICT` y
+//! `RESERVED_DOMAIN`— se comprueban por su literal en `codigos_estables`, que es lo que
+//! `scripts/check-sdk-codes.mjs` exige de la evidencia de la capacidad.
 
 use std::collections::{BTreeSet, HashMap};
 use std::net::TcpListener;
@@ -264,12 +264,15 @@ impl Cluster {
         }
     }
 
-    /// El primer nodo. **No** una lista separada por comas: `ConnectOptions::servers` lo
-    /// documenta, pero `async-nats` 0.50 interpreta un `&str` como UNA dirección y una lista da
-    /// «NATS server URL is invalid: invalid port number». El stream es R3 y las escrituras
-    /// atraviesan el cluster igualmente.
-    fn url(&self) -> String {
-        format!("nats://127.0.0.1:{}", self.ports[0])
+    /// Los tres nodos, separados por comas: `ConnectOptions::servers`. `async-nats` 0.50 no
+    /// entiende una cadena así (la interpreta como UNA dirección: «NATS server URL is invalid»); el
+    /// SDK la separa en `connect()`. Antes este test se conectaba solo al primer nodo.
+    fn url_lista(&self) -> String {
+        self.ports
+            .iter()
+            .map(|p| format!("nats://127.0.0.1:{p}"))
+            .collect::<Vec<_>>()
+            .join(",")
     }
 }
 
@@ -961,7 +964,10 @@ fn comprueba(caso: &str, i: usize, step: &Value, obs: &Value, fallos: &mut Vec<S
 /// Ejecuta los casos de `state-semantics.json` de una topología con un broker concreto.
 async fn corre_semantica(url: &str, topologia: &str) -> Vec<String> {
     let doc: Value = serde_json::from_str(SEMANTICA).expect("state-semantics.json");
-    let ops = Ops::new(url).await;
+    // `url` puede ser una LISTA de servidores separados por coma (la que usan los buses del SDK, que la
+    // separa en `connect()`); la conexión cruda de `ops` usa `async_nats` directamente, que no la entiende.
+    let primero = url.split(',').next().expect("al menos una dirección");
+    let ops = Ops::new(primero).await;
     let caso = Caso {
         url: url.to_string(),
         ops,
@@ -1005,7 +1011,8 @@ async fn semantica_de_un_nodo() {
 async fn semantica_de_un_cluster_de_tres_nodos() {
     let bin = broker_bin!();
     let cluster = Cluster::start(&bin);
-    let fallos = corre_semantica(&cluster.url(), "cluster3").await;
+    // Los tres nodos, separados por comas: la lista entera, como la configuraría una alta disponibilidad.
+    let fallos = corre_semantica(&cluster.url_lista(), "cluster3").await;
     assert!(fallos.is_empty(), "\n{}", fallos.join("\n"));
 }
 
@@ -1928,6 +1935,49 @@ async fn validacion_antes_de_la_red() {
             )
             .await,
         ),
+        // El séptimo código: un contrato mal formado (antes, un `InvalidSubject` sin código de estado).
+        (
+            "INVALID_STATE_CONTRACT",
+            st.put_with("clientes.cliente", "cli-1", &validos, acme())
+                .await,
+        ),
+        (
+            "INVALID_STATE_CONTRACT",
+            st.put_with("clientes.cliente.v1.creado", "cli-1", &validos, acme())
+                .await,
+        ),
+        (
+            "INVALID_STATE_CONTRACT",
+            st.put_with("Clientes.cliente.v1", "cli-1", &validos, acme())
+                .await,
+        ),
+        // contrato Y clave mal a la vez: gana el contrato (10-state.md §3.6).
+        (
+            "INVALID_STATE_CONTRACT",
+            st.put_with("clientes.cliente", "a.b", &validos, acme())
+                .await,
+        ),
+        (
+            "INVALID_STATE_CONTRACT",
+            st.delete_with(
+                "clientes.cliente",
+                "cli-1",
+                2,
+                DeleteOptions::default().with_tenant_id("acme"),
+            )
+            .await,
+        ),
+        // `7.0` es un decimal para `serde_json`: aquí SÍ se rechaza (en Node es indistinguible de `7`).
+        (
+            "MISSING_AGGREGATE_VERSION",
+            st.put_with(
+                CONTRATO,
+                "cli-1",
+                &serde_json::from_str::<Value>("{\"aggregateVersion\": 7.0}").unwrap(),
+                acme(),
+            )
+            .await,
+        ),
         (
             "RESERVED_DOMAIN",
             st.put_with("state.cliente.v1", "cli-1", &validos, acme())
@@ -1960,6 +2010,20 @@ async fn validacion_antes_de_la_red() {
     assert_eq!(
         codigo(&st.get_with("dlq.cliente.v1", "k", acme_get()).await).as_deref(),
         Some("RESERVED_DOMAIN")
+    );
+    assert_eq!(
+        codigo(&st.get_with("clientes.cliente", "k", acme_get()).await).as_deref(),
+        Some("INVALID_STATE_CONTRACT")
+    );
+    assert_eq!(
+        codigo(
+            &st.watch("clientes.cliente.v1.creado", |_e: StateEntry, _d| async {
+                Ok(())
+            })
+            .await
+        )
+        .as_deref(),
+        Some("INVALID_STATE_CONTRACT")
     );
     assert_eq!(
         codigo(
@@ -2038,11 +2102,16 @@ async fn codigos_estables_dominios_reservados_en_publish_y_subscribe() {
         .is_ok());
 }
 
-/// Los seis códigos de `04-errors.md` §6, por su literal y con su clase: es lo que
+/// Los siete códigos de `04-errors.md` §6, por su literal y con su clase: es lo que
 /// `scripts/check-sdk-codes.mjs` exige de la evidencia de la capacidad `state`.
 #[tokio::test]
 async fn codigos_estables() {
-    let casos: [(FluxError, &str, ErrorClass); 6] = [
+    let casos: [(FluxError, &str, ErrorClass); 7] = [
+        (
+            flux::state_subject("clientes.cliente", "acme", "k").unwrap_err(),
+            "INVALID_STATE_CONTRACT",
+            ErrorClass::Permanent,
+        ),
         (
             flux::validate_state_tenant("ACME").unwrap_err(),
             "INVALID_TENANT_FOR_STATE",
@@ -2085,6 +2154,7 @@ async fn codigos_estables() {
         assert_eq!(err.code(), Some(code), "{err:?}");
         assert_eq!(err.class(), Some(class), "{code}");
     }
+    assert_eq!(flux::INVALID_STATE_CONTRACT_CODE, "INVALID_STATE_CONTRACT");
     assert_eq!(
         flux::INVALID_TENANT_FOR_STATE_CODE,
         "INVALID_TENANT_FOR_STATE"
@@ -2396,6 +2466,18 @@ async fn dlq_poison_y_permanent_de_consumo_nunca_llegan_al_handler() {
     assert_eq!(ilegible["tenantid"], "acme");
     assert_eq!(ilegible["subject"], "cli-10");
     assert_eq!(ilegible["partitionkey"], "cli-10");
+    // `time` = el instante ACTUAL del consumo (10-state.md §6), con el formato de siempre.
+    let hora = ilegible["time"].as_str().expect("time");
+    assert_eq!(hora.len(), 24, "3 decimales y `Z`: {hora}");
+    let ahora = chrono::Utc::now();
+    let escrito = chrono::DateTime::parse_from_rfc3339(hora).expect("RFC 3339");
+    assert!(
+        (ahora - escrito.with_timezone(&chrono::Utc))
+            .num_seconds()
+            .abs()
+            < 60,
+        "time debe ser el instante del consumo, no uno inventado: {hora}"
+    );
     assert_eq!(ilegible["dataclassification"], "internal");
     assert_eq!(ilegible["type"], "com.flux.state.clientes.cliente.v1");
     assert_eq!(ilegible["id"], ilegible["correlationid"]);
@@ -3019,15 +3101,34 @@ async fn validacion_l3_en_put_y_en_la_lapida() {
     sin_lapida
         .schemas
         .remove("https://schemas.internal/system/state/eliminado/1.0.0.json");
+    let metricas_viejo = Arc::new(InMemoryMetrics::new());
     let viejo = connect(
         ConnectOptions::new(plano.broker.url(), "crm-viejo", "test", "1.0.0")
             .with_tenant_id("acme")
+            .with_metrics(metricas_viejo.clone())
             .with_validation(ValidationOptions::strict(sin_lapida)),
     )
     .await
     .expect("conexión");
     let r = viejo.state().delete(CONTRATO, "cli-1", 3).await;
     assert_eq!(codigo(&r).as_deref(), Some("SCHEMA_NOT_FOUND"), "{r:?}");
+    // `SCHEMA_NOT_FOUND` es un fallo de L3: cuenta como `invalid_schema`, igual que en un evento
+    // (08-observability.md §2.4), también cuando la llamada lanza — y no cuenta como otra cosa.
+    assert_eq!(
+        metricas_viejo.counter(
+            "flux_state_writes_total{contract=\"clientes.cliente.v1\",outcome=\"invalid_schema\"}"
+        ),
+        Some(1)
+    );
+    for otro in ["ok", "stale", "conflict"] {
+        assert_eq!(
+            metricas_viejo.counter(&format!(
+                "flux_state_writes_total{{contract=\"clientes.cliente.v1\",outcome=\"{otro}\"}}"
+            )),
+            None,
+            "{otro}"
+        );
+    }
 }
 
 /// La firma (07-signing.md) también vale en estado: «la misma firma» (10-state.md §2.5). Un `put`
@@ -3089,6 +3190,570 @@ async fn firma_en_estado_se_firma_y_se_verifica() {
         .starts_with("MISSING_SIGNATURE: "));
     assert!(dlq[0].0.get("signature").is_none());
     assert_eq!(obs.claves().len(), 1);
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+//  4. Un `watch` vivo durante `flux state resync`, el tenant de un `watch`, la DLQ y los servidores
+// ═════════════════════════════════════════════════════════════════════════════
+
+impl Ops {
+    /// `flux state resync`: borrar el durable y recrearlo con la configuración canónica.
+    async fn resync(&self, stream_name: &str, durable: &str, filtro: &str) {
+        let s = self.js.get_stream(stream_name).await.expect("stream");
+        s.delete_consumer(durable).await.expect("borrar el durable");
+        self.durable(stream_name, durable, filtro).await;
+    }
+}
+
+/// **Un `watch` vivo sobrevive a `flux state resync`** (10-state.md §5.2). Sin el arreglo, `async-nats`
+/// da por terminado el flujo de mensajes al recibir `409 Consumer Deleted` (un `Err(ConsumerDeleted)`
+/// y después `None`), y el bucle del SDK salía **en silencio**: un `watch` muerto que parecía vivo, con
+/// la conexión sana. Medido con nats-server 2.14.5 y `async-nats` 0.50: tras el `resync` **no llegaba
+/// nada nunca** (120 s de espera; ni siquiera un `put` en vivo posterior). El observador tiene los
+/// permisos exactos —**sin `CONSUMER.CREATE`**—: reabrir usa solo `CONSUMER.INFO` y `MSG.NEXT`.
+#[tokio::test]
+async fn watch_vivo_sobrevive_a_un_resync() {
+    let bin = broker_bin!();
+    let mundo = Mundo::completo(&bin).await;
+    let dueno = mundo.dueno().await;
+    for i in 1..=5 {
+        dueno
+            .state()
+            .put(CONTRATO, &format!("r{i}"), &pii(i))
+            .await
+            .unwrap();
+    }
+    let (observador, log) = mundo.observador_con_log().await;
+    let obs = Observacion::nueva();
+    let w = observador
+        .state()
+        .watch_with(CONTRATO, obs.manejador(), obs.opciones(Some("acme")))
+        .await
+        .expect("watch");
+    w.wait_synced().await;
+    assert_eq!(lock(&obs.entradas).len(), 5, "la foto inicial");
+    assert_eq!(obs.sincronizado.load(Ordering::SeqCst), 1);
+
+    // `flux state resync`
+    let t0 = Instant::now();
+    mundo
+        .ops
+        .resync(STREAM, &mundo.durable, "state.clientes.cliente.v1.acme.*")
+        .await;
+    espera(
+        || lock(&obs.entradas).len() >= 10,
+        Duration::from_secs(15),
+        &format!(
+            "tras el resync debe volver la foto entera; el SDK dijo: {:?}",
+            lock(&log)
+        ),
+    )
+    .await;
+    assert!(
+        t0.elapsed() < Duration::from_secs(15),
+        "la foto volvió a los {:?}: reabrir debe tardar segundos",
+        t0.elapsed()
+    );
+    let tras: BTreeSet<String> = lock(&obs.entradas)[5..]
+        .iter()
+        .map(|e| e.key.clone())
+        .collect();
+    assert_eq!(
+        tras,
+        (1..=5).map(|i| format!("r{i}")).collect::<BTreeSet<_>>()
+    );
+    assert_eq!(
+        obs.sincronizado.load(Ordering::SeqCst),
+        1,
+        "`on_synced` NO se invoca de nuevo tras un resync: es una vez por watch"
+    );
+    {
+        let l = lock(&log);
+        assert!(
+            l.iter().any(|m| m.contains("se borró con el watch"))
+                && l.iter().any(|m| m.contains("reabierto")),
+            "se avisa por el logger: {l:?}"
+        );
+    }
+
+    // …y el canal en VIVO sigue vivo: un cambio posterior llega.
+    let mut v2 = pii(1);
+    v2["aggregateVersion"] = json!(2);
+    dueno.state().put(CONTRATO, "r1", &v2).await.unwrap();
+    espera(
+        || {
+            lock(&obs.entradas)
+                .iter()
+                .any(|e| e.key == "r1" && e.aggregate_version == 2)
+        },
+        Duration::from_secs(10),
+        "un put en vivo tras el resync",
+    )
+    .await;
+    // Y no hubo una sola violación de permisos: no se pidió nada que no esté concedido (ni CREATE).
+    assert!(
+        mundo.broker.violations().is_empty(),
+        "{:?}",
+        mundo.broker.violations()
+    );
+}
+
+/// Un `watch` cuyo durable se borra y **no se recrea** reintenta con aviso, sin colgarse, y `close()` lo
+/// para: el bucle de reapertura no puede ser un hilo que nadie detiene.
+#[tokio::test]
+async fn watch_cuyo_durable_no_vuelve_reintenta_y_close_lo_para() {
+    let bin = broker_bin!();
+    let mundo = Mundo::completo(&bin).await;
+    let dueno = mundo.dueno().await;
+    dueno.state().put(CONTRATO, "a1", &pii(1)).await.unwrap();
+    let (observador, log) = mundo.observador_con_log().await;
+    let obs = Observacion::nueva();
+    let w = observador
+        .state()
+        .watch_with(CONTRATO, obs.manejador(), obs.opciones(Some("acme")))
+        .await
+        .expect("watch");
+    w.wait_synced().await;
+    let s = mundo.ops.js.get_stream(STREAM).await.expect("stream");
+    s.delete_consumer(&mundo.durable).await.expect("borrar"); // y nadie lo recrea
+    espera(
+        || lock(&log).iter().any(|m| m.contains("no se pudo reabrir")),
+        Duration::from_secs(10),
+        "debe avisar de que no puede reabrir",
+    )
+    .await;
+    let t0 = Instant::now();
+    observador.close().await.ok();
+    assert!(
+        t0.elapsed() < Duration::from_secs(5),
+        "close() no espera al durable que no vuelve"
+    );
+    // El bucle de reapertura NOTA el cierre y lo dice: un reintento que se detiene no es indistinguible
+    // de uno que sigue colgado (y no se queda reintentando contra una conexión cerrada).
+    espera(
+        || {
+            lock(&log)
+                .iter()
+                .any(|m| m.contains("se detuvo sin haber podido reabrir"))
+        },
+        Duration::from_secs(5),
+        "tras close() el bucle de reapertura debe detenerse y decirlo",
+    )
+    .await;
+}
+
+/// Un durable **recreado con otro filtro** (el de todos los tenants) NO se consume tras un resync: sin la
+/// comprobación de configuración al reabrir, el observador de `acme` recibiría las claves de `globex` sin
+/// ningún error.
+#[tokio::test]
+async fn watch_no_consume_un_durable_recreado_con_otro_filtro() {
+    let bin = broker_bin!();
+    let mundo = Mundo::completo(&bin).await;
+    let dueno = mundo.dueno().await;
+    dueno.state().put(CONTRATO, "a1", &pii(1)).await.unwrap();
+    dueno
+        .state()
+        .put_with(CONTRATO, "g1", &pii(2), con_tenant("globex"))
+        .await
+        .unwrap();
+    let (observador, log) = mundo.observador_con_log().await;
+    let obs = Observacion::nueva();
+    let w = observador
+        .state()
+        .watch_with(CONTRATO, obs.manejador(), obs.opciones(Some("acme")))
+        .await
+        .expect("watch");
+    w.wait_synced().await;
+    assert_eq!(obs.claves(), BTreeSet::from(["a1".to_string()]));
+
+    // Alguien lo recrea con el filtro de TODOS los tenants.
+    mundo
+        .ops
+        .resync(STREAM, &mundo.durable, "state.clientes.cliente.v1.*.*")
+        .await;
+    espera(
+        || {
+            lock(&log)
+                .iter()
+                .any(|m| m.contains("no se pudo reabrir") && m.contains("filter_subject"))
+        },
+        Duration::from_secs(10),
+        "debe avisar de que el durable no es el pedido",
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    assert_eq!(
+        obs.claves(),
+        BTreeSet::from(["a1".to_string()]),
+        "el durable con otro filtro no se consume: g1 no llega"
+    );
+}
+
+/// El tenant de un `watch` sale de la opción y de `connect()`, **nunca del evento en curso**
+/// (10-state.md §2.4, §5.2): un `watch` no corre dentro de un handler.
+#[tokio::test]
+async fn watch_no_hereda_el_tenant_del_evento_en_curso() {
+    let bin = broker_bin!();
+    let plano = Plano::nuevo(&bin).await;
+    let con_tenant_ = plano.bus("tienda-web", Some("acme")).await;
+    let sin_tenant = plano.bus("tienda-todos", None).await;
+    let evento = flux::EventContext {
+        correlation_id: "corr-1".into(),
+        causation_id: "ev-9".into(),
+        tenant_id: "globex".into(),
+        ..Default::default()
+    };
+
+    // Con tenant en `connect()`: gana ese, no el del evento.
+    let a = flux::context::scope(Some(evento.clone()), async {
+        con_tenant_
+            .state()
+            .watch(CONTRATO, |_e: StateEntry, _d| async { Ok(()) })
+            .await
+    })
+    .await
+    .expect("watch");
+    assert_eq!(a.tenant_id.as_deref(), Some("acme"));
+    assert_eq!(a.durable, "tienda-web__state_clientes_cliente_v1__acme");
+
+    // Sin tenant en la opción ni en `connect()`: se observan TODOS, no el del evento.
+    let b = flux::context::scope(Some(evento.clone()), async {
+        sin_tenant
+            .state()
+            .watch(CONTRATO, |_e: StateEntry, _d| async { Ok(()) })
+            .await
+    })
+    .await
+    .expect("watch");
+    assert_eq!(
+        b.tenant_id, None,
+        "heredar el del evento haría depender el filtro de qué evento llegó primero"
+    );
+    assert_eq!(b.durable, "tienda-todos__state_clientes_cliente_v1");
+
+    // CONTROL, la otra cara: `put` dentro del mismo contexto SÍ hereda el tenant del evento.
+    flux::context::scope(Some(evento), async {
+        sin_tenant
+            .state()
+            .put(CONTRATO, "derivado-1", &pii(1))
+            .await
+            .expect("put")
+    })
+    .await;
+    assert!(plano
+        .ops
+        .leer(STREAM, "state.clientes.cliente.v1.globex.derivado-1")
+        .await
+        .is_some());
+    assert!(plano
+        .ops
+        .leer(STREAM, "state.clientes.cliente.v1.acme.derivado-1")
+        .await
+        .is_none());
+    // Y con `strict` y sin tenant en la opción ni en `connect()`, un `watch` dentro de un handler sigue
+    // siendo un error de configuración (el evento no cuenta).
+    let estricto = bus_con(&plano.broker.url(), "tienda-estricta", None, |o| {
+        o.with_tenant_isolation(TenantIsolation::Strict)
+    })
+    .await;
+    let r = flux::context::scope(
+        Some(flux::EventContext {
+            tenant_id: "globex".into(),
+            ..Default::default()
+        }),
+        async {
+            estricto
+                .state()
+                .watch(CONTRATO, |_e: StateEntry, _d| async { Ok(()) })
+                .await
+        },
+    )
+    .await;
+    assert!(matches!(r, Err(FluxError::TenantIsolation { .. })), "{r:?}");
+}
+
+/// `on_synced` con N tenants: la API toma **un** tenant por `watch`, así que son N watches y N
+/// invocaciones, una por cada uno (10-state.md §5.5). Combinarlas es de la aplicación.
+#[tokio::test]
+async fn on_synced_con_n_tenants_son_n_watches_y_n_invocaciones() {
+    let bin = broker_bin!();
+    let plano = Plano::nuevo(&bin).await;
+    let dueno = plano.bus("crm-api", None).await;
+    dueno
+        .state()
+        .put_with(CONTRATO, "a1", &pii(1), con_tenant("acme"))
+        .await
+        .unwrap();
+    dueno
+        .state()
+        .put_with(CONTRATO, "g1", &pii(2), con_tenant("globex"))
+        .await
+        .unwrap();
+    let multi = plano.bus("tienda-multi", None).await;
+    let (a, g) = (Observacion::nueva(), Observacion::nueva());
+    let wa = multi
+        .state()
+        .watch_with(CONTRATO, a.manejador(), a.opciones(Some("acme")))
+        .await
+        .unwrap();
+    let wg = multi
+        .state()
+        .watch_with(CONTRATO, g.manejador(), g.opciones(Some("globex")))
+        .await
+        .unwrap();
+    wa.wait_synced().await;
+    wg.wait_synced().await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(a.sincronizado.load(Ordering::SeqCst), 1);
+    assert_eq!(g.sincronizado.load(Ordering::SeqCst), 1);
+    assert_eq!(a.claves(), BTreeSet::from(["a1".to_string()]));
+    assert_eq!(g.claves(), BTreeSet::from(["g1".to_string()]));
+}
+
+/// 10-state.md §6: un error que **no es de flux** no deja su mensaje en la DLQ (un driver de base de
+/// datos cita la fila entera y la DLQ guarda 90 días); uno de flux conserva el suyo, **sin su cadena de
+/// causas**. Lo medido, contra el broker: el `dlqerror` que llega al stream.
+#[tokio::test]
+async fn dlq_un_error_que_no_es_de_flux_no_deja_su_mensaje() {
+    let bin = broker_bin!();
+    let plano = Plano::nuevo(&bin).await;
+    let dueno = plano.bus("crm-api", Some("acme")).await;
+    for k in ["driver", "http", "flux-con-causa", "flux"] {
+        dueno
+            .state()
+            .put(
+                CONTRATO,
+                k,
+                &json!({ "clienteId": k, "email": "ana@example.com", "aggregateVersion": 1 }),
+            )
+            .await
+            .unwrap();
+    }
+    let cita = "duplicate key value violates unique constraint: Key (email)=(ana@example.com)";
+    let observador = bus_con(&plano.broker.url(), "tienda-web", None, |o| {
+        o.with_classifier(flux::ClassifierOptions {
+            unknown_policy: flux::UnknownPolicy::Permanent, // un error sin clasificar va a la DLQ ya
+            ..Default::default()
+        })
+    })
+    .await;
+    let _w = observador
+        .state()
+        .watch_with(
+            CONTRATO,
+            move |e: StateEntry, _d| async move {
+                match e.key.as_str() {
+                    // un error cualquiera, de un driver
+                    "driver" => Err(std::io::Error::other(cita).into()),
+                    // un HttpError: el clasificador lo reconoce (HTTP_422, PERMANENT), pero no es de flux
+                    "http" => {
+                        Err(flux::HttpError::new(422, format!("POST /clientes: {cita}")).into())
+                    }
+                    // de flux, con el error del driver como causa
+                    "flux-con-causa" => Err(FluxError::permanent("conflicto con otra cita")
+                        .with_code("FILA_DUPLICADA")
+                        .with_source(std::io::Error::other(cita))
+                        .into()),
+                    _ => Err(FluxError::permanent("pedido ya cancelado")
+                        .with_code("PEDIDO_YA_CANCELADO")
+                        .into()),
+                }
+            },
+            WatchOptions::default().with_tenant_id("acme"),
+        )
+        .await
+        .expect("watch");
+    let dlq = plano.dlq(4).await;
+    for (_, texto) in &dlq {
+        assert!(
+            !texto.contains("ana@example.com") && !texto.contains("duplicate key"),
+            "la DLQ filtra el mensaje del driver: {texto}"
+        );
+    }
+    let frase_fija = json_of_protocolo()["state"]["dlq"]["dlqerrorFixedPhrase"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let de = |k: &str| {
+        dlq.iter()
+            .find(|(e, _)| e["data"]["key"] == k)
+            .unwrap_or_else(|| panic!("{k} no llegó a la DLQ"))
+            .0["dlqerror"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+    assert_eq!(de("driver"), format!("UNKNOWN: {frase_fija}"));
+    assert_eq!(
+        de("http"),
+        format!("HTTP_422: {frase_fija}"),
+        "el código se conserva; el mensaje, no"
+    );
+    assert_eq!(
+        de("flux-con-causa"),
+        "FILA_DUPLICADA: conflicto con otra cita"
+    );
+    assert_eq!(de("flux"), "PEDIDO_YA_CANCELADO: pedido ya cancelado");
+}
+
+fn json_of_protocolo() -> Value {
+    serde_json::from_str(include_str!("../../protocol.json")).expect("protocol.json")
+}
+
+/// `ConnectOptions::servers` con **varios** servidores separados por coma (o `with_servers`): se prueba
+/// con un `nats-server` real. `async-nats` 0.50 interpreta un `&str` como UNA dirección y una lista da
+/// «la lista de servidores no se entiende» (medido, también cuando todas son válidas): una alta
+/// disponibilidad que no se puede configurar no es una opción. El primero está **caído**: conecta al segundo.
+#[tokio::test]
+async fn varios_servidores_el_primero_caido_conecta_al_siguiente() {
+    let bin = broker_bin!();
+    let plano = Plano::nuevo(&bin).await;
+    let caido = free_port(); // un puerto que nadie escucha
+    let vivo = plano.broker.port;
+    for lista in [
+        format!("nats://127.0.0.1:{caido},nats://127.0.0.1:{vivo}"),
+        format!("nats://127.0.0.1:{vivo},nats://127.0.0.1:{caido}"),
+        format!(" nats://127.0.0.1:{caido} , nats://127.0.0.1:{vivo} ,"),
+    ] {
+        let b = tokio::time::timeout(
+            Duration::from_secs(15),
+            connect(
+                ConnectOptions::new(&lista, "ha-svc", "test", "1.0.0")
+                    .with_tenant_id("acme")
+                    .with_schema_base_url("https://schemas.internal"),
+            ),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("connect({lista:?}) no terminó"))
+        .unwrap_or_else(|e| panic!("connect({lista:?}): {e}"));
+        assert!(b.is_connected(), "{lista:?}");
+        // Y funciona de verdad: un `put` y un `get` por esa conexión.
+        let r = b.state().put(CONTRATO, "ha-1", &pii(1)).await.expect("put");
+        assert!(r.applied || r.outcome == WriteOutcome::Stale, "{r:?}");
+        assert!(b.state().get(CONTRATO, "ha-1").await.unwrap().is_some());
+        b.close().await.ok();
+    }
+    // `with_servers`: lo mismo con la lista como `string[]`.
+    let opts = ConnectOptions::new("nats://127.0.0.1:1", "ha-svc", "test", "1.0.0")
+        .with_servers([
+            format!("nats://127.0.0.1:{caido}"),
+            format!("nats://127.0.0.1:{vivo}"),
+        ])
+        .with_tenant_id("acme")
+        .with_schema_base_url("https://schemas.internal");
+    let b = connect(opts).await.expect("with_servers");
+    assert!(b.is_connected());
+    b.close().await.ok();
+
+    // Una dirección MAL escrita en la lista sigue siendo un error de entrada, no un reintento eterno…
+    let r = connect(ConnectOptions::new(
+        format!("nats://127.0.0.1:{vivo},esto no es una url"),
+        "ha-svc",
+        "test",
+        "1.0.0",
+    ))
+    .await;
+    let e = r.expect_err("una dirección mal escrita falla");
+    assert!(
+        e.to_string()
+            .contains("la lista de servidores no se entiende"),
+        "{e}"
+    );
+    // …y una lista VACÍA falla antes de la red, diciendo qué pasa.
+    let r = connect(ConnectOptions::new(" , ", "ha-svc", "test", "1.0.0")).await;
+    assert!(
+        matches!(&r, Err(FluxError::Config(m)) if m.contains("`servers` está vacío")),
+        "{:?}",
+        r.err()
+    );
+}
+
+/// `GET <path>` por HTTP contra el puerto de monitorización de un `nats-server`: lo justo para saber a
+/// qué servidor está conectado un cliente (`/connz`), sin una dependencia más.
+fn http_get(port: u16, path: &str) -> String {
+    use std::io::{Read, Write};
+    let mut s = std::net::TcpStream::connect(("127.0.0.1", port)).expect("monitorización");
+    s.set_read_timeout(Some(Duration::from_secs(3))).ok();
+    write!(s, "GET {path} HTTP/1.0\r\nHost: x\r\n\r\n").expect("petición");
+    let mut out = String::new();
+    s.read_to_string(&mut out).ok();
+    out
+}
+
+/// La alta disponibilidad **de verdad**: dos servidores, el cliente conecta a uno (cuál, lo decide el
+/// barajado de `async-nats`; se **mide** con `/connz`), ese servidor muere, y el cliente se reconecta al
+/// otro **a través de la lista** — que la reconexión usa la lista entera, no solo el primer arranque.
+#[tokio::test]
+async fn varios_servidores_la_reconexion_usa_la_lista() {
+    let bin = broker_bin!();
+    let (http_a, http_b) = (free_port(), free_port());
+    let mut a = Broker::start(&bin, &format!("http: 127.0.0.1:{http_a}\n"));
+    let mut b = Broker::start(&bin, &format!("http: 127.0.0.1:{http_b}\n"));
+    let lista = format!("{},{}", a.url(), b.url());
+    let bus = connect(
+        ConnectOptions::new(&lista, "ha-svc", "test", "1.0.0")
+            .with_schema_base_url("https://schemas.internal"),
+    )
+    .await
+    .expect("connect");
+    let conectado = |http: u16| http_get(http, "/connz?auth=true").contains("ha-svc@test");
+    espera(
+        || conectado(http_a) || conectado(http_b),
+        Duration::from_secs(10),
+        "el cliente debe aparecer en /connz de uno de los dos",
+    )
+    .await;
+    let (cae, queda) = if conectado(http_a) {
+        (&mut a, http_b)
+    } else {
+        (&mut b, http_a)
+    };
+    assert!(!conectado(queda), "conectado a UNO solo");
+
+    // Mata el servidor al que está conectado.
+    let _ = cae.child.kill();
+    let _ = cae.child.wait();
+    espera(
+        || conectado(queda),
+        Duration::from_secs(20),
+        "el cliente debe reconectarse al otro servidor de la lista",
+    )
+    .await;
+    assert!(bus.is_connected());
+    // Y sigue sirviendo: publica por JetStream en el que queda (sin streams de estado: crea uno de eventos).
+    let ops = Ops::new(&format!(
+        "nats://127.0.0.1:{}",
+        if queda == http_a { a.port } else { b.port }
+    ))
+    .await;
+    ops.js
+        .create_stream(stream::Config {
+            name: "EVT_PEDIDOS".into(),
+            subjects: vec!["pedidos.>".into()],
+            ..Default::default()
+        })
+        .await
+        .expect("stream");
+    espera_publicar(&bus).await;
+}
+
+/// Un `publish` por la conexión reconectada: reintenta un rato, porque justo tras la reconexión la primera
+/// petición puede caer en la ventana en la que el cliente aún reanuda sus suscripciones.
+async fn espera_publicar(bus: &Bus) {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        match bus
+            .publish(
+                "pedidos.pedido.v1.creado",
+                &json!({ "pedidoId": "p-1", "aggregateVersion": 1 }),
+            )
+            .await
+        {
+            Ok(_) => return,
+            Err(e) => assert!(Instant::now() < deadline, "no publica tras reconectar: {e}"),
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
