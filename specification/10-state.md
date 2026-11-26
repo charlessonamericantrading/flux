@@ -107,7 +107,10 @@ CloudEvents ([01-envelope.md §2.1](01-envelope.md)), que aquí vale la clave.
 
 El **nombre de contrato** de un estado es `<dominio>.<agregado>.v<major>` (`clientes.cliente.v1`):
 el subject sin `state.`, sin tenant y sin clave. Es lo que recibe `state.watch` y lo que figura
-en las métricas.
+en las métricas. Una cadena que no tiene esa forma —`clientes.cliente` sin versión,
+`clientes.cliente.v1.creado` con cuatro tokens, `Clientes.cliente.v1` con mayúsculas— es
+**`INVALID_STATE_CONTRACT`** (PERMANENT); un dominio reservado ([§2.7](#27-dominios-reservados)),
+`RESERVED_DOMAIN`, que se evalúa antes (§3.6).
 
 **Por qué el tenant va en el subject y no solo en el sobre.** Con el tenant solo en el sobre, dos
 tenants con la misma clave (`cli-1`) escribirían **el mismo mensaje**: el segundo pisaría al
@@ -169,10 +172,21 @@ Dos matices que importan:
 - **No hay valor por defecto.** Un evento sin tenant explícito cae en `system`; un estado **no**:
   el tenant está en el subject, y un tenant equivocado no es una etiqueta mal puesta sino un dato
   guardado en otro sitio ([09-multitenancy.md §5](09-multitenancy.md) ya dice que `system` no es
-  un comodín). El tenant se resuelve, por este orden, de: la opción de la llamada, el evento en
-  curso (un estado derivado dentro de un handler pertenece al tenant del evento que lo causó) y
-  el `tenantId` de `connect()`. Si no sale ninguno, `INVALID_TENANT_FOR_STATE`. Quien quiera
-  `system` lo dice (*decidido provisionalmente*).
+  un comodín). Quien quiera `system` lo dice (*decidido provisionalmente*).
+- **Cómo se resuelve, por operación.** No es el mismo orden para todas, y esa diferencia es
+  deliberada:
+
+  | Operación | Orden de resolución | Si no sale ninguno |
+  |---|---|---|
+  | `put`, `delete`, `get` | la opción de la llamada → el **evento en curso** → el `tenantId` de `connect()` | `INVALID_TENANT_FOR_STATE` |
+  | `watch` | la opción de la llamada → el `tenantId` de `connect()`. **Nunca el evento en curso** | se observan **todos** los tenants (con `tenantIsolation: "strict"`, un error de configuración: [§5.2](#52-watch)) |
+
+  Un `put` o un `get` **dentro de un handler** derivan de un evento, y un estado derivado
+  pertenece al tenant del evento que lo causó. Un `watch` **no corre dentro de un handler**: se
+  abre al arrancar y vive tanto como el servicio, y heredar el tenant de «el evento que se esté
+  procesando» haría que su filtro dependiera de qué evento llegó primero, o de si alguien lo abrió
+  desde un handler por descuido. Lo que un `watch` observa lo decide quien lo escribe o quien
+  configura la conexión, nunca el tráfico.
 
 ### 2.5 El sobre
 
@@ -344,9 +358,19 @@ va en los eventos ([03-delivery.md §5.1](03-delivery.md)). El SDK no lo inventa
 
 - **DEBE** ser un **entero ≥ 1** y **≤ 2^53 − 1** (9007199254740991: el mayor que Node, y todo
   lo que use `double`, representa sin perder precisión). Ausente, `null`, una cadena (`"7"`), un
-  decimal (`7.5`, y también `7.0`), `0`, un negativo o uno mayor: `MISSING_AGGREGATE_VERSION`
-  (PERMANENT). El nombre cubre todo lo que no sea un entero ≥ 1, no solo la ausencia. Se
-  comprueba **siempre**, con o sin validación L3: es una regla del protocolo, no del esquema.
+  decimal (`7.5`, y `7.0` donde el lenguaje lo distinga: véase el punto siguiente), `0`, un
+  negativo o uno mayor: `MISSING_AGGREGATE_VERSION` (PERMANENT). El nombre cubre todo lo que no
+  sea un entero ≥ 1, no solo la ausencia. Se comprueba **siempre**, con o sin validación L3: es
+  una regla del protocolo, no del esquema.
+- **`7.0` depende del lenguaje, y la spec lo dice en vez de fingir que no.** El contador es un
+  entero, y `7.0` no lo es *para quien lo distingue*: un SDK cuyo parser de JSON separa el entero
+  del flotante (Rust con `serde_json`, donde `7.0` es un `f64`) **DEBE** rechazarlo con
+  `MISSING_AGGREGATE_VERSION`. En un lenguaje de **número JSON único** —Node: `JSON.parse("7.0")`
+  y `7` son el mismo `number`— es **indistinguible** de `7`, y el SDK no puede saber qué escribió
+  quien lo llamó: ahí se acepta como `7`. Es un **límite conocido del lenguaje**, no un fallo del
+  SDK, y no hay nada que corregir en él. Por eso `7.0` **no** figura en
+  `conformance/cases/state-semantics.json` (ese fichero es JSON, y lo leen los dos): lo comprueba
+  el test de cada SDK que sí distingue, y el de Node documenta que no puede.
 - **Una versión que no avanza es `stale`, y una igual tampoco avanza**: dos escrituras con la
   misma versión son, por contrato, el mismo dato, y la segunda no se aplica. Corregir un valor
   exige subir la versión.
@@ -379,6 +403,7 @@ En este orden, **antes de abrir ninguna petición** (el primero que falla gana):
 | Comprobación | Código | Clase |
 |---|---|---|
 | Dominio reservado ([§2.7](#27-dominios-reservados)) | `RESERVED_DOMAIN` | PERMANENT |
+| Forma del contrato ([§2.2](#22-el-subject)) | `INVALID_STATE_CONTRACT` | PERMANENT |
 | Clave ([§2.3](#23-la-clave)) | `INVALID_STATE_KEY` | PERMANENT |
 | Tenant ([§2.4](#24-el-tenant)) | `INVALID_TENANT_FOR_STATE` | PERMANENT |
 | `data` objeto; `aggregateVersion` ([§3.4](#34-la-versión)) | `MISSING_AGGREGATE_VERSION` | PERMANENT |
@@ -451,6 +476,9 @@ y el dato personal ya no está en el stream.
 - Un consumidor **DEBE** borrar o anonimizar su copia local al recibir una lápida (§5.3). Es lo
   que hace real el derecho de supresión **aguas abajo**.
 - `get` de una clave con lápida devuelve **`null`**, igual que de una que nunca existió (§5.1).
+  `flux state get` (el CLI), en cambio, **muestra la lápida**: es una herramienta de diagnóstico, y
+  su versión y su `revision` son justo lo que explica por qué un `put` da `stale`. La diferencia es
+  **intencionada**: el SDK contesta «¿hay un valor?» y el CLI «¿qué hay en esta clave?».
 
 ## 5. Leer
 
@@ -470,7 +498,7 @@ La respuesta lleva el mensaje tal cual —cuerpo y cabeceras `Nats-Subject`, `Na
 `Nats-Time-Stamp`, más las que se publicaron— y **no** consume nada: no hay consumidor ni acuse.
 
 - **Clave inexistente → `404 Message Not Found`** (A-32), y el SDK devuelve `null`. Una **lápida**
-  también devuelve `null`.
+  también devuelve `null` (el CLI la muestra: §4).
 - **Un stream que no existe, o sin `allow_direct`, no devuelve 404: no contesta nadie**
   (`no responders`), y los dos casos se ven igual (A-32). El SDK lanza `NOT_PROVISIONED` con un
   mensaje que nombra las dos causas y apunta a `flux provision` y a `flux doctor`
@@ -496,8 +524,10 @@ await bus.state.watch("clientes.cliente.v1", async (entrada, ctx) => {
 durable de `STATE_<DOM>`.
 
 - **Durable:** `<servicio>__state_<dom>_<agr>_v<M>` y, si filtra por tenant, el sufijo
-  `__<tenant>`. Los puntos y los guiones pasan a `_`, como en
-  [02-naming.md §4](02-naming.md): `tienda-web__state_clientes_cliente_v1__acme`. El tenant va en
+  `__<tenant>`. Los puntos y los guiones **del contrato y del tenant** pasan a `_`, como en
+  [02-naming.md §4](02-naming.md): `tienda-web__state_clientes_cliente_v1__acme`. **El nombre del
+  servicio no se toca**: conserva sus guiones (`tienda-web`, no `tienda_web`), porque es lo que
+  `^[a-z0-9]+(-[a-z0-9]+)*$` y la ACL de `gen-acl.mjs` esperan delante del `__`. El tenant va en
   el nombre porque **un durable compartido reparte los mensajes entre quienes lo usan**
   (A-47): dos instancias del mismo servicio, una por tenant, con un durable sin sufijo, se
   quitarían la mitad de la foto cada una.
@@ -505,9 +535,13 @@ durable de `STATE_<DOM>`.
   [03-delivery.md §2](03-delivery.md) (`ack_wait == backoff[0]`, `max_deliver: 6`, …).
 - **Filtro:** `state.<dom>.<agr>.v<M>.<tenant>.*`, o `….*.*` sin tenant. Con
   `tenantIsolation: "strict"`, el segundo es un error de configuración
-  ([09-multitenancy.md §3](09-multitenancy.md)). Con tenant en `connect()` **siempre** filtra, sea
-  cual sea su valor: aquí `system` es un tenant como cualquier otro (*decidido
-  provisionalmente*).
+  ([09-multitenancy.md §3](09-multitenancy.md)). **El tenant de un `watch` sale de la opción de la
+  llamada y, si no, de `connect()`** —y **nunca del evento en curso**: §2.4 explica por qué—. Con
+  tenant en `connect()` **siempre** filtra, sea cual sea su valor: aquí `system` es un tenant como
+  cualquier otro (*decidido provisionalmente*).
+- **Un `watch` observa un tenant, o todos; no una lista.** La API de los SDKs toma **un**
+  `tenantId` por llamada, y cada llamada es **un** durable. Un servicio que observa N tenants
+  llama N veces, y cada llamada tiene su `onSynced` ([§5.5](#55-onsynced)).
 - **Un consumidor que estuvo caído recibe solo el último valor de cada clave que cambió**, no los
   intermedios: no los hay (A-35). Un valor **reemplazado mientras estaba en vuelo no se
   reentrega**: si el handler hace `nak` de la revisión 10 y mientras tanto entra la 20, la 10 ha
@@ -520,7 +554,35 @@ durable de `STATE_<DOM>`.
 
 **Resincronizar** es borrar el durable y volver a crearlo: el broker entrega otra vez el último
 valor de cada clave (A-37). Lo hace `flux state resync` con credenciales de **operación**: un
-servicio no puede borrar durables ([06-security.md §3.5](06-security.md)).
+servicio no puede borrar durables ([06-security.md §3.5](06-security.md)). **Un `resync` de un
+durable que no existe se rechaza** (lo decidió el CLI): no hay nada que resincronizar, y crearlo
+dejaría un durable fantasma por un nombre mal escrito —un `--tenant` que falta, un servicio
+equivocado—; el CLI dice cuáles existen.
+
+**Un `watch` vivo durante un `resync`.** El `resync` borra el durable **bajo un `watch` que sigue abierto**:
+el broker contesta al pull pendiente `409 Consumer Deleted`. El SDK **DEBE** tratarlo como «repite el
+pull» —no como un fallo, y menos como el final del `watch`—: vuelve a consultar el durable **por su
+nombre** (`CONSUMER.INFO`, que el observador ya tiene) con backoff hasta que exista, **comprueba su
+configuración como al abrir** (un durable recreado con otro filtro **no** se consume: entregaría las
+claves de otro tenant sin ningún error) y vuelve a pedir mensajes. **No necesita `CONSUMER.CREATE`**:
+quien recrea el durable es `flux state resync`, con credenciales de operación. Avisa por el logger al
+perder el durable y al recuperarlo, y `close()` lo detiene. `onSynced` **no** se invoca de nuevo
+(§5.5): es una vez por `watch`.
+
+Medido (nats-server 2.14.5; 5 claves, un `watch` abierto y un `resync` inmediato —borrar y recrear—;
+tiempo desde que se recrea el durable hasta la primera entrada de la foto nueva):
+
+| Cliente | Sin tratar `consumer deleted` | Reabriendo el consumo |
+|---|---|---|
+| `nats.js` 3.4.0 (Node) | **43,0 s** (tres veces) | 0,1 s (tres veces) |
+| `async-nats` 0.50 (Rust) | **nunca**: 120 s después el `watch` seguía sin recibir nada, ni un `put` en vivo | 0,2–0,3 s (tres veces) |
+
+Cada cliente falla de forma distinta, y la de Rust es la peor. `nats.js` notifica `consumer_deleted` pero no
+repite el pull hasta que detecta la falta de latidos (`heartbeats_missed`: dos de 15 s y el reintento): ~43 s
+de un `watch` mudo, que luego se recupera solo. `async-nats` da por **terminado** el flujo de mensajes
+(`Err(ConsumerDeleted)` y después `None`), y un bucle que trata el fin del flujo como «me pidieron parar»
+sale **en silencio**: un `watch` muerto con la conexión sana y sin ningún error. Un cliente en el que no se
+pueda reabrir así **DEBE** documentar su tiempo medido, no suponerlo.
 
 ### 5.3 La entrada
 
@@ -583,9 +645,9 @@ no la del sobre.
 { onSynced: () => listo() }
 ```
 
-Se invoca **una sola vez por `watch()`** —no una por tenant, ni por reconexión— cuando el
-handler ya ha procesado **todo lo que había pendiente al abrirlo**. Es la señal de «mi réplica
-local ya puede contestar lecturas». Concretamente:
+Se invoca **una sola vez por `watch()`** —no una por reconexión, ni de nuevo tras un `resync`
+(§5.2)— cuando el handler ya ha procesado **todo lo que había pendiente al abrirlo**. Es la señal
+de «mi réplica local ya puede contestar lecturas». Concretamente:
 
 1. Al abrir, el SDK pregunta por el consumidor (`CONSUMER.INFO`): `num_pending` y
    `num_ack_pending`.
@@ -598,6 +660,15 @@ local ya puede contestar lecturas». Concretamente:
    lanzados hasta ese momento han terminado (con éxito o con error). `num_pending` solo no basta:
    cuenta lo no entregado y no lo entregado-y-sin-terminar, y con handlers concurrentes llega a 0
    cuando aún quedan hasta 256 en vuelo.
+
+**Varios tenants.** El contrato es: si una sola llamada observa **N tenants** (N durables), `onSynced`
+se invoca **una vez**, cuando **los N** están sincronizados —con uno solo sincronizado, la réplica
+local aún no puede contestar por los otros—, y de inmediato solo si los N estaban al día. **La API
+actual de Node y de Rust no ofrece esa llamada**: `watch` toma **un** `tenantId` (o ninguno, y observa
+todos con un único durable), y un servicio que observa N tenants hace N llamadas, cada una con su
+`onSynced`. Combinarlas —«listo cuando han llegado las N»— es de la aplicación, que es quien sabe
+cuántos tenants tiene. No se ha inventado una API de lista para tapar esto; si un SDK la añade,
+**DEBE** cumplir la regla de arriba.
 
 **Escrituras durante la sincronización.** La foto no es una fotografía parada: el broker entrega
 en orden de secuencia, y una clave reescrita mientras se sincroniza aparece **una vez, con su
@@ -634,6 +705,15 @@ PERMANENT, o agota sus reintentos, manda la entrada a la **DLQ de estado**.
   estaba, también `dataclassification`.
 - **`dlqerror` NO DEBE contener valores de `data`**: código, y como mucho la ruta del campo
   (`INVALID_SCHEMA: /pais …`, nunca el valor). Es la misma razón, vista desde el texto.
+- **Un error que no es de flux no deja su mensaje en la DLQ.** Lo que lanza un driver de base de
+  datos (`duplicate key value violates unique constraint … Key (email)=(ana@example.com)`) cita la
+  fila entera, y la DLQ guarda 90 días. Un error **de flux** —los del SDK y los que lanza la
+  aplicación con `PermanentError`/`RetryableError`, cuyo mensaje escribió quien sabía que iría a la
+  DLQ— conserva el suyo. Cualquier otro se reduce a su código y a una frase fija:
+  `UNKNOWN: error sin clasificar de la aplicación; el mensaje se omite para no copiar datos a la DLQ
+  (10-state.md §6)`, con el código que le dé el clasificador (`UNKNOWN`, o el que reconozca:
+  `HTTP_503`, `ECONNRESET`). Tampoco se concatena la cadena de causas de un error de flux: la causa
+  es, justamente, el error del driver.
 - **Si el original llevaba `signkeyid` y `signature`, el evento de DLQ de estado NO los
   conserva**: firman un `data` que ya no está, y una firma que no verifica sobre un sobre que
   parece el original es una afirmación falsa ([07-signing.md §5](07-signing.md)). *Decidido
@@ -642,9 +722,11 @@ PERMANENT, o agota sus reintentos, manda la entrada a la **DLQ de estado**.
   cuerpo en ninguna forma —ni los `rawBase64` que sí llevan los eventos—, porque podría contener
   el dato. No hay sobre original que conservar, así que el SDK sintetiza uno con lo único fiable,
   **el subject**: `id` UUIDv7 nuevo (y `correlationid` igual), `source` y `producerversion` del
-  servicio que consume, `type` y `dataschema` del contrato, `subject` = la clave y `tenantid` =
-  el tenant, **ambos tomados del subject**, `dataclassification: "internal"`, las `dlq*`
-  (`dlqreason: "poison"`) y `data: { key, revision }`.
+  servicio que consume, `time` = **el instante actual** (el del consumo: no hay otro que decir),
+  `type` y `dataschema` del contrato, `subject` = la clave y `tenantid` = el tenant, **ambos
+  tomados del subject**, `partitionkey` = **la clave**, `dataclassification: "internal"`, las `dlq*`
+  (`dlqreason: "poison"`) y `data: { key, revision }`. Lo único que **no** es reproducible byte a
+  byte entre dos consumos es lo que depende del reloj y del azar: `id`, `correlationid` y `time`.
 - **`Nats-Msg-Id` de la DLQ de estado:** `dlq-<id>-<dlqconsumer>`, como en los eventos.
 
 **El estado no se reproduce desde la DLQ.** Republicar un valor viejo pisaría uno más nuevo —la
@@ -705,6 +787,7 @@ generador debe producir. `protocol.json` → `state.acl` fija los patrones.
 state.<dom>.>
 $JS.API.DIRECT.GET.STATE_<DOM>.state.<dom>.>
 + el durable de su DLQ de estado: CONSUMER.INFO, MSG.NEXT y ACK de  <servicio>__dlq_state_<dom>
+  (sobre DLQ_<DOM>: son los patrones de `security.acl.permissionPatterns`, no los de `STATE_<DOM>`)
 ```
 
 **Observador** (`watch`, y `get` de lo que observa), por contrato y tenant:
@@ -739,9 +822,11 @@ Lo que se midió, y por qué la lista es esta:
   `STREAM.INFO` con `subjects_filter` en el cuerpo devuelve **todos los subjects del stream con
   su recuento**, es decir, **todas las claves y todos los tenants** (A-39). Con ese único permiso,
   un servicio confinado a `acme` conoce los clientes de `globex`. Sin él, `put`, `get` y `watch`
-  funcionan igual (A-38, A-48). El dueño **PUEDE** tenerlo, porque ya ve todos sus tenants; el generador
-  **no se lo concede** (06-security.md §3.8): el SDK tampoco lo usa, y si un día hace falta es un permiso más
-  del dueño, nunca del observador.
+  funcionan igual (A-38, A-48). **El dueño tampoco lo recibe**: el SDK no lo usa —las claves y los tenants que
+  necesita los conoce porque es quien los escribe, y `subjects_filter` es justo lo que lista todos—, y
+  conceder «por si acaso» lo que nadie usa es el principio de un permiso que alguien acabará ampliando. Si
+  un día hiciera falta, sería un permiso más del dueño, nunca del observador, y entraría aquí primero
+  (06-security.md §3.8).
   Lo que **sí** queda visible para un observador es lo que expone `STREAM.INFO.DLQ_<DOM>`:
   los subjects de DLQ —cinco tokens, sin clave ni tenant— y sus recuentos.
 
@@ -779,7 +864,7 @@ Un SDK declara la capacidad `state` ([00-protocol.md §5](00-protocol.md)) solo 
    `state-tombstone`, `state-subject`, `state-dlq`).
 2. Reconoce **10071 y 10164** como conflicto de secuencia (§3.2) —se prueba contra un cluster, o
    con una respuesta fabricada de cada forma—.
-3. Los **seis** códigos de [04-errors.md §6](04-errors.md), con su clase.
+3. Los **siete** códigos de [04-errors.md §6](04-errors.md), con su clase.
 4. `publish()` rechaza los dominios reservados (§2.7) con `RESERVED_DOMAIN`.
 5. Resuelve el contrato en el índice `state` del bundle, no por red.
 6. Ejecuta, contra un broker real y con los permisos que genera `gen-acl.mjs`, el ciclo del
@@ -821,6 +906,12 @@ es barato **ahora** y deja de serlo cuando haya datos en un stream:
 | 11 | El stream `DLQ_<DOM>` captura `dlq.state.<dom>.>` solo si el dominio tiene estado | §6 |
 | 12 | El dueño lee la DLQ de estado con `<servicio>__dlq_state_<dominio>` | §6 |
 | 13 | La DLQ de estado no conserva la firma, ni el cuerpo de un mensaje ilegible | §6 |
-| 14 | `STREAM.INFO.STATE_<DOM>` no se concede a observadores; el SDK no lo usa | §8 |
+| 14 | `STREAM.INFO.STATE_<DOM>` no se concede a nadie —ni al dueño—; el SDK no lo usa | §8 |
 | 15 | El `consumer` de las métricas de estado es el durable sin tenant, y el gauge la suma | §9 |
 | 16 | `type` de la lápida con `deleted` (del plan) frente a `eliminado` en su esquema | §4 |
+| 17 | El tenant de un `watch` sale de la opción y de `connect()`, nunca del evento en curso | §2.4, §5.2 |
+| 18 | Un contrato mal formado es `INVALID_STATE_CONTRACT` (el séptimo código) | §2.2, §3.6 |
+| 19 | `7.0` se rechaza donde el lenguaje distingue entero de flotante; en Node es indistinguible de `7` | §3.4 |
+| 20 | Un error que no es de flux deja en `dlqerror` solo su código y una frase fija | §6 |
+| 21 | `onSynced` de varios tenants: una vez, cuando todos están sincronizados; la API actual toma un tenant por `watch` | §5.5 |
+| 22 | Un `watch` vivo reabre su consumo cuando el durable se borra (`resync`), sin `CONSUMER.CREATE` y comprobando la configuración | §5.2 |

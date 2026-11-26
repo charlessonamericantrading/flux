@@ -192,7 +192,8 @@ pub const SCHEMA_NOT_FOUND_CODE: &str = "SCHEMA_NOT_FOUND";
 
 /// El payload no cumple el JSON Schema que su propio `dataschema` declara — L3.
 ///
-/// Vive en la taxonomía y no en [`crate::validation`] porque es un error del protocolo:
+/// Vive en la taxonomía y no en el módulo `validation` (que solo existe con la feature del mismo
+/// nombre, y por eso no se enlaza: sin ella el enlace no resolvería) porque es un error del protocolo:
 /// se puede construir, propagar y clasificar sin la feature `validation` activada, que
 /// solo hace falta para *detectarlo*.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -269,7 +270,12 @@ pub const INVALID_CREDENTIALS_CODE: &str = "INVALID_CREDENTIALS";
 /// socket — 04-errors.md §5.3.
 pub const INVALID_TLS_OPTIONS_CODE: &str = "INVALID_TLS_OPTIONS";
 
-// ─── Los seis códigos de la capacidad `state` — 04-errors.md §6 ──────────────
+// ─── Los siete códigos de la capacidad `state` — 04-errors.md §6 ─────────────
+
+/// Código estable: el contrato de un estado no es `<dominio>.<agregado>.v<major>` —
+/// 04-errors.md §6. **PERMANENT.** Es el séptimo: la lista de seis no tenía dónde poner un
+/// contrato mal formado, y este SDK lanzaba un `InvalidSubject` sin código de estado.
+pub const INVALID_STATE_CONTRACT_CODE: &str = "INVALID_STATE_CONTRACT";
 
 /// Código estable: el tenant de un estado no sirve, o no se pudo resolver ninguno —
 /// 04-errors.md §6. **PERMANENT.**
@@ -565,9 +571,27 @@ pub enum FluxError {
 
     // ─── Estado replicado — 10-state.md, 04-errors.md §6 ─────────────────────────
     //
-    // Los seis son variantes propias y no un `Permanent(Failure)` con `with_code(…)` por la misma
+    // Los siete son variantes propias y no un `Permanent(Failure)` con `with_code(…)` por la misma
     // razón que `NotProvisioned`: el código es el que agrupa el panel
     // (`flux_events_dlq_total{code}`) y **la aplicación no puede sustituirlo**.
+    /// El contrato de un estado no es `<dominio>.<agregado>.v<major>` — 10-state.md §2.2.
+    ///
+    /// El subject del estado sin `state.`, sin tenant y sin clave, en minúsculas y `kebab-case`:
+    /// `clientes.cliente.v1`. Son tres tokens y el último es `v` y un entero ≥ 1. Un dominio
+    /// reservado **no** es este error: es [`FluxError::ReservedDomain`], que se evalúa antes
+    /// (10-state.md §3.6). No se cuenta en `flux_state_writes_total`: su valor es la etiqueta
+    /// `contract`, y uno mal formado crearía una serie por cada error de tipeo. Falla **antes** de
+    /// tocar la red.
+    ///
+    /// **PERMANENT.**
+    #[error("{}", format_invalid_contract(.contract, .reason))]
+    InvalidStateContract {
+        /// El contrato rechazado.
+        contract: String,
+        /// Por qué se rechazó.
+        reason: String,
+    },
+
     /// El tenant de un estado no sirve, o no se pudo resolver ninguno — 10-state.md §2.4.
     ///
     /// A diferencia de un evento, un estado **no** cae en `system` por defecto: aquí el tenant
@@ -672,6 +696,14 @@ pub enum FluxError {
         #[source]
         source: HandlerError,
     },
+}
+
+fn format_invalid_contract(contract: &str, reason: &str) -> String {
+    format!(
+        "contrato de estado inválido {contract:?}: {reason}. Un contrato es \
+         `<dominio>.<agregado>.v<major>` —el subject del estado sin `state.`, sin tenant y sin \
+         clave—, en minúsculas y kebab-case: `clientes.cliente.v1` (10-state.md §2.2)"
+    )
 }
 
 fn format_invalid_tenant(tenant: Option<&str>, reason: &str) -> String {
@@ -918,6 +950,7 @@ impl FluxError {
             // Los cuatro de estado que se lanzan al LLAMAR: la llamada está mal y repetirla da
             // el mismo error — 04-errors.md §6. Un `put` dentro de un handler que los provoque va
             // a la DLQ en la primera entrega.
+            | Self::InvalidStateContract { .. }
             | Self::InvalidTenantForState { .. }
             | Self::InvalidStateKey { .. }
             | Self::MissingAggregateVersion { .. }
@@ -949,7 +982,8 @@ impl FluxError {
             Self::ConnectionRejected { .. } => return Some(CONNECTION_REJECTED_CODE),
             Self::InvalidCredentials(_) => return Some(INVALID_CREDENTIALS_CODE),
             Self::InvalidTlsOptions(_) => return Some(INVALID_TLS_OPTIONS_CODE),
-            // Los seis de estado: el código es el que agrupa el panel, no la aplicación.
+            // Los siete de estado: el código es el que agrupa el panel, no la aplicación.
+            Self::InvalidStateContract { .. } => return Some(INVALID_STATE_CONTRACT_CODE),
             Self::InvalidTenantForState { .. } => return Some(INVALID_TENANT_FOR_STATE_CODE),
             Self::InvalidStateKey { .. } => return Some(INVALID_STATE_KEY_CODE),
             Self::MissingAggregateVersion { .. } => return Some(MISSING_AGGREGATE_VERSION_CODE),

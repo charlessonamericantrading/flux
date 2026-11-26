@@ -362,6 +362,29 @@ function fallosDeAclDeEstado(doc, emitir = permisosDe) {
     // dominios reservados (comprobado abajo), no el patrón.
     if (k !== "state.acl.ownerPublish" && k !== "security.acl.permissionPatterns.ownDomain" && r.test("state.>")) f.push(`${k} concede state.>: escribir el estado de todos los dominios`);
   }
+  // ownerPermissions: el durable de la DLQ de estado del dueño vive en DLQ_<DOM>, no en STATE_<DOM>. Sus permisos NO son
+  // los `consumerInfo`/`consumerNext`/`ack` de state.acl (de STATE_ y del observador) sino los de
+  // security.acl.permissionPatterns, que ya admiten `<servicio>__dlq_state_<dom>`. Medido con regex, no afirmado.
+  {
+    const dur = "crm-api__dlq_state_clientes";
+    const muestras = { consumerInfo: `$JS.API.CONSUMER.INFO.DLQ_CLIENTES.${dur}`, consumerNext: `$JS.API.CONSUMER.MSG.NEXT.DLQ_CLIENTES.${dur}`, ack: `$JS.ACK.DLQ_CLIENTES.${dur}.>` };
+    for (const [k, x] of Object.entries(muestras)) {
+      if (!re(acl.permissionPatterns?.[k] ?? "(?!)").test(x)) f.push(`security.acl.permissionPatterns.${k} debe admitir el durable de la DLQ de estado del dueño (${x})`);
+      if (re(st[k] ?? "(?!)").test(x)) f.push(`state.acl.${k} admite ${x}: es de STATE_<DOM>, y el durable de la DLQ del dueño va en DLQ_<DOM> (sus permisos son los de security.acl.permissionPatterns)`);
+    }
+    const op = st.ownerPermissions ?? [];
+    for (const k of ["consumerInfo", "consumerNext", "ack"]) {
+      if (op.some((e) => e.split(" ")[0] === k)) f.push(`state.acl.ownerPermissions cita «${k}» a secas: eso es el patrón de STATE_<DOM> (state.acl.${k}); los del durable de la DLQ del dueño son security.acl.permissionPatterns.${k}`);
+      if (!op.includes(`security.acl.permissionPatterns.${k}`)) f.push(`state.acl.ownerPermissions debe citar security.acl.permissionPatterns.${k} (el durable de la DLQ de estado del dueño)`);
+    }
+    for (const e of [...op, ...(st.observerPermissions ?? [])]) {
+      const ruta = e.split(" ")[0];
+      const existe = ruta.startsWith("security.") ? typeof resolver(ruta) === "string" : typeof st[ruta] === "string";
+      if (!existe) f.push(`state.acl: «${e}» no se resuelve a ningún patrón (state.acl.<clave> o security.acl.permissionPatterns.<clave>)`);
+    }
+    if (op.some((e) => /STREAM\.INFO|streamInfo/.test(e))) f.push("state.acl.ownerPermissions incluye STREAM.INFO: el dueño NO recibe STREAM.INFO.STATE_<DOM> (10-state.md §8)");
+    if (/PUEDE tenerlo/.test(st.$commentStreamInfo ?? "")) f.push("state.acl.$commentStreamInfo dice que el dueño PUEDE tener STREAM.INFO.STATE_<DOM>: no lo recibe");
+  }
   // El dueño escribe en SU dominio de estado, no en todos: `state.clientes.>` sí, `state.>` y `state.*.>` no.
   const owp = re(st.ownerPublish ?? "(?!)");
   if (!owp.test("state.clientes.>") || ["state.>", "state.*.>", ">", "state.clientes.cliente.>"].some((x) => owp.test(x))) f.push("state.acl.ownerPublish debe aceptar state.<dominio>.> y rechazar state.>, state.*.> y lo más estrecho que un dominio");
@@ -425,6 +448,11 @@ function fallosDeAclDeEstado(doc, emitir = permisosDe) {
       }
       for (const d of e.durables.filter((x) => x.kind === "dlq-state")) {
         if (!durableDlqEstado.test(d.durable)) f.push(`${donde}: el durable de DLQ de estado «${d.durable}» no cumple state.dlq.readerDurable.pattern`);
+        for (const [k, x] of [["consumerInfo", `$JS.API.CONSUMER.INFO.${d.stream}.${d.durable}`], ["consumerNext", `$JS.API.CONSUMER.MSG.NEXT.${d.stream}.${d.durable}`], ["ack", `$JS.ACK.${d.stream}.${d.durable}.>`]]) {
+          if (!e.publish.includes(x)) f.push(`${donde}: falta el permiso ${x} del durable de su DLQ de estado`);
+          const cats = categoriasDe(x);
+          if (!eq(cats, [`security.acl.permissionPatterns.${k}`])) f.push(`${donde}: «${x}» (durable de la DLQ del dueño) debe casar solo con security.acl.permissionPatterns.${k}; casa con [${cats.join(", ")}]`);
+        }
         if (!svc.stateOwns.includes(d.stream.replace(/^DLQ_/, "").toLowerCase().replace(/_/g, "-"))) f.push(`${donde}: lee la DLQ de estado de un dominio que no es suyo (${d.stream})`);
       }
       if (e.durables.filter((x) => x.kind === "dlq-state").length !== svc.stateOwns.length) f.push(`${donde}: debe leer la DLQ de estado de cada dominio con estado que posee`);
@@ -505,6 +533,7 @@ function fallosDeConnect(doc) {
 // real (cero fallos) y sobre copias estropeadas a propósito (cada una DEBE dar al menos uno). Una
 // invariante que solo se ha visto en verde no demuestra nada.
 const CODIGOS_ESTADO = {
+  INVALID_STATE_CONTRACT: "permanent",
   INVALID_TENANT_FOR_STATE: "permanent",
   INVALID_STATE_KEY: "permanent",
   MISSING_AGGREGATE_VERSION: "permanent",
@@ -532,12 +561,18 @@ function fallosDeEstado(doc) {
     if (cs[c].capability !== "state") f.push(`errors.codes.${c}.capability debe ser "state"`);
   }
   const deEstado = Object.entries(cs).filter(([k, v]) => !k.startsWith("$") && v?.capability === "state").map(([k]) => k).sort();
-  if (!eq(deEstado, Object.keys(CODIGOS_ESTADO).sort())) f.push(`los códigos de la capacidad state son una lista CERRADA de seis; hay [${deEstado.join(", ")}]`);
+  if (!eq(deEstado, Object.keys(CODIGOS_ESTADO).sort())) f.push(`los códigos de la capacidad state son una lista CERRADA de siete; hay [${deEstado.join(", ")}]`);
   // El único POISON de estado es el de identidad: miente sobre su tenant o su clave.
   if (cs.STATE_SUBJECT_MISMATCH?.action !== "term+dlq+alert") f.push('errors.codes.STATE_SUBJECT_MISMATCH.action debe ser "term+dlq+alert" (es POISON)');
   if (cs.STATE_SUBJECT_MISMATCH?.neverApplied !== true) f.push("errors.codes.STATE_SUBJECT_MISMATCH.neverApplied debe ser true: la entrada no se aplica");
+  // El séptimo: un contrato mal formado. Falla antes de la red y NO se cuenta (su valor es la etiqueta `contract`).
+  if (cs.INVALID_STATE_CONTRACT?.failsBeforeNetwork !== true || cs.INVALID_STATE_CONTRACT?.notCountedInMetrics !== true) f.push("errors.codes.INVALID_STATE_CONTRACT: falla antes de la red y no se cuenta en flux_state_writes_total (un contrato mal formado crearía una serie por cada error de tipeo)");
+  if (!eq(cs.INVALID_STATE_CONTRACT?.thrownBy, ["put", "get", "delete", "watch"])) f.push("errors.codes.INVALID_STATE_CONTRACT.thrownBy debe ser [put, get, delete, watch]");
+  if (st.contract?.errorCode !== "INVALID_STATE_CONTRACT") f.push('state.contract.errorCode debe ser "INVALID_STATE_CONTRACT"');
+  if (!(st.metrics?.flux_state_writes_total?.notCounted ?? []).includes("INVALID_STATE_CONTRACT")) f.push("state.metrics.flux_state_writes_total.notCounted debe incluir INVALID_STATE_CONTRACT");
   if (!doc.capabilities?.definitions?.state) f.push("capabilities.definitions.state: falta la definición de la capacidad (con su evidencia)");
   else if (doc.capabilities.definitions.state.evidence !== "sdk-files") f.push('capabilities.definitions.state.evidence debe ser "sdk-files", como `security`');
+  else if (!doc.capabilities.definitions.state.requires?.includes("seven-state-error-codes") || doc.capabilities.definitions.state.requires?.includes("six-state-error-codes")) f.push("capabilities.definitions.state.requires debe pedir seven-state-error-codes (la lista de códigos de estado es de siete)");
 
   // 02-naming.md §1.3: dominios reservados.
   const rd = doc.naming?.reservedDomains;
@@ -578,6 +613,9 @@ function fallosDeEstado(doc) {
   if (st.key?.caseSensitive !== true || st.key?.pii !== "forbidden") f.push("state.key: es sensible a mayúsculas y nunca PII");
   if (st.tenant?.maxLength !== 64) f.push("state.tenant.maxLength debe ser 64: el durable lleva el tenant y NATS limita los nombres de consumidor a 255 (A-42)");
   if (st.tenant?.default !== "none") f.push('state.tenant.default debe ser "none": en estado no hay tenant por defecto');
+  // 10-state.md §2.4 y §5.2: `put`/`delete`/`get` heredan el tenant del evento en curso; `watch`, NUNCA (no corre dentro de un handler).
+  if (!eq(st.tenant?.resolutionOrder, ["call-option", "event-in-progress", "connection-tenantId"]) || !eq(st.tenant?.resolutionOrderAppliesTo, ["put", "delete", "get"])) f.push("state.tenant.resolutionOrder (put, delete, get) debe ser [call-option, event-in-progress, connection-tenantId]");
+  if (!eq(st.tenant?.watchResolutionOrder, ["call-option", "connection-tenantId"]) || st.tenant?.watchNeverUsesEventInProgress !== true) f.push("state.tenant.watchResolutionOrder debe ser [call-option, connection-tenantId], sin el evento en curso: un watch no corre dentro de un handler y heredar su tenant haría depender el filtro de qué evento llegó primero");
   // El durable de un watch no puede confundirse con el de un evento ni con el de DLQ.
   const durEvento = re(doc.naming?.durableConsumer?.pattern ?? "");
   const durEstado = re(st.watch?.durable?.pattern ?? "");
@@ -609,6 +647,10 @@ function fallosDeEstado(doc) {
   if (av.maximum !== Number.MAX_SAFE_INTEGER) f.push("state.aggregateVersion.maximum debe ser 2^53 - 1 (9007199254740991): el mayor entero que Node representa sin perder precisión");
   if (av.checkedWithoutValidation !== true) f.push("state.aggregateVersion.checkedWithoutValidation debe ser true: es una regla del protocolo, no del esquema");
   if (st.schemaPath?.mustDeclare?.aggregateVersion?.required !== true) f.push("state.schemaPath.mustDeclare.aggregateVersion debe ser required");
+  // `7.0`: se rechaza donde el parser distingue entero de flotante; en Node es indistinguible de `7` (límite del lenguaje, no un fallo).
+  const sp = av.sevenPointZero ?? {};
+  if (sp.rejectedWhenParserDistinguishesIntFromFloat !== true || !eq(sp.singleNumberLanguages, ["node"]) || sp.inStateSemanticsJson !== false) f.push("state.aggregateVersion.sevenPointZero: 7.0 se rechaza donde el parser distingue entero de flotante; Node es un lenguaje de número único (indistinguible de 7) y el caso no va en state-semantics.json");
+  if (av.decimalIsInvalid !== true) f.push("state.aggregateVersion.decimalIsInvalid debe ser true");
 
   // La lápida: fija, con versión, permanente.
   const tb = st.tombstone ?? {};
@@ -640,6 +682,14 @@ function fallosDeEstado(doc) {
   if (!eq(wt.entry, ["key", "tenantId", "deleted", "data", "aggregateVersion", "revision"])) f.push("state.watch.entry debe ser [key, tenantId, deleted, data, aggregateVersion, revision]");
   if (wt.replacedMessagesAreNotRedelivered !== true || wt.usesStreamInfoOnState !== false) f.push("state.watch: un valor reemplazado no se reentrega, y no usa STREAM.INFO.STATE_<DOM>");
   if (wt.onSynced?.emptyStream !== "immediately-before-any-entry" || wt.onSynced?.invocations !== "once-per-watch") f.push("state.watch.onSynced: con el stream vacío se invoca de inmediato, una vez por watch");
+  // Un watch VIVO durante un resync: reabre el consumo (nats.js tarda 43 s en repetir el pull; async-nats da el flujo por terminado y un bucle que lo
+  // trata como «parar» sale en silencio). Sin CONSUMER.CREATE y comprobando la configuración: un durable recreado con otro filtro entrega otro tenant.
+  const dd = wt.durableDeletedWhileWatching ?? {};
+  if (dd.action !== "reopen-the-consumption" || !(dd.mustNot ?? []).includes("stop-silently") || !(dd.mustNot ?? []).includes("treat-end-of-stream-as-stop-request")) f.push("state.watch.durableDeletedWhileWatching: reabrir el consumo; nunca parar en silencio ni tratar el fin del flujo como una petición de parar");
+  if (dd.needsConsumerCreate !== false || !eq(dd.reusesPermissions, ["consumerInfo", "consumerNext"])) f.push("state.watch.durableDeletedWhileWatching: reabrir NO necesita CONSUMER.CREATE (usa CONSUMER.INFO y MSG.NEXT del observador)");
+  if (dd.checksConfigBeforeConsuming !== true || dd.afterResyncOnSyncedFiresAgain !== false || dd.stoppedByClose !== true || dd.warnsThroughLogger !== true) f.push("state.watch.durableDeletedWhileWatching: comprueba la configuración antes de consumir, avisa por el logger, lo detiene close(), y onSynced no se invoca de nuevo");
+  if (!dd.measured?.withoutHandling?.["nats.js 3.4.0"] || !dd.measured?.withoutHandling?.["async-nats 0.50"] || !dd.measured?.reopening) f.push("state.watch.durableDeletedWhileWatching.measured: lo medido (sin tratarlo y reabriendo) en nats.js y async-nats");
+  if (wt.onSynced?.severalTenantsInOneCall !== "once-when-all-synced" || wt.onSynced?.apiTakesOneTenantPerWatch !== true || wt.onSynced?.afterResyncFiresAgain !== false) f.push("state.watch.onSynced: con varios tenants en una llamada, una vez cuando todos están sincronizados; la API toma un tenant por watch; un resync no la invoca de nuevo");
 
   // La DLQ de estado: sin dato, sin firma, sin replay.
   const dq = st.dlq ?? {};
@@ -647,6 +697,13 @@ function fallosDeEstado(doc) {
   if (dq.replay !== "forbidden" || dq.recovery !== "flux state resync") f.push("state.dlq: el estado no se reproduce desde la DLQ; la recuperación es flux state resync");
   if (dq.dropsSignature !== true || dq.dlqerrorNeverContainsDataValues !== true || dq.unreadableMessageBodyNeverCopied !== true) f.push("state.dlq: sin firma, sin valores en dlqerror y sin el cuerpo de un mensaje ilegible");
   if (!eq(dq.streamSubjectsWhenDomainHasNoState, ["dlq.<dominio>.>"])) f.push("state.dlq.streamSubjectsWhenDomainHasNoState: un dominio sin estado conserva el DLQ_<DOM> de la 1.0 (1.1 es aditiva)");
+  // Un mensaje ilegible sintetiza su sobre: time = ahora y partitionkey = la clave (lo único fiable es el subject).
+  const sy = dq.unreadableSynthesizedEnvelope ?? {};
+  if (sy.time !== "now" || sy.partitionkey !== "key-from-subject" || sy.subject !== "key-from-subject" || sy.tenantid !== "tenant-from-subject") f.push("state.dlq.unreadableSynthesizedEnvelope: time = el instante actual, y partitionkey, subject y tenantid salen del subject de NATS");
+  if (sy.dataclassification !== "internal" || sy.dlqreason !== "poison" || sy.idIsNewUuidV7 !== true || !eq(sy.notReproducibleByteForByte, ["id", "correlationid", "time"])) f.push("state.dlq.unreadableSynthesizedEnvelope: internal, poison, id UUIDv7 nuevo; solo id, correlationid y time no son reproducibles");
+  // `dlqerror` de un error que NO es de flux: solo el código y una frase fija; nunca el mensaje del driver (puede citar la fila).
+  if (dq.dlqerrorOfNonFluxErrors !== "code-and-fixed-phrase-only" || dq.dlqerrorFluxErrorsKeepOwnMessage !== true || dq.dlqerrorNeverConcatenatesCauseChain !== true) f.push("state.dlq.dlqerrorOfNonFluxErrors debe ser code-and-fixed-phrase-only: el mensaje de un driver puede citar la fila entera y la DLQ guarda 90 días; los errores de flux conservan el suyo, sin su cadena de causas");
+  if (dq.dlqerrorFixedPhrase !== "error sin clasificar de la aplicación; el mensaje se omite para no copiar datos a la DLQ (10-state.md §6)") f.push("state.dlq.dlqerrorFixedPhrase debe ser la frase que emiten los SDKs: «error sin clasificar de la aplicación; el mensaje se omite para no copiar datos a la DLQ (10-state.md §6)»");
 
   // ACL: lo concedible de estado, sin STREAM.INFO.STATE y con el tenant fijado.
   const acl = st.acl ?? {};
@@ -667,6 +724,8 @@ function fallosDeEstado(doc) {
   const mw = st.metrics?.flux_state_writes_total;
   if (!eq(mw?.labels, ["contract", "outcome"])) f.push("state.metrics.flux_state_writes_total.labels debe ser [contract, outcome]");
   if (!eq(mw?.outcomes, ["ok", "stale", "conflict", "invalid_schema"])) f.push("state.metrics.flux_state_writes_total.outcomes debe ser [ok, stale, conflict, invalid_schema]");
+  // Igual que publish() con un evento: TODO fallo de L3 es invalid_schema, también SCHEMA_NOT_FOUND (modo estricto, esquema ausente del bundle).
+  if (!eq(mw?.invalidSchemaCodes, ["MISSING_AGGREGATE_VERSION", "INVALID_SCHEMA", "SCHEMA_NOT_FOUND"])) f.push("state.metrics.flux_state_writes_total.invalidSchemaCodes debe ser [MISSING_AGGREGATE_VERSION, INVALID_SCHEMA, SCHEMA_NOT_FOUND]: SCHEMA_NOT_FOUND en modo estricto cuenta como invalid_schema, igual que en un evento");
   for (const prohibida of doc.observability?.forbiddenLabels ?? []) {
     if ((mw?.labels ?? []).includes(prohibida)) f.push(`state.metrics.flux_state_writes_total usa la etiqueta prohibida "${prohibida}"`);
   }
@@ -875,7 +934,35 @@ let mutacionesEstado = 0;
     "quitar un código de estado": (d) => { delete d.errors.codes.STATE_CONFLICT; },
     "STATE_SUBJECT_MISMATCH como PERMANENT": (d) => { d.errors.codes.STATE_SUBJECT_MISMATCH.class = "permanent"; },
     "STATE_CONFLICT como PERMANENT": (d) => { d.errors.codes.STATE_CONFLICT.class = "permanent"; },
-    "un séptimo código de estado": (d) => { d.errors.codes.OTRO_CODIGO_DE_ESTADO = { class: "permanent", capability: "state" }; },
+    "un octavo código de estado": (d) => { d.errors.codes.OTRO_CODIGO_DE_ESTADO = { class: "permanent", capability: "state" }; },
+    "quitar INVALID_STATE_CONTRACT": (d) => { delete d.errors.codes.INVALID_STATE_CONTRACT; },
+    "INVALID_STATE_CONTRACT como RETRYABLE": (d) => { d.errors.codes.INVALID_STATE_CONTRACT.class = "retryable"; },
+    "INVALID_STATE_CONTRACT de otra capacidad": (d) => { d.errors.codes.INVALID_STATE_CONTRACT.capability = "security"; },
+    "INVALID_STATE_CONTRACT cuenta en la métrica": (d) => { d.errors.codes.INVALID_STATE_CONTRACT.notCountedInMetrics = false; },
+    "INVALID_STATE_CONTRACT con red": (d) => { d.errors.codes.INVALID_STATE_CONTRACT.failsBeforeNetwork = false; },
+    "el contrato sin su código": (d) => { delete d.state.contract.errorCode; },
+    "la métrica cuenta INVALID_STATE_CONTRACT": (d) => { d.state.metrics.flux_state_writes_total.notCounted = d.state.metrics.flux_state_writes_total.notCounted.filter((c) => c !== "INVALID_STATE_CONTRACT"); },
+    "la capacidad pide seis códigos": (d) => { d.capabilities.definitions.state.requires = d.capabilities.definitions.state.requires.map((r) => (r === "seven-state-error-codes" ? "six-state-error-codes" : r)); },
+    "watch hereda el tenant del evento en curso": (d) => { d.state.tenant.watchResolutionOrder = ["call-option", "event-in-progress", "connection-tenantId"]; },
+    "watch sin prohibir el evento en curso": (d) => { d.state.tenant.watchNeverUsesEventInProgress = false; },
+    "put sin el evento en curso": (d) => { d.state.tenant.resolutionOrder = ["call-option", "connection-tenantId"]; },
+    "SCHEMA_NOT_FOUND no cuenta como invalid_schema": (d) => { d.state.metrics.flux_state_writes_total.invalidSchemaCodes = ["MISSING_AGGREGATE_VERSION", "INVALID_SCHEMA"]; },
+    "7.0 exigido también en Node": (d) => { d.state.aggregateVersion.sevenPointZero.singleNumberLanguages = []; },
+    "7.0 aceptado donde se distingue": (d) => { d.state.aggregateVersion.sevenPointZero.rejectedWhenParserDistinguishesIntFromFloat = false; },
+    "7.0 en state-semantics.json": (d) => { d.state.aggregateVersion.sevenPointZero.inStateSemanticsJson = true; },
+    "la DLQ sintetizada con time fijo": (d) => { d.state.dlq.unreadableSynthesizedEnvelope.time = "from-original"; },
+    "la DLQ sintetizada sin partitionkey": (d) => { d.state.dlq.unreadableSynthesizedEnvelope.partitionkey = "absent"; },
+    "dlqerror con el mensaje del driver": (d) => { d.state.dlq.dlqerrorOfNonFluxErrors = "driver-message"; },
+    "dlqerror concatena la cadena de causas": (d) => { d.state.dlq.dlqerrorNeverConcatenatesCauseChain = false; },
+    "dlqerror sin su frase fija": (d) => { d.state.dlq.dlqerrorFixedPhrase = "error"; },
+    "onSynced se invoca de nuevo tras un resync": (d) => { d.state.watch.onSynced.afterResyncFiresAgain = true; },
+    "un watch vivo se para en silencio al borrarse el durable": (d) => { d.state.watch.durableDeletedWhileWatching.action = "stop"; },
+    "se admite parar en silencio": (d) => { d.state.watch.durableDeletedWhileWatching.mustNot = []; },
+    "reabrir necesita CONSUMER.CREATE": (d) => { d.state.watch.durableDeletedWhileWatching.needsConsumerCreate = true; },
+    "reabrir sin comprobar la configuración": (d) => { d.state.watch.durableDeletedWhileWatching.checksConfigBeforeConsuming = false; },
+    "sin lo medido en async-nats": (d) => { delete d.state.watch.durableDeletedWhileWatching.measured.withoutHandling["async-nats 0.50"]; },
+    "sin el bloque de reapertura": (d) => { delete d.state.watch.durableDeletedWhileWatching; },
+    "onSynced de varios tenants, una por tenant": (d) => { d.state.watch.onSynced.severalTenantsInOneCall = "once-per-tenant"; },
     "una capacidad state sin definir": (d) => { delete d.capabilities.definitions.state; },
     "quitar un dominio reservado": (d) => { d.naming.reservedDomains.names = ["state", "rpc", "system"]; },
     "max_msgs_per_subject de 5": (d) => { d.state.stream.maxMsgsPerSubject = 5; },
@@ -956,6 +1043,13 @@ let mutacionesAcl = 0;
     "streamInfo admite STATE_": (d) => { d.security.acl.permissionPatterns.streamInfo = "^\\$JS\\.API\\.STREAM\\.INFO\\.(EVT|DLQ|STATE)_[A-Z0-9_]+$"; },
     "ownerPublish admite state.>": (d) => { d.state.acl.ownerPublish = "^state\\.([a-z0-9]+(-[a-z0-9]+)*\\.)?>$"; },
     "el patrón de estado casa con el de dominio propio": (d) => { d.state.acl.ownerPublish = d.security.acl.permissionPatterns.ownDomain; },
+    "ownerPermissions con el consumerInfo de STATE_ a secas": (d) => { d.state.acl.ownerPermissions[2] = "consumerInfo (durable dlq_state)"; },
+    "ownerPermissions sin el ack del durable de DLQ": (d) => { d.state.acl.ownerPermissions = d.state.acl.ownerPermissions.slice(0, 4); },
+    "ownerPermissions cita un patrón que no existe": (d) => { d.state.acl.ownerPermissions.push("security.acl.permissionPatterns.noExiste"); },
+    "ownerPermissions incluye STREAM.INFO de estado": (d) => { d.state.acl.ownerPermissions.push("security.acl.permissionPatterns.streamInfo (STATE_<DOM>)"); },
+    "el comentario dice que el dueño PUEDE tener STREAM.INFO": (d) => { d.state.acl.$commentStreamInfo += " El dueno PUEDE tenerlo."; },
+    "state.acl.consumerInfo admite el durable de DLQ_": (d) => { d.state.acl.consumerInfo = "^\\$JS\\.API\\.CONSUMER\\.INFO\\.(STATE|DLQ)_[A-Z0-9_]+\\.[a-z0-9]+(-[a-z0-9]+)*__[a-z0-9_]+$"; },
+    "security.acl.consumerInfo ya no admite DLQ_": (d) => { d.security.acl.permissionPatterns.consumerInfo = "^\\$JS\\.API\\.CONSUMER\\.INFO\\.EVT_[A-Z0-9_]+\\.[a-z0-9]+(-[a-z0-9]+)*__[a-z0-9_]+$"; },
   };
   for (const [nombre, estropea] of Object.entries(delDocumento)) {
     const copia = structuredClone(p);

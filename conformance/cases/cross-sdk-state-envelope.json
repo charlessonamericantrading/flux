@@ -351,6 +351,60 @@
       "tenantId": "acme",
       "key": "cli-1",
       "errorCode": "RESERVED_DOMAIN"
+    },
+    {
+      "contract": "clientes.cliente",
+      "tenantId": "acme",
+      "key": "cli-1",
+      "errorCode": "INVALID_STATE_CONTRACT"
+    },
+    {
+      "contract": "clientes.cliente.v1.creado",
+      "tenantId": "acme",
+      "key": "cli-1",
+      "errorCode": "INVALID_STATE_CONTRACT"
+    },
+    {
+      "contract": "clientes.cliente.1",
+      "tenantId": "acme",
+      "key": "cli-1",
+      "errorCode": "INVALID_STATE_CONTRACT"
+    },
+    {
+      "contract": "clientes.cliente.v0",
+      "tenantId": "acme",
+      "key": "cli-1",
+      "errorCode": "INVALID_STATE_CONTRACT"
+    },
+    {
+      "contract": "Clientes.cliente.v1",
+      "tenantId": "acme",
+      "key": "cli-1",
+      "errorCode": "INVALID_STATE_CONTRACT"
+    },
+    {
+      "contract": "clientes.Cliente.v1",
+      "tenantId": "acme",
+      "key": "cli-1",
+      "errorCode": "INVALID_STATE_CONTRACT"
+    },
+    {
+      "contract": "",
+      "tenantId": "acme",
+      "key": "cli-1",
+      "errorCode": "INVALID_STATE_CONTRACT"
+    },
+    {
+      "contract": "clientes.cliente",
+      "tenantId": "ACME",
+      "key": "a.b",
+      "errorCode": "INVALID_STATE_CONTRACT"
+    },
+    {
+      "contract": "state.cliente",
+      "tenantId": "acme",
+      "key": "cli-1",
+      "errorCode": "RESERVED_DOMAIN"
     }
   ]
 }

@@ -9,7 +9,7 @@
 //! 5 a 30 s sin una palabra sobre permisos. La única pista llega como un evento aparte
 //! (`Event::ServerError`) que nadie escucha por defecto.
 //!
-//! De ahí el [`DenialLog`]: el SDK escucha esos eventos y, mientras espera una respuesta del
+//! De ahí el `DenialLog` (interno): el SDK escucha esos eventos y, mientras espera una respuesta del
 //! broker, **también** espera una denegación del subject al que acaba de publicar. La que
 //! llega primero gana, y una denegación llega en milisegundos.
 //!

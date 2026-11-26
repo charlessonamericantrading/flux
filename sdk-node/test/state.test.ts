@@ -2,7 +2,7 @@
  * Estado replicado — pruebas UNITARIAS (sin broker). specification/10-state.md.
  *
  * Aquí se fija lo que no necesita un nats-server: los bytes exactos, las reglas de validación
- * (que corren ANTES de la red), los seis códigos de 04-errors.md §6, el algoritmo de `put`
+ * (que corren ANTES de la red), los siete códigos de 04-errors.md §6, el algoritmo de `put`
  * contra un broker en memoria que hace lo que se midió (A-33: chequeo de secuencia con DOS
  * códigos de conflicto; A-32: las cabeceras se conservan) y las métricas.
  *
@@ -26,6 +26,7 @@ import {
   AGGREGATE_VERSION_MAX,
   ErrorClass,
   InvalidDataClassificationError,
+  InvalidStateContractError,
   InvalidStateKeyError,
   InvalidTenantForStateError,
   MissingAggregateVersionError,
@@ -57,7 +58,8 @@ import {
   type StateEventInput,
 } from "../src/index.js";
 import { isNoResponders } from "../src/security.js";
-import { PendingSum } from "../src/state.js";
+import { PendingSum, UNCLASSIFIED_DLQ_ERROR, isValidAggregateVersion } from "../src/state.js";
+import { runWithContext } from "../src/context.js";
 import * as publica from "../src/index.js";
 
 // ─── Utilidades ──────────────────────────────────────────────────────────────
@@ -245,7 +247,17 @@ describe("protocol.json → state: lo que el SDK acepta y rechaza", () => {
 
   test("contratos: valid / invalid de protocol.json", () => {
     for (const c of st.contract.valid) assert.doesNotThrow(() => parseStateContract(c), c);
-    for (const c of st.contract.invalid) assert.throws(() => parseStateContract(c), (e: unknown) => e instanceof Error, c);
+    // Cada inválido da un CÓDIGO ESTABLE: el dominio reservado, RESERVED_DOMAIN; la forma, INVALID_STATE_CONTRACT
+    // (el séptimo código: antes era un error sin código).
+    for (const c of st.contract.invalid) {
+      const reservado = protocolo.naming.reservedDomains.names.includes(c.split(".")[0]);
+      assert.throws(
+        () => parseStateContract(c),
+        (e: { code?: string }) => e.code === (reservado ? "RESERVED_DOMAIN" : st.contract.errorCode),
+        c,
+      );
+    }
+    assert.equal(st.contract.errorCode, "INVALID_STATE_CONTRACT");
   });
 
   test("subject: valid / invalid de protocol.json (el patrón completo de 6 tokens)", () => {
@@ -297,18 +309,33 @@ describe("protocol.json → state: lo que el SDK acepta y rechaza", () => {
     assert.equal(AGGREGATE_VERSION_MAX, 9007199254740991);
     assert.equal(AGGREGATE_VERSION_MAX, st.aggregateVersion.maximum);
   });
+
+  test("`7.0` en Node es el entero 7: un LÍMITE CONOCIDO DEL LENGUAJE, dicho por la spec, no un fallo", () => {
+    // JSON.parse("7.0") y 7 son el mismo `number`: el SDK no puede saber qué escribió quien lo llamó (10-state.md §3.4).
+    assert.ok(Object.is(JSON.parse("7.0"), 7));
+    assert.equal(isValidAggregateVersion(JSON.parse("7.0")), true);
+    // …lo que SÍ se rechaza es un decimal de verdad, y el resto de la lista
+    for (const malo of [7.5, 0.5, 0, -1, NaN, Infinity, "7", null, undefined, 9007199254740992]) {
+      assert.equal(isValidAggregateVersion(malo), false, String(malo));
+    }
+    // La spec y protocol.json lo dicen así: se rechaza donde el parser distingue; Node es de número único.
+    assert.deepEqual(st.aggregateVersion.sevenPointZero.singleNumberLanguages, ["node"]);
+    assert.equal(st.aggregateVersion.sevenPointZero.rejectedWhenParserDistinguishesIntFromFloat, true);
+    assert.match(especificacion, /límite conocido del lenguaje/);
+  });
 });
 
 // ═════════════════════════════════════════════════════════════════════════════
-// 3. Los seis códigos de 04-errors.md §6
+// 3. Los siete códigos de 04-errors.md §6
 // ═════════════════════════════════════════════════════════════════════════════
 
-describe("los seis códigos de error de estado — 04-errors.md §6", () => {
+describe("los siete códigos de error de estado — 04-errors.md §6", () => {
   const casos: Array<{
     code: string;
     clase: ErrorClass;
     crea: () => Error & { code?: string; fluxClass?: ErrorClass; opts?: { code?: string } };
   }> = [
+    { code: "INVALID_STATE_CONTRACT", clase: ErrorClass.PERMANENT, crea: () => new InvalidStateContractError("clientes.cliente", "no son tres tokens") },
     { code: "INVALID_TENANT_FOR_STATE", clase: ErrorClass.PERMANENT, crea: () => new InvalidTenantForStateError("ACME") },
     { code: "INVALID_STATE_KEY", clase: ErrorClass.PERMANENT, crea: () => new InvalidStateKeyError("a.b") },
     { code: "MISSING_AGGREGATE_VERSION", clase: ErrorClass.PERMANENT, crea: () => new MissingAggregateVersionError(undefined) },
@@ -332,7 +359,7 @@ describe("los seis códigos de error de estado — 04-errors.md §6", () => {
     });
   }
 
-  test("la lista es CERRADA: protocol.json declara exactamente estos seis para `state`", () => {
+  test("la lista es CERRADA: protocol.json declara exactamente estos siete para `state`", () => {
     const declarados = Object.entries(protocolo.errors.codes as Record<string, { capability?: string }>)
       .filter(([, d]) => d.capability === "state")
       .map(([k]) => k)
@@ -514,14 +541,31 @@ describe("validación previa a la red — put, delete, get y watch (10-state.md 
       await rechazaCon("RESERVED_DOMAIN", bus.state.delete(c, "k", { aggregateVersion: 2 }));
       await rechazaCon("RESERVED_DOMAIN", bus.state.watch(c, () => {}));
     }
-    // un contrato mal formado es PERMANENT, pero NO lleva uno de los seis códigos: la lista es cerrada
-    for (const c of ["clientes.cliente", "clientes.cliente.v1.creado", "Clientes.cliente.v1", "clientes.cliente.v0"]) {
-      await assert.rejects(bus.state.put(c, "k", dato()), (e: { code?: string; fluxClass?: string; message: string }) => {
-        assert.notEqual(e.message, REDTOCADA);
-        assert.equal(e.code, undefined, "un código inventado rompería la lista cerrada de 04-errors.md §6");
+    // un contrato mal formado es INVALID_STATE_CONTRACT (el séptimo código), PERMANENT, en las cuatro operaciones y sin red
+    for (const c of ["clientes.cliente", "clientes.cliente.v1.creado", "Clientes.cliente.v1", "clientes.cliente.v0", "clientes.cliente.1", ""]) {
+      await rechazaCon("INVALID_STATE_CONTRACT", bus.state.put(c, "k", dato()));
+      await rechazaCon("INVALID_STATE_CONTRACT", bus.state.get(c, "k"));
+      await rechazaCon("INVALID_STATE_CONTRACT", bus.state.delete(c, "k", { aggregateVersion: 2 }));
+      await rechazaCon("INVALID_STATE_CONTRACT", bus.state.watch(c, () => {}));
+      await assert.rejects(bus.state.put(c, "k", dato()), (e: { fluxClass?: string; opts?: { code?: string } }) => {
+        assert.equal(e.opts?.code, "INVALID_STATE_CONTRACT", "el clasificador lee `opts.code`: sin él el código del panel sería el nombre de la clase");
         return e.fluxClass === ErrorClass.PERMANENT;
       });
     }
+    // y un contrato que ni siquiera es una cadena
+    for (const c of [undefined, null, 7, {}]) {
+      await rechazaCon("INVALID_STATE_CONTRACT", bus.state.put(c as never, "k", dato()));
+    }
+    // CONTROL: uno bien formado SÍ llega a la red (y la red falsa lo para)
+    await assert.rejects(bus.state.put(CONTRATO, "k", dato()), (e: Error) => e.message === REDTOCADA);
+  });
+
+  test("el mensaje de INVALID_STATE_CONTRACT dice qué contrato y cuál es la forma, y no cita ningún valor de data", () => {
+    const e = new InvalidStateContractError("clientes.cliente", "debe tener exactamente 3 tokens, tiene 2");
+    assert.match(e.message, /"clientes\.cliente"/);
+    assert.match(e.message, /<dominio>\.<agregado>\.v<major>/);
+    assert.match(e.message, /clientes\.cliente\.v1/);
+    assert.equal(new InvalidStateContractError(7, "x").message.includes("7"), false, "no cita un valor que no es una cadena: dice su tipo");
   });
 
   test("watch: tenant inválido → INVALID_TENANT_FOR_STATE; strict sin tenant → TenantIsolationError; sin red", async () => {
@@ -535,12 +579,39 @@ describe("validación previa a la red — put, delete, get y watch (10-state.md 
     });
   });
 
-  test("EL ORDEN de §3.6: dominio reservado → clave → tenant → versión → clasificación", async () => {
+  test("watch: el tenant sale de la opción y de connect(), NUNCA del evento en curso (10-state.md §2.4, §5.2)", async () => {
+    // Con `strict` y sin tenant en connect() ni en la llamada, un watch es un error de configuración… aunque se abra
+    // DENTRO de un handler cuyo evento lleva tenant. Si heredara el del evento, el filtro dependería de qué evento llegó primero.
+    const estricto = await busSinRed({ tenantId: undefined, tenantIsolation: "strict" });
+    await runWithContext({ correlationid: "corr-1", causationid: "ev-9", tenantid: "globex" }, async () => {
+      await assert.rejects(estricto.state.watch(CONTRATO, () => {}), (e: Error) => {
+        assert.ok(e instanceof TenantIsolationError, "el evento en curso no cuenta como tenant de un watch");
+        assert.notEqual(e.message, REDTOCADA);
+        return true;
+      });
+      // CONTROL: la OPCIÓN sí vale dentro del handler: pasa la validación (ni TenantIsolationError ni un código de estado)
+      // y se cae más adelante, al tocar la red falsa…
+      await assert.rejects(estricto.state.watch(CONTRATO, () => {}, { tenantId: "globex" }), (e: Error & { code?: string }) => {
+        assert.ok(!(e instanceof TenantIsolationError), "con la opción, `strict` está satisfecho");
+        return e.code === undefined;
+      });
+      // …y put/get/delete SÍ heredan el tenant del evento (un estado derivado pertenece al del evento que lo causó):
+      // aquí sin opción y sin connect(), no es INVALID_TENANT_FOR_STATE sino que llegan a la red falsa.
+      await assert.rejects(estricto.state.put(CONTRATO, "k", dato()), (e: Error) => e.message === REDTOCADA);
+      await assert.rejects(estricto.state.get(CONTRATO, "k"), (e: Error) => e.message === REDTOCADA);
+    });
+    // CONTROL de la otra cara: SIN evento en curso, put sin tenant sí falla (no hay `system` implícito)
+    await rechazaCon("INVALID_TENANT_FOR_STATE", estricto.state.put(CONTRATO, "k", dato()));
+  });
+
+  test("EL ORDEN de §3.6: dominio reservado → contrato → clave → tenant → versión → clasificación", async () => {
     const bus = await busSinRed({ tenantId: undefined });
     // todo mal a la vez, y se va quitando un fallo cada vez: gana el primero de la lista
     const todoMal = (c: string, k: string, t: string | undefined, v: unknown, cl: unknown) =>
       bus.state.put(c, k, dato(v), { tenantId: t, classification: cl as never });
     await rechazaCon("RESERVED_DOMAIN", todoMal("state.x.v1", "a.b", "ACME", 0, "restricted"));
+    await rechazaCon("RESERVED_DOMAIN", todoMal("state.x", "a.b", "ACME", 0, "restricted")); // 2 tokens Y reservado: gana el reservado
+    await rechazaCon("INVALID_STATE_CONTRACT", todoMal("clientes.cliente", "a.b", "ACME", 0, "restricted"));
     await rechazaCon("INVALID_STATE_KEY", todoMal(CONTRATO, "a.b", "ACME", 0, "restricted"));
     await rechazaCon("INVALID_TENANT_FOR_STATE", todoMal(CONTRATO, "ok", "ACME", 0, "restricted"));
     await rechazaCon("INVALID_TENANT_FOR_STATE", todoMal(CONTRATO, "ok", undefined, 0, "restricted"));
@@ -1130,11 +1201,31 @@ describe("flux_state_writes_total{contract,outcome} — 08-observability.md §2.
     assert.equal(cuenta(m, "conflict"), 0);
   });
 
-  test("los errores de programación NO se cuentan: clave, tenant, dominio reservado, clasificación y transporte", async () => {
+  test("SCHEMA_NOT_FOUND (modo estricto, el esquema no está en el bundle) cuenta como invalid_schema, igual que en un evento", async () => {
+    const sinEsquemas = { ...bundle, schemas: Object.fromEntries(Object.entries(bundle.schemas).filter(([k]) => !k.includes("/state/clientes/cliente/") && !k.includes("eliminado"))) };
+    const m = new InMemoryMetrics();
+    const b = new BrokerEnMemoria();
+    const bus = await b.bus({ metrics: m, validation: { mode: "strict", bundle: sinEsquemas } });
+    // el put: el esquema del contrato no está; el delete: el de la lápida no está
+    await assert.rejects(bus.state.put(CONTRATO, "cli-1", dato(1)), (e: { opts?: { code?: string } }) => e.opts?.code === "SCHEMA_NOT_FOUND");
+    await assert.rejects(bus.state.delete(CONTRATO, "cli-1", { aggregateVersion: 2 }), (e: { opts?: { code?: string } }) => e.opts?.code === "SCHEMA_NOT_FOUND");
+    assert.equal(cuenta(m, "invalid_schema"), 2, "SCHEMA_NOT_FOUND es un fallo de L3: invalid_schema, también cuando la llamada lanza");
+    assert.equal(cuenta(m, "ok") + cuenta(m, "stale") + cuenta(m, "conflict"), 0);
+    assert.equal(b.publicaciones.length + b.lecturas.length, 0, "falla ANTES de leer ni escribir");
+    // CONTROL: en modo `warn` el mismo bundle NO lanza (y por tanto no cuenta invalid_schema)
+    const w = new InMemoryMetrics();
+    const bw = await new BrokerEnMemoria().bus({ metrics: w, validation: { mode: "warn", bundle: sinEsquemas } });
+    assert.equal((await bw.state.put(CONTRATO, "cli-1", dato(1))).outcome, "ok");
+    assert.equal(cuenta(w, "invalid_schema"), 0);
+    assert.equal(cuenta(w, "ok"), 1);
+  });
+
+  test("los errores de programación NO se cuentan: contrato, clave, tenant, dominio reservado, clasificación y transporte", async () => {
     const m = new InMemoryMetrics();
     const b = new BrokerEnMemoria();
     const bus = await b.bus({ metrics: m });
     for (const op of [
+      () => bus.state.put("clientes.cliente", "k", dato(1)), // INVALID_STATE_CONTRACT: su valor es la etiqueta `contract`
       () => bus.state.put(CONTRATO, "a.b", dato(1)),
       () => bus.state.put(CONTRATO, "k", dato(1), { tenantId: "ACME" }),
       () => bus.state.put("state.x.v1", "k", dato(1)),
@@ -1257,6 +1348,12 @@ describe("DLQ de estado — 10-state.md §6", () => {
     assert.equal(toStateDlqEvent(buildStateEvent(original()), { key: "cli-1", revision: 1, ...dlq(), error: "y".repeat(2000) }).dlqerror!.length, 1024);
   });
 
+  test("la frase fija del `dlqerror` de un error que no es de flux es la de protocol.json (una sola fuente)", () => {
+    assert.equal(UNCLASSIFIED_DLQ_ERROR, protocolo.state.dlq.dlqerrorFixedPhrase);
+    assert.match(especificacion, /error sin clasificar de la aplicación; el mensaje se omite para no copiar datos a la DLQ/);
+    assert.equal(protocolo.state.dlq.dlqerrorOfNonFluxErrors, "code-and-fixed-phrase-only");
+  });
+
   test("un mensaje ILEGIBLE: el sobre se sintetiza con lo único fiable —el subject— y NO lleva su cuerpo", () => {
     const ev = buildUnreadableStateDlqEvent({
       contract: CONTRATO,
@@ -1271,6 +1368,8 @@ describe("DLQ de estado — 10-state.md §6", () => {
     });
     assert.equal(ev.id, ev.correlationid);
     assert.equal(ev.subject, "cli-9");
+    assert.equal(ev.partitionkey, "cli-9", "partitionkey = la clave (10-state.md §6)");
+    assert.equal(ev.time, "2026-08-20T10:25:39.412Z", "time = el instante que da quien llama: el SDK pasa el instante ACTUAL del consumo (10-state.md §6)");
     assert.equal(ev.tenantid, "acme");
     assert.equal(ev.source, "/produccion/tienda-web", "el servicio que consume");
     assert.equal(ev.producerversion, "5.0.0");
@@ -1306,12 +1405,12 @@ describe("flux_consumer_pending de estado es la SUMA de los durables, no el últ
   });
 });
 
-describe("la API pública: bus.state, los seis códigos y las funciones puras; sin tipos de NATS", () => {
+describe("la API pública: bus.state, los siete códigos y las funciones puras; sin tipos de NATS", () => {
   test("exporta lo que el arnés cruzado y las aplicaciones necesitan", () => {
     for (const n of [
       "stateSubject", "buildStateEvent", "buildStateTombstone", "buildStateDlqEvent", "toStateDlqEvent", "buildUnreadableStateDlqEvent",
       "stateDurableName", "stateFilterSubject", "stateStreamName", "stateDlqSubject", "parseStateContract", "isSequenceConflict",
-      "InvalidTenantForStateError", "InvalidStateKeyError", "MissingAggregateVersionError", "StateSubjectMismatchError", "StateConflictError", "ReservedDomainError",
+      "InvalidStateContractError", "InvalidTenantForStateError", "InvalidStateKeyError", "MissingAggregateVersionError", "StateSubjectMismatchError", "StateConflictError", "ReservedDomainError",
       "RESERVED_DOMAINS", "STATE_CONFLICT_CODES", "TOMBSTONE_DATASCHEMA", "stateSchemaUriFor",
     ]) {
       assert.ok(n in publica, `index.ts no exporta ${n}`);
@@ -1337,6 +1436,7 @@ describe("la API pública: bus.state, los seis códigos y las funciones puras; s
     assert.throws(() => buildStateEvent({ ...f, key: "a.b" }), InvalidStateKeyError);
     assert.throws(() => buildStateEvent({ ...f, tenantId: "ACME" }), InvalidTenantForStateError);
     assert.throws(() => buildStateEvent({ ...f, contract: "state.x.v1" }), ReservedDomainError);
+    assert.throws(() => buildStateEvent({ ...f, contract: "clientes.cliente" }), InvalidStateContractError);
     assert.throws(() => buildStateEvent({ ...f, data: { x: 1 } }), MissingAggregateVersionError);
     assert.throws(() => buildStateEvent({ ...f, classification: "restricted" }), InvalidDataClassificationError);
     assert.throws(() => buildStateTombstone({ ...entradaDe("state-tombstone").input, aggregateVersion: 0 }), MissingAggregateVersionError);

@@ -471,8 +471,8 @@ dueño, por la misma razón que en §3.4.
   tenants** del stream con su recuento (A-39): con ese único permiso un servicio confinado a `acme` conoce los
   clientes de `globex`. El SDK no lo usa —`put`, `get` y `watch` funcionan sin él, porque `CONSUMER.INFO`
   distingue «no existe el consumidor» de «no existe el stream» (A-48)— y ningún patrón de `protocol.json` lo
-  casa. [10-state.md §8](10-state.md) dice que el dueño **PUEDE** tenerlo, y el generador **no se lo
-  concede**: si un día hace falta, es un permiso más del dueño y nunca del observador (S18).
+  casa. [10-state.md §8](10-state.md) lo dice igual: **el dueño tampoco lo recibe**. Si un día
+  hace falta, es un permiso más del dueño y nunca del observador (S18).
 - **La forma de cuerpo de `DIRECT.GET`** (`$JS.API.DIRECT.GET.<stream>` + `{"seq": n}` o `{"last_by_subj": …}`)
   lee cualquier mensaje, y ninguna ACL ve el cuerpo. No casa con el permiso por subject, y el broker rechaza un
   cuerpo en la forma por subject (`408`, A-38): no se puede colar la lectura de otro mensaje por un permiso de

@@ -264,11 +264,12 @@ await bus.state.watch("clientes.cliente.v1", async (entrada) => {         // fot
   stream `STATE_<DOM>` guarda **un valor por clave**; `delete` publica una **lápida** (con su
   versión) que lo sustituye.
 - **Tenant explícito**: sin valor por defecto (ni `system` implícito). Una clave que no cumple el
-  patrón es `INVALID_STATE_KEY`, no algo que se escape.
-- `onSynced` se invoca **una vez**: al terminar la foto inicial, o de inmediato si no hay nada.
-- **Seis códigos**: `INVALID_TENANT_FOR_STATE`, `INVALID_STATE_KEY`, `MISSING_AGGREGATE_VERSION`,
-  `RESERVED_DOMAIN` (PERMANENT), `STATE_SUBJECT_MISMATCH` (POISON) y `STATE_CONFLICT`
-  (RETRYABLE) — [04-errors.md §6](specification/04-errors.md).
+  patrón es `INVALID_STATE_KEY`, no algo que se escape. El tenant de `put`/`get`/`delete` sale de la
+  opción, del evento en curso y de `connect()`; el de `watch`, solo de la opción y de `connect()`.
+- `onSynced` se invoca **una vez** por `watch`: al terminar la foto inicial, o de inmediato si no hay nada.
+- **Siete códigos**: `INVALID_STATE_CONTRACT`, `INVALID_TENANT_FOR_STATE`, `INVALID_STATE_KEY`,
+  `MISSING_AGGREGATE_VERSION`, `RESERVED_DOMAIN` (PERMANENT), `STATE_SUBJECT_MISMATCH` (POISON) y
+  `STATE_CONFLICT` (RETRYABLE) — [04-errors.md §6](specification/04-errors.md).
 - La DLQ de estado (`dlq.state.<dom>.<agr>.v<M>`) **no lleva el dato**, y el estado **no se
   reproduce** desde ella.
 - Métrica `flux_state_writes_total{contract,outcome}`; **nunca** la clave ni el tenant como
