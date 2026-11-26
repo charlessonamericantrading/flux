@@ -94,7 +94,7 @@ El resultado sería que **dos servicios del mismo ecosistema emiten `time` disti
 para el mismo instante**. Eso rompe:
 
 - El **replay verbatim** desde la DLQ, que deja de ser byte a byte idéntico.
-- Cualquier **firma criptográfica** sobre el evento serializado (fase 4).
+- Cualquier **firma criptográfica** sobre el evento serializado ([07-signing.md](07-signing.md)).
 - La **deduplicación por hash de contenido**.
 - Los **fixtures compartidos** entre SDKs en la suite de conformidad.
 
@@ -308,7 +308,7 @@ Un objeto JSON con las mismas claves en otro orden es equivalente como dato y
 **distinto como bytes**, y flux depende de la secuencia de bytes en cuatro sitios:
 
 - El **replay verbatim** desde la DLQ deja de producir el mismo mensaje.
-- Una **firma criptográfica** sobre el evento serializado (fase 4) no verifica.
+- Una **firma criptográfica** sobre el evento serializado ([07-signing.md](07-signing.md)) no verifica.
 - La **deduplicación por hash de contenido** ve dos eventos donde hay uno.
 - Los **fixtures compartidos** entre SDKs dejan de comparar.
 
