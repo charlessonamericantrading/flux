@@ -32,9 +32,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use flux::{
-    connect, Bus, ConnectOptions, Credentials, Delivery, ErrorClass, Event, FluxError, HandlerError, LogFn,
-    LogLevel, PublishOptions, RequestOptions, Responder, RpcContext, RpcRequest, StateEntry, TlsOptions,
-    WatchOptions,
+    connect, Bus, ConnectOptions, Credentials, Delivery, ErrorClass, Event, FluxError,
+    HandlerError, LogFn, LogLevel, PublishOptions, RequestOptions, Responder, RpcContext,
+    RpcRequest, StateEntry, TlsOptions, WatchOptions,
 };
 use serde_json::{json, Map, Value};
 use tokio::sync::mpsc;
@@ -48,6 +48,9 @@ fn env(name: &str, por_defecto: Option<&str>) -> String {
         }),
     }
 }
+
+/// Lo que cuenta un `call_many`: cuántas se contestaron, quién las atendió y qué falló, por código.
+type Cuentas = (u64, HashMap<String, u64>, HashMap<String, u64>);
 
 /// Lo que comparten las órdenes: el bus y lo que el participante cuenta de sí mismo.
 struct Compartido {
@@ -87,7 +90,10 @@ fn describir_error(e: &FluxError, ms: Option<f64>) -> Value {
 /// El nombre de la variante, que es lo que en Node es `error.name`.
 fn nombre_de(e: &FluxError) -> String {
     let d = format!("{e:?}");
-    d.split(|c: char| !c.is_alphanumeric()).next().unwrap_or("Error").to_string()
+    d.split(|c: char| !c.is_alphanumeric())
+        .next()
+        .unwrap_or("Error")
+        .to_string()
 }
 
 fn mediana(xs: &[f64]) -> f64 {
@@ -132,7 +138,11 @@ fn opciones_de_llamada(o: &Value) -> RequestOptions {
 /// UNA llamada: `{ ok, data, ms }` o `{ ok: false, error, ms }`.
 async fn llamar(s: &Compartido, operacion: &str, data: &Value, opciones: &Value) -> Value {
     let t0 = Instant::now();
-    match s.bus.request_with(operacion, data, opciones_de_llamada(opciones)).await {
+    match s
+        .bus
+        .request_with(operacion, data, opciones_de_llamada(opciones))
+        .await
+    {
         Ok(ev) => {
             let d: Value = serde_json::from_str(ev.data.get()).unwrap_or(Value::Null);
             json!({ "ok": true, "data": d, "ms": ms(t0) })
@@ -148,9 +158,24 @@ async fn atender(
     peticion: RpcRequest,
     ctx: RpcContext,
 ) -> Result<Value, HandlerError> {
-    *s.atendidas.lock().unwrap().entry(operacion.clone()).or_insert(0) += 1;
-    s.ids_vistos.lock().unwrap().entry(operacion.clone()).or_default().push(ctx.id.clone());
-    let b = s.comportamientos.lock().unwrap().get(&operacion).cloned().unwrap_or_else(|| json!({ "kind": "echo" }));
+    *s.atendidas
+        .lock()
+        .unwrap()
+        .entry(operacion.clone())
+        .or_insert(0) += 1;
+    s.ids_vistos
+        .lock()
+        .unwrap()
+        .entry(operacion.clone())
+        .or_default()
+        .push(ctx.id.clone());
+    let b = s
+        .comportamientos
+        .lock()
+        .unwrap()
+        .get(&operacion)
+        .cloned()
+        .unwrap_or_else(|| json!({ "kind": "echo" }));
     if let Some(espera) = b["afterMs"].as_u64() {
         tokio::time::sleep(Duration::from_millis(espera)).await;
     }
@@ -161,7 +186,10 @@ async fn atender(
             o.insert("instancia".into(), json!(s.etiqueta));
             o.insert("tenant".into(), json!(ctx.tenant_id));
             o.insert("correlationId".into(), json!(ctx.correlation_id));
-            o.insert("correlacionEsElId".into(), json!(ctx.correlation_id == ctx.id));
+            o.insert(
+                "correlacionEsElId".into(),
+                json!(ctx.correlation_id == ctx.id),
+            );
             o.insert("peticionId".into(), json!(ctx.id));
             if let Some(a) = &ctx.aggregate_id {
                 o.insert("aggregateId".into(), json!(a));
@@ -173,7 +201,9 @@ async fn atender(
             let mensaje = b["message"].as_str().map(str::to_string);
             let code = b["code"].as_str().map(str::to_string);
             let e = if b["class"].as_str() == Some("retryable") {
-                let mut e = FluxError::retryable(mensaje.unwrap_or_else(|| "el servicio de tarifas no responde".into()));
+                let mut e = FluxError::retryable(
+                    mensaje.unwrap_or_else(|| "el servicio de tarifas no responde".into()),
+                );
                 if let Some(c) = code {
                     e = e.with_code(c);
                 }
@@ -182,7 +212,8 @@ async fn atender(
                 }
                 e
             } else {
-                let mut e = FluxError::permanent(mensaje.unwrap_or_else(|| "pedido ya cancelado".into()));
+                let mut e =
+                    FluxError::permanent(mensaje.unwrap_or_else(|| "pedido ya cancelado".into()));
                 if let Some(c) = code {
                     e = e.with_code(c);
                 }
@@ -191,18 +222,26 @@ async fn atender(
             Err(Box::new(e))
         }
         // Una excepción que NO lanzó a propósito la aplicación: su texto puede llevar valores de `data`, rutas…
-        "unknown" => Err(Box::new(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            b["text"].as_str().unwrap_or("SECRETO-DE-LA-EXCEPCION").to_string(),
+        "unknown" => Err(Box::new(std::io::Error::other(
+            b["text"]
+                .as_str()
+                .unwrap_or("SECRETO-DE-LA-EXCEPCION")
+                .to_string(),
         ))),
         // Lo que el clasificador RECONOCE (un 503 de una dependencia, `ECONNRESET`), con el texto de la excepción por medio.
         "http" => Err(Box::new(flux::HttpError::new(
             u16::try_from(b["status"].as_u64().unwrap_or(503)).unwrap_or(503),
-            b["text"].as_str().unwrap_or("SECRETO-DEL-PROVEEDOR").to_string(),
+            b["text"]
+                .as_str()
+                .unwrap_or("SECRETO-DEL-PROVEEDOR")
+                .to_string(),
         ))),
         "econnreset" => Err(Box::new(std::io::Error::new(
             std::io::ErrorKind::ConnectionReset,
-            b["text"].as_str().unwrap_or("SECRETO-DEL-PROVEEDOR").to_string(),
+            b["text"]
+                .as_str()
+                .unwrap_or("SECRETO-DEL-PROVEEDOR")
+                .to_string(),
         ))),
         "big" => Ok(json!({
             "instancia": s.etiqueta,
@@ -220,8 +259,15 @@ async fn ejecutar(s: Arc<Compartido>, o: Value) -> Value {
     match cmd.as_str() {
         // Atiende una operación con un comportamiento. Falla con el error del SDK (p. ej. PERMISSION_DENIED por falta de permiso).
         "respond" => {
-            let b = if o["behavior"].is_null() { json!({ "kind": "echo" }) } else { o["behavior"].clone() };
-            s.comportamientos.lock().unwrap().insert(operacion.clone(), b);
+            let b = if o["behavior"].is_null() {
+                json!({ "kind": "echo" })
+            } else {
+                o["behavior"].clone()
+            };
+            s.comportamientos
+                .lock()
+                .unwrap()
+                .insert(operacion.clone(), b);
             let (s2, op2) = (Arc::clone(&s), operacion.clone());
             let handler = move |req: RpcRequest, ctx: RpcContext| {
                 let (s3, op3) = (Arc::clone(&s2), op2.clone());
@@ -238,14 +284,19 @@ async fn ejecutar(s: Arc<Compartido>, o: Value) -> Value {
         }
         // Cambia el comportamiento de una operación YA atendida.
         "behavior" => {
-            s.comportamientos.lock().unwrap().insert(operacion, o["behavior"].clone());
+            s.comportamientos
+                .lock()
+                .unwrap()
+                .insert(operacion, o["behavior"].clone());
             json!({ "ok": true })
         }
         // Parada ordenada de UNA operación (`Responder::stop`).
         "stop" => {
             let r = s.responders.lock().unwrap().remove(&operacion);
             match r {
-                None => json!({ "ok": false, "error": { "name": "Error", "message": format!("no se atiende {operacion}") } }),
+                None => {
+                    json!({ "ok": false, "error": { "name": "Error", "message": format!("no se atiende {operacion}") } })
+                }
                 Some(r) => {
                     let t0 = Instant::now();
                     r.stop().await;
@@ -266,7 +317,11 @@ async fn ejecutar(s: Arc<Compartido>, o: Value) -> Value {
                 let codigo = if r["ok"] == json!(true) {
                     "OK".to_string()
                 } else {
-                    r["error"]["code"].as_str().or(r["error"]["name"].as_str()).unwrap_or("?").to_string()
+                    r["error"]["code"]
+                        .as_str()
+                        .or(r["error"]["name"].as_str())
+                        .unwrap_or("?")
+                        .to_string()
                 };
                 let c = codigos.get(&codigo).and_then(Value::as_u64).unwrap_or(0);
                 codigos.insert(codigo, json!(c + 1));
@@ -285,18 +340,28 @@ async fn ejecutar(s: Arc<Compartido>, o: Value) -> Value {
             let n = o["n"].as_u64().unwrap_or(100);
             let concurrencia = o["concurrency"].as_u64().unwrap_or(20).max(1);
             let siguiente = Arc::new(AtomicU64::new(0));
-            let resultados: Arc<Mutex<(u64, HashMap<String, u64>, HashMap<String, u64>)>> = Arc::new(Mutex::new((0, HashMap::new(), HashMap::new())));
+            let resultados: Arc<Mutex<Cuentas>> =
+                Arc::new(Mutex::new((0, HashMap::new(), HashMap::new())));
             let mut tareas = Vec::new();
             for _ in 0..concurrencia {
-                let (s, siguiente, resultados) = (Arc::clone(&s), Arc::clone(&siguiente), Arc::clone(&resultados));
-                let (operacion, data, opciones) = (operacion.clone(), o["data"].clone(), o["options"].clone());
+                let (s, siguiente, resultados) = (
+                    Arc::clone(&s),
+                    Arc::clone(&siguiente),
+                    Arc::clone(&resultados),
+                );
+                let (operacion, data, opciones) =
+                    (operacion.clone(), o["data"].clone(), o["options"].clone());
                 tareas.push(tokio::spawn(async move {
                     loop {
                         let i = siguiente.fetch_add(1, Ordering::SeqCst);
                         if i >= n {
                             break;
                         }
-                        let mut d = if data.is_object() { data.clone() } else { json!({}) };
+                        let mut d = if data.is_object() {
+                            data.clone()
+                        } else {
+                            json!({})
+                        };
                         d["n"] = json!(i);
                         let r = llamar(&s, &operacion, &d, &opciones).await;
                         let mut g = resultados.lock().unwrap();
@@ -305,7 +370,11 @@ async fn ejecutar(s: Arc<Compartido>, o: Value) -> Value {
                             let quien = r["data"]["instancia"].as_str().unwrap_or("?").to_string();
                             *g.1.entry(quien).or_insert(0) += 1;
                         } else {
-                            let c = r["error"]["code"].as_str().or(r["error"]["name"].as_str()).unwrap_or("?").to_string();
+                            let c = r["error"]["code"]
+                                .as_str()
+                                .or(r["error"]["name"].as_str())
+                                .unwrap_or("?")
+                                .to_string();
                             *g.2.entry(c).or_insert(0) += 1;
                         }
                     }
@@ -391,7 +460,9 @@ async fn ejecutar(s: Arc<Compartido>, o: Value) -> Value {
             let contract = o["contract"].as_str().unwrap_or("").to_string();
             let key = o["key"].as_str().unwrap_or("").to_string();
             match s.bus.state().put(&contract, &key, &o["data"]).await {
-                Ok(w) => json!({ "ok": true, "outcome": format!("{:?}", w.outcome).to_lowercase(), "revision": w.revision }),
+                Ok(w) => {
+                    json!({ "ok": true, "outcome": format!("{:?}", w.outcome).to_lowercase(), "revision": w.revision })
+                }
                 Err(e) => json!({ "ok": false, "error": describir_error(&e, None) }),
             }
         }
@@ -414,7 +485,9 @@ async fn ejecutar(s: Arc<Compartido>, o: Value) -> Value {
             let _ = s.bus.close().await;
             json!({ "ok": true, "ms": ms(t0) })
         }
-        otro => json!({ "ok": false, "error": { "name": "Error", "message": format!("orden desconocida «{otro}»") } }),
+        otro => {
+            json!({ "ok": false, "error": { "name": "Error", "message": format!("orden desconocida «{otro}»") } })
+        }
     }
 }
 
@@ -431,7 +504,9 @@ async fn main() {
     let logs: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let sink = Arc::clone(&logs);
     let log: LogFn = Arc::new(move |level: LogLevel, msg: &str| {
-        sink.lock().unwrap().push(format!("{} {msg}", format!("{level:?}").to_uppercase()));
+        sink.lock()
+            .unwrap()
+            .push(format!("{} {msg}", format!("{level:?}").to_uppercase()));
     });
 
     // `with_tls` EXIGE TLS: el esquema solo importa para el host y el puerto.
@@ -449,8 +524,10 @@ async fn main() {
         let f: Value = serde_json::from_str(&firma).expect("FLUX_P_SIGNING debe ser JSON");
         #[cfg(feature = "signing")]
         {
-            let mut so = flux::SigningOptions::default()
-                .with_private_key(f["privateKey"].as_str().unwrap_or(""), f["keyId"].as_str().unwrap_or(""));
+            let mut so = flux::SigningOptions::default().with_private_key(
+                f["privateKey"].as_str().unwrap_or(""),
+                f["keyId"].as_str().unwrap_or(""),
+            );
             if let Some(claves) = f["publicKeys"].as_object() {
                 for (id, pem) in claves {
                     so = so.with_public_key(id, pem.as_str().unwrap_or(""));
@@ -466,7 +543,9 @@ async fn main() {
         #[cfg(not(feature = "signing"))]
         {
             let _ = f;
-            eprintln!("FLUX_P_SIGNING pide la firma y este ejemplo se compiló sin `--features signing`");
+            eprintln!(
+                "FLUX_P_SIGNING pide la firma y este ejemplo se compiló sin `--features signing`"
+            );
             std::process::exit(2);
         }
     }
@@ -474,8 +553,10 @@ async fn main() {
     let bus = match connect(opts).await {
         Ok(b) => b,
         Err(e) => {
-            salir(&json!({ "id": 0, "ready": true, "sdk": "rust", "service": servicio, "label": etiqueta,
-                           "ok": false, "error": describir_error(&e, None) }));
+            salir(
+                &json!({ "id": 0, "ready": true, "sdk": "rust", "service": servicio, "label": etiqueta,
+                           "ok": false, "error": describir_error(&e, None) }),
+            );
             return;
         }
     };
@@ -490,7 +571,9 @@ async fn main() {
         consumidos: AtomicU64::new(0),
         observados: AtomicU64::new(0),
     });
-    salir(&json!({ "id": 0, "ready": true, "sdk": "rust", "service": servicio, "label": etiqueta }));
+    salir(
+        &json!({ "id": 0, "ready": true, "sdk": "rust", "service": servicio, "label": etiqueta }),
+    );
 
     // stdin es bloqueante: en un hilo aparte, y las órdenes llegan por un canal.
     let (tx, mut rx) = mpsc::unbounded_channel::<String>();
@@ -507,7 +590,9 @@ async fn main() {
     let pendientes: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>> = Arc::new(Mutex::new(Vec::new()));
     while let Some(linea) = rx.recv().await {
         let Ok(o) = serde_json::from_str::<Value>(&linea) else {
-            salir(&json!({ "id": -1, "ok": false, "error": { "name": "Error", "message": "línea que no es JSON" } }));
+            salir(
+                &json!({ "id": -1, "ok": false, "error": { "name": "Error", "message": "línea que no es JSON" } }),
+            );
             continue;
         };
         let id = o["id"].clone();

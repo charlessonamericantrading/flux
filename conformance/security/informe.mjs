@@ -17,7 +17,7 @@ export function lineaObservado(o) {
   if (o.reply?.error) partes.push(`error ${o.reply.error.err_code ?? ""} «${o.reply.error.description}»`);
   // Los escenarios con SDKs reales (`sdk_script`): el error del SDK (código, clase), los tiempos y lo que el broker anotó.
   if (o.ok === false && o.error) partes.push(`${o.error.name ?? "error"} ${o.error.code ?? ""}${o.error.class ? ` (${o.error.class})` : ""} «${String(o.error.message ?? "").slice(0, 110)}»`);
-  for (const k of ["codes", "p50Ms", "maxMs", "wallMs", "serverViolationCount", "total", "replyMatches", "mailbox"]) {
+  for (const k of ["codes", "p50Ms", "maxMs", "wallMs", "serverViolationCount", "total", "replyMatches", "mailbox", "subjects", "otherReplyMatches"]) {
     if (o[k] !== undefined && o[k] !== null) partes.push(`${k}=${typeof o[k] === "object" ? JSON.stringify(o[k]) : typeof o[k] === "number" ? Math.round(o[k] * 10) / 10 : o[k]}`);
   }
   if (o.data && typeof o.data === "object" && o.ok) partes.push(`data=${JSON.stringify(o.data).slice(0, 140)}`);

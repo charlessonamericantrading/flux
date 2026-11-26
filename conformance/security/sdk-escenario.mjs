@@ -19,7 +19,8 @@
  *
  *   wallMs                  lo que tardó la orden, medido aquí
  *   serverViolations[]      las violaciones de permiso que el nats-server anotó durante el paso (`serverViolationCount`: cuántas;
- *                           `scenarioViolationCount`: cuántas desde que empezó el escenario)
+ *                           `scenarioViolations[]` y `scenarioViolationCount`: las de todo el escenario). Un paso que las mira
+ *                           espera antes a que el log del servidor deje de crecer (100 ms): llega por otra tubería que la respuesta
  *
  * Órdenes de los agentes (el mismo protocolo en los dos SDKs; el vocabulario completo, en `security-acl.json`):
  *   respond · behavior · stop · call · call_repeat · call_many · consume · watch · publish · state_put · stats · close
@@ -218,9 +219,20 @@ export class EscenarioSdk {
     } catch (e) {
       obs = { ok: false, outcome: "error", error: { name: e?.name ?? "Error", message: e?.message ?? String(e) } };
     }
-    const lineas = (this.ctx.srv?.salida ?? "").slice(logAntes).split("\n").filter(esViolacion).map((l) => l.replace(/^\[\d+\] \S+ \S+ /, ""));
-    const desdeElPrincipio = (this.ctx.srv?.salida ?? "").slice(this.logAlEmpezar).split("\n").filter(esViolacion);
-    obs = { ...obs, wallMs: Date.now() - t0, serverViolations: lineas, serverViolationCount: lineas.length, scenarioViolationCount: desdeElPrincipio.length };
+    // El log del servidor llega por una tubería y la respuesta del agente por otra: sin esperar, la línea de una denegación puede
+    // llegar DESPUÉS de la respuesta del agente que la provocó. Solo se espera en los pasos que miran lo que el servidor anotó.
+    if (Object.keys(s.expect ?? {}).some((k) => /^(server|scenario)Violation/.test(k))) await this.#asentarLog();
+    const limpia = (l) => l.replace(/^\[\d+\] \S+ \S+ /, "");
+    const lineas = (this.ctx.srv?.salida ?? "").slice(logAntes).split("\n").filter(esViolacion).map(limpia);
+    const desdeElPrincipio = (this.ctx.srv?.salida ?? "").slice(this.logAlEmpezar).split("\n").filter(esViolacion).map(limpia);
+    obs = {
+      ...obs,
+      wallMs: Date.now() - t0,
+      serverViolations: lineas,
+      serverViolationCount: lineas.length,
+      scenarioViolations: desdeElPrincipio,
+      scenarioViolationCount: desdeElPrincipio.length,
+    };
     const fallos = evaluar(this.#plantilla(s.expect, marker), obs);
     return { ...base, ok: fallos.length === 0, observado: obs, fallos };
   }
@@ -231,6 +243,22 @@ export class EscenarioSdk {
     if (Array.isArray(v)) return v.map((x) => this.#plantilla(x, marker));
     if (v && typeof v === "object") return Object.fromEntries(Object.entries(v).map(([k, x]) => [k, this.#plantilla(x, marker)]));
     return v;
+  }
+
+  /** Espera a que el log del servidor deje de crecer durante 100 ms (con un tope de 2 s). */
+  async #asentarLog() {
+    const srv = this.ctx.srv;
+    if (!srv) return;
+    const limite = Date.now() + 2000;
+    let largo = srv.salida.length;
+    let desde = Date.now();
+    while (Date.now() < limite && Date.now() - desde < 100) {
+      await dormir(25);
+      if (srv.salida.length !== largo) {
+        largo = srv.salida.length;
+        desde = Date.now();
+      }
+    }
   }
 
   describir(s) {

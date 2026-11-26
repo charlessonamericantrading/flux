@@ -14,15 +14,16 @@
  * `FLUX_SDK_NODE_DIST` / `FLUX_SDK_RUST_DIR` apuntando a la copia. Cada mutante declara qué casos DEBEN fallar. Antes, esos mismos
  * casos se ejecutan SIN mutar y tienen que pasar: si no, un fallo no probaría nada.
  *
- * El repo real no se toca: el mutante vive en `os.tmpdir()` y se borra al terminar. El de Rust se compila en el MISMO `target/`
- * (`CARGO_TARGET_DIR`, por defecto el de `sdk-rust/`): las dependencias, ya compiladas, no se repiten, y solo se recompila el
- * crate `flux` de la copia (~30 s); la siguiente ejecución normal vuelve a recompilar el suyo.
+ * El repo real no se toca: el mutante vive en `os.tmpdir()` y se borra al terminar. El de Rust se compila en una COPIA del `target/`
+ * (`CARGO_TARGET_DIR`, por defecto el de `sdk-rust/`: unos GB): las dependencias, ya compiladas, no se repiten, y solo se recompila el
+ * crate `flux` de la copia (~30 s). Sin `target/` previo, la primera compilación es completa (minutos).
  *
  * Entorno: el de `security.mjs` (NATS_SERVER, FLUX_TEST_PORTS, FLUX_REQUIRE_BROKER).
  * Sale con 0 si todos los mutantes se detectan, 1 si alguno NO, 2 si el entorno está mal.
  */
 
 import { spawn, spawnSync } from "node:child_process";
+import { existsSync, rmSync } from "node:fs";
 import { cp, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -210,6 +211,22 @@ function ejecutarSuite(runner, casos, env) {
   });
 }
 
+/**
+ * El `target/` en el que se compilan los mutantes de Rust: una COPIA del real (con las dependencias ya compiladas: solo se recompila
+ * el crate `flux` de cada mutante, ~30 s) y no el real. Compilar un mutante en el real dejaría su ejecutable en el sitio del bueno, y
+ * cargo —que lo da por fresco— no lo volvería a poner. Se crea una vez y se borra al terminar.
+ */
+let copiaDeTarget;
+async function objetivoDeRust() {
+  if (copiaDeTarget) return copiaDeTarget;
+  copiaDeTarget = await mkdtemp(path.join(os.tmpdir(), "flux-mutante-sdk-target-"));
+  // Que un fallo o una señal no dejen unos GB en el temporal.
+  process.on("exit", () => rmSync(copiaDeTarget, { recursive: true, force: true }));
+  const real = process.env.CARGO_TARGET_DIR ?? path.join(ROOT, "sdk-rust", "target");
+  if (existsSync(real)) await cp(real, copiaDeTarget, { recursive: true, preserveTimestamps: true });
+  return copiaDeTarget;
+}
+
 /** Copia el SDK a un temporal y aplica el mutante. Devuelve el entorno con el que ejecutar la suite. */
 async function prepararMutante(m) {
   const dir = await mkdtemp(path.join(os.tmpdir(), "flux-mutante-sdk-"));
@@ -230,7 +247,7 @@ async function prepararMutante(m) {
     ruta = path.join(dir, "sdk-rust", m.archivo);
     env = {
       FLUX_SDK_RUST_DIR: path.join(dir, "sdk-rust"),
-      CARGO_TARGET_DIR: process.env.CARGO_TARGET_DIR ?? path.join(ROOT, "sdk-rust", "target"),
+      CARGO_TARGET_DIR: await objetivoDeRust(),
     };
   }
   const texto = await readFile(ruta, "utf8");
@@ -295,6 +312,8 @@ for (const m of elegidos) {
     await rm(prep.dir, { recursive: true, force: true });
   }
 }
+
+if (copiaDeTarget) await rm(copiaDeTarget, { recursive: true, force: true });
 
 console.log(`\n${R.escapan.length === 0 ? "✓" : "✗"} ${R.detectados}/${R.total} mutantes detectados` + (R.escapan.length ? ` · NO detectados: ${R.escapan.join(", ")}` : ""));
 process.exit(R.escapan.length === 0 ? 0 : 1);
