@@ -10,8 +10,10 @@
 //! vector; si los generase el SDK, los bytes no serían comparables entre lenguajes.
 //!
 //! Además de `build`, `dlq`, `sign`, `verify` y `parse`, implementa las cuatro operaciones de la
-//! capacidad `state` (`state-build`, `state-tombstone`, `state-subject` y `state-dlq`): el runner
-//! las ejecuta solo en los SDKs que la declaran en `protocol.json`.
+//! capacidad `state` (`state-build`, `state-tombstone`, `state-subject` y `state-dlq`) y las cinco de
+//! la capacidad `rpc` (`rpc-request`, `rpc-reply`, `rpc-error`, `rpc-operation` y `rpc-timeout`:
+//! `conformance/cases/cross-sdk-rpc-envelope.json`): el runner las ejecuta solo en los SDKs que las
+//! declaran en `protocol.json`.
 //!
 //! ```text
 //! echo '{"op":"build","event":{…}}' | cargo run --quiet --bin conformance-harness --features signing
@@ -25,9 +27,12 @@ use std::io::Read;
 use chrono::{DateTime, Utc};
 use flux::signing::{Signer, SigningOptions, VerificationMode, Verifier};
 use flux::{
-    build_event, build_state_event, build_state_tombstone, data_to_raw, parse_event, serialize,
-    state_dataschema, state_subject, to_dlq_event, to_state_dlq_event, BuildEventInput,
-    DataClassification, DlqInfo, DlqReason, Event, FluxError, StateEventInput, StateTombstoneInput,
+    build_event, build_rpc_error, build_rpc_reply, build_rpc_request, build_state_event,
+    build_state_tombstone, data_to_raw, parse_event, resolve_timeout_ms, rpc_dataschema,
+    rpc_subject, serialize, state_dataschema, state_subject, to_dlq_event, to_state_dlq_event,
+    BuildEventInput, DataClassification, DlqInfo, DlqReason, ErrorClass, Event, FluxError, ReplyTo,
+    RpcErrorBody, RpcErrorInput, RpcReplyInput, RpcRequestInput, RpcRequestRef, RpcSide,
+    StateEventInput, StateTombstoneInput,
 };
 use serde::Deserialize;
 use serde_json::value::RawValue;
@@ -159,6 +164,104 @@ struct DlqEstadoEntrada {
     revision: u64,
 }
 
+// ─── Entrada de petición/respuesta (capacidad `rpc`) ─────────────────────────
+//
+// PLANA, como el `input` de los fixtures de `cross-sdk-rpc-envelope.json` más el `op`. `data` sigue
+// siendo `RawValue`: los bytes del payload son los del vector. `dataschema` NO viene: lo deriva el SDK
+// de la operación, porque es parte de lo que se compara.
+
+/// `rpc-request`.
+#[derive(Deserialize)]
+struct RpcPeticionEntrada {
+    operation: String,
+    #[serde(rename = "tenantId")]
+    tenant_id: String,
+    #[serde(default, rename = "aggregateId")]
+    aggregate_id: Option<String>,
+    id: String,
+    source: String,
+    time: String,
+    correlationid: String,
+    producerversion: String,
+    classification: String,
+    #[serde(default)]
+    causationid: Option<String>,
+    #[serde(default)]
+    traceparent: Option<String>,
+    #[serde(default)]
+    tracestate: Option<String>,
+    data: Box<RawValue>,
+}
+
+/// La petición a la que contestan `rpc-reply` y `rpc-error`: lo que la respuesta **hereda**. El
+/// `correlationid` de primer nivel que traen los vectores es redundante y aquí no se usa.
+#[derive(Deserialize)]
+struct RpcReferenciaEntrada {
+    operation: String,
+    id: String,
+    correlationid: String,
+    tenantid: String,
+    #[serde(default)]
+    subject: Option<String>,
+    #[serde(default)]
+    partitionkey: Option<String>,
+}
+
+impl From<RpcReferenciaEntrada> for RpcRequestRef {
+    fn from(r: RpcReferenciaEntrada) -> Self {
+        Self {
+            operation: r.operation,
+            id: r.id,
+            correlationid: r.correlationid,
+            tenantid: r.tenantid,
+            subject: r.subject,
+            partitionkey: r.partitionkey,
+        }
+    }
+}
+
+/// `rpc-reply`.
+#[derive(Deserialize)]
+struct RpcRespuestaEntrada {
+    request: RpcReferenciaEntrada,
+    id: String,
+    source: String,
+    time: String,
+    producerversion: String,
+    classification: String,
+    #[serde(default)]
+    traceparent: Option<String>,
+    #[serde(default)]
+    tracestate: Option<String>,
+    data: Box<RawValue>,
+}
+
+/// El `error` de `rpc-error`.
+#[derive(Deserialize)]
+struct RpcCuerpoErrorEntrada {
+    class: String,
+    code: String,
+    message: String,
+    /// Como `timeoutMs`: un entero escrito con `.0` o con exponente es un entero para JavaScript.
+    #[serde(default, rename = "retryAfterMs")]
+    retry_after_ms: Option<Value>,
+}
+
+/// `rpc-error`.
+#[derive(Deserialize)]
+struct RpcErrorEntrada {
+    request: RpcReferenciaEntrada,
+    id: String,
+    source: String,
+    time: String,
+    producerversion: String,
+    #[serde(default)]
+    traceparent: Option<String>,
+    #[serde(default)]
+    tracestate: Option<String>,
+    error: RpcCuerpoErrorEntrada,
+}
+
 #[derive(Deserialize)]
 struct FirmaEntrada {
     #[serde(rename = "privateKeyPem")]
@@ -247,6 +350,16 @@ fn instante(s: &str) -> Result<DateTime<Utc>, Fallo> {
     DateTime::parse_from_rfc3339(s)
         .map(|t| t.with_timezone(&Utc))
         .map_err(|e| Fallo::nuevo("HARNESS_INPUT", format!("`{s}` no es RFC 3339: {e}")))
+}
+
+/// Un número JSON que se escribió con parte decimal pero es un entero (`5000.0`, `2e3`): para
+/// JavaScript, que no distingue, lo es. `None` si tiene parte fraccionaria o no cabe en un `i64`.
+#[allow(clippy::cast_possible_truncation)]
+fn entero_de_decimal(valor: Option<f64>) -> Option<i64> {
+    let v = valor?;
+    // 2^63 como f64 es exacto; `i64::MAX as f64` redondea hacia arriba, así que se compara con `<`.
+    (v.fract() == 0.0 && v >= -9_223_372_036_854_775_808.0 && v < 9_223_372_036_854_775_808.0)
+        .then_some(v as i64)
 }
 
 /// La base de los esquemas del repo: `schemas/state/<dom>/<agr>/<semver>.json` cuelga de aquí. Es
@@ -414,6 +527,134 @@ fn ejecutar(e: &Entrada, texto: &str) -> Result<Value, Fallo> {
                 instante(&info.dlqtime)?,
             );
             Ok(json!({ "ok": true, "bytes": b64_encode(&serialize(&con_dlq)?) }))
+        }
+
+        // ─── Petición/respuesta (capacidad `rpc`) ────────────────────────────────────────
+        "rpc-request" => {
+            let p: RpcPeticionEntrada = entrada_de_estado(texto)?;
+            let dataschema = rpc_dataschema(BASE_ESQUEMAS, &p.operation, RpcSide::Request)?;
+            let evento = build_rpc_request(RpcRequestInput {
+                operation: p.operation,
+                tenant_id: p.tenant_id,
+                aggregate_id: p.aggregate_id,
+                id: p.id,
+                source: p.source,
+                time: instante(&p.time)?,
+                correlationid: p.correlationid,
+                causationid: p.causationid,
+                producerversion: p.producerversion,
+                classification: clasificacion(&p.classification)?,
+                dataschema,
+                traceparent: p.traceparent,
+                tracestate: p.tracestate,
+                data: p.data,
+            })?;
+            Ok(json!({ "ok": true, "bytes": b64_encode(&serialize(&evento)?) }))
+        }
+
+        "rpc-reply" => {
+            let r: RpcRespuestaEntrada = entrada_de_estado(texto)?;
+            let dataschema = rpc_dataschema(BASE_ESQUEMAS, &r.request.operation, RpcSide::Reply)?;
+            let evento = build_rpc_reply(RpcReplyInput {
+                request: r.request.into(),
+                id: r.id,
+                source: r.source,
+                time: instante(&r.time)?,
+                producerversion: r.producerversion,
+                classification: clasificacion(&r.classification)?,
+                dataschema,
+                traceparent: r.traceparent,
+                tracestate: r.tracestate,
+                data: r.data,
+            })?;
+            Ok(json!({ "ok": true, "bytes": b64_encode(&serialize(&evento)?) }))
+        }
+
+        "rpc-error" => {
+            let r: RpcErrorEntrada = entrada_de_estado(texto)?;
+            let clase = match r.error.class.as_str() {
+                "retryable" => ErrorClass::Retryable,
+                "permanent" => ErrorClass::Permanent,
+                // `poison` no viaja, y cualquier otra cosa tampoco: el SDK no construye ese error.
+                otra => {
+                    return Err(Fallo::nuevo(
+                        "INVALID_RPC_CALL",
+                        format!("`class` del error debe ser retryable o permanent: {otra}"),
+                    ))
+                }
+            };
+            let retry_after_ms = match &r.error.retry_after_ms {
+                None => None,
+                Some(Value::Number(n)) => Some(
+                    n.as_u64()
+                        .or_else(|| {
+                            entero_de_decimal(n.as_f64()).and_then(|v| u64::try_from(v).ok())
+                        })
+                        .ok_or_else(|| {
+                            Fallo::nuevo(
+                                "INVALID_RPC_CALL",
+                                "`retryAfterMs` debe ser un entero >= 0",
+                            )
+                        })?,
+                ),
+                Some(_) => {
+                    return Err(Fallo::nuevo(
+                        "INVALID_RPC_CALL",
+                        "`retryAfterMs` debe ser un entero >= 0",
+                    ))
+                }
+            };
+            let evento = build_rpc_error(RpcErrorInput {
+                reply_to: ReplyTo::Request(r.request.into()),
+                id: r.id,
+                source: r.source,
+                time: instante(&r.time)?,
+                producerversion: r.producerversion,
+                traceparent: r.traceparent,
+                tracestate: r.tracestate,
+                error: RpcErrorBody {
+                    class: clase,
+                    code: r.error.code,
+                    message: r.error.message,
+                    retry_after_ms,
+                },
+            })?;
+            Ok(json!({ "ok": true, "bytes": b64_encode(&serialize(&evento)?) }))
+        }
+
+        // El subject de NATS, o el código estable del rechazo: INVALID_RPC_CALL o RESERVED_DOMAIN.
+        "rpc-operation" => {
+            let v: Value = entrada_de_estado(texto)?;
+            let Some(operacion) = v.get("operation").and_then(Value::as_str) else {
+                return Err(Fallo::nuevo(
+                    "INVALID_RPC_CALL",
+                    "`operation` debe ser una cadena",
+                ));
+            };
+            Ok(json!({ "ok": true, "subject": rpc_subject(operacion)? }))
+        }
+
+        // Los milisegundos efectivos, o INVALID_RPC_CALL. `timeoutMs` ausente es 5000; `null` NO es
+        // «ausente»: es inválido. Un número entero con `.0` (o `2e3`) es un entero, como en JavaScript.
+        "rpc-timeout" => {
+            let v: Value = entrada_de_estado(texto)?;
+            let pedido = match v.get("timeoutMs") {
+                None => None,
+                Some(Value::Number(n)) => Some(
+                    n.as_i64()
+                        .or_else(|| entero_de_decimal(n.as_f64()))
+                        .ok_or_else(|| {
+                            Fallo::nuevo("INVALID_RPC_CALL", "`timeoutMs` debe ser un entero")
+                        })?,
+                ),
+                Some(_) => {
+                    return Err(Fallo::nuevo(
+                        "INVALID_RPC_CALL",
+                        "`timeoutMs` debe ser un número entero",
+                    ))
+                }
+            };
+            Ok(json!({ "ok": true, "effectiveMs": resolve_timeout_ms(pedido)? }))
         }
 
         otro => Ok(json!({ "ok": false, "code": "UNSUPPORTED_OP", "detail": otro })),
