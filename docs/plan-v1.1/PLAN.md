@@ -217,6 +217,18 @@ Pequeña. Un PR.
 
 **Aceptación:** la definición de hecho de §0.
 
+#### Fase 0b — Huecos de CI y deuda de documentación
+
+Los destapó la ejecución de la Fase 0 (PR #2). Verificados, no supuestos:
+
+| # | Hueco | Dónde se cierra |
+|---|---|---|
+| 1 | El job de CI de Python instala solo `pytest cryptography`: los tests de `client` y de `validation` no corren en CI | `fase-0b-ci-docs` |
+| 2 | El job de CI de Rust no usa `--all-features`: `validation` y `signing` no se prueban en CI y el README ya llama L3 a Rust | `fase-1-rust` |
+| 3 | `sdk-php/README.md` se contradice (301 frente a 304 tests; «Sin verificar» frente a «verificado») | `fase-0b-ci-docs` |
+| 4 | Etiquetas «fase 4» obsoletas en `01-envelope.md` y `06-security.md` §7; `verifiedAgainst` de los casos `cross-sdk-*` cita 3 y 4 SDKs, no 7 | `fase-0b-ci-docs` |
+| 5 | `conformance/run.mjs` lleva las comprobaciones escritas en código; `cases/*.json` solo las documenta. Ningún runner ejecuta `nak-delay-ignored-with-backoff.json` | Fase 1.5: la suite de seguridad **debe** leer sus casos de datos y ejecutarlos, o no puede llamarse «el contrato, ejecutable» |
+
 ---
 
 ### Fase 1 — Seguridad que se ejecuta
