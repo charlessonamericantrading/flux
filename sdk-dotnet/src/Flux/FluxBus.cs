@@ -377,6 +377,7 @@ public sealed class FluxBus : IAsyncDisposable
     private readonly ConcurrentDictionary<string, byte> _ensuredStreams = new(StringComparer.Ordinal);
     private readonly DenialLog _denials;
     private readonly string _inboxPrefix;
+    private readonly ConcurrentDictionary<object, Func<Task>> _tracked = new();
 
     private FluxBus(
         NatsConnection connection,
@@ -395,7 +396,39 @@ public sealed class FluxBus : IAsyncDisposable
         _source = Protocol.SourceUri(options.Environment, options.Service);
         _metrics.ConnectionState(Flux.ConnectionState.Connected);
         _denials.Recorded += ReportDenial;
+        State = new StateClient(this);
     }
+
+    /// <summary>
+    /// Estado replicado — la capacidad <c>state</c> (specification/10-state.md): <c>PutAsync</c>, <c>DeleteAsync</c>, <c>GetAsync</c> y
+    /// <c>WatchAsync</c>. El valor ACTUAL de un agregado, que su dueño publica y los demás observan; sustituye a
+    /// <c>GET /clientes/123</c>, a la carga inicial y al polling de datos.
+    /// </summary>
+    public StateClient State { get; }
+
+    // ─── lo que los clientes de capacidad (State, Rpc) necesitan del bus ─────
+
+    internal NatsConnection Connection => _connection;
+
+    internal NatsJSContext JetStream => _jetStream;
+
+    internal ConnectOptions Options => _options;
+
+    internal string Source => _source;
+
+    internal IMetricsSink Metrics => _metrics;
+
+    internal Classifier Classifier => _classifier;
+
+    internal string? CurrentTraceparent() => _options.TraceparentProvider?.Invoke() ?? FluxContext.ActiveTraceparent();
+
+    /// <summary>Registra algo que <see cref="DisposeAsync"/> debe parar antes de cerrar la conexión.</summary>
+    internal void Track(object key, Func<Task> stop) => _tracked[key] = stop;
+
+    internal void Untrack(object key) => _tracked.TryRemove(key, out _);
+
+    internal Task PublishToDlqRawAsync(string dlqSubject, FluxEvent dlqEvent, string msgId, CancellationToken cancellationToken) =>
+        PublishToDlqAsync(dlqSubject[4..], dlqEvent, msgId, cancellationToken);
 
     /// <summary>
     /// Abre la conexión al bus.
@@ -862,7 +895,7 @@ public sealed class FluxBus : IAsyncDisposable
 
     private static TimeSpan FromNanos(long nanos) => TimeSpan.FromTicks(nanos / 100L);
 
-    private static ConsumerConfigSnapshot Snapshot(ConsumerConfig config) => new()
+    internal static ConsumerConfigSnapshot Snapshot(ConsumerConfig config) => new()
     {
         AckWait = config.AckWait,
         MaxDeliver = (int)config.MaxDeliver,
@@ -1159,18 +1192,27 @@ public sealed class FluxBus : IAsyncDisposable
     {
         var payload = Envelope.Serialize(dlqEvent);
         var dlqSubject = Protocol.DlqSubject(subject);
-        var ack = await GuardAsync(
-            new[] { dlqSubject },
-            token => _jetStream.PublishAsync(
-                subject: dlqSubject,
-                data: payload,
-                // El msgID incluye el consumidor: dos consumidores distintos del mismo evento
-                // producen dos entradas de DLQ, y son dos hechos distintos.
-                opts: new NatsJSPubOpts { MsgId = msgId },
-                cancellationToken: token).AsTask(),
-            "enrutar el evento a la DLQ",
-            cancellationToken).ConfigureAwait(false);
-        ack.EnsureSuccess();
+        try
+        {
+            var ack = await GuardAsync(
+                new[] { dlqSubject },
+                token => _jetStream.PublishAsync(
+                    subject: dlqSubject,
+                    data: payload,
+                    // El msgID incluye el consumidor: dos consumidores distintos del mismo evento
+                    // producen dos entradas de DLQ, y son dos hechos distintos.
+                    opts: new NatsJSPubOpts { MsgId = msgId },
+                    cancellationToken: token).AsTask(),
+                "enrutar el evento a la DLQ",
+                cancellationToken).ConfigureAwait(false);
+            ack.EnsureSuccess();
+        }
+        catch (NatsJSDuplicateMessageException)
+        {
+            // NATS.Net lanza donde Node y Rust devuelven `duplicate: true`. Un duplicado aquí NO es un fallo: es la reentrega de un mensaje
+            // cuya entrada de DLQ ya se guardó y cuyo `term()` no llegó a confirmarse. Tratarlo como error lo dejaría sin terminar
+            // y se reentregaría hasta `max_deliver` con la DLQ ya escrita.
+        }
     }
 
     /// <summary>
@@ -1222,7 +1264,7 @@ public sealed class FluxBus : IAsyncDisposable
             DlqReason = DlqReason.Poison,
             DlqAttempts = 1,
             DlqConsumer = consumer,
-            DlqError = Envelope.Truncate(error, Envelope.MaxDlqErrorChars),
+            DlqError = Text.TruncateUtf8Bytes(error, Envelope.MaxDlqErrorBytes),
             DlqTime = now,
             Data = data,
         };
@@ -1342,7 +1384,7 @@ public sealed class FluxBus : IAsyncDisposable
     /// <see cref="ConsumerConfigVerifier"/>. Si no existe y crearlo está DENEGADO, no es un fallo de
     /// red ni un timeout: es que nadie lo aprovisionó — <see cref="NotProvisionedException"/>.
     /// </remarks>
-    private async Task<INatsJSConsumer> EnsureConsumerAsync(
+    internal async Task<INatsJSConsumer> EnsureConsumerAsync(
         string stream,
         string durable,
         ConsumerConfig requested,
@@ -1406,7 +1448,7 @@ public sealed class FluxBus : IAsyncDisposable
     /// que estar denegado.
     /// </para>
     /// </remarks>
-    private async Task EnsurePullAllowedAsync(string stream, string durable, CancellationToken cancellationToken)
+    internal async Task EnsurePullAllowedAsync(string stream, string durable, CancellationToken cancellationToken)
     {
         var subject = $"$JS.API.CONSUMER.MSG.NEXT.{stream}.{durable}";
         // Una denegación de un intento anterior sobre este durable no debe condenar a este.
@@ -1456,7 +1498,7 @@ public sealed class FluxBus : IAsyncDisposable
     /// es un timeout de 5 a 10 s.
     /// </remarks>
     /// <exception cref="PermissionDeniedException">El broker denegó alguno de esos subjects.</exception>
-    private async Task<T> GuardAsync<T>(
+    internal async Task<T> GuardAsync<T>(
         IReadOnlyCollection<string> subjects,
         Func<CancellationToken, Task<T>> operation,
         string attempt,
@@ -1548,6 +1590,13 @@ public sealed class FluxBus : IAsyncDisposable
         {
             await subscription.UnsubscribeAsync().ConfigureAwait(false);
         }
+
+        foreach (var stop in _tracked.Values.ToList())
+        {
+            await stop().ConfigureAwait(false);
+        }
+
+        _tracked.Clear();
 
         _subscriptions.Clear();
         _metrics.ConnectionState(Flux.ConnectionState.Disconnected);

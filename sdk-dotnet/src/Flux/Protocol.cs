@@ -216,6 +216,12 @@ public static class Protocol
             throw new InvalidSubjectException(subject ?? "null", "el subject es obligatorio");
         }
 
+        // Un dominio reservado (`dlq`, `state`, `rpc`, `system`) se rechaza ANTES que la forma, y antes de tocar la red
+        // (10-state.md §2.7): `rpc.pedido.v1.creado` tiene cuatro tokens y «debe tener cuatro» no diría qué pasa de verdad.
+        // `publish()` no puede escribir en `state.`, `rpc.` ni `dlq.`: un evento publicado ahí no pasaría por el chequeo de
+        // secuencia del estado, ni tendría respuesta posible.
+        ReservedDomainException.AssertNot(subject);
+
         // La comprobación de minúsculas va ANTES que el patrón para poder dar un mensaje
         // útil: los subjects de NATS son case-sensitive, así que "Pedidos.pedido.v1.creado"
         // crea un subject fantasma al que nadie está suscrito y no produce ningún error.

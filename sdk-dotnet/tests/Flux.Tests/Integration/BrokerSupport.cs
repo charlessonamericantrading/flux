@@ -156,6 +156,23 @@ public sealed class BrokerFactAttribute : FactAttribute
     }
 }
 
+/// <summary>
+/// <c>[Theory]</c> de un test que necesita un <c>nats-server</c> real: como <see cref="BrokerFactAttribute"/>.
+/// </summary>
+[AttributeUsage(AttributeTargets.Method)]
+public sealed class BrokerTheoryAttribute : TheoryAttribute
+{
+    /// <summary>Crea el atributo. <paramref name="node"/> y <paramref name="openssl"/>: requisitos extra.</summary>
+    public BrokerTheoryAttribute(bool node = false, bool openssl = false)
+    {
+        var falta = Prereq.Missing(node, openssl);
+        if (falta is not null && !Prereq.Required)
+        {
+            Skip = $"se SALTA: {falta}. Define NATS_SERVER, o FLUX_REQUIRE_BROKER=1 para que su ausencia sea un fallo.";
+        }
+    }
+}
+
 /// <summary>Un <c>nats-server</c> con su configuración y su directorio temporal. Al soltarlo mata SOLO su proceso.</summary>
 internal sealed class TestBroker : IAsyncDisposable
 {

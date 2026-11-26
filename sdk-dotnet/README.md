@@ -597,6 +597,80 @@ con credenciales que caducan o rotan (la spec tampoco lo fija); un cluster.
 
 ---
 
+## Estado replicado (capacidad `state`)
+
+El contrato es [`specification/10-state.md`](../specification/10-state.md): el valor **actual** de una clave, replicado a quien lo observa, con **un** dueño que escribe.
+`bus.State` es el cliente (`StateClient`); el contrato se nombra como `<dominio>.<agregado>.v<major>` (`clientes.cliente.v1`) y el stream es `STATE_<DOM>`.
+
+```csharp
+await using var bus = await FluxBus.ConnectAsync(new ConnectOptions { Service = "crm-api", /* … */ TenantId = "acme" });
+
+// El dueño escribe. `aggregateVersion` va en `data` y es obligatoria: sin ella no hay actualización condicional.
+var r = await bus.State.PutAsync("clientes.cliente.v1", "cli-1", new { clienteId = "cli-1", nombre = "Ana", aggregateVersion = 7 });
+// r.Applied, r.Outcome (Ok | Stale), r.Revision
+
+await bus.State.DeleteAsync("clientes.cliente.v1", "cli-1", new StateDeleteOptions { AggregateVersion = 8 });   // la lápida
+
+// Una lectura puntual (DIRECT.GET): null si no existe O si es una lápida.
+StateEntry? e = await bus.State.GetAsync("clientes.cliente.v1", "cli-1");
+
+// Quien observa: la foto actual y luego los cambios. El handler es idempotente y no asume orden.
+await using var watch = await bus.State.WatchAsync(
+    "clientes.cliente.v1",
+    async (entry, delivery, ct) =>
+    {
+        if (entry.Deleted) { await copia.BorrarAsync(entry.TenantId, entry.Key, ct); return; }
+        await copia.AplicarAsync(entry.TenantId, entry.Key, entry.AggregateVersion, entry.Data!.Value, ct);   // UPDATE … WHERE aggregate_version < $n
+    },
+    new StateWatchOptions { OnSynced = () => Console.WriteLine("copia al día") });
+await watch.Synced;
+```
+
+También se puede consumir como `IAsyncEnumerable<StateEntry>`: `await foreach (var e in bus.State.WatchEntriesAsync("clientes.cliente.v1", ct: ct)) { … }`. La entrada se
+**confirma al volver el cuerpo del bucle a pedir la siguiente**; si el cuerpo lanza o se hace `break`, no se confirma y se reentrega.
+
+**Lo que hace `PutAsync` y no hay que escribir:** lee el último mensaje de la clave (`DIRECT.GET`), lo reconoce si es **suyo** (el `id` que ya publicó: un acuse perdido no es un `stale`),
+descarta una versión que no avanza (`Stale`, **no es un error**: la igual tampoco avanza) y publica **siempre por JetStream** con `Nats-Expected-Last-Subject-Sequence` y `Nats-Msg-Id`. Un conflicto
+(**10071** y también **10164**, el de un R3 bajo carrera) vuelve a leer; a los **3 intentos** es `StateConflictException` (`STATE_CONFLICT`, RETRYABLE). El `tenantid` del sobre es el del
+subject de NATS; la clasificación por omisión es `confidential` y `restricted` se rechaza (`INVALID_DATACLASSIFICATION`).
+
+**`watch`** crea un durable por servicio, contrato y tenant (`tienda-web__state_clientes_cliente_v1__acme`) con `deliver_policy: last_per_subject`, y **comprueba** que el broker lo tiene así
+(un durable con otro filtro entregaría un tenant ajeno sin error: `ConsumerConfigMismatchException`). Si el durable se borra (`flux state resync`) el `watch` se reabre solo y entrega la foto
+otra vez (0,1 s medido, A-216). `OnSynced` se dispara **una vez**, también con el contrato vacío (y entonces antes de entregar nada).
+
+**Una entrada que no se puede aplicar** va a `dlq.state.<dom>.<agr>.v<M>` con el sobre original y **sin su dato** (`data` pasa a `{ key, revision }`: un dato personal ya borrado no sobrevive 90 días
+en la DLQ) y **sin la firma**. Un error del handler que no es de flux no deja su mensaje en `dlqerror` (puede citar la fila entera): solo el código y una frase fija. `STATE_SUBJECT_MISMATCH`
+—el sobre y el subject de NATS discrepan en tenant, clave o tipo—, `restricted` y un cuerpo ilegible son **POISON**: nunca llegan al handler, y `OnPoison` recibe `Raw` vacío.
+
+| Código | Cuándo | Clase |
+|---|---|---|
+| `INVALID_STATE_CONTRACT` | el contrato no es `<dominio>.<agregado>.v<major>` (major de 1 a 4 dígitos) | PERMANENT |
+| `INVALID_TENANT_FOR_STATE` | tenant ausente, mayúsculas, `_`, `.`, más de 64 caracteres | PERMANENT |
+| `INVALID_STATE_KEY` | la clave no es un token (`^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$`, coincidencia **completa**: un `\n` final no vale) | PERMANENT |
+| `MISSING_AGGREGATE_VERSION` | `aggregateVersion` ausente, `null`, cadena, `0`, negativa, `7.5`, **`7.0`** o mayor que 2^53 − 1 | PERMANENT |
+| `STATE_SUBJECT_MISMATCH` | al consumir: el sobre miente sobre el subject | POISON |
+| `STATE_CONFLICT` | tres conflictos de secuencia seguidos | RETRYABLE |
+| `RESERVED_DOMAIN` | un contrato o un subject de evento en `state`, `dlq`, `rpc` o `system` | PERMANENT |
+
+El orden de validación es el de §3.6 y **el primero que falla gana**: dominio reservado → forma del contrato → clave → tenant → versión → clasificación → resto del sobre.
+
+**Dónde .NET se aparta de Node y de Rust**, y por qué los bytes siguen siendo los mismos:
+
+- `7.0` y `1e0` se rechazan como en Rust (un `JsonElement` conserva el texto del número). Node no puede distinguirlos de `7` (§3.4).
+- La forma canónica de `data` (§4.1 de la spec del sobre: UTF-8 literal, sin espacios, la última clave repetida gana) **no** la da `System.Text.Json` (escapa los planos astrales y no deduplica
+  claves): la escribe `CanonicalJson`. `dlqerror` se recorta a **1024 bytes UTF-8** sin partir un carácter; `message` de un error de rpc cuenta **puntos de código**; `time` se normaliza a 3 decimales y `Z`.
+- `NATS.Net` devuelve el 10071 dentro del `PubAck` y lanza `NatsJSDuplicateMessageException` ante un duplicado donde Node y Rust devuelven `duplicate: true`: A-214.
+
+Los tests: `tests/Flux.Tests/StateTests.cs` (sin broker: **todos los vectores de estado de `conformance/harness/vectors.json`** en proceso, con los SHA-256 de la spec, y las reglas de clave, tenant y versión),
+`Integration/StateSemanticsTests.cs` (los escenarios de `conformance/cases/state-semantics.json` contra un broker: tres instancias del dueño convergen, el acuse perdido, los tenants) y
+`Integration/StateIntegrationTests.cs` (con los permisos de `gen-acl` y `flux provision`: **el ciclo de 100 claves**, la lápida, un observador confinado a su tenant, cada permiso que falta, la DLQ de
+estado, el POISON, la reapertura tras un resync, el 10164 fabricado). `Flux.ConformanceHarness` implementa `state-build`, `state-tombstone`, `state-subject`, `state-dlq` y `external-id`: el cruzado
+(`node conformance/cross-sdk.mjs --only node,dotnet --exigir state`) compara sus **87** vectores con los de Node, byte a byte.
+
+⚠️ **Lo que NO está ejecutado**: un stream de estado con `replicas: 3` (el 10164 se fabrica; el caso `cluster-three-owner-instances-converge` no corre aquí), y la lectura de réplica de §3.7 bajo carga.
+
+---
+
 ## Diferencias con el SDK de referencia (Node)
 
 El envelope, el naming, la taxonomía de errores y la config de consumidor son **idénticos

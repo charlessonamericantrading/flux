@@ -120,10 +120,11 @@ public class EnvelopeTests
     {
         // Una cadena vacía es un valor legal de string, así que el compilador no puede
         // distinguirla de "presente": la comprobación es en ejecución, igual que en Go.
-        Assert.Throws<EnvelopeException>(() => Envelope.BuildEvent(FixtureInput() with { TenantId = "" }));
-        Assert.Throws<EnvelopeException>(() => Envelope.BuildEvent(FixtureInput() with { CorrelationId = "" }));
-        Assert.Throws<EnvelopeException>(() => Envelope.BuildEvent(FixtureInput() with { ProducerVersion = "" }));
-        Assert.Throws<EnvelopeException>(() => Envelope.BuildEvent(FixtureInput() with { DataSchema = "" }));
+        // `EnvelopeInputException` es una `EnvelopeException` con el código estable del parser (MISSING_REQUIRED_EXTENSION…).
+        Assert.ThrowsAny<EnvelopeException>(() => Envelope.BuildEvent(FixtureInput() with { TenantId = "" }));
+        Assert.ThrowsAny<EnvelopeException>(() => Envelope.BuildEvent(FixtureInput() with { CorrelationId = "" }));
+        Assert.ThrowsAny<EnvelopeException>(() => Envelope.BuildEvent(FixtureInput() with { ProducerVersion = "" }));
+        Assert.ThrowsAny<EnvelopeException>(() => Envelope.BuildEvent(FixtureInput() with { DataSchema = "" }));
     }
 
     [Fact]
@@ -620,18 +621,23 @@ public class EnvelopeTests
     }
 
     [Fact]
-    public void ElDlqErrorSeRecortaSinPartirCaracteres()
+    public void ElDlqErrorSeRecortaEnBytesUtf8SinPartirCaracteres()
     {
-        var largo = new string('á', 5_000);
+        // 1500 × `é` (2 bytes cada una): 1024 bytes son 512 caracteres, no 1024 —lo que daba medir en unidades UTF-16—.
+        var largo = new string('é', 1_500);
 
         var enDlq = Envelope.ToDlqEvent(
             Envelope.BuildEvent(FixtureInput()), new Envelope.DlqInfo(DlqReason.Poison, 1, "c", largo));
 
-        Assert.Equal(Envelope.MaxDlqErrorChars, enDlq.DlqError!.Length);
+        Assert.Equal(512, enDlq.DlqError!.Length);
+        Assert.Equal(1_024, System.Text.Encoding.UTF8.GetByteCount(enDlq.DlqError));
 
-        // Un par sustituto no se parte por la mitad: partirlo produciría U+FFFD en el JSON.
-        var emoji = string.Concat(Enumerable.Repeat("🚚", 1_000));
-        Assert.True(Envelope.Truncate(emoji, 1_001).Length % 2 == 0);
+        // Un carácter de 4 bytes que no cabe se descarta ENTERO: partirlo produciría U+FFFD en el JSON.
+        var emoji = new string('a', 1_022) + "🚚";
+        var cortado = Envelope.ToDlqEvent(
+            Envelope.BuildEvent(FixtureInput()), new Envelope.DlqInfo(DlqReason.Poison, 1, "c", emoji)).DlqError!;
+        Assert.Equal(new string('a', 1_022), cortado);
+        Assert.DoesNotContain('\uFFFD', cortado);
     }
 
     // ─── igualdad ────────────────────────────────────────────────────────────

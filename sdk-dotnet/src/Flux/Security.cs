@@ -237,14 +237,20 @@ public sealed class NotProvisionedException : ClassifiedException
     /// <param name="service">El servicio al que se denegó.</param>
     /// <param name="deniedSubject">El subject denegado (el de la creación).</param>
     /// <param name="innerException">La causa, si la hay.</param>
+    /// <param name="detail">Sustituye al texto entero del mensaje (lo usa el estado: la señal es que nadie contesta a la lectura directa).</param>
     public NotProvisionedException(
         ResourceKind kind,
         string name,
         string? stream,
         string service,
         string deniedSubject,
-        Exception? innerException = null)
+        Exception? innerException = null,
+        string? detail = null)
         : base(
+            // `detail` sustituye al texto entero. Lo usa el estado (04-errors.md §6): ahí la señal no es un `CREATE` denegado sino
+            // que NADIE contesta a la lectura directa —un stream que no existe y uno sin `allow_direct` se ven igual (A-32)—, y el
+            // mensaje DEBE nombrar las dos causas, no una denegación que no ha habido.
+            detail ??
             (kind == ResourceKind.Stream
                 ? "el stream \"" + name + "\""
                 : "el consumidor \"" + name + "\" del stream \"" + stream + "\"") +

@@ -1192,12 +1192,17 @@
       "dotnet": {
         "capabilities": [
           "signing",
-          "security"
+          "security",
+          "state"
         ],
         "evidence": {
           "security": [
             "sdk-dotnet/tests/Flux.Tests/Integration/SecurityIntegrationTests.cs",
             "sdk-dotnet/tests/Flux.Tests/SecurityTests.cs"
+          ],
+          "state": [
+            "sdk-dotnet/tests/Flux.Tests/Integration/StateIntegrationTests.cs",
+            "sdk-dotnet/tests/Flux.Tests/Integration/StateSemanticsTests.cs"
           ]
         }
       },

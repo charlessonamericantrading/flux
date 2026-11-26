@@ -147,7 +147,7 @@ public sealed class PoisonException : ClassifiedException
 /// bug local, no un mensaje ajeno corrupto. No tiene clase de flux porque nunca llega a
 /// haber un mensaje que clasificar.
 /// </remarks>
-public sealed class EnvelopeException : Exception
+public class EnvelopeException : Exception
 {
     /// <summary>Construye la excepción.</summary>
     public EnvelopeException(string message)

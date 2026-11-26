@@ -37,8 +37,11 @@ public static class Envelope
     /// </remarks>
     public const string TimeFormat = "yyyy-MM-dd'T'HH:mm:ss.fff'Z'";
 
-    /// <summary>Longitud máxima de <c>dlqerror</c>, en caracteres.</summary>
-    public const int MaxDlqErrorChars = 1024;
+    /// <summary>
+    /// Longitud máxima de <c>dlqerror</c>, en <b>bytes UTF-8</b>, cortado sin partir un carácter — 04-errors.md §3. Antes se medía en
+    /// unidades UTF-16 (Node) o en caracteres: 1500 <c>é</c> daban 2693 bytes en total. Es lo que decidieron los «Ajustes».
+    /// </summary>
+    public const int MaxDlqErrorBytes = 1024;
 
     /// <summary>Serializa un instante en el formato del protocolo (UTC, 3 decimales).</summary>
     public static string FormatTime(DateTimeOffset instant) =>
@@ -282,23 +285,36 @@ public static class Envelope
         var type = Protocol.SubjectToType(input.Subject);
         var data = NormalizeData(input.Data);
 
-        foreach (var (name, value) in new[]
+        // Un atributo que rellena el SDK no puede llegar vacío (01-envelope.md §3.1, §3.3): con el MISMO código que daría el
+        // parser ante el mismo defecto, para que el arnés cruzado los compare (MISSING_REQUIRED_ATTRIBUTE / _EXTENSION).
+        foreach (var (name, value, extension) in new[]
                  {
-                     ("Id", input.Id),
-                     ("Source", input.Source),
-                     ("DataSchema", input.DataSchema),
-                     ("CorrelationId", input.CorrelationId),
-                     ("TenantId", input.TenantId),
-                     ("ProducerVersion", input.ProducerVersion),
+                     ("id", input.Id, false),
+                     ("source", input.Source, false),
+                     ("dataschema", input.DataSchema, false),
+                     ("correlationid", input.CorrelationId, true),
+                     ("tenantid", input.TenantId, true),
+                     ("producerversion", input.ProducerVersion, true),
                  })
         {
             if (string.IsNullOrEmpty(value))
             {
-                throw new EnvelopeException(
-                    $"{name} es obligatorio y llegó vacío. Lo rellena el SDK a partir de " +
-                    "ConnectOptions; si estás llamando a BuildEvent a mano, rellénalo " +
-                    "(01-envelope.md §5)");
+                throw new EnvelopeInputException(
+                    $"`{name}` es obligatorio y llegó vacío. Lo rellena el SDK a partir de ConnectOptions; si estás llamando a " +
+                    "BuildEvent a mano, rellénalo (01-envelope.md §3.1, §5)",
+                    extension ? "MISSING_REQUIRED_EXTENSION" : "MISSING_REQUIRED_ATTRIBUTE");
             }
+        }
+
+        // `time` de quien llama se normaliza a la forma canónica o se rechaza; sin él, el reloj del sistema.
+        string time;
+        if (input.Time is { } instante)
+        {
+            time = FormatTime(instante);
+        }
+        else
+        {
+            time = FormatTime(DateTimeOffset.UtcNow);
         }
 
         // Por convención partitionkey = aggregateId, salvo que se pida otra cosa
@@ -311,7 +327,7 @@ public static class Envelope
             Id = input.Id,
             Source = input.Source,
             Type = type,
-            Time = FormatTime(input.Time ?? DateTimeOffset.UtcNow),
+            Time = time,
             DataContentType = Protocol.DataContentType,
             DataSchema = input.DataSchema,
             AggregateId = input.AggregateId,
@@ -335,6 +351,18 @@ public static class Envelope
     /// añadir campos después sin romper el esquema, y toda la política de compatibilidad
     /// de 05-compatibility.md se apoya en poder hacerlo — 01-envelope.md §4.
     /// </remarks>
+    internal static JsonElement ToElement(object data, bool nonObject)
+    {
+        var element = data switch
+        {
+            JsonElement je => je.Clone(),
+            JsonDocument jd => jd.RootElement.Clone(),
+            _ => JsonSerializer.SerializeToElement(data, JsonOptions),
+        };
+        _ = nonObject;
+        return element;
+    }
+
     private static JsonElement NormalizeData(object data)
     {
         var element = data switch
@@ -369,7 +397,9 @@ public static class Envelope
     /// <exception cref="EnvelopeException">El evento no cabe en 1 MiB.</exception>
     public static byte[] Serialize(FluxEvent evento)
     {
-        var bytes = UnescapeAstralPlane(JsonSerializer.SerializeToUtf8Bytes(evento, JsonOptions));
+        // La forma canónica (01-envelope.md §4.1): UTF-8 literal, sin escapes `\u` salvo los obligatorios, hex en minúscula,
+        // claves repetidas de `data` deduplicadas. El encoder de System.Text.Json no la produce (ver CanonicalJson).
+        var bytes = CanonicalJson.Canonicalize(JsonSerializer.SerializeToUtf8Bytes(evento, JsonOptions));
         if (bytes.Length > Protocol.MaxMessageBytes)
         {
             throw new EnvelopeException(
@@ -383,111 +413,6 @@ public static class Envelope
         }
 
         return bytes;
-    }
-
-    /// <summary>
-    /// Devuelve los caracteres FUERA DEL BMP a su forma literal UTF-8.
-    /// </summary>
-    /// <remarks>
-    /// ⚠️ <see cref="JavaScriptEncoder.UnsafeRelaxedJsonEscaping"/> emite literalmente todo
-    /// el BMP —<c>é</c>, <c>✅</c>— pero **escapa los escalares fuera del BMP** como la
-    /// pareja de escapes de sus dos suplentes: el cohete U+1F680 sale como doce caracteres
-    /// ASCII —barra invertida, <c>u</c> y cuatro dígitos, dos veces— en vez de como sus
-    /// cuatro octetos <c>F0 9F 9A 80</c>. No es
-    /// configurable: los rangos de <see cref="System.Text.Unicode.UnicodeRange"/> llegan
-    /// hasta U+FFFF, así que ni <c>JavaScriptEncoder.Create(UnicodeRanges.All)</c> lo evita,
-    /// y la alternativa —un <c>JavaScriptEncoder</c> propio— exige <c>unsafe</c> en el
-    /// paquete base por los punteros de sus miembros abstractos.
-    /// <para>
-    /// El JSON resultante es equivalente al parsearlo, pero <b>no son los mismos bytes</b>, y
-    /// de los bytes dependen el replay verbatim desde la DLQ, la deduplicación por hash y la
-    /// firma Ed25519: un evento con un emoji firmado aquí NO verificaría en Node, Go, Java o
-    /// Python, que emiten el literal. Además 01-envelope.md §1.1 prohíbe explícitamente los
-    /// escapes <c>\uXXXX</c>.
-    /// </para>
-    /// <para>
-    /// Es exactamente el mismo fallo que tuvo el SDK de Java (Jackson lo hacía en su
-    /// generador de bytes) y lo detecta el mismo vector: <c>utf8-literal</c> del arnés de
-    /// conformidad cruzada. Los tests de un solo SDK no podían verlo porque solo cubrían el
-    /// BMP.
-    /// </para>
-    /// <para>
-    /// El recorrido solo toca parejas de suplentes VÁLIDAS. Un <c>\uXXXX</c> del BMP se deja
-    /// como está —los caracteres de control DEBEN ir escapados en JSON— y una barra
-    /// invertida escapada (<c>\\</c>) se salta entera, así que un payload que contenga el
-    /// texto literal <c>\uD83D</c> sobrevive intacto.
-    /// </para>
-    /// </remarks>
-    private static byte[] UnescapeAstralPlane(byte[] utf8)
-    {
-        // Ruta rápida: sin ninguna barra invertida no hay nada que deshacer, y es el caso
-        // de la inmensa mayoría de los eventos. Cero copias.
-        if (Array.IndexOf(utf8, (byte)'\\') < 0)
-        {
-            return utf8;
-        }
-
-        var salida = new byte[utf8.Length];
-        var escritos = 0;
-
-        for (var i = 0; i < utf8.Length;)
-        {
-            if (utf8[i] != (byte)'\\')
-            {
-                salida[escritos++] = utf8[i++];
-                continue;
-            }
-
-            // `\\` es una barra invertida escapada: se copian las dos y se sigue. Sin esto,
-            // el texto literal `🚀` dentro de un payload se "descodificaría" a un
-            // emoji que el productor nunca escribió.
-            if (i + 1 < utf8.Length && utf8[i + 1] == (byte)'\\')
-            {
-                salida[escritos++] = utf8[i++];
-                salida[escritos++] = utf8[i++];
-                continue;
-            }
-
-            if (i + 11 < utf8.Length &&
-                utf8[i + 1] == (byte)'u' && utf8[i + 6] == (byte)'\\' && utf8[i + 7] == (byte)'u' &&
-                TryHex(utf8, i + 2, out var alto) && TryHex(utf8, i + 8, out var bajo) &&
-                alto is >= 0xD800 and <= 0xDBFF && bajo is >= 0xDC00 and <= 0xDFFF)
-            {
-                var escalar = 0x10000 + ((alto - 0xD800) << 10) + (bajo - 0xDC00);
-                escritos += Encoding.UTF8.GetBytes(char.ConvertFromUtf32(escalar), 0, 2, salida, escritos);
-                i += 12;
-                continue;
-            }
-
-            salida[escritos++] = utf8[i++];
-        }
-
-        return escritos == salida.Length ? salida : salida[..escritos];
-    }
-
-    /// <summary>Lee cuatro dígitos hexadecimales ASCII. Devuelve <see langword="false"/> si no lo son.</summary>
-    private static bool TryHex(byte[] utf8, int offset, out int value)
-    {
-        value = 0;
-        for (var i = offset; i < offset + 4; i++)
-        {
-            var b = utf8[i];
-            var digito = b switch
-            {
-                >= (byte)'0' and <= (byte)'9' => b - '0',
-                >= (byte)'a' and <= (byte)'f' => b - 'a' + 10,
-                >= (byte)'A' and <= (byte)'F' => b - 'A' + 10,
-                _ => -1,
-            };
-            if (digito < 0)
-            {
-                return false;
-            }
-
-            value = (value << 4) | digito;
-        }
-
-        return true;
     }
 
     // ─── Parseo ──────────────────────────────────────────────────────────────
@@ -727,7 +652,7 @@ public static class Envelope
     /// <param name="Reason">Clase del fallo que lo mató.</param>
     /// <param name="Attempts">Número de entrega en que murió. Nunca menor que 1.</param>
     /// <param name="Consumer">Durable que lo enrutó.</param>
-    /// <param name="Error">Mensaje del error. Se recorta a <see cref="MaxDlqErrorChars"/>.</param>
+    /// <param name="Error">Mensaje del error. Se recorta a <see cref="MaxDlqErrorBytes"/> bytes UTF-8, sin partir un carácter.</param>
     public sealed record DlqInfo(DlqReason Reason, int Attempts, string Consumer, string Error);
 
     /// <summary>
@@ -754,7 +679,7 @@ public static class Envelope
             DlqReason = info.Reason,
             DlqAttempts = info.Attempts,
             DlqConsumer = info.Consumer,
-            DlqError = Truncate(info.Error, MaxDlqErrorChars),
+            DlqError = Text.TruncateUtf8Bytes(info.Error, MaxDlqErrorBytes),
             DlqTime = FormatTime(DateTimeOffset.UtcNow),
         };
     }
@@ -779,33 +704,5 @@ public static class Envelope
             DlqError = null,
             DlqTime = null,
         };
-    }
-
-    /// <summary>
-    /// Recorta a <paramref name="maxChars"/> caracteres sin partir un par sustituto.
-    /// </summary>
-    /// <remarks>
-    /// Node hace <c>.slice(0, 1024)</c> sobre unidades UTF-16 y aquí se corta igual, así
-    /// que el punto de corte coincide con el del SDK de referencia (Go corta por bytes
-    /// UTF-8 y puede diferir). El guardia del sustituto alto es un extra: partir un par
-    /// produciría un <c>dlqerror</c> con U+FFFD, que es peor que un mensaje un carácter
-    /// más corto.
-    /// </remarks>
-    public static string Truncate(string value, int maxChars)
-    {
-        ArgumentNullException.ThrowIfNull(value);
-
-        if (value.Length <= maxChars)
-        {
-            return value;
-        }
-
-        var cut = maxChars;
-        if (cut > 0 && char.IsHighSurrogate(value[cut - 1]))
-        {
-            cut--;
-        }
-
-        return value[..cut];
     }
 }
