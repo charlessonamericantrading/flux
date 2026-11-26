@@ -1,0 +1,18 @@
+# Sonda de la Fase 3: qué ve quien llama con `async-nats` (la librería del SDK de Rust) en las situaciones que
+# fija specification/11-request-reply.md §4.3. La ejecuta `conformance/rpc-broker.mjs` (casos A-72 y A-76);
+# no es parte de ningún SDK ni se publica. Escribe una línea JSON por observación.
+[package]
+name = "rpc-async-nats-probe"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+async-nats = "0.50"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
+futures = "0.3"
+bytes = "1"
+serde_json = "1"
+
+# El resolutor de la sonda no debe mezclarse con el de ningún SDK.
+[workspace]
