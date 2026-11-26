@@ -1,6 +1,6 @@
 # flux CLI
 
-Herramienta operativa del [Event Protocol v1](../README.md): `doctor`, `tail`, `dlq`, `state`,
+Herramienta operativa del [Event Protocol v1](../README.md): `doctor`, `tail`, `dlq`, `state`, `call`,
 `validate` y `provision`.
 
 ```bash
@@ -71,6 +71,44 @@ Diagnóstico
   ✗ STATE_CLIENTES/tienda-web__state_clientes_cliente_v1  deliver_policy=all, debe ser last_per_subject
   ✗ STATE_CLIENTES/tienda-web__state_clientes_cliente_v1  el nombre no lleva tenant y el filtro es del tenant «acme»
 ```
+
+### La petición/respuesta ([11-request-reply.md §8](../specification/11-request-reply.md))
+
+**Ningún stream debe capturar una operación.** Un stream de JetStream que captura el subject de una operación
+(`rpc.<dominio>.<agregado>.v<major>.<operacion>`) contesta a cada petición con **su acuse**
+(`{"stream":"…","seq":n}`, A-18), que quien llama toma por la respuesta —casi siempre antes que la real: 394 de 400,
+A-67—, mientras el responder ejecuta la orden igualmente **y el stream guarda cada petición, datos personales
+incluidos**. `flux doctor` mira los subjects de **cada stream de la account** y los compara, token a token
+(`*` casa uno, `>` casa uno o más), con `rpc.*.*.*.*` —la forma de **toda** operación: `rpc.` y cuatro tokens—,
+no con `rpc.>`, que marcaría de más un filtro de seis tokens que no puede capturar ninguna. Es un **error**
+(sale con `1`), no un aviso, y dice qué stream, qué le hace a las peticiones y el comando exacto que lo arregla:
+
+```
+Petición/respuesta  (11-request-reply.md §8)
+  ✗ 1 stream(s) capturan operaciones: TRAMPA (rpc.x.>)  — qué hace y cómo se arregla, en el diagnóstico
+
+Diagnóstico
+  ✗ TRAMPA  captura operaciones de petición/respuesta: `rpc.x.>` se solapa con rpc.*.*.*.* (stream con acuse)
+      Contesta a cada petición con SU acuse ({"stream":…,"seq":n}): quien llama lo recibe como si fuera la respuesta …
+      Cómo se arregla: quita `rpc.x.>` de sus subjects — `nats stream edit TRAMPA --subjects "clientes.>"`.
+```
+
+| Filtro de stream | ¿Se marca? | Qué pasa si existe |
+|---|---|---|
+| `rpc.>`, `rpc.x.>`, `rpc.*.>`, la propia operación, `rpc.*.*.*.*` | **Sí** | contesta con su acuse y guarda cada petición |
+| `>`, `*.>`, `*.*.*.*.*` | **Sí** | JetStream solo los deja crear **sin acuse** (`no_ack`, A-69): no contestan, pero **cuentan como interés** —`no responders` (`RPC_UNAVAILABLE`, ~1 ms) pasa a ser un timeout— y guardan cada petición **y cada respuesta**. Los crea quien «quiere verlo todo» |
+| un stream `no_ack` sobre `rpc.x.>` | **Sí** | lo mismo: sin acuse, pero con interés y persistencia |
+| `clientes.>`, `dlq.>`, `state.>`, `*.*.*.*`, `*.*.*.*.*.*`, `rpc.*.*.*.*.>` | No | no pueden capturar una operación de cinco tokens |
+
+El resultado va también en `--json` (`flux doctor --json`): `{ ok, streams, consumers, rpc, findings }`, con
+`rpc.capturas` (cada stream, sus subjects y si es `no_ack`) y los `findings` de todo el doctor. El algoritmo
+es el de `protocol.json` → `rpc.doctor`, y el **broker** coincide con él: `STREAM.NAMES` con
+`subject=rpc.*.*.*.*` devuelve exactamente los streams que el doctor marca (25 patrones, A-110).
+**`flux provision` nunca crea un stream así**: sus `EVT_<DOM>` son `<dom>.>` y `rpc` es un dominio reservado, y
+además `recursosDeseados` lo **comprueba** y se niega antes de crear nada.
+
+Se ejecuta con credenciales de **operación**: lista los streams de **la account**. Con el Modelo B (una account por tenant)
+hay que ejecutarlo **una vez por account**, con las credenciales de cada una.
 
 ## `flux tail` — eventos en vivo
 
@@ -271,6 +309,54 @@ han medido.
 
 ---
 
+## `flux call` — una petición a mano, para depurar
+
+```bash
+flux call clientes.cliente.v1.calcular-descuento --tenant acme --env produccion \
+  --data '{"clienteId":"cli-1","totalCents":9990,"moneda":"EUR"}' --timeout 2000
+```
+
+La operación es el **nombre** de 4 tokens (`<dominio>.<agregado>.v<major>.<operacion>`): el prefijo `rpc.` lo pone la
+CLI (con él, `RESERVED_DOMAIN`). Construye el sobre **como un SDK** ([11-request-reply.md §3.1](../specification/11-request-reply.md)):
+`id` UUIDv7 generado, `source` `/<entorno>/flux-cli`, `time` con 3 decimales y `Z`, las cuatro extensiones, `correlationid` =
+su propio `id` (no nace de otro evento), sin `causationid` ni `traceparent` (no hay traza activa: no se inventa) y `data` el
+último atributo. **Nunca** se escribe a mano: no existe ninguna opción para `id`, `time`, `type` ni `correlationid`. Los bytes
+son los de la spec: la prueba reconstruye con la CLI la petición de §3.5 y comprueba su SHA-256. La manda por **core NATS**
+(sin JetStream) a `rpc.<operacion>`, con `reply` a un inbox privado (`_INBOX.flux-cli.>`: la ACL de quien la use debe concederlo),
+por una conexión con `headers` y `no_responders`, y traduce lo que ve:
+
+| Situación | Lo que imprime | Sale |
+|---|---|---|
+| Responde el servicio | `✓`, el tipo de la respuesta, su `source`, su `id` y el `data` | `0` |
+| El servicio contesta un error (`com.flux.rpc.error.v1`) | su `code`, su `class` (`retryable` / `permanent`) y su mensaje; `retryAfterMs` si lo da | `1` |
+| Nadie escucha | **`RPC_UNAVAILABLE`** (RETRYABLE) en **milisegundos**, no en el timeout (A-56) | `1` |
+| No llega respuesta | **`RPC_TIMEOUT`** (RETRYABLE), avisando de que **la operación pudo ejecutarse** (A-61, A-62) y dando el `id` para buscarla en el log del responder; si un stream captura la operación (`STREAM.NAMES`, con permiso sobre la API de JetStream), **lo nombra** | `1` |
+| Llega el acuse de un stream, o algo que no es la respuesta a ESTA petición | **`RPC_INVALID_REPLY`** (PERMANENT): las cinco comprobaciones de §4.3 (CloudEvent válido y tipos exactos, `type`, `causationid`, `correlationid`/`tenantid` heredados, esquema del error). Con el acuse, dice el stream y apunta a `flux doctor` | `1` |
+| La petición no cabe (el menor entre 1 MiB y el `max_payload` del broker) | **`RPC_MESSAGE_TOO_LARGE`** antes de enviar nada; claim-check o cursor | `1` |
+| Operación mal formada, `data` que no es un objeto, `--timeout` fuera de rango | **`INVALID_RPC_CALL`**, siempre **antes de tocar la red** | `1` |
+| Dominio reservado (`rpc`, `dlq`, `state`, `system`) | **`RESERVED_DOMAIN`**, antes de tocar la red | `1` |
+| El broker deniega la publicación o la suscripción al inbox | **`PERMISSION_DENIED`** en ~1 ms, con el subject (con esta librería; `async-nats` solo daría un timeout, A-72) | `1` |
+| No se pudo conectar | cómo levantar el broker | `2` |
+
+| Opción | |
+|---|---|
+| `--data <json>` | **Obligatoria.** El cuerpo, un objeto JSON; `@fichero.json`; o `@-` (stdin). Un error de JSON **no reproduce el texto**: puede llevar datos personales y los mensajes de error acaban en logs |
+| `--tenant <t>` | **Obligatoria.** Explícito: la CLI no asume uno, ni `system` |
+| `--env <entorno>` | **Obligatoria** (o `$FLUX_ENV`). Va en `source`; un SDK la recibe en `connect()` y la CLI no la adivina |
+| `--timeout <ms>` | 1 a 25 000 (por defecto 5 000, [§4.2](../specification/11-request-reply.md)). Fuera de rango o no entero es `INVALID_RPC_CALL`: **no se recorta**. El máximo está por debajo del `ack_wait` de 30 s |
+| `--aggregate-id <id>` | El agregado sobre el que se pide: es el `subject` del sobre (y su `partitionkey`), **no** el subject de NATS |
+| `--classification <c>` | `public`, `internal` (por defecto), `confidential` o `restricted`. Un dato personal como parámetro lleva `confidential` |
+| `--bundle <fichero>` | El bundle de esquemas (por defecto `schemas/bundle.json`). Con él, `data` se valida **sin red** contra el esquema de la petición **y la respuesta contra el suyo** (`INVALID_SCHEMA` con **todas** las rutas y ningún valor); y el `dataschema` sale de su índice `rpc`. Sin él, o con una operación que no esté, se avisa y se usa el `<major>.0.0`. Necesita `ajv` (dependencia opcional) |
+| `--no-validate` | No valida `data` ni la respuesta: para mandar a propósito una petición inválida y ver qué contesta el responder |
+| `--json` | `{ ok, operation, subject, ms, request, reply?, error?, notes? }`, con `data` el último atributo de cada sobre |
+| `--show-data` | Imprime el `data` de una respuesta (y de la petición, con `-v`) aunque sea `confidential` o `restricted`. Como `tail`: **una terminal acaba en un log**, y la respuesta de una operación puede llevar datos personales |
+| `-v` | Imprime también el sobre de la petición enviada |
+
+**Lo que no hace.** No firma ni verifica firmas: contra un responder con la firma en `require`, su error
+(`MISSING_SIGNATURE`) es lo que se ve. No reintenta: una llamada, un intento (reintentar un `RPC_TIMEOUT` exige el mismo `id` y
+los mismos bytes, §4.5, y un `id` es de un solo uso aquí). No usa el SDK: construye el sobre por su cuenta
+(`rpc-model.mjs`), como `state` (`state-model.mjs`), y por eso lo puede comparar con los vectores de la spec.
+
 ## `flux validate` — sin broker
 
 ```
@@ -394,7 +480,7 @@ lo genera `gen-acl.mjs`: vive fuera del manifiesto y fuera de la config de los s
 
 Opciones de `state`: `--tenant <t>` (`ls`: solo ese tenant; `resync`: el durable de ese tenant), `--json`
 (`ls`, `get`), `--show-data` (`get`, `tail`, `dlq inspect`), `--limit <n>` (`ls`), `--confirm` y `--yes`
-(`resync`).
+(`resync`). Opciones de `call`: ver su sección. `--json` vale también para `doctor`.
 
 ## Pruebas
 
@@ -408,6 +494,12 @@ FLUX_REQUIRE_BROKER=1 npm test          # sin nats-server, las pruebas con broke
 puerto libre de `FLUX_TEST_PORTS` (por defecto `4650-4699`), ejecutan la CLI **como proceso** y escriben el
 estado **a mano**, con el algoritmo de `put`/`delete` de [10-state.md §3.2](../specification/10-state.md)
 sobre NATS crudo: ni la CLI ni sus pruebas usan el SDK de flux.
+
+La petición/respuesta se prueba igual: los **responders** (uno que contesta, otro que falla, uno lento, uno que no
+existe) se escriben **a mano** sobre NATS crudo (`test/rpc-helpers.mjs`: suscripción exacta, grupo de cola, respuesta que
+hereda `correlationid` y `tenantid`), y sus constructores se comprueban contra los **bytes** de
+`conformance/cases/cross-sdk-rpc-envelope.json`. Un broker con **permisos** (`no_auth_user` con una ACL de llamante) prueba el
+inbox privado y la denegación; el doctor se cruza con el **broker** (`STREAM.NAMES`) en 25 patrones.
 
 Van **en los dos sentidos**: la simulación de `resync` no cambia nada y `--confirm` sí; `doctor` sale `0` con
 la configuración buena y `1` con cada una de las doce rotas (y vuelve a `0` al arreglarla); `dlq replay`
@@ -425,6 +517,11 @@ Los comandos de estado repiten el algoritmo de nombres y las reglas de validaci�
 silencio **no llevan ninguna constante propia**: los patrones, los límites y la configuración canónica se
 leen de `protocol.json` (bloque `state`). El módulo se carga **de forma perezosa**: `validate` y `keygen`
 siguen funcionando en un checkout sin `protocol.json`.
+
+`flux call` y `flux doctor` (la parte de petición/respuesta) hacen lo mismo con `rpc-model.mjs`: el patrón de la operación,
+el rango del timeout, el tamaño máximo, la forma de toda operación (`rpc.*.*.*.*`) y el esquema del error se leen de
+`protocol.json` (bloque `rpc`). **`ajv`** es una dependencia **opcional** con importación diferida (L3 es opt-in, como en el
+SDK de Node): sin él, `call` lo avisa y no valida `data`.
 
 `flux provision` es la excepción a «la CLI no sale de `cli/`»: importa
 [`scripts/lib/manifest.mjs`](../scripts/lib/manifest.mjs) (nombres, expansión de `consumes` y
