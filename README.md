@@ -126,16 +126,16 @@ protocolo a v2.
 
 ## Estado de los SDKs
 
-| SDK | Nivel | Tests | Verificado |
-|---|---|---|---|
-| [Node / TypeScript](sdk-node/) | **L3** | 105 | ✅ |
-| [Python](sdk-python/) | **L3** | 205 | ✅ |
-| [Go](sdk-go/) | **L3** | 162 | ✅ (también con `-race`) |
-| [Java](sdk-java/) | **L3** | 144 | ✅ (Maven en el runner) |
-| [.NET](sdk-dotnet/) | **L3** | 189 | ✅ |
-| [Rust](sdk-rust/) | L2 | 175 | ✅ (incl. 14 contra NATS real) |
-| [PHP](sdk-php/) | **L3** | 304 | ✅ incl. 3 de integración contra NATS real |
-| [PHP](sdk-php/) | L2 | 201 | ✅ (transporte no — ver abajo) |
+| SDK | Nivel | Tests | Verificado | Capacidades |
+|---|---|---|---|---|
+| [Node / TypeScript](sdk-node/) | **L3** | 105 | ✅ | `signing` `security` |
+| [Python](sdk-python/) | **L3** | 205 | ✅ | `signing` |
+| [Go](sdk-go/) | **L3** | 162 | ✅ (también con `-race`) | `signing` |
+| [Java](sdk-java/) | **L3** | 144 | ✅ (Maven en el runner) | `signing` |
+| [.NET](sdk-dotnet/) | **L3** | 189 | ✅ | `signing` |
+| [Rust](sdk-rust/) | L2 | 175 | ✅ (incl. 14 contra NATS real) | `signing` `security` |
+| [PHP](sdk-php/) | **L3** | 304 | ✅ incl. 3 de integración contra NATS real | `signing` |
+| [PHP](sdk-php/) | L2 | 201 | ✅ (transporte no — ver abajo) | `signing` |
 
 Los cinco primeros se compilan y ejecutan en CI en cada push. La suite de conformidad corre
 aparte, contra un NATS real: **14/14**.
@@ -145,6 +145,18 @@ aparte, contra un NATS real: **14/14**.
 > incertidumbre tras un puerto (`Flux\Transport\NatsTransport`), probado con un cliente
 > falso. Todo lo demás —envelope, naming, clasificación y el runtime del consumidor— se
 > prueba sin broker y está en verde. Ver [`sdk-php/README.md`](sdk-php/).
+
+**Capacidades** son extensiones opcionales que un SDK declara **sin cambiar de nivel**
+([`00-protocol.md` §5](specification/00-protocol.md)). La fuente es `protocol.json` →
+`capabilities`, y `node scripts/check-sdk-codes.mjs` comprueba que esta columna la repite.
+
+| Capacidad | Qué es | Un SDK sin ella… |
+|---|---|---|
+| `signing` | Firma Ed25519 del evento — [`07-signing.md`](specification/07-signing.md) | No firma ni verifica; sigue siendo conforme |
+| `security` | Inbox privado `_INBOX.<servicio>`, TLS con CA propia, credenciales `.creds`/nkey, `NOT_PROVISIONED`/`PERMISSION_DENIED`, primera conexión que falla rápido y denegaciones visibles — [`06-security.md`](specification/06-security.md) | **No es compatible con la configuración segura**: con el inbox por defecto el broker le deniega su propio inbox y su primera petición falla |
+
+Hoy solo Node y Rust declaran `security`. Un SDK no anuncia una capacidad hasta que la ha
+ejecutado contra un broker real.
 
 ---
 

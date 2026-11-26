@@ -99,6 +99,7 @@ pub mod envelope;
 pub mod errors;
 pub mod metrics;
 pub mod protocol;
+pub mod security;
 
 /// Firma Ed25519 de eventos — **extensión OPCIONAL**, detrás de la feature `signing`.
 ///
@@ -138,20 +139,23 @@ pub use envelope::{
 };
 pub use errors::{
     as_classified, describe, Classification, ConfigDifference, ErrorClass, Failure, FluxError,
-    HandlerError, HandlerResult, SchemaNotFoundError, SchemaValidationError, INVALID_SCHEMA_CODE,
-    SCHEMA_NOT_FOUND_CODE,
+    HandlerError, HandlerResult, RejectionReason, ResourceKind, SchemaNotFoundError,
+    SchemaValidationError, CONNECTION_REJECTED_CODE, INVALID_CREDENTIALS_CODE, INVALID_SCHEMA_CODE,
+    INVALID_TLS_OPTIONS_CODE, NOT_PROVISIONED_CODE, PERMISSION_DENIED_CODE, SCHEMA_NOT_FOUND_CODE,
 };
 pub use metrics::{
     ConnectionState, ConsumeOutcome, DlqReasonLabel, InMemoryMetrics, MetricsSink, NoMetrics,
     PublishOutcome, DURATION_BUCKETS,
 };
 pub use protocol::{
-    dlq_stream_name, dlq_subject, durable_name, is_dlq_subject, is_valid_subject, parse_subject,
-    source_uri, stream_name, subject_to_type, total_time_to_dlq, validate_service_name,
-    ParsedSubject, CANONICAL_BACKOFF, CONFORMANCE_LEVEL, DATA_CONTENT_TYPE, DEFAULT_ACK_WAIT,
-    DEFAULT_MAX_ACK_PENDING, DEFAULT_MAX_DELIVER, DLQ_STREAM_MAX_AGE, DUPLICATE_WINDOW,
-    MAX_MESSAGE_BYTES, PROTOCOL_NAME, PROTOCOL_VERSION, SPEC_VERSION, STREAM_MAX_AGE,
+    dlq_stream_name, dlq_subject, durable_name, inbox_prefix, is_dlq_subject, is_valid_subject,
+    parse_subject, source_uri, stream_name, subject_to_type, total_time_to_dlq,
+    validate_service_name, ParsedSubject, CANONICAL_BACKOFF, CONFORMANCE_LEVEL, DATA_CONTENT_TYPE,
+    DEFAULT_ACK_WAIT, DEFAULT_MAX_ACK_PENDING, DEFAULT_MAX_DELIVER, DLQ_STREAM_MAX_AGE,
+    DUPLICATE_WINDOW, MAX_MESSAGE_BYTES, PROTOCOL_NAME, PROTOCOL_VERSION, SPEC_VERSION,
+    STREAM_MAX_AGE,
 };
+pub use security::TlsOptions;
 #[cfg(feature = "signing")]
 pub use signing::{generate_key_pair, Signer, SigningOptions, VerificationMode, Verifier};
 #[cfg(feature = "validation")]

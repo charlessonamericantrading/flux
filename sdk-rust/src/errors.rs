@@ -246,6 +246,80 @@ impl fmt::Display for SchemaNotFoundError {
 
 impl StdError for SchemaNotFoundError {}
 
+// ─── Errores de aprovisionamiento y de permisos ──────────────────────────────
+
+/// Código estable de un stream o consumidor que no existe y que este servicio no puede
+/// crear — 06-security.md §3.
+pub const NOT_PROVISIONED_CODE: &str = "NOT_PROVISIONED";
+
+/// Código estable de una operación que el broker denegó por permisos — 06-security.md §3.
+pub const PERMISSION_DENIED_CODE: &str = "PERMISSION_DENIED";
+
+/// Código estable de una conexión inicial que el broker rechazó por algo que reintentar no
+/// arregla (credencial rechazada, TLS que no encaja) — 04-errors.md §5.3.
+pub const CONNECTION_REJECTED_CODE: &str = "CONNECTION_REJECTED";
+
+/// Código estable de unas credenciales mal formadas, detectadas **antes** de abrir ningún
+/// socket — 04-errors.md §5.3.
+pub const INVALID_CREDENTIALS_CODE: &str = "INVALID_CREDENTIALS";
+
+/// Código estable de unas opciones TLS mal formadas, detectadas **antes** de abrir ningún
+/// socket — 04-errors.md §5.3.
+pub const INVALID_TLS_OPTIONS_CODE: &str = "INVALID_TLS_OPTIONS";
+
+/// Por qué el broker rechazó la conexión inicial: el `reason` de
+/// [`FluxError::ConnectionRejected`]. Los mismos dos valores que `reason` en el SDK de Node.
+///
+/// Son dos y no más a propósito: es lo que separa a quien tiene que arreglar algo. Con
+/// [`Self::Auth`] se mira el usuario y su credencial en el broker; con [`Self::Tls`], los
+/// certificados y la CA. Distinguir `tls` de «TLS que el broker no ofrece» o de «certificado
+/// de cliente que falta» no lo permite la librería de NATS (04-errors.md §5.3): esos matices
+/// viajan en el mensaje, no en el motivo.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RejectionReason {
+    /// El broker rechazó la credencial del servicio (`Authorization Violation`).
+    Auth,
+    /// El handshake TLS no se pudo completar: el certificado del broker no verifica, el
+    /// broker no ofrece TLS y se exigió, o exige un certificado de cliente que no hay.
+    Tls,
+}
+
+impl RejectionReason {
+    /// `"auth"` o `"tls"`, tal como los escribe el SDK de Node en `reason`.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Auth => "auth",
+            Self::Tls => "tls",
+        }
+    }
+}
+
+impl fmt::Display for RejectionReason {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Qué recurso de JetStream falta. Es un tipo de flux y no el de NATS: la API pública no
+/// expone el broker (00-protocol.md §3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResourceKind {
+    /// Un stream (`EVT_<DOMINIO>`, `DLQ_<DOMINIO>`).
+    Stream,
+    /// Un consumidor durable.
+    Consumer,
+}
+
+impl fmt::Display for ResourceKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Stream => "stream",
+            Self::Consumer => "consumidor",
+        })
+    }
+}
+
 /// Un campo en el que el servidor no honró lo solicitado.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConfigDifference {
@@ -368,7 +442,99 @@ pub enum FluxError {
         differences: Vec<ConfigDifference>,
     },
 
+    /// Falta un stream o un consumidor y el broker deniega crearlo — 06-security.md §3.
+    ///
+    /// **No es un timeout.** En producción streams y consumidores los aprovisiona la
+    /// infraestructura (`flux provision`) y la ACL del servicio no concede crearlos: con un
+    /// recurso ausente, la petición de creación se deniega, el broker no responde y
+    /// `async-nats` solo lo cuenta como "timed out" a los 5–30 s. El SDK escucha las
+    /// denegaciones y falla al instante, nombrando el recurso que falta.
+    ///
+    /// Se clasifica **PERMANENT**: reintentar no hace aparecer el recurso, igual que un 403
+    /// no se arregla esperando (04-errors.md §1.2).
+    #[error("{}", format_not_provisioned(*.kind, .name, .denied))]
+    NotProvisioned {
+        /// Qué falta.
+        kind: ResourceKind,
+        /// Su nombre (`EVT_PEDIDOS`, `facturacion-api__pedidos_pedido_v1_creado`).
+        name: String,
+        /// La denegación literal del broker (`Publish to "$JS.API.STREAM.CREATE.…"`).
+        denied: String,
+    },
+
+    /// El broker denegó una operación por permisos — 06-security.md §3.
+    ///
+    /// Es la otra cara de [`FluxError::NotProvisioned`]: aquí ni siquiera hay permiso para
+    /// *mirar* si el recurso existe, o para publicar en un subject. El caso típico es una
+    /// ACL de la v1, que no concede nada de `$JS.API.*` ni un inbox privado: el SDK moderno
+    /// no puede ni consultar su stream, y sin esta detección el síntoma es un timeout que no
+    /// dice nada.
+    ///
+    /// **PERMANENT**, por la misma razón que [`FluxError::NotProvisioned`].
+    #[error("{}", format_permission_denied(.operation, .denied))]
+    PermissionDenied {
+        /// Lo que el SDK intentaba, en términos de flux (`abrir el stream EVT_PEDIDOS`).
+        operation: String,
+        /// La denegación literal del broker.
+        denied: String,
+    },
+
+    /// El broker rechazó la **conexión inicial** por algo que reintentar no arregla —
+    /// 04-errors.md §5.3 y 03-delivery.md §6.1.
+    ///
+    /// `connect()` espera a un broker que aún no ha arrancado, pero no a esto: una credencial
+    /// que el broker no acepta o un handshake TLS que no encaja no cambian por esperar, y un
+    /// servicio que los reintentara para siempre arrancaría, pasaría su healthcheck y se
+    /// quedaría mudo (medido, A-30). Por eso se devuelve al instante, con la causa.
+    ///
+    /// **PERMANENT**: es el 403 de la conexión. A diferencia de [`FluxError::NotProvisioned`]
+    /// no nace en un handler, pero la clase significa lo mismo: reintentar da el mismo fallo.
+    ///
+    /// Cubre **solo** la primera conexión. Qué hacer si el broker rechaza la credencial en una
+    /// *re*conexión (caducada, rotada) no está medido y la spec no lo fija.
+    #[error("{}", format_connection_rejected(*.reason, .servers, .detail))]
+    ConnectionRejected {
+        /// Qué se rechazó: la credencial o el TLS.
+        reason: RejectionReason,
+        /// La lista de servidores a la que se intentaba conectar.
+        servers: String,
+        /// La causa tal como la cuenta la librería (`invalid peer certificate: UnknownIssuer`).
+        /// No lleva credenciales: es el texto del error de TLS o de autorización.
+        detail: String,
+        /// El error de `async-nats` que lo causó. Nunca se expone su tipo en la firma.
+        #[source]
+        source: HandlerError,
+    },
+
+    /// Credenciales mal formadas, detectadas **antes** de abrir ningún socket —
+    /// 04-errors.md §5.3.
+    ///
+    /// Es un error de **configuración del servicio**, no del broker: un valor vacío, un
+    /// `.creds` ilegible o sin JWT y semilla, una semilla que no es de usuario (`SU…`). Se
+    /// distingue de [`FluxError::ConnectionRejected`] —credencial **bien formada** que el
+    /// broker no acepta— porque lo que hay que revisar es distinto: aquello es lo que se
+    /// pasó a `connect()`, esto es lo que hay en el broker.
+    ///
+    /// **PERMANENT.** El texto nunca incluye el valor de una credencial: acaba en logs.
+    #[error("credenciales inválidas en connect(): {0}")]
+    InvalidCredentials(String),
+
+    /// Opciones TLS mal formadas, detectadas **antes** de abrir ningún socket —
+    /// 04-errors.md §5.3.
+    ///
+    /// Un fichero ilegible o que no es PEM, o un certificado de cliente sin su clave (o al
+    /// revés). Sin esta comprobación `async-nats` los lee dentro de su bucle de conexión, y ahí
+    /// un fichero equivocado es un error más que se reintenta. Un certificado que el broker no
+    /// acepta no es esto: es [`FluxError::ConnectionRejected`] con [`RejectionReason::Tls`].
+    ///
+    /// **PERMANENT.**
+    #[error("opciones TLS inválidas en connect(): {0}")]
+    InvalidTlsOptions(String),
+
     /// Fallo de transporte: conexión, publicación, creación de stream o de consumidor.
+    ///
+    /// Una conexión inicial rechazada por la credencial o por el TLS **no** es esto: es
+    /// [`FluxError::ConnectionRejected`], con su código estable.
     #[error("{context}")]
     Transport {
         /// Qué se estaba intentando, en términos de flux.
@@ -397,6 +563,45 @@ fn format_mismatch(durable: &str, diffs: &[ConfigDifference]) -> String {
          Si el campo es ack_wait, comprueba que backoff[0] valga exactamente lo mismo.",
     );
     s
+}
+
+fn format_not_provisioned(kind: ResourceKind, name: &str, denied: &str) -> String {
+    format!(
+        "el {kind} `{name}` no existe y este servicio no tiene permiso para crearlo \
+         (el broker denegó {denied}). En producción los streams y los consumidores se \
+         aprovisionan fuera del SDK con `flux provision`, con credenciales de operación \
+         (06-security.md §3): aprovisiónalo y reinicia el servicio. No es un timeout."
+    )
+}
+
+fn format_connection_rejected(reason: RejectionReason, servers: &str, detail: &str) -> String {
+    let (what, check) = match reason {
+        RejectionReason::Auth => (
+            "el broker rechazó la credencial de este servicio",
+            "Revisa `Credentials` y que el usuario exista en la account del servicio \
+             (06-security.md §2)",
+        ),
+        RejectionReason::Tls => (
+            "no se pudo establecer TLS",
+            "Revisa: ¿la CA de `TlsOptions` es la que firma el certificado del broker (una \
+             CA propia sustituye a las raíces del sistema)?, ¿cubren sus SAN el host al que \
+             te conectas?, ¿ofrece el broker TLS?, ¿exige certificado de cliente (mTLS)? El \
+             SDK no baja a texto plano (06-security.md §2)",
+        ),
+    };
+    format!(
+        "no se pudo conectar a `{servers}`: {what} ({detail}). Reintentar no lo arregla, así \
+         que `connect()` no espera. {check}."
+    )
+}
+
+fn format_permission_denied(operation: &str, denied: &str) -> String {
+    format!(
+        "el broker denegó {denied} al {operation}. La ACL de este servicio no concede ese \
+         subject (06-security.md §3). Una ACL de la v1 —sin permisos sobre `$JS.API.*` ni \
+         inbox privado `_INBOX.<servicio>.>`— no basta: ver «Seguridad» en el README del \
+         SDK para la lista exacta de permisos."
+    )
 }
 
 impl FluxError {
@@ -486,9 +691,22 @@ impl FluxError {
             // es sintácticamente correcto —se parseó, no es POISON— pero incumple su
             // contrato, y reintentarlo seis veces dará seis veces lo mismo
             // — 00-protocol.md §5 y 04-errors.md §1.2.
-            Self::Permanent(_) | Self::SchemaValidation(_) | Self::SchemaNotFound(_) => {
-                Some(ErrorClass::Permanent)
-            }
+            //
+            // `NotProvisioned` y `PermissionDenied` también: son el 403 del broker. Un
+            // handler que publica y recibe uno de los dos no lo arregla esperando, así que
+            // sin clase caerían en la política de lo desconocido —2 entregas, ~30 s de cola
+            // bloqueada— para acabar en el mismo sitio.
+            //
+            // Los tres de `connect()` (04-errors.md §5.3) también: reintentar una credencial
+            // rechazada, un TLS que no encaja o una opción mal formada da el mismo fallo.
+            Self::Permanent(_)
+            | Self::SchemaValidation(_)
+            | Self::SchemaNotFound(_)
+            | Self::NotProvisioned { .. }
+            | Self::PermissionDenied { .. }
+            | Self::ConnectionRejected { .. }
+            | Self::InvalidCredentials(_)
+            | Self::InvalidTlsOptions(_) => Some(ErrorClass::Permanent),
             Self::Poison(_) => Some(ErrorClass::Poison),
             _ => None,
         }
@@ -504,6 +722,12 @@ impl FluxError {
         match self {
             Self::SchemaValidation(_) => return Some(INVALID_SCHEMA_CODE),
             Self::SchemaNotFound(_) => return Some(SCHEMA_NOT_FOUND_CODE),
+            // Igual que los de esquema: el código es el que agrupa el panel, no la app.
+            Self::NotProvisioned { .. } => return Some(NOT_PROVISIONED_CODE),
+            Self::PermissionDenied { .. } => return Some(PERMISSION_DENIED_CODE),
+            Self::ConnectionRejected { .. } => return Some(CONNECTION_REJECTED_CODE),
+            Self::InvalidCredentials(_) => return Some(INVALID_CREDENTIALS_CODE),
+            Self::InvalidTlsOptions(_) => return Some(INVALID_TLS_OPTIONS_CODE),
             _ => {}
         }
         let f = self.failure()?;
@@ -695,6 +919,166 @@ mod tests {
         assert_eq!(ErrorClass::Retryable.as_str(), "retryable");
         assert_eq!(ErrorClass::Permanent.as_str(), "permanent");
         assert_eq!(ErrorClass::Poison.as_str(), "poison");
+    }
+
+    /// 06-security.md §3: un recurso que falta y no se puede crear es PERMANENT — esperar no
+    /// lo crea — y lleva un código estable que NO cambia la aplicación.
+    #[test]
+    fn not_provisioned_es_permanent_con_codigo_estable() {
+        let err = FluxError::NotProvisioned {
+            kind: ResourceKind::Stream,
+            name: "EVT_PEDIDOS".into(),
+            denied: "Publish to \"$JS.API.STREAM.CREATE.EVT_PEDIDOS\"".into(),
+        };
+        assert_eq!(err.class(), Some(ErrorClass::Permanent));
+        assert_eq!(err.code(), Some("NOT_PROVISIONED"));
+        assert_eq!(err.code(), Some(NOT_PROVISIONED_CODE));
+        assert_eq!(err.retry_after(), None);
+
+        // Accionable: nombra el recurso y dice cómo se arregla. Y dice que NO es un timeout.
+        let texto = err.to_string();
+        assert!(texto.contains("stream `EVT_PEDIDOS`"), "{texto}");
+        assert!(texto.contains("flux provision"), "{texto}");
+        assert!(texto.contains("No es un timeout"), "{texto}");
+
+        let consumidor = FluxError::NotProvisioned {
+            kind: ResourceKind::Consumer,
+            name: "facturacion-api__pedidos_pedido_v1_creado".into(),
+            denied: "Publish to \"$JS.API.CONSUMER.CREATE.…\"".into(),
+        };
+        assert!(consumidor
+            .to_string()
+            .contains("consumidor `facturacion-api__"));
+    }
+
+    #[test]
+    fn permission_denied_es_permanent_con_codigo_estable() {
+        let err = FluxError::PermissionDenied {
+            operation: "consultar el stream `EVT_PEDIDOS`".into(),
+            denied: "Publish to \"$JS.API.STREAM.INFO.EVT_PEDIDOS\"".into(),
+        };
+        assert_eq!(err.class(), Some(ErrorClass::Permanent));
+        assert_eq!(err.code(), Some(PERMISSION_DENIED_CODE));
+        assert!(err.to_string().contains("$JS.API.STREAM.INFO.EVT_PEDIDOS"));
+        // Los dos códigos son distintos: «falta el recurso» y «no puedo ni mirarlo» son dos
+        // incidentes con dos remedios.
+        assert_ne!(NOT_PROVISIONED_CODE, PERMISSION_DENIED_CODE);
+    }
+
+    /// 04-errors.md §5.3: los tres errores de `connect()` son PERMANENT y su código es estable
+    /// —el literal exacto de la spec— y distinto entre sí: son tres remedios.
+    #[test]
+    fn los_errores_de_connect_son_permanent_con_codigo_estable() {
+        let rechazo = |reason| FluxError::ConnectionRejected {
+            reason,
+            servers: "tls://nats:4222".into(),
+            detail: "invalid peer certificate: UnknownIssuer".into(),
+            source: "causa".into(),
+        };
+        let casos = [
+            (rechazo(RejectionReason::Auth), "CONNECTION_REJECTED"),
+            (rechazo(RejectionReason::Tls), "CONNECTION_REJECTED"),
+            (
+                FluxError::InvalidCredentials("semilla".into()),
+                "INVALID_CREDENTIALS",
+            ),
+            (
+                FluxError::InvalidTlsOptions("ca".into()),
+                "INVALID_TLS_OPTIONS",
+            ),
+        ];
+        for (err, codigo) in &casos {
+            assert_eq!(err.code(), Some(*codigo), "{err:?}");
+            assert_eq!(err.class(), Some(ErrorClass::Permanent), "{err:?}");
+            assert_eq!(err.retry_after(), None);
+        }
+        assert_eq!(CONNECTION_REJECTED_CODE, "CONNECTION_REJECTED");
+        assert_eq!(INVALID_CREDENTIALS_CODE, "INVALID_CREDENTIALS");
+        assert_eq!(INVALID_TLS_OPTIONS_CODE, "INVALID_TLS_OPTIONS");
+        // No se confunden con los de permisos, ni entre ellos.
+        let todos = [
+            NOT_PROVISIONED_CODE,
+            PERMISSION_DENIED_CODE,
+            CONNECTION_REJECTED_CODE,
+            INVALID_CREDENTIALS_CODE,
+            INVALID_TLS_OPTIONS_CODE,
+        ];
+        let distintos: std::collections::HashSet<_> = todos.iter().collect();
+        assert_eq!(distintos.len(), todos.len());
+        // Lo que NO lleva código estable sigue sin llevarlo: un `Config` o un `Transport`
+        // genéricos no se disfrazan de uno de estos tres.
+        assert_eq!(FluxError::Config("x".into()).code(), None);
+        assert_eq!(
+            FluxError::Transport {
+                context: "x".into(),
+                source: "y".into()
+            }
+            .code(),
+            None
+        );
+    }
+
+    /// El mensaje de un rechazo dice la causa y qué revisar, según el motivo, y el `reason`
+    /// se lee como en Node (`"auth"` / `"tls"`).
+    #[test]
+    fn el_rechazo_de_la_conexion_dice_la_causa_y_que_revisar() {
+        let auth = FluxError::ConnectionRejected {
+            reason: RejectionReason::Auth,
+            servers: "nats://nats:4222".into(),
+            detail: "authorization violation".into(),
+            source: "x".into(),
+        }
+        .to_string();
+        assert!(auth.contains("rechazó la credencial"), "{auth}");
+        assert!(auth.contains("`nats://nats:4222`"), "{auth}");
+        assert!(auth.contains("authorization violation"), "{auth}");
+        assert!(auth.contains("Reintentar no lo arregla"), "{auth}");
+        assert!(!auth.contains("SAN"), "no mezcla las dos causas: {auth}");
+
+        let tls = FluxError::ConnectionRejected {
+            reason: RejectionReason::Tls,
+            servers: "tls://nats:4222".into(),
+            detail: "invalid peer certificate: UnknownIssuer".into(),
+            source: "x".into(),
+        }
+        .to_string();
+        assert!(tls.contains("UnknownIssuer"), "{tls}");
+        assert!(tls.contains("CA"), "{tls}");
+        assert!(tls.contains("SAN"), "{tls}");
+        assert!(tls.contains("no baja a texto plano"), "{tls}");
+        assert!(!tls.contains("rechazó la credencial"), "{tls}");
+
+        assert_eq!(RejectionReason::Auth.as_str(), "auth");
+        assert_eq!(RejectionReason::Tls.to_string(), "tls");
+    }
+
+    /// Envueltos por una capa de la aplicación siguen clasificándose: un handler que publica
+    /// y recibe uno de los dos no puede caer en la política de lo desconocido.
+    #[test]
+    fn los_errores_de_provision_y_permisos_se_clasifican_envueltos() {
+        for err in [
+            FluxError::NotProvisioned {
+                kind: ResourceKind::Consumer,
+                name: "c".into(),
+                denied: "d".into(),
+            },
+            FluxError::PermissionDenied {
+                operation: "o".into(),
+                denied: "d".into(),
+            },
+            FluxError::ConnectionRejected {
+                reason: RejectionReason::Tls,
+                servers: "s".into(),
+                detail: "d".into(),
+                source: "x".into(),
+            },
+            FluxError::InvalidCredentials("c".into()),
+            FluxError::InvalidTlsOptions("t".into()),
+        ] {
+            let envuelto = Envuelto(err);
+            let c = as_classified(&envuelto).expect("se encuentra en la cadena");
+            assert_eq!(c.class(), Some(ErrorClass::Permanent));
+        }
     }
 
     #[test]

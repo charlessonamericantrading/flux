@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
-# Reproduce las observaciones del plan v1.1 contra un nats-server REAL.
+# Reproduce las observaciones del plan v1.1 que AÚN no son casos de conformance/cases/ (estado
+# replicado y petición/respuesta, Fases 2 y 3) contra un nats-server REAL. La ACL ya es
+# `node conformance/security.mjs`.
 #
 #   (cd conformance && npm install)
 #   docs/plan-v1.1/evidencia/ejecutar.sh
@@ -9,7 +11,6 @@
 set -euo pipefail
 
 AQUI="$(cd "$(dirname "$0")" && pwd)"
-RAIZ="$(cd "$AQUI/../../.." && pwd)"
 BIN="${NATS_SERVER:-nats-server}"
 TMP="$(mktemp -d)"
 PID=""
@@ -24,24 +25,8 @@ arrancar() {
 }
 parar() { kill "$PID" 2>/dev/null || true; wait "$PID" 2>/dev/null || true; PID=""; }
 
-# ── 1. La ACL TAL CUAL la genera el repo ──────────────────────────────────────
-# Único cambio: user/password en lugar de `nkey`, para poder conectar sin generar
-# claves, y un usuario `ops` sin restricciones que prepara los streams.
-node "$RAIZ/scripts/gen-acl.mjs" "$RAIZ/examples/services.json" | STORE="$TMP/js1" node -e '
-  let t = require("node:fs").readFileSync(0, "utf8");
-  t = t.replace(/nkey: "<NKEY_DE_([A-Z0-9_]+)>"/g,
-    (_, n) => `user: "${n.toLowerCase().replace(/_/g, "-")}", password: "pw"`);
-  t = t.replace("    users: [", "    users: [\n      { user: \"ops\", password: \"pw\" },");
-  process.stdout.write(`port: 4233\njetstream { store_dir: "${process.env.STORE}" }\n` + t);
-' >"$TMP/generada.conf"
-
-arrancar "$TMP/generada.conf"
-node "$AQUI/acl-generada.mjs"
-parar
-
-# ── 2. El diseño candidato ────────────────────────────────────────────────────
+# ── El diseño candidato: estado replicado y petición/respuesta (Fases 2 y 3) ──────────────────
 sed "s|__STORE__|$TMP/js2|" "$AQUI/candidata.conf" >"$TMP/candidata.conf"
-echo
 arrancar "$TMP/candidata.conf"
 node "$AQUI/diseno-candidato.mjs"
 parar

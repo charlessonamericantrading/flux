@@ -1,0 +1,575 @@
+{
+  "suite": "security-acl",
+  "title": "Los permisos que genera gen-acl.mjs, ejecutados contra un nats-server real",
+  "spec": "specification/06-security.md §2 y §3",
+  "plan": "docs/plan-v1.1/PLAN.md §1.5 (S1–S11) y Apéndice A",
+  "runner": "conformance/security.mjs",
+  "$comment": "Estos casos son DATOS: conformance/security.mjs no sabe qué es S1, solo ejecuta las operaciones de `vocabulary` y compara lo observado con `expect`. Añadir un caso es escribir JSON; solo una operación nueva toca el intérprete (conformance/security/interprete.mjs). El orden de las claves de un paso no importa; un campo desconocido, o una expectativa sobre algo que la operación no observa, es un ERROR al cargar: una errata no puede degradarse a «no se comprueba nada». Un caso DEBE llevar `spec`, `rationale` (qué se rompe si deja de ser cierto), `observed` (versión del servidor, fecha y resultado) y, si nace de un bug, `counterExample`. Los nombres de stream y de durable van LITERALES: es una derivación independiente de la de scripts/lib/manifest.mjs, y si el generador nombrara mal un durable un caso que reutilizase su código concedería exactamente el permiso equivocado y pasaría.",
+  "verifiedAgainst": "nats-server 2.14.5",
+  "verifiedOn": "2026-11-26",
+
+  "scenario": {
+    "manifest": "examples/services.json",
+    "ops": "El usuario `ops` no tiene restricciones y aprovisiona con `flux provision` por TLS. Es el único que crea streams y consumidores: ningún servicio tiene permiso para ello.",
+    "services": {
+      "pedidos-api": "dueño de pedidos; consume inventario.stock.v1.ajustado",
+      "facturacion-api": "dueño de facturacion; consume pedidos.pedido.v1.creado y .cancelado",
+      "inventario-api": "dueño de inventario; consume pedidos.pedido.v1.creado y .cancelado",
+      "logistica-api": "dueño de logistica; consume pedidos.pedido.v1.*, facturacion.factura.v2.emitida"
+    },
+    "tls": "El servidor exige TLS (sin allow_non_tls) con un certificado de una CA efímera creada con openssl para esta ejecución. Todo cliente de la suite confía solo en esa CA."
+  },
+
+  "vocabulary": {
+    "$comment": "`as` es un actor: el nombre de un servicio del manifiesto (conecta con SU nkey y SU inbox privado `_INBOX.<servicio>`), `ops`, o un objeto { service, inbox?, + variante }. `inbox`: `private` (por defecto en un servicio), `default` (el aleatorio de la librería: lo que haría un SDK que no fije el prefijo; por defecto en ops) o un prefijo explícito. Una VARIANTE parte de los permisos que genera gen-acl.mjs para el servicio y los estropea a propósito: `without` (quita permisos de publicación: DEBEN existir), `extraPublish`, `extraSubscribe`, `replaceSubscribe` (reemplaza la suscripción; `[]` escribe `allow: []`, que NATS lee como «sin restricción») o `dev` (parte de gen-acl.mjs --dev). Las variantes no existen con --acl (no hay permisos generados de los que partir). `{me}` en una cadena es el servicio que actúa y `{marker}` una marca única por caso y ejecución. `expect` compara con lo que la operación observa: valor exacto, o { match: regex }, { includes }, { lte }, { gte }, { not }, { present: bool }; una clave con puntos entra en objetos (`reply.error.err_code`). `control: true` marca un paso cuyo resultado esperado es lo MALO: demuestra que la sonda puede fallar. `onlyWith: generated-acl` lo omite con --acl.",
+    "ops": {
+      "connect": {
+        "doc": "Una conexión que puede NO establecerse. `tls`: ca (la buena) | wrong_ca (confía en una CA que no firmó el certificado del servidor) | system (solo las CA del sistema) | none (texto plano, por un socket: la librería de NATS sube sola a TLS). `auth`: ok | unknown_key (una nkey bien formada que el servidor no conoce) | none.",
+        "needsActor": true,
+        "optional": ["tls", "auth"],
+        "observes": ["outcome", "text", "ms"],
+        "outcomes": ["connected", "rejected"]
+      },
+      "publish": {
+        "doc": "Publicación de core, sin esperar respuesta. Si el broker la deniega NO hay excepción: descarta el mensaje y avisa por la conexión, así que `denied` se observa en ese aviso.",
+        "needsActor": true,
+        "args": ["subject"],
+        "observes": ["outcome", "text"],
+        "outcomes": ["permitted", "denied"]
+      },
+      "subscribe": {
+        "doc": "Suscripción de core. Una suscripción denegada tampoco lanza: se observa por el aviso del broker.",
+        "needsActor": true,
+        "args": ["subject"],
+        "observes": ["outcome", "text"],
+        "outcomes": ["permitted", "denied"]
+      },
+      "request": {
+        "doc": "Petición a un subject (típicamente la API de JetStream) con un cuerpo JSON. `denied` es una violación de permiso, `answered` que llegó una respuesta —buena o de error: el permiso existe— y `no_answer` un timeout o «no responders» (NO es una denegación).",
+        "needsActor": true,
+        "args": ["subject"],
+        "optional": ["body", "timeoutMs"],
+        "observes": ["outcome", "text", "reply", "ms"],
+        "outcomes": ["denied", "answered", "no_answer"]
+      },
+      "js_publish": {
+        "doc": "Publicación por JetStream, esperando el acuse del stream que la captura.",
+        "needsActor": true,
+        "args": ["subject"],
+        "optional": ["data"],
+        "observes": ["outcome", "stream", "seq", "text", "ms"],
+        "outcomes": ["ok", "denied", "error"]
+      },
+      "create_consumer": {
+        "doc": "Crear un consumidor con la config canónica y un filtro dado en el CUERPO (`filter`). `subjectFilter` es el filtro que va en el SUBJECT de la petición (por defecto, el mismo; `null` = sin filtro en el subject). `api: durable_create` usa la API antigua CONSUMER.DURABLE.CREATE, donde el filtro va solo en el cuerpo y ninguna ACL lo ve.",
+        "needsActor": true,
+        "args": ["stream", "durable", "filter"],
+        "optional": ["subjectFilter", "api"],
+        "observes": ["outcome", "text", "reply", "ms"],
+        "outcomes": ["denied", "answered", "no_answer"]
+      },
+      "delete_consumer": {
+        "doc": "Lo hace ops: borra un consumidor (para que otro actor lo CREE de verdad).",
+        "args": ["stream", "durable"],
+        "observes": ["outcome"],
+        "outcomes": ["ok"]
+      },
+      "reset_consumer": {
+        "doc": "Lo hace ops: borra y vuelve a crear un consumidor con la config canónica. `deliver`: all (por defecto) | new (solo lo que se publique después: deja el estado determinista).",
+        "args": ["stream", "durable", "filter"],
+        "optional": ["deliver"],
+        "observes": ["outcome"],
+        "outcomes": ["ok"]
+      },
+      "pull": {
+        "doc": "Como un SDK: consumers.get (CONSUMER.INFO) y pedir UN mensaje (CONSUMER.MSG.NEXT). Guarda el mensaje para el `ack` siguiente del mismo actor. `denied`: el broker deniega el INFO o el pull —el pull se detecta por el aviso asíncrono, no hay excepción—. `ackTokens` es el número de tokens del subject de ack (`$JS.ACK.<stream>.<durable>.…`).",
+        "needsActor": true,
+        "args": ["stream", "durable"],
+        "optional": ["timeoutMs"],
+        "observes": ["outcome", "subject", "data", "seq", "deliveryCount", "ackTokens", "ackSubject", "text"],
+        "outcomes": ["message", "none", "denied", "error"]
+      },
+      "ack": {
+        "doc": "Responde al último mensaje del actor: ack | wip | nak | term. Son publicaciones sueltas: si se deniegan no hay excepción. `violation` es el aviso del broker sobre `$JS.ACK`, o null.",
+        "needsActor": true,
+        "optional": ["kind", "delayMs"],
+        "observes": ["outcome", "violation"],
+        "outcomes": ["sent"]
+      },
+      "consumer_state": {
+        "doc": "Lo mira ops: el estado REAL del consumidor en el broker, no lo que dice el cliente.",
+        "args": ["stream", "durable"],
+        "observes": ["outcome", "ackPending", "ackFloor", "numPending", "redelivered", "delivered", "deliveredStream"],
+        "outcomes": ["ok"]
+      },
+      "violations": {
+        "doc": "Las violaciones de permiso que el broker notificó a la conexión de ese actor en este caso.",
+        "needsActor": true,
+        "observes": ["count", "text"]
+      },
+      "leak_probe": {
+        "doc": "El escenario de A-2 / A-22: un espía (`spy`) se suscribe a `subscribe` mientras una víctima legítima (`victim`) lee `reads` por pull. Hay fuga si el espía recibe el contenido. La víctima puede ser ops con el prefijo de inbox de otro servicio: lo que importa de ella es por dónde viajan sus entregas.",
+        "args": ["spy", "subscribe", "victim", "reads"],
+        "observes": ["victimRead", "leaked", "subject", "via", "subscriptions"]
+      },
+      "sdk_cycle": {
+        "doc": "Un SDK REAL (`node` | `rust`) hace el ciclo completo —publicar, consumir, ack, reintento, DLQ— contra la ACL generada, como un proceso aparte gobernado por el entorno. El runner mira después, desde el broker, lo que quedó. `events`: [{ caso: ok | permanente | reintento, calls, data }].",
+        "args": ["sdk", "producer", "consumer", "subject", "events"],
+        "optional": ["timeoutMs"],
+        "observes": ["outcome", "childExit", "text", "published", "handlerCalls", "ackPending", "numPending", "dlqCount", "dlqReason", "dlqAttempts", "dlqIdPreserved", "dlqDataLast", "serverViolations", "serverViolationLines", "serverViolationText", "sdkLog"]
+      },
+      "regression": {
+        "doc": "S9: levanta un SEGUNDO servidor con la ACL congelada de `acl`, vuelve a ejecutar en él los casos de `reruns` y expone `<caso>.passes`, `<caso>.failed` y `<caso>.steps.<id del paso>.<campo observado>`. La regresión se cumple cuando esos casos FALLAN como se documenta.",
+        "args": ["acl", "reruns"],
+        "observes": ["*"]
+      }
+    }
+  },
+
+  "brokerObservations": {
+    "$comment": "Qué caso cubre cada observación del Apéndice A del plan que es del BROKER. Las que no aparecen aquí no tienen caso en esta suite: o son del SDK (A-8b, A-26…A-28, A-30), o son de las fases 2 y 3 (A-9…A-18), o necesitan otra forma de arrancar el servidor (A-8d, A-23).",
+    "A-1": ["S9"],
+    "A-2": ["S6", "S9"],
+    "A-3": ["S1"],
+    "A-4": ["S2"],
+    "A-5": ["S3"],
+    "A-6": ["S4"],
+    "A-7": ["S6"],
+    "A-8": ["S5"],
+    "A-8a": ["S1", "S2"],
+    "A-8c": ["S10"],
+    "A-8f": ["S6", "S13"],
+    "A-19": ["S12"],
+    "A-20": ["S12"],
+    "A-21": ["S13"],
+    "A-22": ["S6"],
+    "A-24": ["S8"],
+    "A-25": ["S14"],
+    "A-27": ["S10", "S11"],
+    "A-29": ["S11"]
+  },
+
+  "cases": [
+    {
+      "id": "S1",
+      "title": "Un servicio publica en su dominio y consume lo concedido, de extremo a extremo",
+      "spec": "06-security.md §3: la lista de permisos por servicio; §3.1 el dueño lee su DLQ con un pull consumer",
+      "plan": "PLAN §1.5 S1",
+      "covers": ["A-3", "A-8a"],
+      "bugs": ["H1"],
+      "rationale": "Es la prueba de que el modelo de permisos FUNCIONA. Si un permiso que el SDK necesita no está en la lista generada, el servicio no puede consumir: la ACL «protege» porque no deja hacer nada, que es el fallo H1. Si el formato del subject de ack cambiara (otro prefijo, un dominio JetStream), `$JS.ACK.<stream>.<durable>.>` dejaría de cubrirlo y cada evento se procesaría bien y se reentregaría para siempre sin ningún error (A-19): el caso fija el formato observado para que la ACL se rompa en alto y no en silencio.",
+      "observed": {
+        "server": "nats-server 2.14.5",
+        "date": "2026-11-26",
+        "result": "Sin una sola denegación (0 violaciones en las conexiones de pedidos-api y facturacion-api). $JS.API.INFO y STREAM.INFO de EVT_PEDIDOS y DLQ_PEDIDOS responden; el pull entrega con el subject original y el subject de ack tiene 9 tokens ($JS.ACK.EVT_PEDIDOS.<durable>.1.1.1.<ts>.0). wip, ack, nak(300 ms) —que reentrega con deliveryCount 2— y term dejan ackPending 0 en el broker; el dueño lee su DLQ con un pull consumer sin ninguna suscripción."
+      },
+      "counterExample": {
+        "what": "La ACL v1 (conformance/fixtures/acl-v1.conf) no concede nada sobre $JS.API.*",
+        "effect": "facturacion-api no puede ni consultar su stream: Permissions Violation for Publish to \"$JS.API.STREAM.INFO.EVT_PEDIDOS\". Tampoco $JS.API.INFO ni CONSUMER.CREATE.… (A-1). Un servicio con esa ACL no consume nada, y el SDK falla también al publicar porque antes consulta su stream.",
+        "caughtBy": "S9"
+      },
+      "steps": [
+        { "as": "ops", "op": "reset_consumer", "stream": "EVT_PEDIDOS", "durable": "facturacion-api__pedidos_pedido_v1_creado", "filter": "pedidos.pedido.v1.creado", "deliver": "new", "expect": { "outcome": "ok" } },
+        { "as": "ops", "op": "reset_consumer", "stream": "DLQ_PEDIDOS", "durable": "pedidos-api__dlq_pedidos", "filter": "dlq.pedidos.>", "deliver": "new", "expect": { "outcome": "ok" } },
+
+        { "as": "pedidos-api", "op": "request", "subject": "$JS.API.INFO", "title": "connect() del SDK: la consulta de la cuenta JetStream", "expect": { "outcome": "answered", "reply.error": { "present": false } } },
+        { "as": "pedidos-api", "op": "request", "subject": "$JS.API.STREAM.INFO.EVT_PEDIDOS", "title": "publish() del SDK: consulta su propio stream", "expect": { "outcome": "answered", "reply.config.name": "EVT_PEDIDOS" } },
+        { "as": "pedidos-api", "op": "js_publish", "subject": "pedidos.pedido.v1.creado", "data": "{\"pedidoId\":\"{marker}\"}", "title": "publica en su propio dominio por JetStream (el acuse vuelve por su inbox privado)", "expect": { "outcome": "ok", "stream": "EVT_PEDIDOS" } },
+
+        { "as": "facturacion-api", "id": "stream-info-consumido", "op": "request", "subject": "$JS.API.STREAM.INFO.EVT_PEDIDOS", "title": "subscribe() del SDK: comprueba que existe el stream que consume", "expect": { "outcome": "answered", "reply.config.name": "EVT_PEDIDOS" } },
+        { "as": "facturacion-api", "op": "request", "subject": "$JS.API.STREAM.INFO.DLQ_PEDIDOS", "title": "subscribe() del SDK: comprueba que existe la DLQ del dominio (A-8b)", "expect": { "outcome": "answered", "reply.config.name": "DLQ_PEDIDOS" } },
+        { "as": "facturacion-api", "op": "request", "subject": "$JS.API.CONSUMER.INFO.EVT_PEDIDOS.facturacion-api__pedidos_pedido_v1_creado", "title": "el consumidor aprovisionado existe y lleva su filtro exacto", "expect": { "outcome": "answered", "reply.config.filter_subject": "pedidos.pedido.v1.creado" } },
+        { "as": "facturacion-api", "op": "pull", "stream": "EVT_PEDIDOS", "durable": "facturacion-api__pedidos_pedido_v1_creado", "title": "pide mensajes (MSG.NEXT) y recibe el evento, con el subject ORIGINAL", "expect": { "outcome": "message", "subject": "pedidos.pedido.v1.creado", "data": { "includes": "{marker}" }, "ackTokens": 9 }, "note": "El subject de ack observado tiene 9 tokens: $JS.ACK.<STREAM>.<durable>.<n>.<n>.<n>.<ts>.<n> (A-3). Si cambia, la ACL se rompe en alto." },
+        { "as": "facturacion-api", "op": "ack", "kind": "wip", "title": "work-in-progress", "expect": { "violation": null } },
+        { "as": "facturacion-api", "op": "ack", "kind": "ack", "title": "ack", "expect": { "violation": null } },
+        { "as": "ops", "op": "consumer_state", "stream": "EVT_PEDIDOS", "durable": "facturacion-api__pedidos_pedido_v1_creado", "title": "el broker registró el ack: nada pendiente", "expect": { "ackPending": 0, "numPending": 0 } },
+
+        { "as": "pedidos-api", "op": "js_publish", "subject": "pedidos.pedido.v1.creado", "data": "{\"pedidoId\":\"{marker}-nak\"}", "expect": { "outcome": "ok" } },
+        { "as": "facturacion-api", "op": "pull", "stream": "EVT_PEDIDOS", "durable": "facturacion-api__pedidos_pedido_v1_creado", "expect": { "outcome": "message", "data": { "includes": "{marker}-nak" }, "deliveryCount": 1 } },
+        { "as": "facturacion-api", "op": "ack", "kind": "nak", "delayMs": 300, "title": "nak(300 ms)", "expect": { "violation": null } },
+        { "as": "facturacion-api", "op": "pull", "stream": "EVT_PEDIDOS", "durable": "facturacion-api__pedidos_pedido_v1_creado", "title": "el mensaje se reentrega con deliveryCount 2", "expect": { "outcome": "message", "data": { "includes": "{marker}-nak" }, "deliveryCount": 2 } },
+        { "as": "facturacion-api", "op": "ack", "kind": "term", "title": "term()", "expect": { "violation": null } },
+        { "as": "ops", "op": "consumer_state", "stream": "EVT_PEDIDOS", "durable": "facturacion-api__pedidos_pedido_v1_creado", "expect": { "ackPending": 0 } },
+
+        { "as": "facturacion-api", "op": "js_publish", "subject": "dlq.pedidos.pedido.v1.creado", "data": "{\"muerto\":\"{marker}\"}", "title": "manda a la DLQ de lo que consume", "expect": { "outcome": "ok", "stream": "DLQ_PEDIDOS" } },
+        { "as": "pedidos-api", "op": "pull", "stream": "DLQ_PEDIDOS", "durable": "pedidos-api__dlq_pedidos", "title": "el DUEÑO lee su DLQ con un pull consumer, sin ninguna suscripción (A-8a)", "expect": { "outcome": "message", "subject": "dlq.pedidos.pedido.v1.creado", "data": { "includes": "{marker}" } } },
+        { "as": "pedidos-api", "op": "ack", "kind": "ack", "expect": { "violation": null } },
+        { "as": "ops", "op": "consumer_state", "stream": "DLQ_PEDIDOS", "durable": "pedidos-api__dlq_pedidos", "expect": { "ackPending": 0 } },
+
+        { "as": "pedidos-api", "op": "violations", "title": "ni una sola denegación en toda la conversación (pedidos-api)", "expect": { "count": 0 } },
+        { "as": "facturacion-api", "op": "violations", "title": "ni una sola denegación en toda la conversación (facturacion-api)", "expect": { "count": 0 } }
+      ]
+    },
+
+    {
+      "id": "S2",
+      "title": "Un servicio no puede crear un consumidor con un filtro más amplio",
+      "spec": "06-security.md §3: CONSUMER.CREATE no se concede por defecto; con --dev, solo sobre el durable propio y con su filtro exacto",
+      "plan": "PLAN §1.5 S2",
+      "covers": ["A-4", "A-8a"],
+      "rationale": "El filtro de un consumidor va en el CUERPO de la petición, y una ACL no lee cuerpos: si el subject concedido no atara el filtro, un servicio con permiso para crear SU durable lo crearía sobre `pedidos.>` y leería dominios que no tiene concedidos. Es lo que hace imprescindible que el filtro vaya TAMBIÉN en el subject (`CONSUMER.CREATE.<stream>.<durable>.<filtro>`) y que el servidor compare ambos (A-4). Sin esta comprobación el permiso de creación sería una puerta abierta; por eso en producción no se concede (el durable lo crea `flux provision`) y con --dev solo con el filtro exacto.",
+      "observed": {
+        "server": "nats-server 2.14.5",
+        "date": "2026-11-26",
+        "result": "En producción: Permissions Violation for Publish to \"$JS.API.CONSUMER.CREATE.EVT_PEDIDOS.facturacion-api__pedidos_pedido_v1_creado.pedidos.pedido.v1.creado\", incluso con el filtro exacto. Con --dev y un filtro más amplio en el cuerpo, el SERVIDOR responde el error 10131 «Consumer create request did not match filtered subject from create subject»; con --dev y el filtro exacto crea el durable (recreado tras borrarlo). La DLQ de otro dominio sigue denegada."
+      },
+      "steps": [
+        { "as": "facturacion-api", "op": "create_consumer", "stream": "EVT_PEDIDOS", "durable": "facturacion-api__pedidos_pedido_v1_creado", "filter": "pedidos.pedido.v1.creado", "title": "en producción NO tiene CREATE, ni siquiera con el filtro exacto", "expect": { "outcome": "denied", "text": { "match": "Publish to \"\\$JS\\.API\\.CONSUMER\\.CREATE\\.EVT_PEDIDOS\\.facturacion-api__pedidos_pedido_v1_creado\\." } } },
+        { "as": "facturacion-api", "op": "create_consumer", "stream": "EVT_PEDIDOS", "durable": "facturacion-api__pedidos_pedido_v1_creado", "filter": "pedidos.>", "subjectFilter": "pedidos.pedido.v1.creado", "title": "…ni con un filtro más amplio en el cuerpo", "expect": { "outcome": "denied" } },
+        { "as": "facturacion-api", "op": "create_consumer", "stream": "EVT_INVENTARIO", "durable": "facturacion-api__espia", "filter": "inventario.>", "title": "…ni sobre un stream que no consume", "expect": { "outcome": "denied" } },
+        { "as": "facturacion-api", "op": "create_consumer", "stream": "DLQ_PEDIDOS", "durable": "facturacion-api__dlq_pedidos", "filter": "dlq.pedidos.>", "title": "…ni sobre la DLQ de un dominio ajeno (A-8a)", "expect": { "outcome": "denied" } },
+
+        { "as": { "service": "facturacion-api", "dev": true }, "op": "create_consumer", "stream": "EVT_PEDIDOS", "durable": "facturacion-api__pedidos_pedido_v1_creado", "filter": "pedidos.>", "subjectFilter": "pedidos.pedido.v1.creado", "title": "con --dev el subject SÍ está concedido: un filtro más amplio en el cuerpo lo rechaza el SERVIDOR (A-4)", "expect": { "outcome": "answered", "reply.error.description": { "match": "did not match filtered subject from create subject" } } },
+        { "as": { "service": "facturacion-api", "dev": true }, "op": "create_consumer", "stream": "DLQ_FACTURACION", "durable": "facturacion-api__dlq_facturacion", "filter": "dlq.>", "subjectFilter": "dlq.facturacion.>", "title": "con --dev, `dlq.>` en el cuerpo de su DLQ tampoco pasa (A-8a)", "expect": { "outcome": "answered", "reply.error.description": { "match": "did not match filtered subject from create subject" } } },
+        { "as": { "service": "facturacion-api", "dev": true }, "op": "create_consumer", "stream": "DLQ_PEDIDOS", "durable": "facturacion-api__dlq_pedidos", "filter": "dlq.pedidos.>", "title": "con --dev, la DLQ de otro dominio sigue denegada", "expect": { "outcome": "denied" } },
+        { "as": "ops", "op": "delete_consumer", "stream": "EVT_PEDIDOS", "durable": "facturacion-api__pedidos_pedido_v1_cancelado", "expect": { "outcome": "ok" } },
+        { "as": { "service": "facturacion-api", "dev": true }, "op": "create_consumer", "stream": "EVT_PEDIDOS", "durable": "facturacion-api__pedidos_pedido_v1_cancelado", "filter": "pedidos.pedido.v1.cancelado", "title": "control: con --dev y el filtro EXACTO sí crea su durable", "control": true, "expect": { "outcome": "answered", "reply.error": { "present": false }, "reply.config.filter_subject": "pedidos.pedido.v1.cancelado" } }
+      ]
+    },
+
+    {
+      "id": "S3",
+      "title": "Un servicio no puede usar CONSUMER.DURABLE.CREATE ni gestionar streams",
+      "spec": "06-security.md §3: nunca CONSUMER.DURABLE.CREATE.*, ni crear, modificar, borrar o purgar streams",
+      "plan": "PLAN §1.5 S3",
+      "covers": ["A-5", "A-8f"],
+      "rationale": "En la API antigua, CONSUMER.DURABLE.CREATE.<stream>.<durable>, el filtro va SOLO en el cuerpo: ninguna ACL puede atarlo. Concederla —aunque sea sobre el durable propio— deja a un servicio crear un consumidor sobre cualquier subject del stream. La gestión de streams (crear, cambiar su retención, borrarlos, purgarlos) es de quien aprovisiona: un servicio comprometido que pudiera purgar EVT_PEDIDOS destruiría el log de eventos de todo el ecosistema. Se prueba con recursos que no existen para que, si la ACL fallara, el caso no destruya nada que otro caso necesite; `ms` comprueba además que la denegación es rápida y no un timeout (A-8f).",
+      "observed": {
+        "server": "nats-server 2.14.5",
+        "date": "2026-11-26",
+        "result": "Permissions Violation for Publish to \"$JS.API.CONSUMER.DURABLE.CREATE.…\" —también sobre su propio stream y su propio durable—, STREAM.CREATE, STREAM.UPDATE, STREAM.DELETE, STREAM.PURGE y CONSUMER.DELETE, todas en 0–1 ms (una violación, no un timeout). El control de ops llega al broker y recibe el error 10059 «stream not found»."
+      },
+      "steps": [
+        { "as": "facturacion-api", "op": "create_consumer", "api": "durable_create", "stream": "EVT_INVENTARIO", "durable": "facturacion-api__espia2", "filter": "inventario.stock.v1.ajustado", "title": "DURABLE.CREATE sobre un stream que no consume", "expect": { "outcome": "denied", "ms": { "lte": 1000 } } },
+        { "as": "facturacion-api", "op": "create_consumer", "api": "durable_create", "stream": "EVT_PEDIDOS", "durable": "facturacion-api__pedidos_pedido_v1_creado", "filter": "pedidos.>", "title": "DURABLE.CREATE sobre SU PROPIO stream y su propio durable, con un filtro más amplio", "expect": { "outcome": "denied" } },
+        { "as": "facturacion-api", "op": "request", "subject": "$JS.API.STREAM.CREATE.EVT_ESPIA", "body": { "name": "EVT_ESPIA", "subjects": ["espia.>"] }, "title": "crear un stream", "expect": { "outcome": "denied" } },
+        { "as": "facturacion-api", "op": "request", "subject": "$JS.API.STREAM.UPDATE.EVT_NOEXISTE", "title": "modificar un stream", "expect": { "outcome": "denied" } },
+        { "as": "facturacion-api", "op": "request", "subject": "$JS.API.STREAM.DELETE.EVT_NOEXISTE", "title": "borrar un stream", "expect": { "outcome": "denied" } },
+        { "as": "facturacion-api", "op": "request", "subject": "$JS.API.STREAM.PURGE.EVT_NOEXISTE", "title": "purgar un stream", "expect": { "outcome": "denied" } },
+        { "as": "facturacion-api", "op": "request", "subject": "$JS.API.CONSUMER.DELETE.EVT_NOEXISTE.x", "title": "borrar un consumidor", "expect": { "outcome": "denied" } },
+        { "as": "ops", "op": "request", "subject": "$JS.API.STREAM.DELETE.EVT_NOEXISTE", "title": "control: lo mismo hecho por ops SÍ llega al broker (responde «no existe», no deniega)", "control": true, "expect": { "outcome": "answered" } }
+      ]
+    },
+
+    {
+      "id": "S4",
+      "title": "Un servicio no puede leer un stream con MSG.GET ni DIRECT.GET",
+      "spec": "06-security.md §3: nunca STREAM.MSG.GET.*; un servicio consume por pull y no lee streams",
+      "plan": "PLAN §1.5 S4",
+      "covers": ["A-6"],
+      "rationale": "STREAM.MSG.GET y DIRECT.GET leen por número de secuencia o por subject, sin consumidor, sin ack y sin dejar rastro en ningún durable: es la forma de leer TODO un stream sin que nadie lo note. Conceder `$JS.API.>` «para arreglar» una denegación las abre las dos. Incluso el stream que el servicio SÍ consume debe estar cerrado a esta vía: consumir es por su durable, con su filtro, y ahí es donde la ACL confina.",
+      "observed": {
+        "server": "nats-server 2.14.5",
+        "date": "2026-11-26",
+        "result": "STREAM.MSG.GET y DIRECT.GET (de EVT_INVENTARIO y del stream que consume, EVT_PEDIDOS), STREAM.INFO de un stream no concedido y los listados STREAM.NAMES, STREAM.LIST, CONSUMER.NAMES y CONSUMER.LIST: Permissions Violation for Publish to \"…\", en 0–2 ms. El control de ops recibe respuesta del broker."
+      },
+      "steps": [
+        { "as": "facturacion-api", "op": "request", "subject": "$JS.API.STREAM.MSG.GET.EVT_INVENTARIO", "body": { "seq": 1 }, "title": "MSG.GET de un stream que no consume", "expect": { "outcome": "denied" } },
+        { "as": "facturacion-api", "op": "request", "subject": "$JS.API.STREAM.MSG.GET.EVT_PEDIDOS", "body": { "seq": 1 }, "title": "MSG.GET del stream que SÍ consume", "expect": { "outcome": "denied" } },
+        { "as": "facturacion-api", "op": "request", "subject": "$JS.API.DIRECT.GET.EVT_PEDIDOS", "body": { "seq": 1 }, "title": "DIRECT.GET del stream que consume", "expect": { "outcome": "denied" } },
+        { "as": "facturacion-api", "op": "request", "subject": "$JS.API.DIRECT.GET.EVT_INVENTARIO", "body": { "seq": 1 }, "title": "DIRECT.GET de un stream que no consume", "expect": { "outcome": "denied" } },
+        { "as": "facturacion-api", "op": "request", "subject": "$JS.API.STREAM.INFO.EVT_INVENTARIO", "title": "consultar un stream que no tiene concedido", "expect": { "outcome": "denied" } },
+        { "as": "facturacion-api", "op": "request", "subject": "$JS.API.STREAM.NAMES", "title": "listar los streams", "expect": { "outcome": "denied" } },
+        { "as": "facturacion-api", "op": "request", "subject": "$JS.API.STREAM.LIST", "title": "listar los streams con su detalle", "expect": { "outcome": "denied" } },
+        { "as": "facturacion-api", "op": "request", "subject": "$JS.API.CONSUMER.NAMES.EVT_PEDIDOS", "title": "listar los consumidores de un stream", "expect": { "outcome": "denied" } },
+        { "as": "facturacion-api", "op": "request", "subject": "$JS.API.CONSUMER.LIST.EVT_PEDIDOS", "title": "listar los consumidores con su detalle", "expect": { "outcome": "denied" } },
+        { "as": "ops", "op": "request", "subject": "$JS.API.STREAM.MSG.GET.EVT_PEDIDOS", "body": { "seq": 1 }, "title": "control: ops SÍ lo puede leer (el broker responde: mensaje o «no hay»)", "control": true, "expect": { "outcome": "answered" } }
+      ]
+    },
+
+    {
+      "id": "S5",
+      "title": "Un servicio no puede pedir mensajes ni responder por el consumidor de otro",
+      "spec": "06-security.md §3: permisos EXACTOS por consumidor durable",
+      "plan": "PLAN §1.5 S5",
+      "covers": ["A-8"],
+      "rationale": "Los permisos de un durable llevan su nombre completo (`<servicio>__<subject>`), no un comodín. Si el generador concediera `CONSUMER.MSG.NEXT.EVT_PEDIDOS.>` un servicio podría quitarle los mensajes a otro, y con `$JS.ACK.EVT_PEDIDOS.>` confirmarlos sin procesarlos: eventos perdidos sin ningún error en el dueño del durable. El `ack` ajeno es un publish de core: no lanza, así que solo el aviso del broker delata la denegación.",
+      "observed": {
+        "server": "nats-server 2.14.5",
+        "date": "2026-11-26",
+        "result": "CONSUMER.MSG.NEXT, CONSUMER.INFO y $JS.ACK.EVT_PEDIDOS.inventario-api__pedidos_pedido_v1_creado.1.1.1.1.0: Permissions Violation for Publish to \"…\" (el ack, solo como aviso asíncrono por la conexión: el publish no lanza). Un pull completo contra el durable ajeno acaba denegado y su propio durable sí responde."
+      },
+      "steps": [
+        { "as": "facturacion-api", "op": "request", "subject": "$JS.API.CONSUMER.MSG.NEXT.EVT_PEDIDOS.inventario-api__pedidos_pedido_v1_creado", "body": { "batch": 1, "expires": 300000000 }, "title": "pedir mensajes del durable de inventario-api (MSG.NEXT)", "expect": { "outcome": "denied" } },
+        { "as": "facturacion-api", "op": "request", "subject": "$JS.API.CONSUMER.INFO.EVT_PEDIDOS.inventario-api__pedidos_pedido_v1_creado", "title": "consultar el durable de inventario-api (CONSUMER.INFO)", "expect": { "outcome": "denied" } },
+        { "as": "facturacion-api", "op": "publish", "subject": "$JS.ACK.EVT_PEDIDOS.inventario-api__pedidos_pedido_v1_creado.1.1.1.1.0", "title": "confirmar (ack) un mensaje del durable de inventario-api", "expect": { "outcome": "denied" } },
+        { "as": "facturacion-api", "op": "pull", "stream": "EVT_PEDIDOS", "durable": "inventario-api__pedidos_pedido_v1_creado", "timeoutMs": 800, "title": "un pull completo, como lo haría un SDK, contra el durable ajeno", "expect": { "outcome": "denied" } },
+        { "as": "facturacion-api", "op": "request", "subject": "$JS.API.CONSUMER.INFO.EVT_PEDIDOS.facturacion-api__pedidos_pedido_v1_creado", "title": "control: SU propio durable sí responde", "control": true, "expect": { "outcome": "answered", "reply.error": { "present": false } } }
+      ]
+    },
+
+    {
+      "id": "S6",
+      "title": "Un servicio no puede suscribirse a _INBOX.> ni al inbox de otro, y nadie lee lo que no le toca",
+      "spec": "06-security.md §3: inbox PRIVADO por servicio (_INBOX.<servicio>.>); ningún permiso de suscripción sobre subjects de dominio",
+      "plan": "PLAN §1.5 S6",
+      "covers": ["A-2", "A-7", "A-8f", "A-22"],
+      "bugs": ["H2"],
+      "rationale": "Las entregas de un pull consumer viajan por el inbox de quien lo pide, y conservan el subject ORIGINAL del evento (A-22). Con un `_INBOX.>` común, cualquier servicio que se suscriba ahí lee los eventos que otro consume, de dominios que no tiene concedidos: la ACL parece confinar y no confina nada (H2). Solo la ACL lo evita —el SDK no puede—, y el SDK DEBE fijar el prefijo del inbox o ni siquiera podrá hacer una petición. Los pasos de control demuestran que la sonda puede fallar: con `_INBOX.>` el espía SÍ lee el evento.",
+      "observed": {
+        "server": "nats-server 2.14.5",
+        "date": "2026-11-26",
+        "result": "Permissions Violation for Subscription to \"_INBOX.>\", \"_INBOX.inventario-api.>\", \"pedidos.>\", \"inventario.>\" y \"dlq.>\"; su inbox privado sí está permitido. Un servicio con el inbox por defecto no puede ni pedir: Permissions Violation for Subscription to \"_INBOX.<nuid>.*\" en 2 ms. Con el espía de facturacion-api en `_INBOX.>` e `inventario.>` mientras el evento se consume (víctima ops con inbox privado, y víctima real pedidos-api): leaked=false. Control: si se concede `_INBOX.>`, leaked=true y el espía recibe el evento con el subject original inventario.stock.v1.ajustado."
+      },
+      "counterExample": {
+        "what": "La ACL v1 concedía `_INBOX.>` a todos los servicios y subscribe sobre los subjects consumidos",
+        "effect": "facturacion-api, sin concesión alguna sobre `inventario`, leyó el evento completo de inventario.stock.v1.ajustado espiando `_INBOX.>` mientras pedidos-api lo consumía (A-2). La suscripción directa a `inventario.>` sí estaba denegada: la fuga no la veía nadie.",
+        "caughtBy": "S9"
+      },
+      "steps": [
+        { "as": "facturacion-api", "op": "subscribe", "subject": "_INBOX.>", "title": "suscribirse a `_INBOX.>`", "expect": { "outcome": "denied" } },
+        { "as": "facturacion-api", "op": "subscribe", "subject": "_INBOX.inventario-api.>", "title": "suscribirse al inbox de OTRO servicio", "expect": { "outcome": "denied" } },
+        { "as": "facturacion-api", "op": "subscribe", "subject": "pedidos.>", "title": "suscribirse al dominio que consume (consume por pull, no por suscripción)", "expect": { "outcome": "denied" } },
+        { "as": "facturacion-api", "op": "subscribe", "subject": "inventario.>", "title": "suscribirse a un dominio no concedido", "expect": { "outcome": "denied" } },
+        { "as": "facturacion-api", "op": "subscribe", "subject": "dlq.>", "title": "suscribirse a las DLQ de todos", "expect": { "outcome": "denied" } },
+        { "as": "facturacion-api", "op": "subscribe", "subject": "_INBOX.{me}.verificacion", "title": "control: SU inbox privado sí está permitido", "control": true, "expect": { "outcome": "permitted" } },
+        { "as": { "service": "facturacion-api", "inbox": "default" }, "op": "request", "subject": "$JS.API.INFO", "title": "un servicio que NO fija su inbox privado ni siquiera puede hacer una petición (por eso el SDK lo fija solo)", "control": true, "expect": { "outcome": "denied", "text": { "match": "Subscription to \"_INBOX\\." }, "ms": { "lte": 1000 } } },
+
+        { "id": "fuga-con-espia", "op": "leak_probe", "spy": "facturacion-api", "subscribe": ["_INBOX.>", "inventario.>"], "victim": { "service": "ops", "inbox": "_INBOX.pedidos-api" }, "reads": { "stream": "EVT_INVENTARIO", "durable": "pedidos-api__inventario_stock_v1_ajustado", "filter": "inventario.stock.v1.ajustado" }, "title": "escenario A-2: facturacion-api, espiando `_INBOX.>` e `inventario.>`, NO ve el evento que otro consume", "expect": { "victimRead": true, "leaked": false, "subscriptions": { "_INBOX.>": "denied", "inventario.>": "denied" } } },
+        { "id": "fuga-con-victima-real", "op": "leak_probe", "spy": "facturacion-api", "subscribe": ["_INBOX.>", "inventario.>"], "victim": "pedidos-api", "reads": { "stream": "EVT_INVENTARIO", "durable": "pedidos-api__inventario_stock_v1_ajustado", "filter": "inventario.stock.v1.ajustado" }, "onlyWith": "generated-acl", "title": "lo mismo con la víctima REAL: pedidos-api consume con sus permisos generados", "expect": { "victimRead": true, "leaked": false } },
+        { "id": "fuga-control", "op": "leak_probe", "spy": { "service": "facturacion-api", "replaceSubscribe": ["_INBOX.>"] }, "subscribe": ["_INBOX.>"], "victim": { "service": "ops", "inbox": "_INBOX.pedidos-api" }, "reads": { "stream": "EVT_INVENTARIO", "durable": "pedidos-api__inventario_stock_v1_ajustado", "filter": "inventario.stock.v1.ajustado" }, "control": true, "title": "control (A-22): si a facturacion-api se le concede `_INBOX.>`, SÍ lee el evento, con el subject original", "expect": { "victimRead": true, "leaked": true, "subject": "inventario.stock.v1.ajustado" } }
+      ]
+    },
+
+    {
+      "id": "S7",
+      "title": "Un servicio no puede publicar en un dominio ajeno ni en la DLQ de lo que no consume",
+      "spec": "06-security.md §3: un servicio solo publica en el dominio del que es dueño, y en la DLQ de lo que consume",
+      "plan": "PLAN §1.5 S7",
+      "covers": ["A-6"],
+      "rationale": "Es la razón de ser de la ACL: el ownership del dato lo aplica el BROKER. Sin ello cualquier servicio comprometido forja eventos de otro dominio con un `source` que miente, y el consumidor que los recibe no puede distinguirlos. La DLQ ajena importa igual: un servicio que escribe en `dlq.<dominio ajeno>.>` ensucia la bandeja de triaje de otro equipo con «muertos» que no son suyos. Los controles demuestran que sí puede publicar donde le toca.",
+      "observed": {
+        "server": "nats-server 2.14.5",
+        "date": "2026-11-26",
+        "result": "Permissions Violation for Publish to \"pedidos.pedido.v1.creado\", \"inventario.stock.v1.ajustado\", \"pedidos.pedido.v1.cancelado\" (por core), \"dlq.inventario.stock.v1.ajustado\" (por JetStream y por core) y \"dlq.logistica.paquete.v1.perdido\". Controles: publicar en su propio dominio da el acuse de EVT_FACTURACION, y en la DLQ de lo que consume está permitido."
+      },
+      "steps": [
+        { "as": "facturacion-api", "op": "js_publish", "subject": "pedidos.pedido.v1.creado", "title": "publicar por JetStream en un dominio ajeno (pedidos)", "expect": { "outcome": "denied" } },
+        { "as": "facturacion-api", "op": "js_publish", "subject": "inventario.stock.v1.ajustado", "title": "publicar por JetStream en otro dominio ajeno (inventario)", "expect": { "outcome": "denied" } },
+        { "as": "facturacion-api", "op": "publish", "subject": "pedidos.pedido.v1.cancelado", "title": "…y por core NATS, que no esperaría acuse", "expect": { "outcome": "denied" } },
+        { "as": "facturacion-api", "op": "js_publish", "subject": "dlq.inventario.stock.v1.ajustado", "title": "publicar en la DLQ de lo que NO consume, por JetStream", "expect": { "outcome": "denied" } },
+        { "as": "facturacion-api", "op": "publish", "subject": "dlq.inventario.stock.v1.ajustado", "title": "…y por core", "expect": { "outcome": "denied" } },
+        { "as": "facturacion-api", "op": "publish", "subject": "dlq.logistica.paquete.v1.perdido", "title": "publicar en la DLQ de un dominio que no es suyo ni consume", "expect": { "outcome": "denied" } },
+        { "as": "facturacion-api", "op": "js_publish", "subject": "facturacion.factura.v2.emitida", "title": "control: en su propio dominio SÍ", "control": true, "expect": { "outcome": "ok", "stream": "EVT_FACTURACION" } },
+        { "as": "facturacion-api", "op": "publish", "subject": "dlq.pedidos.pedido.v1.cancelado", "title": "control: en la DLQ de lo que SÍ consume está permitido", "control": true, "expect": { "outcome": "permitted" } }
+      ]
+    },
+
+    {
+      "id": "S8",
+      "title": "Una conexión sin TLS, con una CA ajena o con credencial inválida es rechazada",
+      "spec": "06-security.md §2: TLS obligatorio y credencial por servicio",
+      "plan": "PLAN §1.5 S8",
+      "covers": ["A-24"],
+      "rationale": "Una credencial NATS que viaja en claro, o un cliente que acepta cualquier certificado, deshacen el resto del modelo: quien lee la red o se hace pasar por el broker tiene las credenciales del servicio. El servidor DEBE exigir TLS (sin `allow_non_tls`) y rechazar toda credencial que no conoce. El primer paso es el control: la conexión BUENA sí se establece, así que los rechazos de los demás pasos son de lo que se estropeó y no de un entorno mal montado.",
+      "observed": {
+        "server": "nats-server 2.14.5",
+        "date": "2026-11-26",
+        "result": "Texto plano con una credencial válida: el servidor cierra la conexión sin contestar. Una CA ajena o solo las del sistema: UNABLE_TO_VERIFY_LEAF_SIGNATURE en 4–7 ms. Una nkey desconocida o ninguna credencial: AuthorizationError «Authorization Violation». El control (CA correcta, credencial correcta) conecta en ~30 ms. La librería de NATS sube sola a TLS contra un servidor que lo exige, por eso el texto plano se prueba por un socket."
+      },
+      "steps": [
+        { "as": "facturacion-api", "op": "connect", "tls": "ca", "auth": "ok", "title": "control: TLS con la CA correcta y su credencial", "control": true, "expect": { "outcome": "connected" } },
+        { "as": "facturacion-api", "op": "connect", "tls": "none", "auth": "ok", "title": "texto plano con una credencial VÁLIDA: el servidor cierra antes de leerla", "expect": { "outcome": "rejected" } },
+        { "as": "facturacion-api", "op": "connect", "tls": "wrong_ca", "auth": "ok", "title": "el cliente confía en una CA AJENA: no verifica el certificado del servidor", "expect": { "outcome": "rejected", "text": { "match": "UNABLE_TO_VERIFY_LEAF_SIGNATURE|certificate" } } },
+        { "as": "facturacion-api", "op": "connect", "tls": "system", "auth": "ok", "title": "el cliente solo confía en las CA del sistema (la efímera no está)", "expect": { "outcome": "rejected", "text": { "match": "UNABLE_TO_VERIFY_LEAF_SIGNATURE|certificate" } } },
+        { "as": "facturacion-api", "op": "connect", "tls": "ca", "auth": "unknown_key", "title": "una nkey bien formada que el servidor no conoce", "expect": { "outcome": "rejected", "text": { "match": "Authorization" } } },
+        { "as": "facturacion-api", "op": "connect", "tls": "ca", "auth": "none", "title": "sin credencial alguna", "expect": { "outcome": "rejected", "text": { "match": "Authorization" } } }
+      ]
+    },
+
+    {
+      "id": "S9",
+      "title": "Regresión: con la ACL antigua (v1), S1 falla y la fuga de A-2 ocurre",
+      "spec": "06-security.md §3; conformance/fixtures/acl-v1.conf, congelada",
+      "plan": "PLAN §1.5 S9",
+      "covers": ["A-1", "A-2"],
+      "bugs": ["H1", "H2"],
+      "rationale": "Un test que solo se ha visto en verde no demuestra nada. Este caso ejecuta S1 y S6 contra la ACL que generaba gen-acl.mjs ANTES de la Fase 1 y exige que FALLEN, y que fallen por el motivo documentado: H1 (no puede consultar su stream) y H2 (el espía lee el evento de otro). Si un día esa ACL «funciona», o el servidor ha cambiado de semántica, o la suite ha dejado de detectar lo que dice detectar: DEBE fallar, no adaptarse.",
+      "observed": {
+        "server": "nats-server 2.14.5",
+        "date": "2026-11-26",
+        "result": "Con la ACL v1 congelada en un segundo servidor (TLS, mismos casos): S1 FALLA (17 pasos) y ya el primer paso con un stream es Permissions Violation for Publish to \"$JS.API.STREAM.INFO.EVT_PEDIDOS\" (A-1); S6 FALLA (4 pasos) porque la suscripción a `_INBOX.>` se permite y el espía lee el evento: leaked=true con victimRead=true (A-2)."
+      },
+      "counterExample": {
+        "what": "La ACL v1 completa, congelada en conformance/fixtures/acl-v1.conf (commit a4db4b8 de gen-acl.mjs)",
+        "effect": "H1: ningún permiso sobre $JS.API.*, así que un servicio no consume nada. H2: `_INBOX.>` común, así que cualquiera lee lo que reciba otro."
+      },
+      "steps": [
+        {
+          "op": "regression",
+          "acl": "conformance/fixtures/acl-v1.conf",
+          "reruns": ["S1", "S6"],
+          "title": "S1 y S6 contra la ACL v1",
+          "expect": {
+            "S1.passes": false,
+            "S1.steps.stream-info-consumido.outcome": "denied",
+            "S1.steps.stream-info-consumido.text": { "match": "Publish to \"\\$JS\\.API\\.STREAM\\.INFO\\.EVT_PEDIDOS\"" },
+            "S6.passes": false,
+            "S6.steps.fuga-con-espia.victimRead": true,
+            "S6.steps.fuga-con-espia.leaked": true
+          }
+        }
+      ]
+    },
+
+    {
+      "id": "S10",
+      "title": "El SDK de Node pasa su ciclo completo bajo la ACL generada",
+      "spec": "06-security.md §3 y §4: lo que los SDKs consumen es lo que el generador concede",
+      "plan": "PLAN §1.5 S10",
+      "covers": ["A-8c", "A-27"],
+      "needs": ["sdk-node/dist"],
+      "rationale": "El generador deriva los permisos de lo que el SDK de Node hace; si el SDK cambia (otra consulta antes de publicar, otro subject de ack) y el generador no, el servicio no arranca en producción y la ACL «correcta» queda en el papel. Es la prueba cruzada: el SDK REAL, sin modificar, con nkey, TLS con CA propia e inbox privado, contra los permisos que sale de gen-acl.mjs y SIN `CONSUMER.CREATE` (el durable lo crea flux provision). Si el SDK necesita un permiso que el generador no concede, ESO es el hallazgo: no se parchea ni el uno ni el otro a ciegas.",
+      "observed": {
+        "server": "nats-server 2.14.5",
+        "date": "2026-11-26",
+        "result": "pedidos-api publica 3 eventos y facturacion-api los consume con el SDK de Node sin modificar (credentials.nkeySeed, tls.caFile, inbox privado fijado por el SDK): handler ok [1], permanente [1], reintento [1, 2]; ackPending 0 y numPending 0 en el broker; 1 evento en la DLQ con dlqreason permanent, dlqattempts 1, el id original y data como último atributo; 0 violaciones en el log del servidor. Sin CONSUMER.CREATE concedido: el SDK pregunta antes de crear."
+      },
+      "steps": [
+        { "as": "ops", "op": "reset_consumer", "stream": "EVT_PEDIDOS", "durable": "facturacion-api__pedidos_pedido_v1_creado", "filter": "pedidos.pedido.v1.creado", "deliver": "new", "expect": { "outcome": "ok" } },
+        {
+          "op": "sdk_cycle",
+          "sdk": "node",
+          "producer": "pedidos-api",
+          "consumer": "facturacion-api",
+          "subject": "pedidos.pedido.v1.creado",
+          "timeoutMs": 60000,
+          "events": [
+            { "caso": "ok", "calls": 1, "data": { "pedidoId": "ped-{marker}-1" } },
+            { "caso": "permanente", "calls": 1, "data": { "pedidoId": "ped-{marker}-2" } },
+            { "caso": "reintento", "calls": 2, "data": { "pedidoId": "ped-{marker}-3" } }
+          ],
+          "title": "pedidos-api publica 3 eventos; facturacion-api los consume (ok, PERMANENT → DLQ, RETRYABLE → reintento)",
+          "expect": {
+            "outcome": "ok",
+            "published": 3,
+            "handlerCalls.ok": [1],
+            "handlerCalls.permanente": [1],
+            "handlerCalls.reintento": [1, 2],
+            "ackPending": 0,
+            "numPending": 0,
+            "dlqCount": 1,
+            "dlqReason": "permanent",
+            "dlqAttempts": 1,
+            "dlqIdPreserved": true,
+            "dlqDataLast": true,
+            "serverViolations": 0
+          }
+        }
+      ]
+    },
+
+    {
+      "id": "S11",
+      "title": "El SDK de Rust pasa su ciclo completo bajo la ACL generada",
+      "spec": "06-security.md §3 y §4: lo que los SDKs consumen es lo que el generador concede",
+      "plan": "PLAN §1.5 S11",
+      "covers": ["A-27", "A-29"],
+      "needs": ["cargo"],
+      "rationale": "Lo mismo que S10 con una segunda implementación independiente: el historial del repo muestra que cada port destapa un fallo de la spec. El SDK de Rust consulta, pide mensajes y confirma por subjects que no son los de Node (A-29: no usa `$JS.API.INFO`), y bajo los permisos exactos ambos DEBEN funcionar. Un permiso que solo uno de los dos necesita se ve aquí y no en producción. En `async-nats` una publicación denegada no se ve en ningún sitio salvo en `Event::ServerError` (A-28): por eso el caso mira las violaciones en el LOG DEL SERVIDOR y exige cero.",
+      "observed": {
+        "server": "nats-server 2.14.5",
+        "date": "2026-11-26",
+        "result": "Lo mismo que S10 con el SDK de Rust (async-nats 0.50): ciclo completo correcto, mismos efectos en el broker. DESVIACIÓN: el SDK intenta CONSUMER.CREATE antes de preguntar y deja 1 violación en el log del servidor, `Publish Violation - Subject \"$JS.API.CONSUMER.CREATE.EVT_PEDIDOS.facturacion-api__pedidos_pedido_v1_creado.pedidos.pedido.v1.creado\"`, en cada subscribe(); solo la ve la suite, no el SDK (A-28)."
+      },
+      "steps": [
+        { "as": "ops", "op": "reset_consumer", "stream": "EVT_PEDIDOS", "durable": "facturacion-api__pedidos_pedido_v1_creado", "filter": "pedidos.pedido.v1.creado", "deliver": "new", "expect": { "outcome": "ok" } },
+        {
+          "op": "sdk_cycle",
+          "sdk": "rust",
+          "producer": "pedidos-api",
+          "consumer": "facturacion-api",
+          "subject": "pedidos.pedido.v1.creado",
+          "timeoutMs": 900000,
+          "events": [
+            { "caso": "ok", "calls": 1, "data": { "pedidoId": "ped-{marker}-1" } },
+            { "caso": "permanente", "calls": 1, "data": { "pedidoId": "ped-{marker}-2" } },
+            { "caso": "reintento", "calls": 2, "data": { "pedidoId": "ped-{marker}-3" } }
+          ],
+          "title": "pedidos-api publica 3 eventos; facturacion-api los consume (ok, PERMANENT → DLQ, RETRYABLE → reintento)",
+          "expect": {
+            "outcome": "ok",
+            "published": 3,
+            "handlerCalls.ok": [1],
+            "handlerCalls.permanente": [1],
+            "handlerCalls.reintento": [1, 2],
+            "ackPending": 0,
+            "numPending": 0,
+            "dlqCount": 1,
+            "dlqReason": "permanent",
+            "dlqAttempts": 1,
+            "dlqIdPreserved": true,
+            "dlqDataLast": true,
+            "serverViolations": 0
+          }
+        }
+      ]
+    },
+
+    {
+      "id": "S12",
+      "onlyWith": "generated-acl",
+      "title": "Sin el permiso de ack o de pull el fallo es SILENCIOSO: solo el aviso del broker lo delata",
+      "spec": "06-security.md §3: los permisos de un durable son cuatro, y los cuatro son necesarios",
+      "plan": "PLAN §1.4 «Denegaciones asíncronas» (más allá de la matriz de §1.5)",
+      "covers": ["A-19", "A-20"],
+      "rationale": "`ack` y la petición de mensajes de un pull son publicaciones sueltas: si se deniegan no hay excepción ni timeout. Sin `$JS.ACK.<S>.<D>.>` cada evento se procesa bien y se REENTREGA cada ack_wait para siempre; sin `CONSUMER.MSG.NEXT` el consumidor queda inerte y parece sano. Son dos fallos de configuración que se manifiestan como «no pasa nada». Este caso fija que el estado del consumidor en el broker es el que delata el fallo, y que el aviso del broker llega por la conexión: lo único que un SDK puede vigilar. Justifica que el generador conceda los CUATRO permisos y que S1 compruebe el estado del consumidor y no solo la ausencia de errores.",
+      "observed": {
+        "server": "nats-server 2.14.5",
+        "date": "2026-11-26",
+        "result": "A-19: sin $JS.ACK.<S>.<D>.> el mensaje se entrega, el ack no lanza y el broker avisa por la conexión (Permissions Violation for Publish to \"$JS.ACK.EVT_PEDIDOS.<durable>.1.1.1.<ts>.0\"); el consumidor queda con ackPending 1. A-20: sin CONSUMER.MSG.NEXT el pull no lanza; solo el aviso (Permissions Violation for Publish to \"$JS.API.CONSUMER.MSG.NEXT.…\") y el consumidor queda con numPending 1 y nada entregado."
+      },
+      "steps": [
+        { "as": "ops", "op": "reset_consumer", "stream": "EVT_PEDIDOS", "durable": "facturacion-api__pedidos_pedido_v1_creado", "filter": "pedidos.pedido.v1.creado", "deliver": "new", "expect": { "outcome": "ok" } },
+        { "as": "pedidos-api", "op": "js_publish", "subject": "pedidos.pedido.v1.creado", "data": "{\"pedidoId\":\"{marker}\"}", "expect": { "outcome": "ok" } },
+        { "as": { "service": "facturacion-api", "without": ["$JS.ACK.EVT_PEDIDOS.facturacion-api__pedidos_pedido_v1_creado.>"] }, "op": "pull", "stream": "EVT_PEDIDOS", "durable": "facturacion-api__pedidos_pedido_v1_creado", "title": "A-19: sin permiso de ack, el mensaje se entrega y se procesa", "expect": { "outcome": "message", "data": { "includes": "{marker}" } } },
+        { "as": { "service": "facturacion-api", "without": ["$JS.ACK.EVT_PEDIDOS.facturacion-api__pedidos_pedido_v1_creado.>"] }, "op": "ack", "kind": "ack", "title": "…pero el ack lo deniega el broker SIN excepción: solo un aviso por la conexión", "expect": { "outcome": "sent", "violation": { "match": "Publish to \"\\$JS\\.ACK\\.EVT_PEDIDOS\\.facturacion-api__pedidos_pedido_v1_creado\\." } } },
+        { "as": "ops", "op": "consumer_state", "stream": "EVT_PEDIDOS", "durable": "facturacion-api__pedidos_pedido_v1_creado", "title": "…y nunca se confirma: queda pendiente y se reentregará cada ack_wait, sin fin", "expect": { "ackPending": 1, "numPending": 0 } },
+
+        { "as": "ops", "op": "reset_consumer", "stream": "EVT_PEDIDOS", "durable": "facturacion-api__pedidos_pedido_v1_creado", "filter": "pedidos.pedido.v1.creado", "deliver": "new", "expect": { "outcome": "ok" } },
+        { "as": "pedidos-api", "op": "js_publish", "subject": "pedidos.pedido.v1.creado", "data": "{\"pedidoId\":\"{marker}-2\"}", "expect": { "outcome": "ok" } },
+        { "as": { "service": "facturacion-api", "without": ["$JS.API.CONSUMER.MSG.NEXT.EVT_PEDIDOS.facturacion-api__pedidos_pedido_v1_creado"] }, "op": "pull", "stream": "EVT_PEDIDOS", "durable": "facturacion-api__pedidos_pedido_v1_creado", "timeoutMs": 1200, "title": "A-20: sin permiso de pull, no recibe nada y NO lanza: solo el aviso del broker lo delata", "expect": { "outcome": "denied", "text": { "match": "CONSUMER\\.MSG\\.NEXT\\.EVT_PEDIDOS\\.facturacion-api__pedidos_pedido_v1_creado" } } },
+        { "as": "ops", "op": "consumer_state", "stream": "EVT_PEDIDOS", "durable": "facturacion-api__pedidos_pedido_v1_creado", "title": "…el consumidor queda inerte: el mensaje sigue ahí, sin entregar", "expect": { "numPending": 1, "delivered": 0 } }
+      ]
+    },
+
+    {
+      "id": "S13",
+      "title": "Denegado, «no existe» y «no hay respuesta» se distinguen, y la denegación es rápida",
+      "spec": "06-security.md §3: NOT_PROVISIONED y PERMISSION_DENIED son errores distintos",
+      "plan": "PLAN §1.4 `NOT_PROVISIONED` (más allá de la matriz de §1.5)",
+      "covers": ["A-8f", "A-21"],
+      "rationale": "Un SDK que ve fallar la consulta de su stream debe decir QUÉ pasa: el recurso no existe y no puede crearlo (NOT_PROVISIONED, se arregla con flux provision) o no tiene permiso ni para preguntar (PERMISSION_DENIED, se arregla en la ACL). Son dos arreglos distintos y si llegan como un timeout no se distinguen de un broker caído. Esto solo es posible si el broker responde «no existe» con su propio código (10059 stream, 10014 consumidor) y la denegación llega como violación en milisegundos, no como espera.",
+      "observed": {
+        "server": "nats-server 2.14.5",
+        "date": "2026-11-26",
+        "result": "STREAM.INFO.EVT_NOEXISTE (ops): respuesta con error 10059; CONSUMER.INFO de un durable inexistente: error 10014; STREAM.INFO.EVT_INVENTARIO (facturacion-api): Permissions Violation for Publish, sin respuesta de JetStream, en 1 ms. El stream concedido responde."
+      },
+      "steps": [
+        { "as": "ops", "op": "request", "subject": "$JS.API.STREAM.INFO.EVT_NOEXISTE", "title": "un stream que no existe: el broker CONTESTA con su código", "expect": { "outcome": "answered", "reply.error.err_code": 10059 } },
+        { "as": "ops", "op": "request", "subject": "$JS.API.CONSUMER.INFO.EVT_PEDIDOS.no-existe", "title": "un consumidor que no existe: otro código", "expect": { "outcome": "answered", "reply.error.err_code": 10014 } },
+        { "as": "facturacion-api", "op": "request", "subject": "$JS.API.STREAM.INFO.EVT_INVENTARIO", "title": "un stream que existe pero no tiene concedido: violación de permiso, no un código de JetStream", "expect": { "outcome": "denied", "reply": null, "ms": { "lte": 1000 } } },
+        { "as": "facturacion-api", "op": "request", "subject": "$JS.API.STREAM.INFO.EVT_PEDIDOS", "title": "control: el que SÍ tiene concedido responde", "control": true, "expect": { "outcome": "answered", "reply.error": { "present": false } } }
+      ]
+    },
+
+    {
+      "id": "S14",
+      "onlyWith": "generated-acl",
+      "title": "Una lista de permisos vacía NO deniega nada: significa «sin restricción»",
+      "spec": "06-security.md §3: una lista de permisos nunca sale vacía",
+      "plan": "PLAN §1.2 (más allá de la matriz de §1.5)",
+      "covers": ["A-25"],
+      "rationale": "En NATS `subscribe: { allow: [] }` es la ACL más abierta posible escrita como la más cerrada. Si el generador emitiera una lista vacía para un servicio sin inbox, ese servicio podría suscribirse a todo y nada en el broker se quejaría. Por eso gen-acl.mjs se niega a generar una lista vacía. Este caso, de control, demuestra que el riesgo es real: un usuario con `allow: []` SÍ se suscribe a `_INBOX.>`.",
+      "observed": {
+        "server": "nats-server 2.14.5",
+        "date": "2026-11-26",
+        "result": "Con `subscribe: { allow: [] }` facturacion-api se suscribe a `_INBOX.>` e `inventario.>` sin ninguna violación: la lista vacía es «sin restricción»."
+      },
+      "steps": [
+        { "as": { "service": "facturacion-api", "replaceSubscribe": [] }, "op": "subscribe", "subject": "_INBOX.>", "title": "control: con `subscribe: { allow: [] }` el servicio SÍ puede suscribirse a `_INBOX.>`", "control": true, "expect": { "outcome": "permitted" } },
+        { "as": { "service": "facturacion-api", "replaceSubscribe": [] }, "op": "subscribe", "subject": "inventario.>", "title": "…y a un dominio que no tiene concedido", "control": true, "expect": { "outcome": "permitted" } }
+      ]
+    }
+  ]
+}

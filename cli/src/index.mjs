@@ -6,13 +6,16 @@
  * construida sobre el SDK no puede diagnosticar los fallos del propio SDK.
  */
 
-import { connect } from "@nats-io/transport-node";
+import { readFile } from "node:fs/promises";
+
+import { connect, credsAuthenticator } from "@nats-io/transport-node";
 import { jetstream, jetstreamManager } from "@nats-io/jetstream";
 
 import { c, die, OK } from "./ui.mjs";
 import { doctor } from "./doctor.mjs";
 import { dlqList, dlqInspect, dlqReplay } from "./dlq.mjs";
 import { tail } from "./tail.mjs";
+import { comandoProvision } from "./provision.mjs";
 
 const SUBJECT_RE =
   /^[a-z0-9]+(-[a-z0-9]+)*\.[a-z0-9]+(-[a-z0-9]+)*\.v[1-9][0-9]*\.[a-z0-9]+(-[a-z0-9]+)*$/;
@@ -29,13 +32,20 @@ ${c.bold("COMANDOS")}
   ${c.cyan("dlq inspect")} <dominio>     Detalle de eventos muertos
   ${c.cyan("dlq replay")} <dominio>      Reproduce desde la DLQ (simulación por defecto)
   ${c.cyan("validate")} <subject>        Comprueba un subject contra el protocolo
+  ${c.cyan("provision")} <services.json> Crea los streams y durables que exige el manifiesto
+                              (idempotente, informa de diferencias, nunca borra)
   ${c.cyan("keygen")} <servicio> <n>     Genera un par Ed25519 para firmar eventos
 
 ${c.bold("OPCIONES GLOBALES")}
   -s, --server <url>        nats://127.0.0.1:4222  (o \$NATS_URL)
-      --creds <fichero>     Credenciales NATS
+      --creds <fichero>     Credenciales NATS (.creds)
   -v, --verbose             Más detalle
   -h, --help
+
+${c.bold("OPCIONES DE provision")}
+      --dry-run             Muestra qué se crearía; no crea nada
+      --replicas <n>        Réplicas de los streams (por defecto 1; producción: 3)
+      --bundle <fichero>    Índice de subjects con esquema (por defecto schemas/bundle.json)
 
 ${c.bold("EJEMPLOS")}
   flux doctor
@@ -44,6 +54,14 @@ ${c.bold("EJEMPLOS")}
   flux dlq ls pedidos
   flux dlq inspect pedidos --subject pedidos.pedido.v1.creado
   flux dlq replay pedidos --subject pedidos.pedido.v1.creado --confirm
+  flux provision examples/services.json --dry-run --creds ops.creds
+  flux provision examples/services.json --replicas 3 --creds ops.creds
+
+${c.bold("PROVISION")}
+  Usa credenciales de OPERACIÓN, no las de un servicio: un servicio no puede crear streams
+  ni consumidores (06-security.md §3). Con el Modelo B (gen-acl.mjs --tenants) hay una
+  account por tenant: se ejecuta una vez por account, con las credenciales de operación
+  de cada una.
 
 ${c.bold("SEGURIDAD")}
   El payload de eventos con dataclassification confidential o restricted NO se
@@ -58,6 +76,9 @@ function parseArgs(argv) {
     else if (a === "-v" || a === "--verbose") opts.verbose = true;
     else if (a === "-s" || a === "--server") opts.server = argv[++i];
     else if (a === "--creds") opts.creds = argv[++i];
+    else if (a === "--dry-run") opts.dryRun = true;
+    else if (a === "--replicas") opts.replicas = Number(argv[++i]);
+    else if (a === "--bundle") opts.bundle = argv[++i];
     else if (a === "--since") opts.since = argv[++i];
     else if (a === "--subject") opts.subject = argv[++i];
     else if (a === "--limit") opts.limit = Number(argv[++i]);
@@ -178,13 +199,33 @@ if (cmd === "validate") {
   process.exit(validate(sub));
 }
 
+if (cmd === "provision") {
+  if (!sub) die("uso: flux provision <services.json> [--dry-run] [--replicas n] [--bundle fichero]");
+  opts.replicas ??= 1;
+  if (!Number.isInteger(opts.replicas) || opts.replicas < 1 || opts.replicas > 5) {
+    die(`--replicas debe ser un entero de 1 a 5, no "${opts.replicas}"`);
+  }
+}
+
+// `--creds` se pasaba antes a una opción `creds` que el cliente NATS ignora: la conexión se
+// abría SIN credenciales y el servidor respondía «Authorization Violation», sin mencionar
+// que el fichero nunca se leyó. Un .creds se entrega con su autenticador.
+let authenticator;
+if (opts.creds) {
+  try {
+    authenticator = credsAuthenticator(new TextEncoder().encode(await readFile(opts.creds, "utf8")));
+  } catch (e) {
+    die(`no se pudo leer el fichero de credenciales "${opts.creds}": ${e.message}`, 2);
+  }
+}
+
 const url = opts.server ?? process.env.NATS_URL ?? "nats://127.0.0.1:4222";
 let nc;
 try {
   nc = await connect({
     servers: url,
     name: "flux-cli",
-    ...(opts.creds && { authenticator: undefined, creds: opts.creds }),
+    ...(authenticator && { authenticator }),
   });
 } catch (e) {
   die(
@@ -211,6 +252,18 @@ try {
     case "tail": {
       if (!sub) die("uso: flux tail <patrón>   p.ej. flux tail 'pedidos.>'");
       await tail(js, jsm, sub, opts);
+      break;
+    }
+
+    case "provision": {
+      const codigo = await comandoProvision(jsm, {
+        manifiesto: sub,
+        dryRun: opts.dryRun,
+        replicas: opts.replicas,
+        bundle: opts.bundle,
+      });
+      await nc.drain();
+      process.exit(codigo);
       break;
     }
 

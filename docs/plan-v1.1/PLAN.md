@@ -253,8 +253,36 @@ Reglas nuevas. Todas tienen evidencia en el Apéndice A.
   $JS.ACK.<STREAM>.<durable>.>
   ```
 
-  Más `$JS.API.INFO` y `$JS.API.STREAM.INFO.<STREAM>` de los streams propios y consumidos.
-  *(A-3, A-4)*
+  Más `$JS.API.INFO` y `$JS.API.STREAM.INFO.<STREAM>` de los streams propios y consumidos,
+  **y de la DLQ de cada stream consumido**: `subscribe()` también consulta `DLQ_<DOM>`, y sin
+  ese permiso intenta crearlo y falla. *(A-3, A-4, A-8b)*
+
+  > **Corregido tras medir.** La versión original de este plan, y `evidencia/candidata.conf`,
+  > no incluían `STREAM.INFO.DLQ_<DOM>`. Con la candidata, el SDK de Node **no** podía
+  > suscribirse (`Permissions Violation for Publish to "$JS.API.STREAM.CREATE.DLQ_PEDIDOS"`).
+- **El dueño lee su propia DLQ con un pull consumer**, no con una suscripción a
+  `dlq.<dominio>.>`: un durable `<servicio>__dlq_<dominio>` sobre `DLQ_<DOM>`, con filtro
+  `dlq.<dominio>.>` y los mismos permisos que cualquier durable, y ninguna suscripción. El plan no lo cubría
+  (la v1 del generador le daba `sub: dlq.<dominio>.>`, que con pull consumers no sirve).
+  Alternativa descartada: la suscripción core, que solo ve los muertos en vivo y reintroduce
+  un permiso de suscripción fuera del inbox. *(A-8a)*
+
+  > **Medido también en el SDK de Node** *(A-26, A-27)*: `subscribe()` comprueba que la DLQ
+  > existe **al arrancar** (descubrirlo con el primer evento envenenado es el peor momento) y
+  > sin el permiso lanza `PermissionDeniedError`; y cada permiso de la lista se probó
+  > **quitándolo** (`sdk-node/test/integration/acl.test.ts`).
+
+  Medido también en el SDK de Rust *(A-28)*:
+  - `$JS.API.INFO` **no lo usa el SDK de Rust** (medido con un sniffer sobre el flujo completo).
+    El cliente de Node sí lo emite con `jetstreamManager()` (A-3): confírmalo allí antes de
+    quitarlo de la lista de Node.
+  - `$JS.API.CONSUMER.CREATE.…` es **prescindible** si `flux provision` crea el consumidor:
+    el SDK **pregunta primero** (`CONSUMER.INFO`) y solo crea si no existe. *(Antes intentaba
+    crear primero: cada arranque dejaba una `Publish Violation` en el log del servidor aunque
+    el SDK la absorbiera.)*
+  - `$JS.API.CONSUMER.INFO.…` es **imprescindible**: lo primero que pregunta `subscribe()`; sin
+    él falla con `PERMISSION_DENIED`. Lo usa además el sondeo de `flux_consumer_pending` (si hay
+    métricas).
 - **Nunca a un servicio:** `$JS.API.CONSUMER.DURABLE.CREATE.*` (el filtro va en el cuerpo
   y ninguna ACL lo ve), `$JS.API.STREAM.MSG.GET.*`, y crear, modificar, borrar o purgar
   streams. *(A-5, A-6)*
@@ -262,7 +290,23 @@ Reglas nuevas. Todas tienen evidencia en el Apéndice A.
   aceptar una CA propia y credenciales nkey / `.creds`.
 - **Streams y consumidores se aprovisionan fuera del SDK** en producción. Si el SDK
   intenta crear y el broker lo deniega, **DEBE** fallar con un error accionable
-  (`NOT_PROVISIONED`), no con un timeout.
+  (`NOT_PROVISIONED`), no con un timeout. *(A-8b)*
+
+  > **Decidido tras medir: `CONSUMER.CREATE` NO se concede por defecto.** El plan original lo
+  > incluía en los permisos de cada durable. No es imprescindible con un durable aprovisionado
+  > (el SDK de Node, si le deniegan el `add`, cae a `CONSUMER.INFO`), y concederlo permite que
+  > un durable borrado lo recree el propio servicio con `deliver_policy: all` —reentrega
+  > silenciosa de hasta 30 días de eventos— o que un servicio comprometido cambie el `ack_wait`
+  > o el `backoff` de su consumidor. `gen-acl.mjs --dev` lo concede, solo sobre el durable
+  > propio y con su filtro exacto, para arrancar sin `flux provision`. Los SDKs hacen *info
+  > antes de crear* (Fase 1.4 y 6).
+
+  **Ojo: el broker no contesta a una petición
+  denegada** (A-28): el SDK tiene que escuchar los `-ERR 'Permissions Violation…'` de la
+  conexión y competirlos con la respuesta, o el síntoma es un timeout de 5–30 s. Falta
+  además un segundo código, `PERMISSION_DENIED`, para cuando ni siquiera hay permiso de
+  *consultar* el recurso (una ACL de la v1): `NOT_PROVISIONED` se reserva para «el recurso
+  falta y no puedo crearlo». Los dos son PERMANENT.
 
 Añade a `AGENTS.md` §8 dos trampas: «los permisos de subject no gobiernan JetStream» y
 «`_INBOX.>` común = cualquiera lo lee todo».
@@ -273,10 +317,46 @@ Añade a `AGENTS.md` §8 dos trampas: «los permisos de subject no gobiernan Jet
   `schemas/bundle.json`**. Un patrón que no encaja con ningún subject declarado es un
   error. Motivo: el nombre del durable es un único token y NATS no permite comodines
   dentro de un token; hay que conocer el subject exacto.
-- Emite los permisos de 1.1. La forma objetivo está escrita a mano en
-  [`evidencia/candidata.conf`](evidencia/candidata.conf).
-- `--nkeys <mapa.json>`: sustituye cada `<NKEY_DE_*>` por la clave pública real.
-- Actualiza también la rama `--tenants` (Modelo B).
+- Emite los permisos de 1.1. La forma objetivo se escribió a mano en
+  [`evidencia/candidata.conf`](evidencia/candidata.conf), con las dos diferencias de arriba
+  (la DLQ de los streams consumidos y la DLQ propia). Ese fichero ya no la contiene: tras la 1.5
+  la genera `gen-acl.mjs` y la ejecuta la suite, y solo quedan los usuarios de las Fases 2 y 3
+  (la versión anterior está en el historial de git).
+- `--nkeys <mapa.json>`: sustituye cada `<NKEY_DE_*>` por la clave pública real. Rechaza una
+  **semilla** (es un secreto), una clave repetida entre servicios (credencial compartida) y un
+  servicio sin clave.
+- Actualiza también la rama `--tenants` (Modelo B). Las claves de `--nkeys` son
+  `<servicio>@<tenant>`: NATS rechaza la misma nkey en dos accounts (*Duplicate nkey*, A-8d).
+
+**Interfaz fijada** (la suite de seguridad se construye sobre ella):
+
+```
+node scripts/gen-acl.mjs <services.json> [--bundle <bundle.json>] [--nkeys <mapa.json>]
+                         [--check] [--tenants] [--json] [--dev]
+```
+
+- `--json` imprime un array con un elemento por servicio (por servicio y tenant con
+  `--tenants`): `{ name, publish, subscribe, owns, consumes, durables }`, donde `consumes` ya
+  está **expandido** a subjects exactos y `durables` es `[{ stream, durable, filter, kind }]`
+  (`kind` ∈ `events | dlq`).
+- `--dev` añade `CONSUMER.CREATE` de cada durable propio (ver arriba). Sin él, ningún permiso
+  de `CREATE`. Una lista de permisos **nunca** sale vacía: en NATS `allow: []` significa «sin
+  restricción», no «nada» (medido).
+- La salida por defecto es un bloque `accounts { … }` **incluible** con `include`; no define
+  puerto, TLS ni JetStream de servidor. No genera el usuario de operación: quien aprovisiona lo
+  añade (p. ej. insertándolo tras `users: [`).
+- `--bundle` por defecto es el `schemas/bundle.json` **de este repositorio**, no el del
+  directorio actual.
+- Un patrón de `consumes` sin coincidencias, o un subject exacto inexistente, es un error con
+  pista; también un comodín que no sea el `>` final y dos subjects que den el mismo durable.
+- La lógica compartida con `flux provision` vive en `scripts/lib/manifest.mjs`;
+  `protocol.json` → `security.acl` fija la lista **cerrada** de permisos concedibles y la de los
+  denegables, y `check-protocol-json.mjs` comprueba que el generador la cumple.
+
+[`scripts/verify-acl.mjs`](../../scripts/verify-acl.mjs) aplica lo generado a un nats-server
+real y comprueba lo permitido y lo denegado, **la minimalidad de cada permiso** (quitando uno,
+el ciclo del servicio se rompe) y que las sondas **detectan** una ACL rota (dos mutantes
+sembrados) y la ACL v1 congelada.
 - `examples/services.json`: cada subject consumido debe existir en `schemas/`. Añade los
   esquemas de ejemplo que falten.
 
@@ -286,6 +366,16 @@ Crea streams `EVT_`/`DLQ_` (`02-naming.md` §3.3) y los consumidores durables co
 configuración canónica (`03-delivery.md` §2). Idempotente. Informa de diferencias. **Nunca
 borra.** Usa credenciales de operación, no de servicio.
 
+Implementado como `flux provision <services.json> [--dry-run] [--replicas n] [--bundle …]
+[--server …] [--creds …]`. Crea, además, el durable con el que cada dueño lee su DLQ. Sale con
+`1` si algún recurso existe con otra configuración (se informa y no se toca) o dio error.
+`--replicas` por defecto 1; producción, 3. Los nombres y la expansión de `consumes` los comparte
+con `gen-acl.mjs` (`scripts/lib/manifest.mjs`); las configuraciones salen de `protocol.json`.
+
+> **Corregido tras medir.** `--creds` de la CLI **no funcionaba**: se pasaba a una opción
+> `creds` que el cliente NATS ignora, y el servidor respondía *Authorization Violation* (A-8e).
+> Ahora se entrega con `credsAuthenticator`, para todos los comandos.
+
 #### 1.4 SDKs — Node y Rust ahora; el resto en la Fase 6
 
 Mientras un SDK no lo implemente, no es compatible con la configuración segura (usaría el
@@ -294,16 +384,26 @@ inbox `_INBOX.>` común y el broker se lo denegaría). La tabla de capacidades d
 
 | Cambio | Detalle |
 |---|---|
-| Prefijo de inbox | `_INBOX.<service>`, siempre. Opción del cliente NATS: `inboxPrefix` (Node), `inbox_prefix` (Python), `CustomInboxPrefix` (Go), `inboxPrefix` (Java), `InboxPrefix` (.NET), `custom_inbox_prefix` (Rust). **PHP usa inboxes `_REQS.n`: verifica cómo se configura en `basis-company/nats`.** Nombres por confirmar en cada librería. |
+| Prefijo de inbox | `_INBOX.<service>`, siempre. Opción del cliente NATS: `inboxPrefix` (Node; confirmado en `@nats-io/transport-node` 3.4.0 y comprobado que rige también las peticiones de la API de JetStream y las entregas del pull), `inbox_prefix` (Python), `CustomInboxPrefix` (Go), `inboxPrefix` (Java), `InboxPrefix` (.NET), `custom_inbox_prefix` (Rust). **PHP usa inboxes `_REQS.n`: verifica cómo se configura en `basis-company/nats`.** Nombres por confirmar en cada librería. |
 | TLS | Opción `tls: { caFile, certFile?, keyFile? }` que pasa al cliente. |
-| Credenciales | Node: cablear `.creds` y semilla nkey con los autenticadores del cliente (H4). Los demás ya aceptan `.creds`; añade nkey donde falte. |
-| `NOT_PROVISIONED` | Si falta el stream o el consumidor y crear está denegado. |
+| Credenciales | Node: cablear `.creds` y semilla nkey con los autenticadores del cliente (H4). Los demás ya aceptan `.creds`; añade nkey donde falte. **Hecho en Node:** `creds` es una **ruta** (como `CredsFile` en Go y Rust), más `credsContent`, `nkeySeed`, `token` y `user`+`pass`; un solo método, y todo lo mal formado lanza en `connect()`. |
+| `NOT_PROVISIONED` | Si falta el stream o el consumidor y crear está denegado. **Node:** `NotProvisionedError`, PERMANENT. Una petición de la API denegada llega en ~1 ms como `RequestError` con `cause: PermissionViolationError` *(A-21)*: reconócela por la `cause`, no por el texto. |
+| Primera conexión | **Añadido tras medir *(A-24)*.** Con `waitOnFirstConnect` el cliente NATS reintenta **cualquier** error sin límite: un certificado que no verifica deja `connect()` esperando para siempre, sin error. El SDK debe esperar a un broker caído y **fallar** ante lo que no se arregla esperando (TLS que no verifica, credenciales rechazadas, TLS pedido y no ofrecido). Node: `ConnectionRejectedError`. |
+| Denegaciones asíncronas | **Añadido tras medir *(A-19, A-20)*.** `ack` y el pull son publicaciones sueltas: si se deniegan no hay excepción. Sin vigilarlas, un ack denegado reentrega para siempre y un pull denegado deja un consumidor inerte «sano». Node: `subscribe()` lanza si el pull se deniega; el ack solo puede avisar por `logger`. |
+| `NOT_PROVISIONED` (Rust) | Si falta el stream o el consumidor y crear está denegado. Más `PERMISSION_DENIED` si ni consultar está permitido. En `async-nats` la denegación solo llega como `Event::ServerError` (A-28) |
+| Conexión inicial (Rust) | **Rust:** `retry_on_initial_connect` de `async-nats` reintenta para siempre y sin distinguir causas, así que una credencial rechazada o un TLS que no encaja dejaban un servicio mudo hasta el primer timeout. `connect()` espera ahora al broker, pero devuelve al instante lo que reintentar no arregla. **Comprueba el mismo patrón en el resto de SDKs** (`waitOnFirstConnect` en Node) |
 
 #### 1.5 Suite de seguridad — `conformance/security.mjs` + `conformance/cases/security-acl.json`
 
-Como `run.mjs`: habla NATS directamente, sin SDK. Pasos: genera claves nkey de prueba
-(`@nats-io/nkeys` ya es dependencia transitiva), genera la config con `gen-acl.mjs`,
-arranca un `nats-server` con TLS, aprovisiona con `flux provision`, y ejecuta la matriz:
+Como `run.mjs`: habla NATS directamente, sin SDK (salvo S10 y S11, que existen justo para lo
+contrario). Pasos: genera claves nkey de prueba (`@nats-io/nkeys`, dependencia directa de
+`conformance/`), genera la config con `gen-acl.mjs`, arranca un `nats-server` con TLS,
+aprovisiona con `flux provision`, y ejecuta la matriz.
+
+**Al revés que `run.mjs`: los casos son DATOS y el runner los ejecuta.**
+[`conformance/cases/security-acl.json`](../../conformance/cases/security-acl.json) define el
+vocabulario de operaciones y, por caso, `spec`, `rationale`, `observed` y `counterExample`;
+[`conformance/security.mjs`](../../conformance/security.mjs) no sabe qué es S1. La matriz:
 
 | Caso | Debe |
 |---|---|
@@ -319,20 +419,47 @@ arranca un `nats-server` con TLS, aprovisiona con `flux provision`, y ejecuta la
 | S10 | El SDK de Node pasa su test de integración bajo esta configuración |
 | S11 | El SDK de Rust pasa su test de integración bajo esta configuración |
 
-Job nuevo `security` en `.github/workflows/spec.yml`. Los jobs de integración que ya
-levantan NATS (Rust, PHP) pasan a usar la configuración segura.
+> **Hecho, y corregido tras medir** (nats-server 2.14.5, 2026-11-26). Además de S1–S11, la suite
+> lleva S12 (A-19, A-20: sin permiso de ack o de pull el fallo es silencioso), S13 (A-21: denegado,
+> «no existe» y «no hay respuesta» se distinguen) y S14 (A-25: una lista vacía no deniega). Lo que
+> la ejecución cambió respecto a lo escrito arriba:
+>
+> - **S8, texto plano.** La librería de NATS sube sola a TLS contra un servidor que lo exige
+>   (`nats://` acaba en `UNABLE_TO_VERIFY_LEAF_SIGNATURE`, no en texto plano), así que no prueba
+>   que una credencial en claro se rechace. Se habla el protocolo a mano por un socket: el
+>   servidor cierra sin contestar en cuanto llegan bytes que no son un ClientHello.
+> - **`flux provision` por TLS.** La CLI no tiene `--ca`: la CA de la PKI efímera le llega por
+>   `NODE_EXTRA_CA_CERTS`. Un operador con una CA privada tendría que hacer lo mismo.
+> - **S11 destapó que Rust no cumplía «info antes de crear», y ya está corregido.** §1.1 decide que
+>   los SDKs preguntan por el consumidor (`CONSUMER.INFO`) antes de crearlo, y Node lo hacía (S10:
+>   cero violaciones en el log del servidor). El SDK de Rust intentaba `CONSUMER.CREATE` primero:
+>   bajo la ACL generada, que no lo concede, cada `subscribe()` dejaba **una `Publish Violation`**
+>   en el log del servidor aunque el ciclo funcionase. Una violación de permiso es una señal de
+>   alerta: una por arranque la vuelve ruido y tapa las reales. La alineación de Rust lo corrigió, y
+>   S11 exige ahora `serverViolations: 0`, igual que S10.
+> - **Los jobs de integración de Rust y PHP siguen contra un NATS abierto.** Pasarlos a la
+>   configuración segura queda para la Fase 6, junto a la paridad de los SDKs.
+
+Job nuevo `security` en `.github/workflows/spec.yml`, justo después de `acl-verify`, que se queda:
+no es redundante (verifica el generador, `flux provision`, la minimalidad de cada permiso, `--dev` y
+el Modelo B). Que los jobs de integración que ya levantan NATS (Rust, PHP) pasen a usar la
+configuración segura queda pendiente (ver arriba).
 
 `docker-compose.yml`: perfil `secure` con TLS y la ACL generada, para desarrollo local.
+[`scripts/dev-secure.mjs`](../../scripts/dev-secure.mjs) genera en `.dev-secure/` (ignorado por git)
+la CA, las nkeys, la ACL y la configuración del servidor que el perfil monta. Verificado arrancando
+`nats-server` directamente con esa configuración y haciendo un ciclo con el SDK de Node; el perfil
+de compose en sí no se ha podido ejecutar (el contenedor de desarrollo no tiene Docker).
 
 **Aceptación**
 
 ```bash
-node conformance/security.mjs                      # S1–S10 en verde
-node conformance/security.mjs --acl fixtures/acl-v1.conf   # DEBE fallar en S1 y S6
+FLUX_REQUIRE_BROKER=1 node conformance/security.mjs                  # S1–S14 en verde
+node conformance/security.mjs --acl conformance/fixtures/acl-v1.conf # DEBE fallar en S1 y S6
 ```
 
 Borra de `docs/plan-v1.1/evidencia/` lo que ya sea un caso (`acl-generada.mjs` y la
-parte 3 de `diseno-candidato.mjs`).
+parte 3 de `diseno-candidato.mjs`). *(Hecho.)*
 
 ---
 
@@ -679,6 +806,28 @@ Cada uno: arnés ampliado con las operaciones nuevas, vectores cruzados en verde
 integración contra NATS bajo la configuración segura, columna de capacidades en el
 `README.md`.
 
+**Seguridad (Fase 1) en Go, Java, .NET, PHP y Python — dos cosas más que el inbox privado, TLS
+y credenciales.** Node y Rust ya las cumplen; los otros cinco las tienen **sin hacer ni medir**:
+
+- **(a) Medir si su primera conexión se cuelga.** El agente de la spec midió que
+  `waitOnFirstConnect` (Node, A-24) deja `connect()` esperando para siempre ante un certificado
+  que no verifica, y que `retry_on_initial_connect` (`async-nats`, A-30) deja el servicio
+  arrancado y mudo. **No midió los demás.** Go usa `RetryOnFailedConnect` y Java
+  `connectReconnectOnConnect`: hay que ejecutarlos contra un broker real con una credencial
+  rechazada, una CA que no firmó el certificado, un host fuera de los SAN y TLS exigido sin TLS
+  en el broker, y apuntar qué hace cada uno (falla, se cuelga o se queda mudo). Si no falla
+  rápido, el SDK escribe su propio bucle de espera (`03-delivery.md` §6.1). Lo medido va a
+  `conformance/cases/` y al Apéndice A.
+- **(b) Emitir los tres códigos y hacer fallar `subscribe()` ante un pull denegado.**
+  `CONNECTION_REJECTED` (motivo `auth` o `tls`), `INVALID_CREDENTIALS` e `INVALID_TLS_OPTIONS`
+  (`04-errors.md` §5.3), todos PERMANENT; y `subscribe()` con `PERMISSION_DENIED` si se deniega
+  `$JS.API.CONSUMER.MSG.NEXT.…` (`06-security.md` §3.7: **DEBE**, no DEBERÍA). El pull denegado
+  no da error y deja un consumidor inerte que parece sano; cómo detectarlo depende de si la
+  librería permite un PING/PONG (Node) o no (Rust: una petición propia al mismo subject). Cada
+  código se prueba **en los dos sentidos**: en su situación y en ninguna otra
+  (`sdk-rust/tests/security.rs`, `h_*` y `g_*`). `node scripts/check-sdk-codes.mjs` exige los
+  literales a todo SDK que declare `security`.
+
 **PHP:** `watch` y `respond` necesitan un proceso de larga duración. Documenta que en
 hosting compartido el camino es el gateway.
 
@@ -747,6 +896,12 @@ Reproducible: [`evidencia/ejecutar.sh`](evidencia/ejecutar.sh).
 | A-6 | Leer el stream con `$JS.API.STREAM.MSG.GET.…` | `Permissions Violation` |
 | A-7 | Otro servicio se suscribe a `_INBOX.>` y a `_INBOX.fx-fact.>` | Denegadas las dos |
 | A-8 | Otro servicio pide mensajes del consumidor ajeno (`CONSUMER.MSG.NEXT`) | `Permissions Violation` |
+| A-8a | El dueño de un dominio lee su DLQ con un pull consumer: `CONSUMER.CREATE.DLQ_<DOM>.<durable>.dlq.<dom>.>` exacto, y sin `STREAM.INFO` | Crea el durable y consume. Con filtro `dlq.>`, o sobre la DLQ de otro dominio: `Permissions Violation` |
+| A-8b | El SDK de Node bajo la ACL generada, quitando permisos de uno en uno (`scripts/verify-acl.mjs`) | Cada permiso es necesario **salvo `CONSUMER.CREATE`** con un durable aprovisionado (cae a `CONSUMER.INFO`). Sin `STREAM.INFO.DLQ_<DOM>`, `subscribe()` intenta `STREAM.CREATE.DLQ_<DOM>` y falla |
+| A-8c | El SDK real de Node, sin modificar, con `inboxPrefix` y autenticador nkey inyectados por `credentials` | `connect`, `subscribe`, `publish`, ruta a la DLQ y lectura de la DLQ por el dueño: todo funciona bajo la ACL generada |
+| A-8d | La misma nkey en dos accounts de una config | `nats-server` no arranca: `Duplicate nkey` |
+| A-8e | `.creds` con un JWT de relleno contra un servidor con nkeys estáticas; y la opción `creds` del cliente NATS | El `credsAuthenticator` autentica (solo importa la semilla). La opción `creds` se ignora: `Authorization Violation` |
+| A-8f | Cómo se manifiesta una denegación en `@nats-io/*` 3.4.0 | Una petición sin permiso falla en ~2 ms con `Permissions Violation for Publish`. Con el inbox por defecto, la primera petición falla en ~3 ms (`…for Subscription to "_INBOX.….*"`). Una suscripción denegada **no lanza** al suscribirse, pero su iterador **lanza** `PermissionViolationError` al consumirlo |
 | A-9 | Stream con `max_msgs_per_subject: 1`: 3 escrituras sobre 2 claves | 2 mensajes en el stream |
 | A-10 | Lectura puntual con *direct get* (`last_by_subj`) | Devuelve el último valor |
 | A-11 | Escribir con `Nats-Expected-Last-Subject-Sequence` desfasada, y crear una clave existente con `0` | `wrong last sequence: N` en ambos |
@@ -757,3 +912,30 @@ Reproducible: [`evidencia/ejecutar.sh`](evidencia/ejecutar.sh).
 | A-16 | Petición atendida por un servicio con `allow_responses: true` y sin permiso de publicación sobre inboxes | Respuesta correcta en ~0,7 ms (local) |
 | A-17 | Llamar a una operación no concedida | `Permissions Violation` |
 | A-18 | Petición a un subject que captura un stream | La «respuesta» recibida es el acuse de JetStream: `{"stream":"TRAMPA","seq":1}` |
+| A-19 | Pull consumer con permisos exactos **sin** `$JS.ACK.<S>.<D>.>` | Se entrega y se procesa; nunca se confirma: `ack_floor=0`, el evento se **reentrega cada `ack_wait`, sin fin**. Ninguna excepción: solo un evento de estado `PermissionViolationError` en `nc.status()` |
+| A-20 | Pull consumer **sin** `$JS.API.CONSUMER.MSG.NEXT.<S>.<D>` | `consume()` no lanza y el consumidor queda inerte, parece sano. Solo el evento de estado. **El primer pull no se publica hasta que alguien itera** el consumidor |
+| A-21 | Petición de la API de JetStream denegada; suscripción denegada | Petición: `RequestError` con `cause: PermissionViolationError`, en ~1 ms (no timeout). Suscripción denegada: el **iterador** de esa suscripción lanza `PermissionViolationError`. «Stream no existe» es `code 10059` y «consumidor no existe» `10014`, distintos de la denegación |
+| A-22 | Espía con `_INBOX.>` mientras un servicio consume por pull con inbox privado | El espía recibe **el evento completo**. Las entregas de un pull llegan con el **subject original** del evento aunque viajen por el inbox: así funciona la fuga H2, y por eso solo la ACL la evita, no el SDK |
+| A-23 | `.creds` contra un broker en modo operador/JWT (JWT firmados a mano con `nkeys`, sin `nsc`) | `.creds` válido conecta; con la semilla de otra clave y sin credenciales: `AuthorizationError`. Ruta y contenido se comportan igual |
+| A-24 | `connect()` con `waitOnFirstConnect: true` y un certificado de servidor que no verifica | **No falla: se cuelga.** Con `false`, falla en ~5 ms con `UNABLE_TO_VERIFY_LEAF_SIGNATURE` (CA que falta o equivocada) o `ERR_TLS_CERT_ALTNAME_INVALID` (host fuera de los SAN). Un servidor sin TLS ante `tls` pedido: `ConnectionError "server does not support 'tls'"` (no baja a texto plano). mTLS sin certificado de cliente: solo `TimeoutError`; el motivo está en el log del servidor |
+| A-25 | Usuario con `subscribe: { allow: [] }` | **Sin restricción**: una lista vacía no deniega. La variante «sin inbox propio» de la matriz de tests no fallaba hasta sustituir la lista vacía por el inbox de otro servicio |
+| A-26 | SDK de Node con la candidata exacta | `subscribe()` falla con `Permissions Violation for Publish to "$JS.API.STREAM.INFO.DLQ_PEDIDOS"`: falta ese permiso en `candidata.conf` |
+| A-27 | Consumidor aprovisionado por `ops`, servicio **sin** `CONSUMER.CREATE` | Funciona si el SDK pregunta antes de crear (`CONSUMER.INFO`); sin consumidor y sin ese permiso: `NotProvisionedError`, en milisegundos y no tras un timeout |
+| A-28 | SDK de Rust (`async-nats` 0.50) con una publicación denegada por la ACL: ¿qué ve quien la hizo? | **Nada**: el servidor descarta el mensaje y manda `-ERR 'Permissions Violation for Publish to "…"'` por la conexión; la petición espera a su timeout. Solo es observable como `Event::ServerError(ServerError::Other(texto))`. El log **del servidor** dice otra cosa: `Publish Violation - Subject "…"`. Fuente: `sdk-rust/tests/security.rs` |
+| A-29 | SDK de Rust bajo permisos exactos: subjects que publica un consumidor y un dueño en un flujo completo (publicar, consumir, ack, WIP, nak, term, DLQ, sondeo) | `STREAM.INFO.EVT_<D>`, `STREAM.INFO.DLQ_<D>` (¡no estaba en la candidata!), `CONSUMER.CREATE.<S>.<d>.<subject>`, `CONSUMER.INFO.<S>.<d>`, `CONSUMER.MSG.NEXT.<S>.<d>`, `$JS.ACK.<S>.<d>.<…>`, `dlq.<subject>`; ninguno de `$JS.API.INFO`. Toda petición responde bajo `_INBOX.<servicio>.` incluida la del pull (`MSG.NEXT`) |
+| A-30 | Fallos de conexión inicial en `async-nats`: credencial rechazada, CA que no firmó, TLS exigido sin TLS en el broker, mTLS sin certificado de cliente | `AuthorizationViolation` el primero; **los tres de TLS llegan como `ConnectErrorKind::Io`** con un `io::Error InvalidData` dentro (`UnknownIssuer`, `InvalidContentType`, `CertificateRequired`), no como `Tls` |
+A-19 a A-27 los reproduce `sdk-node/test/integration/` (`acl.test.ts`, `auth.test.ts`,
+`tls.test.ts`), contra nats-server 2.14.5 y `@nats-io/*` 3.4.0. A-28 a A-30 los reproduce
+`sdk-rust/tests/security.rs`, contra nats-server 2.14.5 y `async-nats` 0.50.
+
+**Qué caso cubre cada una.** Las observaciones **del broker** ya son casos de
+[`conformance/cases/security-acl.json`](../../conformance/cases/security-acl.json) (el mapa
+completo es su bloque `brokerObservations`): A-1 → S9 · A-2 → S6, S9 · A-3 → S1 · A-4 → S2 ·
+A-5 → S3 · A-6 → S4 · A-7 → S6 · A-8 → S5 · A-8a → S1, S2 · A-8c → S10 · A-8f → S6, S13 ·
+A-19, A-20 → S12 · A-21 → S13 · A-22 → S6 · A-24 → S8 (la parte del broker) · A-25 → S14 ·
+A-27 → S10, S11 · A-29 → S11.
+**No tienen caso** porque son del SDK o de la librería (A-8b, A-26, A-28, A-30; los cubren
+`verify-acl.mjs` y los tests de los SDKs), de las Fases 2 y 3 (A-9 … A-18, aún en `evidencia/`) o
+necesitan otra forma de arrancar el servidor (A-8d, la misma nkey en dos accounts: no arranca;
+A-23, el modo operador/JWT; A-8e y A-24, la parte de `connect()` que se cuelga: son de la
+librería y de la CLI).

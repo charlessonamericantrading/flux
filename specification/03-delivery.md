@@ -252,3 +252,50 @@ Un SDK L2 **DEBE**:
   se reentregará, y eso es correcto — es exactamente el caso que la idempotencia
   cubre.
 - Exponer el estado de conexión como un healthcheck consultable.
+
+### 6.1 La primera conexión: esperar al broker, no a lo que no cambia
+
+Reconectar «indefinidamente» es lo correcto **una vez conectado**. La primera conexión es otro
+caso, porque ahí hay dos clases de fallo que el cliente NATS no distingue y que piden
+respuestas opuestas:
+
+| El `connect()` inicial falla porque… | ¿Lo arregla reintentar? | El SDK | Código ([04-errors.md §5.3](04-errors.md)) |
+|---|---|---|---|
+| El broker aún no ha arrancado (conexión rechazada o sin respuesta) | **Sí** | **DEBE** esperar, con la misma espera con jitter que la reconexión | ninguno: no es un error |
+| El broker rechaza las credenciales | No | **DEBE** fallar de inmediato | `CONNECTION_REJECTED`, motivo `auth` |
+| El certificado del servidor no verifica: CA ausente o equivocada, host fuera de los SAN, caducado | No | **DEBE** fallar de inmediato | `CONNECTION_REJECTED`, motivo `tls` |
+| Se exige TLS y el servidor no lo ofrece | No | **DEBE** fallar de inmediato, y **NO DEBE** bajar a texto plano | `CONNECTION_REJECTED`, motivo `tls` |
+| Una opción local está mal formada: un `.creds` ilegible, una semilla que no es de usuario, una CA que no es PEM | No | **DEBE** fallar **antes** de abrir ningún socket | `INVALID_CREDENTIALS` o `INVALID_TLS_OPTIONS`, según la opción |
+| Se exige mTLS y el cliente no presenta certificado | No | **DEBERÍA** fallar de inmediato: no todos los clientes NATS lo distinguen de un timeout | `CONNECTION_REJECTED`, motivo `tls` |
+
+Un servicio que arranca antes que NATS es lo normal en un compose, y por eso la primera fila
+existe: morir en el primer intento convertiría cada despliegue en una carrera. Pero esperar es
+la respuesta equivocada a todas las demás.
+
+**El motivo está medido, no es teórico** (evidencias A-24 y A-30 del
+[Apéndice A del plan v1.1](../docs/plan-v1.1/PLAN.md#apéndice-a--evidencia), contra
+nats-server 2.14.5). `waitOnFirstConnect` (Node, A-24) y `retry_on_initial_connect`
+(`async-nats`, Rust, A-30) reintentan **cualquier** error y sin límite. Con un certificado de
+servidor que no verifica, el primero no falla: **`connect()` se cuelga**; el segundo devuelve
+el control al instante y el servicio queda arrancado, con el healthcheck de proceso en verde,
+y **mudo**: la primera publicación espera su *timeout* y nada dice que el problema es el
+certificado. Es lo peor que le puede pasar a quien acaba de
+configurar TLS: no ve un error, ve un servicio que no hace nada. Con `waitOnFirstConnect:
+false` el mismo fallo es un error en ~5 ms (A-24).
+
+Por eso el bucle de espera lo escribe el SDK, no la librería: la librería reintenta todo y
+solo el SDK sabe qué errores son de «aún no está» y cuáles de «esto no cambia por esperar».
+
+- Cómo reconocerlos depende de la librería, y no siempre es por el tipo: en `async-nats` los
+  tres fallos de TLS llegan como `ConnectErrorKind::Io` con un `io::Error` `InvalidData`
+  dentro, no como `Tls` (A-30); en `@nats-io/*`, un servidor sin TLS ante un `tls` pedido llega
+  como un `ConnectionError` más (A-24). Cada SDK **DEBERÍA** tener, contra un broker real, un
+  caso por cada fila de la tabla: es la única forma de saber que sigue reconociéndose cuando
+  la librería cambia.
+- El error **DEBE** llevar el código de la tabla, decir la causa y qué revisar
+  ([04-errors.md §5.3](04-errors.md)). El código importa tanto como el comportamiento: una
+  fila que fallara «rápido» pero con el código de otra mandaría a quien opera a buscar donde
+  no es. Por eso el caso de cada fila comprueba **qué** código sale, no solo que sale.
+- Esta regla es de la **primera** conexión. Qué debe hacer un SDK si el broker rechaza las
+  credenciales durante una *re*conexión (una credencial que caduca o se rota) **no está
+  medido**, y este documento no lo fija.

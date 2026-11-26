@@ -342,6 +342,22 @@ pub fn is_dlq_subject(subject: &str) -> bool {
     subject.starts_with("dlq.")
 }
 
+/// Devuelve `_INBOX.facturacion-api`: el prefijo del inbox PRIVADO del servicio.
+///
+/// Con el inbox por defecto —`_INBOX.>`, común a todos— cualquier servicio con permiso de
+/// suscripción sobre él lee las respuestas y las entregas de JetStream de los demás: las
+/// entregas viajan por el inbox, así que `facturacion-api` leyó un evento de `inventario`
+/// sin tener concedido ese dominio (plan v1.1, evidencia A-2). Con `_INBOX.<servicio>.>` la
+/// ACL puede confinar a cada servicio al suyo (A-7).
+///
+/// El SDK lo fija solo a partir del nombre de servicio, que ya se valida como un único
+/// token `[a-z0-9-]`: no es una opción pública, porque un servicio que eligiera otro
+/// prefijo se quedaría sin permiso de suscripción y sin una pista de por qué.
+#[must_use]
+pub fn inbox_prefix(service: &str) -> String {
+    format!("_INBOX.{service}")
+}
+
 /// Devuelve `/produccion/pedidos-api` — 01-envelope.md §2.
 ///
 /// `id` + `source` son la clave de deduplicación del ecosistema entero, así que el
@@ -480,5 +496,19 @@ mod tests {
             source_uri("produccion", "pedidos-api"),
             "/produccion/pedidos-api"
         );
+    }
+
+    /// El inbox es privado por construcción: `_INBOX.<servicio>` y nada más. Como el
+    /// servicio es un único token `[a-z0-9-]`, el prefijo nunca puede escapar a otro
+    /// servicio ni al `_INBOX.>` común (06-security.md §3).
+    #[test]
+    fn el_inbox_es_privado_del_servicio() {
+        assert_eq!(inbox_prefix("facturacion-api"), "_INBOX.facturacion-api");
+        // Dos servicios, dos prefijos que no se contienen: `_INBOX.fx.>` no concede
+        // `_INBOX.fx-fact.…` porque el separador es el punto, no el prefijo de texto.
+        let a = format!("{}.", inbox_prefix("fx"));
+        let b = format!("{}.", inbox_prefix("fx-fact"));
+        assert!(!b.starts_with(&a));
+        assert!(!a.starts_with(&b));
     }
 }

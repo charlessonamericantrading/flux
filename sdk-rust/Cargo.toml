@@ -2,10 +2,25 @@
 name = "flux"
 version = "1.0.0"
 edition = "2021"
-# 1.83 es el mínimo real: `io::ErrorKind::{HostUnreachable, NetworkUnreachable}` —que
-# `classify.rs` usa para reconocer lo transitorio por SEMÁNTICA y no por substring— se
-# estabilizaron ahí (`io_error_more`).
-rust-version = "1.83"
+# 1.88.0 es el mínimo real, y está MEDIDO, no supuesto: con 1.87 `cargo` se niega a compilar
+# («async-nats@0.50.0 requires rustc 1.88.0») y con 1.88 pasa `cargo check --all-targets`
+# con y sin `--all-features`. Lo impone una dependencia DIRECTA, no código de este crate:
+#
+#   async-nats 0.50 declara `rust-version = "1.88.0"` — y de él cuelga todo lo demás:
+#     → rand 0.10 → chacha20 0.10 → cpufeatures 0.3    edition 2024: cargo >= 1.85
+#     → time 0.3.55                                    rust-version 1.88
+#     → url → idna → idna_adapter → icu_* 2.3          let-chains: rustc >= 1.88
+#
+# Tampoco es solo una etiqueta de cargo: con `--ignore-rust-version`, 1.85/1.86/1.87 siguen
+# sin compilar (`icu_locale_core` 2.3 usa let-chains, estabilizadas en 1.88).
+#
+# El valor anterior, 1.83, era el mínimo de NUESTRO código —`io::ErrorKind::{HostUnreachable,
+# NetworkUnreachable}`, que `classify.rs` usa para reconocer lo transitorio por semántica y no
+# por substring, se estabilizaron ahí (`io_error_more`)— y no el del árbol de dependencias.
+# Nadie lo notó porque el CI compilaba con `stable` y ningún job ejecutaba la afirmación. Ahora
+# el job `sdk-rust` de `spec.yml` lee ESTA línea, instala ese toolchain y hace `cargo check`:
+# subirla o bajarla sin que las dependencias lo respalden rompe CI.
+rust-version = "1.88.0"
 description = "Cliente Rust del flux Event Protocol v1 — CloudEvents 1.0 sobre NATS JetStream (L2)"
 license = "MIT"
 repository = "https://github.com/charlessonamericantrading/flux"
@@ -39,6 +54,13 @@ futures = "0.3"
 
 async-nats = "0.50"
 
+# Ya está en el árbol: `async-nats` lo trae con su feature por defecto `nkeys`. Se declara
+# aquí porque el SDK valida la semilla nkey en `connect()` —un valor mal formado debe fallar
+# en alto en el arranque— y `async-nats` solo la parsea cuando intenta autenticarse, es
+# decir, dentro de su bucle de reconexión, donde un error de configuración se vuelve un
+# reintento infinito y silencioso. Misma versión resuelta, cero coste añadido.
+nkeys = "0.4"
+
 # ─── Firma Ed25519 — extensión OPCIONAL de v1 (07-signing.md) ────────────────
 #
 # Va detrás de la feature `signing` y NO se activa por defecto a propósito: la firma es
@@ -67,10 +89,13 @@ rand_core = { version = "0.6", features = ["getrandom"], optional = true }
 # esa resolución es exactamente lo que manda el protocolo. El bundle llega como dato y es
 # autocontenido.
 #
-# Versión 0.46 y no la 0.50: la 0.50 sube el MSRV por encima del 1.83 que este crate declara,
-# y subirlo obligaría a actualizar el toolchain de todo servicio que consuma el SDK por una
-# feature que la mayoría no activa. La 0.46 entiende draft 2020-12, que es lo único que hace
-# falta aquí.
+# Versión 0.46: se fijó para no subir el `rust-version` por una feature que la mayoría no
+# activa (la 0.47 en adelante declara 1.85, y entonces el crate declaraba 1.83). Ese motivo ya
+# no se sostiene: el mínimo es 1.88 por `async-nats`, y lo que declara `jsonschema` 0.47+
+# (1.85) queda por debajo. La 0.46 es, pues, una decisión heredada y no una necesidad de MSRV;
+# subirla es un cambio de dependencia aparte, con su propia verificación de L3 (no se ha
+# compilado aquí ninguna versión posterior). La 0.46 entiende draft 2020-12, que es lo único
+# que hace falta aquí.
 jsonschema = { version = "0.46", default-features = false, optional = true }
 
 [features]
@@ -97,3 +122,8 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
 # Los tests de integración leen la DLQ con la API CRUDA de NATS a propósito: comprueban
 # los BYTES que el SDK escribió, no su propia interpretación de ellos.
 async-nats = "0.50"
+# Certificados efímeros para los tests de TLS (`tests/security.rs`): una CA propia, un
+# certificado de servidor y otro de cliente, generados en el propio test. Sin esto habría que
+# commitear una clave privada de prueba —que caduca y que un escáner de secretos marca— o
+# depender de que `openssl` esté instalado.
+rcgen = "0.13"
