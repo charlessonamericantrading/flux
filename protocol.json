@@ -699,10 +699,71 @@
         "$JS.API.STREAM.LIST"
       ],
       "neverGrantedPattern": "^(>|\\$JS\\.>|\\$JS\\.API\\.>|\\$JS\\.API\\.\\*(\\..*)?|\\$JS\\.API\\.CONSUMER\\.DURABLE\\.CREATE(\\..*)?|\\$JS\\.API\\.STREAM\\.(MSG\\.GET|MSG\\.DELETE|CREATE|UPDATE|DELETE|PURGE|NAMES|LIST|SNAPSHOT|RESTORE)(\\..*)?|\\$JS\\.API\\.CONSUMER\\.(DELETE|NAMES|LIST)(\\..*)?|\\$JS\\.API\\.DIRECT\\.GET(\\..*)?)$",
+      "neverGrantedExceptions": [
+        "state.acl.ownerDirectGet",
+        "state.acl.observerDirectGet"
+      ],
+      "$commentNeverGrantedExceptions": "Lo denegable es lo que caza neverGrantedPattern SALVO estas dos formas de DIRECT.GET de ESTADO, referidas a su patron en state.acl (una sola fuente): la del dueno (DIRECT.GET.STATE_<DOM>.state.<dom>.>) y la del observador con el tenant FIJADO (DIRECT.GET.STATE_<DOM>.state.<dom>.<agr>.v<M>.<tenant|*>.*). Es por subject: el broker rechaza un cuerpo en esa forma (408, A-38), asi que no se puede colar la lectura de otro mensaje. La forma de CUERPO ($JS.API.DIRECT.GET.<stream> + {seq}), cualquier comodin por encima del tenant y DIRECT.GET.> siguen denegados. Es una lista aparte y no un lookahead dentro de neverGrantedPattern porque los motores sin lookahead (Rust regex, Go RE2) tienen que poder compilar ese patron; quien lo aplique ignorando las excepciones se equivoca hacia lo seguro (marca como denegable algo concedido), nunca al reves. check-protocol-json.mjs prueba en los dos sentidos que las excepciones son exactamente esas dos y que lo ancho sigue denegado.",
       "neverGrantedReasons": {
         "$JS.API.CONSUMER.DURABLE.CREATE": "API antigua: el filtro va solo en el cuerpo y ninguna ACL lo ve (A-5)",
         "$JS.API.STREAM.MSG.GET y $JS.API.DIRECT.GET": "leen cualquier mensaje por secuencia, sin consumidor ni filtro (A-6)",
         "$JS.API.> y >": "anulan el modelo entero: con ellos un servicio crea consumidores sobre el stream de otro dominio y lee con MSG.GET"
+      }
+    },
+    "manifest": {
+      "$comment": "El manifiesto de ownership (examples/services.json) que alimenta gen-acl.mjs y flux provision. Normativo en specification/06-security.md §3.8; los permisos de estado concretos, en state.acl. `watches` es la lista de contratos de estado que observa un servicio.",
+      "serviceKeys": [
+        "name",
+        "owns",
+        "consumes",
+        "watches"
+      ],
+      "unknownServiceKeysRejected": true,
+      "watches": {
+        "entry": [
+          "<dominio>.<agregado>.v<major>",
+          "{ \"contract\": \"<dominio>.<agregado>.v<major>\", \"tenants\": [\"<tenant>\", ...] }"
+        ],
+        "examples": [
+          "clientes.cliente.v1",
+          {
+            "contract": "clientes.cliente.v1",
+            "tenants": [
+              "acme"
+            ]
+          }
+        ],
+        "contractPattern": "state.contract.pattern",
+        "tenantPattern": "state.tenant.pattern",
+        "tenantMaxLength": 64,
+        "withoutTenants": "observes-all-tenants",
+        "withTenants": "confined-to-those-tenants",
+        "confinementEnforcedBy": "broker",
+        "emptyTenantsListRejected": true,
+        "unknownEntryKeysRejected": true,
+        "durablePerTenant": true,
+        "durable": "state.watch.durable.pattern",
+        "ownDomainRejected": true,
+        "stateInConsumesRejected": true,
+        "contractMustExistInBundleStateIndex": true,
+        "domainMustHaveOwner": true,
+        "$comment": "Sin `tenants`, el servicio observa TODOS los tenants del contrato: durable sin sufijo, filtro state.<contrato>.*.* y DIRECT.GET ...<contrato>.*.*. Con `tenants`, un durable y un DIRECT.GET POR TENANT (el durable lleva el tenant en el nombre: un durable compartido reparte los mensajes, A-47) y el broker deniega cualquier otro (A-14, A-38). `tenants: []` se rechaza: leerlo como 'ninguno' y aplicarlo como 'todos' seria la trampa de `allow: []` (A-25); un `tenant` en singular tambien, para que una errata no sea 'todos los tenants'. El dueno de un dominio no lo observa (ya lo escribe y lo lee con get). El estado no va en `consumes`: es un subject de un dominio reservado."
+      },
+      "stateOwnership": {
+        "domainHasStateIf": "bundle.state-has-a-contract-of-the-domain",
+        "ownerOfDomainWithState": "ownerPublish, ownerDirectGet, durable-of-state-dlq",
+        "ownerStreamInfoState": "never",
+        "observer": "consumerInfo, consumerNext, ack, observerDirectGet per tenant, dlqPublish, streamInfo of DLQ_<DOM>",
+        "observerStreamInfoState": "never",
+        "createOnlyWithDev": true,
+        "$comment": "El generador no concede STREAM.INFO.STATE_<DOM> a NINGUN rol, ni siquiera al dueno (state.acl dice que PUEDE tenerlo): el SDK no lo usa (put, get y watch funcionan sin el, A-38, A-48) y con subjects_filter lista todas las claves y todos los tenants (A-39). Si un dia hace falta, es un permiso mas del dueno, no del observador."
+      },
+      "reservedDomains": {
+        "ownsRejected": true,
+        "consumesRejected": true,
+        "watchesRejected": true,
+        "names": "naming.reservedDomains.names",
+        "$comment": "ownDomain (security.acl.permissionPatterns) casa con `state.>` y `dlq.>`: un servicio dueno del dominio `state` recibiria permiso para escribir el estado de TODOS los dominios. Lo impide el generador (RESERVED_DOMAIN), no el patron."
       }
     },
     "provisioning": {
@@ -713,7 +774,22 @@
       "idempotent": true,
       "neverDeletes": true,
       "neverOverwritesDifferentConfig": true,
-      "notProvisionedErrorCode": "NOT_PROVISIONED"
+      "notProvisionedErrorCode": "NOT_PROVISIONED",
+      "state": {
+        "createsStateStreamPerDomainWithState": true,
+        "stateStream": "state.stream",
+        "createsStateDurablePerWatch": true,
+        "stateDurableDeliverPolicy": "last_per_subject",
+        "createsOwnerStateDlqDurable": true,
+        "dlqStreamSubjectsWhenDomainHasState": [
+          "dlq.<dominio>.>",
+          "dlq.state.<dominio>.>"
+        ],
+        "widensExistingDlqStream": true,
+        "onlyChangeToAnExistingResource": "dlq-subjects-widened-when-the-domain-gains-state",
+        "replicas": "--replicas",
+        "$comment": "flux provision crea STATE_<DOM> con state.stream para cada dominio que TIENE estado (el bundle tiene un contrato suyo), el durable de cada `watches` (uno por tenant si confina) y el durable con el que el dueno lee su DLQ de estado. Un DLQ_<DOM> de la 1.0, que solo captura dlq.<dominio>.>, se AMPLIA con dlq.state.<dominio>.> cuando el dominio gana estado: es lo unico que cambia en un recurso existente, no pierde mensajes (A-44) y cualquier otra diferencia se sigue informando sin tocar. --dry-run lo muestra como `se ampliaria`."
+      }
     },
     "sdk": {
       "$comment": "Lo que un SDK DEBE poder hacer para ser compatible con la configuracion segura (specification/06-security.md §2).",
@@ -1484,7 +1560,7 @@
       "systemSchemas": "schemas/system/*: van en `schemas` del bundle, fuera de `subjects` y de `state`"
     },
     "acl": {
-      "$comment": "Lo que un servicio necesita para el estado, MEDIDO contra un broker con una ACL escrita a mano (A-38 a A-40, A-48) y lo que gen-acl.mjs debe producir (clave `watches`). Extiende security.acl: NO la sustituye ni relaja su lista cerrada, y security.acl.neverGrantedPattern debe exceptuar la forma por subject de ESTADO de DIRECT.GET (y SOLO esa: la forma de cuerpo, y cualquier comodin por encima del tenant, siguen denegados). Un permiso que no encaje en ninguno de estos patrones ni en security.acl.permissionPatterns es un error del generador.",
+      "$comment": "Lo que un servicio necesita para el estado, MEDIDO contra un broker con una ACL escrita a mano (A-38 a A-40, A-48) y lo que gen-acl.mjs debe producir (clave `watches`). Extiende security.acl: NO la sustituye ni relaja su lista cerrada, y security.acl.neverGrantedExceptions exceptua de lo denegable estas dos formas por subject de ESTADO de DIRECT.GET (ownerDirectGet y observerDirectGet, y SOLO esas: la forma de cuerpo, y cualquier comodin por encima del tenant, siguen denegados). Lo que gen-acl.mjs genera de verdad esta en security.manifest y se ejecuta contra un broker en conformance/security.mjs (S15 a S20) y scripts/verify-acl.mjs. Un permiso que no encaje en ninguno de estos patrones ni en security.acl.permissionPatterns es un error del generador.",
       "ownerPublish": "^state\\.[a-z0-9]+(-[a-z0-9]+)*\\.>$",
       "ownerDirectGet": "^\\$JS\\.API\\.DIRECT\\.GET\\.STATE_[A-Z0-9_]+\\.state\\.[a-z0-9]+(-[a-z0-9]+)*\\.>$",
       "observerDirectGet": "^\\$JS\\.API\\.DIRECT\\.GET\\.STATE_[A-Z0-9_]+\\.state\\.[a-z0-9]+(-[a-z0-9]+)*\\.[a-z0-9]+(-[a-z0-9]+)*\\.v[1-9][0-9]*\\.([a-z0-9]+(-[a-z0-9]+)*|\\*)\\.\\*$",
@@ -1514,7 +1590,7 @@
         "consumerNext (durable dlq_state)",
         "ack (durable dlq_state)"
       ],
-      "$commentStreamInfo": "STREAM.INFO con `subjects_filter` en el cuerpo devuelve TODOS los subjects del stream con su recuento, es decir todas las claves y todos los tenants (A-39): con ese unico permiso un servicio confinado a `acme` conoce los clientes de `globex`. Sin el, put, get y watch funcionan igual (A-38, A-48). El dueno PUEDE tenerlo: ya ve todos sus tenants. Lo que si queda visible para un observador es STREAM.INFO.DLQ_<DOM>: los subjects de DLQ (cinco tokens, sin clave ni tenant) y sus recuentos.",
+      "$commentStreamInfo": "STREAM.INFO con `subjects_filter` en el cuerpo devuelve TODOS los subjects del stream con su recuento, es decir todas las claves y todos los tenants (A-39): con ese unico permiso un servicio confinado a `acme` conoce los clientes de `globex`. Sin el, put, get y watch funcionan igual (A-38, A-48). El dueno PUEDE tenerlo (ya ve todos sus tenants), y gen-acl.mjs NO se lo concede: el SDK no lo usa (security.manifest.stateOwnership.ownerStreamInfoState). Lo que si queda visible para un observador es STREAM.INFO.DLQ_<DOM>: los subjects de DLQ (cinco tokens, sin clave ni tenant) y sus recuentos.",
       "$commentCreate": "El filtro de un consumidor no se puede ampliar por el cuerpo: con CREATE.<S>.<d>.<filtro>, un filter_subject distinto da 10131 y un filter_subjects da 10137, y tampoco hereda el del subject si el cuerpo no trae ninguno (A-40). Un `*` final en el permiso admite tambien un filtro por UNA clave: mas estrecho, inocuo."
     },
     "metrics": {
