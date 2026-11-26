@@ -165,7 +165,7 @@ pub(crate) fn reject_reserved_domain(subject_or_contract: &str) -> Result<(), Fl
 /// indexa `bundle.state` y lo que va en la etiqueta `contract` de las métricas.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StateContract {
-    /// Dominio, en kebab-case y **nunca** uno de [`RESERVED_DOMAINS`].
+    /// Dominio, en kebab-case y **nunca** uno de [`crate::RESERVED_DOMAINS`].
     pub domain: String,
     /// Agregado, en kebab-case.
     pub aggregate: String,
