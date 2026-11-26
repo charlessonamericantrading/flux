@@ -126,16 +126,15 @@ async function ejecutar(entrada) {
         ev = createSigner(entrada.signing).sign(ev);
       }
       const d = entrada.dlq;
+      // `dlqtime` lo fija el vector: si lo pusiera el SDK, los bytes no serían comparables entre ejecuciones, y mucho
+      // menos entre lenguajes. El SDK lo normaliza a la forma canónica (o lo rechaza).
       const conDlq = toDlqEvent(ev, {
         reason: d.reason,
         attempts: d.attempts,
         consumer: d.consumer,
         error: d.error,
-      });
-      // `dlqtime` lo fija el vector: si lo pusiera el SDK, los bytes no serían
-      // comparables entre ejecuciones, y mucho menos entre lenguajes.
-      const { data, ...resto } = { ...conDlq, dlqtime: d.dlqtime };
-      return { ok: true, bytes: b64(serialize({ ...resto, data })) };
+      }, d.dlqtime);
+      return { ok: true, bytes: b64(serialize(conDlq)) };
     }
 
     case "sign": {

@@ -205,7 +205,10 @@ rápido con `PERMISSION_DENIED` y un ciclo completo contra un broker real con lo
 petición/respuesta, en los dos sentidos —una operación atendida por dos instancias reparte las peticiones, y al
 parar ambas quien llama recibe `RPC_UNAVAILABLE` en menos de 100 ms—. `security` no es requisito, pero **sin ella el
 SDK no puede ejecutar** el ciclo bajo la configuración segura (el inbox privado es lo que impide leer las
-respuestas ajenas). **Ningún SDK la declara todavía**: la evidencia llega con las fases de los SDKs.
+respuestas ajenas). La declaran **Node** y **Rust** ([`protocol.json`](../protocol.json) → `capabilities`): su evidencia
+son los tests contra un broker real que cita cada uno y el arnés cruzado, que ejecuta `rpc-request`, `rpc-reply`,
+`rpc-error`, `rpc-operation` y `rpc-timeout` en **cada SDK que la declara** y **falla** si uno no los cumple, o si
+declara la capacidad sin su arnés; los demás salen `N/A: no declara rpc`.
 
 Una capacidad nueva se añade aquí con su nombre, su documento normativo y la evidencia que la
 acredita, y ningún SDK la declara hasta que pasa esa evidencia.

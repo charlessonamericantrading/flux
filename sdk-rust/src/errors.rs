@@ -801,6 +801,22 @@ pub enum FluxError {
         reason: String,
     },
 
+    /// Un constructor puro del SDK se niega a construir un sobre de **evento o de estado**: falta (o
+    /// llega vacío) un atributo que el SDK rellena, o `time` no es un instante. A diferencia de
+    /// [`FluxError::Envelope`] **lleva un código estable**, el mismo que daría el parser ante el mismo
+    /// defecto (01-envelope.md §3.1): `MISSING_REQUIRED_ATTRIBUTE` (`id`, `source`, `dataschema`),
+    /// `MISSING_REQUIRED_EXTENSION` (`correlationid`, `tenantid`, `producerversion`) o
+    /// `WRONG_ATTRIBUTE_TYPE` (`time` que no es un instante RFC 3339). El arnés de conformidad compara
+    /// ese código entre SDKs. Los constructores de petición/respuesta dan [`FluxError::InvalidRpcCall`]:
+    /// su conjunto de códigos es cerrado.
+    #[error("{reason}")]
+    InvalidEnvelope {
+        /// El código estable.
+        code: &'static str,
+        /// Qué está mal y cómo se arregla.
+        reason: String,
+    },
+
     /// Fallo de transporte: conexión, publicación, creación de stream o de consumidor.
     ///
     /// Una conexión inicial rechazada por la credencial o por el TLS **no** es esto: es
@@ -1194,6 +1210,8 @@ impl FluxError {
             Self::RpcInvalidReply { .. } => return Some(RPC_INVALID_REPLY_CODE),
             Self::RpcMessageTooLarge { .. } => return Some(RPC_MESSAGE_TOO_LARGE_CODE),
             Self::InvalidRpcCall { .. } => return Some(INVALID_RPC_CALL_CODE),
+            // Un constructor de evento o de estado: el código que daría el parser ante el mismo defecto.
+            Self::InvalidEnvelope { code, .. } => return Some(code),
             _ => {}
         }
         let f = self.failure()?;

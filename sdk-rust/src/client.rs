@@ -2009,7 +2009,8 @@ impl Bus {
         let mut encoded = base64(raw);
         encoded.truncate(700_000);
 
-        let mut envelope = build_event(BuildEventInput {
+        // `system` es un dominio reservado: lo emite el propio SDK, no una aplicación.
+        let mut envelope = crate::envelope::build_event_internal(BuildEventInput {
             subject: "system.poison.v1.capturado".to_string(),
             data: data_to_raw(&json!({
                 "originalSubject": subject,
@@ -2033,7 +2034,8 @@ impl Bus {
         envelope.dlqreason = Some(DlqReason::Poison);
         envelope.dlqattempts = Some(1);
         envelope.dlqconsumer = Some(consumer.to_string());
-        envelope.dlqerror = Some(error.chars().take(1024).collect());
+        // 1024 BYTES UTF-8 sin partir un carácter (04-errors.md §3), no 1024 caracteres.
+        envelope.dlqerror = Some(crate::envelope::truncate_utf8_bytes(error, 1024));
         envelope.dlqtime = Some(now);
 
         let payload = serialize(&envelope)?;

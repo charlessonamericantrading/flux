@@ -42,6 +42,11 @@ español producido por .NET no coincide byte a byte con el de Node o Go. Hace fa
 > `json.dumps(ensure_ascii=False)` y `encoding/json` de Go emiten UTF-8 literal. Un
 > ecosistema que solo hable inglés tampoco lo notaría nunca.
 
+**Qué se escapa y qué no.** Solo `"`, `\` y los caracteres de control U+0000–U+001F (con su forma
+corta —`\b \f \n \r \t`— y, si no la hay, `\u00xx` con los cuatro dígitos en **minúscula**). Todo lo demás va
+**literal**, incluidos U+007F (DEL), U+2028 y U+2029, `<`, `>`, `&` y `/` (`\/` no se conserva). Es lo que escribe
+`JSON.stringify`, y lo que fija la forma canónica de `data` ([§4.1](#41-la-forma-canónica-de-data)).
+
 ## 2. Atributos de contexto — núcleo CloudEvents
 
 | Atributo | Tipo | Obl. | Regla flux |
@@ -101,6 +106,26 @@ para el mismo instante**. Eso rompe:
 Un SDK **DEBE** formatear explícitamente y **NO DEBE** usar el formateador ISO por
 defecto de su lenguaje. Verificado byte a byte entre Node, Python y Go.
 
+**El `time` que da quien llama.** El SDK lo pone él mismo y la API pública no lo recibe; pero los constructores del
+sobre (los que ejecuta el arnés de conformidad, y quien construya un transporte propio) reciben un `time` de fuera.
+Copiarlo tal cual dejaría pasar `…39Z` o `…+02:00` —otros bytes— o un valor que ni siquiera es un instante. Por eso un
+constructor **normaliza** lo que le dan a la forma canónica o lo **rechaza**:
+
+- Se admite un `date-time` de RFC 3339: `T` o `t` (o un espacio) entre fecha y hora; `Z` o `z`, o un desfase
+  `±hh:mm`; decimales opcionales y de **cualquier** longitud. Se convierte a UTC y se escribe con **exactamente 3
+  decimales y `Z`**; los decimales de más de tres se **truncan** (`.9999` es `.999`), no se redondean.
+  `2026-08-20T12:25:39.412+02:00`, `2026-08-20T10:25:39.4120Z` y `2026-08-20T10:25:39.412345Z` dan los mismos
+  bytes que `2026-08-20T10:25:39.412Z`.
+- **No** se admite: algo que no es un instante (`ayer`, `2026-13-20…`, `2026-02-30…`, sin zona horaria, solo fecha, un
+  desfase `+24:00`), **un segundo 60** (un segundo intercalar no existe en UTC de POSIX, y el `Date` de JavaScript lo
+  desplazaría al minuto siguiente: dos SDKs darían dos instantes), ni un instante cuyo año en UTC caiga fuera de
+  0000–9999 (`+10000-01-01…` y `-0001-12-31…` dejarían de ser RFC 3339).
+- Un `time` rechazado es **`WRONG_ATTRIBUTE_TYPE`** (CloudEvents tipa `time` como `Timestamp`); en petición/respuesta,
+  `INVALID_RPC_CALL` ([04-errors.md §7](04-errors.md)).
+
+Node copiaba lo que le daban y Rust lo normalizaba: el mismo `time` daba dos secuencias de bytes. Los vectores
+`ajuste-*-time-*` lo fijan para Node y Rust; **pendiente en Python, Go, Java, .NET y PHP** (Fase 6): hoy no los recorren.
+
 ### 2.3 Comparación de nombres de atributo: case-sensitive
 
 Los nombres de atributo se comparan **respetando mayúsculas**. `{"ID": "..."}` **no**
@@ -124,6 +149,13 @@ propaga un tipo inesperado hasta que alguien compara `tenantid` con `===`.
 
 Un SDK **DEBE** desactivar la coerción de tipos de su deserializador.
 
+Lo mismo vale para los atributos **no obligatorios** y para `dataschema`: un `"subject": 5`, un
+`"causationid": 7` o un `"dlqattempts": "seis"` no se propagan. Es un mensaje ininterpretable —**POISON**— con el código
+**`INVALID_ATTRIBUTE_TYPE`**, que se comprueba **después** de todos los demás de §3.1 y de los atributos raíz
+desconocidos (el orden es parte del contrato). `null` en un opcional es «ausente» (§3.3); `dlqattempts` es un entero de 0
+a 2^32 − 1 y `dlqreason`, uno de `retryable`, `permanent` o `poison`. Rust, Java y .NET ya lo hacían; Node dejaba pasar el
+valor.
+
 ### 2.5 Fidelidad numérica del payload
 
 Un SDK **NO DEBE** reescribir los números de `data` al deserializar y volver a
@@ -136,6 +168,10 @@ esto tanto como del orden de claves (§6).
 
 > La forma más simple de no tener este problema: **no metas decimales en `data`.** Los
 > importes van como entero en la unidad mínima (§4), y ahí no hay nada que normalizar.
+
+Esta regla es del camino que **consume y reenvía** (replay, DLQ): los bytes recibidos salen igual. Un SDK que **construye** un
+`data` nuevo emite su forma canónica ([§4.1](#41-la-forma-canónica-de-data)), y los números que un lenguaje no puede escribir
+como otro no tienen forma común: ahí está documentado qué no se admite.
 
 ### 2.6 Unicidad
 
@@ -246,6 +282,12 @@ El código acaba en la extensión `dlqerror` del evento en la DLQ y en las métr
 dos SDKs emiten códigos distintos para el mismo fallo, agrupar por causa deja de
 funcionar en cuanto el ecosistema es polyglot — que es siempre.
 
+**Los constructores rechazan lo mismo que el parser, con el mismo código.** Un `id`, `source` o `dataschema` vacío
+(`MISSING_REQUIRED_ATTRIBUTE`) o una extensión obligatoria vacía (`MISSING_REQUIRED_EXTENSION`) no sale de un
+constructor del SDK: un evento que su propio parser rechazaría no se construye. Node los aceptaba y Rust los rechazaba sin
+código. En petición/respuesta el conjunto de códigos es cerrado y el rechazo es `INVALID_RPC_CALL`
+([04-errors.md §7](04-errors.md)).
+
 | Extensión | Tipo | Descripción |
 |---|---|---|
 | `correlationid` | String | Identificador del flujo de negocio completo. Se propaga sin modificar a través de toda la cadena de eventos. Si un evento no nace de otro, el SDK lo inicializa con el `id` del propio evento. |
@@ -304,6 +346,40 @@ atributo raíz desconocido, en lugar de dejarlo pasar.
 - **NO DEBE** contener `null` para significar "ausente". Se omite el campo.
 - **DEBERÍA** ser autocontenido: el consumidor no debería necesitar llamar de vuelta
   al productor para actuar.
+
+### 4.1 La forma canónica de `data`
+
+Dos SDKs que reciben el **mismo** `data` deben escribir **los mismos bytes**: el orden de claves y los bytes son
+normativos para el replay, la firma y la dedupe por hash (§6). Hasta aquí no lo eran: Rust guardaba `data` como texto
+crudo y escribía lo que le daban —con espacios, con `\u00f1`, con una clave repetida—, y Node lo pasaba por
+`JSON.parse` y `JSON.stringify`, que lo normaliza. La forma **canónica** es la de Node, la de `JSON.stringify` con UTF-8
+literal:
+
+- **Sin espacios** ni saltos de línea entre elementos.
+- Las claves **en el orden en que se dan**; una clave **repetida** conserva la posición de la primera aparición y el valor
+  de la última (`{"a":1,"b":3,"a":2}` es `{"a":2,"b":3}`).
+- Las cadenas, **UTF-8 literal** salvo lo que ordena §1.1: `\u00f1` es `ñ`, `\/` es `/`, `\u007f` es DEL, un par
+  sustituto escapado es el carácter; `"`, `\` y U+0000–U+001F siguen escapados.
+- Los **números**, como los escribe cada lenguaje, **sin tocarlos** (§2.5): `4995` sale `4995`.
+
+Un constructor reescribe lo que recibe a esta forma; un SDK que consume y reenvía conserva los bytes (§2.5). Node y Rust la
+cumplen y la fijan los vectores `ajuste-data-*`; **pendiente en Python, Go, Java, .NET y PHP** (Fase 6): no se han medido contra
+esos vectores y no se garantiza que escriban esta forma.
+
+**Qué NO se admite en `data`** porque no tiene forma común entre lenguajes —no hay vector que lo iguale y **nada** garantiza que
+dos SDKs coincidan—, así que si los bytes importan (firma, replay, dedupe por hash) **no lo uses**:
+
+| Entrada | Qué pasa | Qué hacer |
+|---|---|---|
+| Un **entero fuera de ±(2^53 − 1)** (`9007199254740993`) | JavaScript lo **redondea** al `double` más cercano (`…992`); Rust lo conserva | Va como **cadena** (`"9007199254740993"`) o se parte en dos campos |
+| Un **flotante** o un exponente (`4995.00`, `1E+2`, `1e21`, `-0`, `0.0`) | JavaScript lo reescribe (`4995`, `100`, `1e+21`, `0`, `0`); Rust y Python escriben `4995.00`, `1E+2`… | **El dinero va en enteros** (`totalCents`, §4): un importe no es un flotante |
+| Una clave que es un **índice de array** (`"1"`, `"42"`) | JavaScript las ordena primero y en orden numérico, **por encima** del orden en que se dieron | Claves con letras (`camelCase`, §4) |
+| Un **sustituto UTF-16 suelto** (`"\ud83d"`) | JavaScript lo admite y lo escribe escapado; Rust lo **rechaza** (no es UTF-8) | No hay texto con un sustituto suelto |
+| Más de **128 niveles** de anidamiento | Rust lo rechaza; JavaScript admite más | `data` plano (§4: autocontenido, objetos poco profundos) |
+| Un número **fuera del rango de un `double`** (`1e400`) | JavaScript lo lee como `Infinity` y `JSON.stringify` lo escribe `null`; Rust lo rechaza | No lo uses |
+
+La tabla no es una lista de fallos de un SDK: son **diferencias de lenguaje** que ningún SDK puede evitar. Quien las necesite
+tiene dos salidas: representarlas como cadena, o no firmar ni deduplicar por hash esos eventos.
 
 ```json
 {

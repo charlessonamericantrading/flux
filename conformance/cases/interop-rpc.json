@@ -1,0 +1,186 @@
+{
+  "suite": "interop-rpc",
+  "title": "Petición/respuesta entre los SDKs REALES de Node y de Rust, bajo los permisos que genera gen-acl.mjs",
+  "spec": "specification/11-request-reply.md §3 a §5 y §12; specification/06-security.md §3.9",
+  "plan": "docs/plan-v1.1/PLAN.md Fase 3 (ola 2: la suite de interoperabilidad) y Apéndice A",
+  "runner": "conformance/interop-rpc.mjs",
+  "$comment": "Estos casos son DATOS: conformance/interop-rpc.mjs no sabe qué es I1, solo monta el MISMO entorno que la suite de seguridad (conformance/security/entorno.mjs: nats-server con TLS, la ACL que genera gen-acl.mjs de examples/services.json, `flux provision`) y ejecuta cada caso con el intérprete de conformance/security/interprete.mjs. El vocabulario (la operación `sdk_script`, con la que un caso lanza SDKs REALES como procesos) es el de conformance/cases/security-acl.json. Un caso con `matrix` se expande en uno por combinación: `{caller}` y `{responder}` se sustituyen en todo el caso (en `sdk` de cada agente y en los títulos), y el id es `I1[node→rust]`. Quien llama y quien responde son SDKs distintos y, de control, el mismo. Cada agente es un PROCESO que habla con el broker solo por la API pública de su SDK (conformance/security/participante-node.mjs y sdk-rust/examples/rpc_participant.rs, con el mismo protocolo): lo que se mide es lo que los SDKs hacen. Un caso DEBE llevar `spec`, `rationale`, `observed` (versión del servidor, fecha y resultado).",
+  "verifiedAgainst": "nats-server 2.14.5",
+  "verifiedOn": "2026-11-26",
+
+  "vocabulary": "security-acl.json",
+
+  "cases": [
+    {
+      "id": "I1",
+      "title": "{caller} llama a una operación que atiende {responder}: el sobre, el tenant, el `aggregateId`, la correlación y el UTF-8 llegan intactos",
+      "spec": "11-request-reply.md §3.1, §3.2, §4.3",
+      "plan": "PLAN Fase 3 (ola 2: interoperabilidad entre SDKs)",
+      "covers": ["A-144"],
+      "needs": ["sdk-node/dist", "cargo"],
+      "matrix": {"caller": ["node", "rust"], "responder": ["node", "rust"]},
+      "rationale": "Cada SDK construye y lee el sobre por su cuenta, y la spec fija cada byte (`cross-sdk-rpc-envelope`), pero lo que ocurre cuando uno lee lo que escribió el otro solo se ve con los dos conectados al mismo broker. Aquí quien llama y quien responde son SDKs distintos (y también los mismos, de control), con tenants distintos —el dueño no filtra por el tenant de su `connect()` (§5.6)— bajo los permisos generados. Si la respuesta de un SDK no heredara `tenantid`, `correlationid` o `causationid` como el otro lo espera, quien llama daría RPC_INVALID_REPLY.",
+      "observed": {"server": "nats-server 2.14.5", "date": "2026-11-26", "result": "Las cuatro combinaciones pasan (node→node, node→rust, rust→node, rust→rust): el dueño (tenant acme) ve el de quien llama (globex, o initech/acme por llamada), el `aggregateId`, el UTF-8 literal y la correlación propia (`correlationid` = `id`); quien llama acepta la respuesta (las cinco comprobaciones de §4.3); 50 llamadas concurrentes contestadas en 32-65 ms, 0 violaciones en el log del servidor."},
+      "steps": [
+        {
+          "op": "sdk_script",
+          "agents": [
+            {"id": "dueno", "sdk": "{responder}", "as": "crm-api", "tenant": "acme"},
+            {"id": "llama", "sdk": "{caller}", "as": "facturacion-api", "tenant": "globex"}
+          ],
+          "script": [
+            {"agent": "dueno", "cmd": "respond", "operation": "clientes.cliente.v1.obtener", "title": "{responder}: crm-api atiende `obtener`", "expect": {"ok": true, "subject": "rpc.clientes.cliente.v1.obtener"}},
+            {"agent": "llama", "cmd": "call", "operation": "clientes.cliente.v1.obtener", "data": {"clienteId": "cli-1", "campana": "Otoño café ñ ✓"}, "options": {"aggregateId": "cli-1", "timeoutMs": 5000}, "title": "{caller} llama a {responder}: el tenant de `connect()` de quien llama (globex, no el del dueño: acme), el `aggregateId`, el UTF-8 literal y la correlación propia llegan intactos, y quien llama acepta la respuesta (las 5 comprobaciones de §4.3)", "expect": {"ok": true, "data.instancia": "dueno", "data.tenant": "globex", "data.aggregateId": "cli-1", "data.eco.campana": "Otoño café ñ ✓", "data.eco.clienteId": "cli-1", "data.correlacionEsElId": true, "serverViolationCount": 0}},
+            {"agent": "llama", "cmd": "call", "operation": "clientes.cliente.v1.obtener", "data": {"clienteId": "cli-2"}, "options": {"tenantId": "initech"}, "title": "con `tenantId: initech` en la llamada: el dueño ve `initech` y la respuesta lo hereda (si no, quien llama diría RPC_INVALID_REPLY)", "expect": {"ok": true, "data.tenant": "initech"}},
+            {"agent": "llama", "cmd": "call", "operation": "clientes.cliente.v1.obtener", "data": {"clienteId": "cli-3"}, "options": {"tenantId": "acme"}, "title": "con el tenant del propio dueño (acme): lo mismo", "expect": {"ok": true, "data.tenant": "acme"}},
+            {"agent": "llama", "cmd": "call_many", "operation": "clientes.cliente.v1.obtener", "n": 50, "concurrency": 10, "data": {"clienteId": "cli-1"}, "title": "50 llamadas concurrentes: todas contestadas por el dueño, ninguna denegada", "expect": {"answered": 50, "failed": 0, "serverViolationCount": 0}}
+          ]
+        }
+      ]
+    },
+    {
+      "id": "I2",
+      "title": "Los errores de {responder} llegan a {caller} con su clase y su `code` intactos: retryable, permanent, desconocido, respuesta que no cabe",
+      "spec": "11-request-reply.md §3.3, §5.3, §5.4",
+      "plan": "PLAN Fase 3 (ola 2: interoperabilidad entre SDKs)",
+      "covers": ["A-65", "A-145"],
+      "needs": ["sdk-node/dist", "cargo"],
+      "matrix": {"caller": ["node", "rust"], "responder": ["node", "rust"]},
+      "rationale": "El error es lo que hace que un handler de eventos que llama a una operación herede la clasificación sin hacer nada: si el otro SDK dice `retryable`, el evento se reentrega con su backoff; si dice `permanent`, va a la DLQ en la primera entrega. Por eso la clase, el `code` y el `retryAfterMs` tienen que cruzar de un SDK al otro sin perder nada. Un error desconocido es `permanent` con un mensaje GENÉRICO —la excepción puede llevar valores de `data`, rutas del servidor o datos personales—, y la respuesta que no cabe (la única que falla en silencio, A-65) tiene que llegar como RPC_MESSAGE_TOO_LARGE en milisegundos, no como un timeout de 5 s. El control final demuestra que la sonda ve un acierto cuando lo hay.",
+      "observed": {"server": "nats-server 2.14.5", "date": "2026-11-26", "result": "Las cuatro combinaciones pasan: un RETRYABLE (HTTP_503, retryAfterMs 5000) y un PERMANENT (PEDIDO_YA_CANCELADO) llegan con su clase, `code`, `message` y `retryAfterMs`; sin código, RETRYABLE y PERMANENT; un 503, un 404 y un ECONNRESET que reconoce el clasificador llegan con HTTP_503 / HTTP_404 / ECONNRESET y mensaje genérico, sin el texto de la excepción; una excepción desconocida da `permanent` UNKNOWN «error interno del servicio» sin el secreto, que queda en el log de quien responde con el `id` de la petición; la respuesta de 1,1 MB da RPC_MESSAGE_TOO_LARGE en ~40 ms con el límite (1048576), no un timeout; algo que no es un objeto, INVALID_SCHEMA. Divergencia menor, sin efecto en el contrato: el mensaje genérico de un PERMANENT que reconoce el clasificador es «una dependencia rechazó la operación» en Node y «la operación no se pudo completar» en Rust."},
+      "steps": [
+        {
+          "op": "sdk_script",
+          "agents": [
+            {"id": "dueno", "sdk": "{responder}", "as": "crm-api", "tenant": "acme"},
+            {"id": "llama", "sdk": "{caller}", "as": "facturacion-api", "tenant": "globex"}
+          ],
+          "script": [
+            {"agent": "dueno", "cmd": "respond", "operation": "clientes.cliente.v1.obtener", "title": "{responder}: crm-api atiende `obtener`", "expect": {"ok": true}},
+            {"agent": "dueno", "cmd": "behavior", "operation": "clientes.cliente.v1.obtener", "behavior": {"kind": "error", "class": "retryable", "code": "HTTP_503", "message": "el servicio de tarifas no responde", "retryAfterMs": 5000}, "title": "el handler de {responder}: lanza un error RETRYABLE con código y `retryAfterMs`", "expect": {"ok": true}},
+            {"agent": "llama", "cmd": "call", "operation": "clientes.cliente.v1.obtener", "data": {"clienteId": "cli-1"}, "options": {"timeoutMs": 5000}, "title": "{caller} lo recibe: lanza un error RETRYABLE con código y `retryAfterMs`", "expect": {"ok": false, "error.class": "retryable", "error.code": "HTTP_503", "error.retryAfterMs": 5000, "error.message": {"includes": "el servicio de tarifas no responde"}, "ms": {"lte": 2500}}},
+            {"agent": "dueno", "cmd": "behavior", "operation": "clientes.cliente.v1.obtener", "behavior": {"kind": "error", "class": "permanent", "code": "PEDIDO_YA_CANCELADO", "message": "el pedido ya está cancelado"}, "title": "el handler de {responder}: lanza un error PERMANENT con código de aplicación", "expect": {"ok": true}},
+            {"agent": "llama", "cmd": "call", "operation": "clientes.cliente.v1.obtener", "data": {"clienteId": "cli-1"}, "options": {"timeoutMs": 5000}, "title": "{caller} lo recibe: lanza un error PERMANENT con código de aplicación", "expect": {"ok": false, "error.class": "permanent", "error.code": "PEDIDO_YA_CANCELADO", "error.message": {"includes": "el pedido ya está cancelado"}, "ms": {"lte": 2500}}},
+            {"agent": "dueno", "cmd": "behavior", "operation": "clientes.cliente.v1.obtener", "behavior": {"kind": "error", "class": "retryable", "message": "reintenta luego"}, "title": "el handler de {responder}: lanza un RETRYABLE sin código: `RETRYABLE`", "expect": {"ok": true}},
+            {"agent": "llama", "cmd": "call", "operation": "clientes.cliente.v1.obtener", "data": {"clienteId": "cli-1"}, "options": {"timeoutMs": 5000}, "title": "{caller} lo recibe: lanza un RETRYABLE sin código: `RETRYABLE`", "expect": {"ok": false, "error.class": "retryable", "error.code": "RETRYABLE"}},
+            {"agent": "dueno", "cmd": "behavior", "operation": "clientes.cliente.v1.obtener", "behavior": {"kind": "error", "class": "permanent", "message": "no se puede"}, "title": "el handler de {responder}: lanza un PERMANENT sin código: `PERMANENT`", "expect": {"ok": true}},
+            {"agent": "llama", "cmd": "call", "operation": "clientes.cliente.v1.obtener", "data": {"clienteId": "cli-1"}, "options": {"timeoutMs": 5000}, "title": "{caller} lo recibe: lanza un PERMANENT sin código: `PERMANENT`", "expect": {"ok": false, "error.class": "permanent", "error.code": "PERMANENT"}},
+            {"agent": "dueno", "cmd": "behavior", "operation": "clientes.cliente.v1.obtener", "behavior": {"kind": "http", "status": 503, "text": "SECRETO-del-proveedor: 503 en https://tarifas.interno/v1"}, "title": "el handler de {responder}: lanza el error de una dependencia que el CLASIFICADOR reconoce (un 503)", "expect": {"ok": true}},
+            {"agent": "llama", "cmd": "call", "operation": "clientes.cliente.v1.obtener", "data": {"clienteId": "cli-1"}, "options": {"timeoutMs": 5000}, "title": "{caller} lo recibe: lanza el error de una dependencia que el CLASIFICADOR reconoce (un 503)", "expect": {"ok": false, "error.class": "retryable", "error.code": "HTTP_503", "error.message": {"match": "^(?!.*(SECRETO|tarifas)).*$"}, "ms": {"lte": 2500}}},
+            {"agent": "dueno", "cmd": "behavior", "operation": "clientes.cliente.v1.obtener", "behavior": {"kind": "http", "status": 404, "text": "SECRETO-del-proveedor: 404 en https://tarifas.interno/v1"}, "title": "el handler de {responder}: lanza el error de una dependencia que el clasificador reconoce como PERMANENT (un 404)", "expect": {"ok": true}},
+            {"agent": "llama", "cmd": "call", "operation": "clientes.cliente.v1.obtener", "data": {"clienteId": "cli-1"}, "options": {"timeoutMs": 5000}, "title": "{caller} lo recibe: lanza el error de una dependencia que el clasificador reconoce como PERMANENT (un 404)", "expect": {"ok": false, "error.class": "permanent", "error.code": "HTTP_404", "error.message": {"match": "^(?!.*(SECRETO|tarifas)).*$"}}},
+            {"agent": "dueno", "cmd": "behavior", "operation": "clientes.cliente.v1.obtener", "behavior": {"kind": "econnreset", "text": "SECRETO-del-proveedor: read ECONNRESET 10.0.0.7:5432"}, "title": "el handler de {responder}: lanza un ECONNRESET (una conexión de su base de datos que se cae)", "expect": {"ok": true}},
+            {"agent": "llama", "cmd": "call", "operation": "clientes.cliente.v1.obtener", "data": {"clienteId": "cli-1"}, "options": {"timeoutMs": 5000}, "title": "{caller} lo recibe: lanza un ECONNRESET (una conexión de su base de datos que se cae)", "expect": {"ok": false, "error.class": "retryable", "error.code": "ECONNRESET", "error.message": {"match": "^(?!.*(SECRETO|10\\.0\\.0\\.7)).*$"}}},
+            {"agent": "dueno", "cmd": "behavior", "operation": "clientes.cliente.v1.obtener", "behavior": {"kind": "unknown", "text": "SECRETO-hunter2: /srv/crm/db.rs:42"}, "title": "el handler de {responder}: lanza una excepción DESCONOCIDA que lleva un secreto en su texto", "expect": {"ok": true}},
+            {"agent": "llama", "cmd": "call", "operation": "clientes.cliente.v1.obtener", "data": {"clienteId": "cli-1"}, "options": {"timeoutMs": 5000}, "title": "{caller} lo recibe: lanza una excepción DESCONOCIDA que lleva un secreto en su texto", "expect": {"ok": false, "error.class": "permanent", "error.code": "UNKNOWN", "error.message": {"not": {"includes": "SECRETO"}}, "ms": {"lte": 2500}}},
+            {"agent": "llama", "cmd": "call", "operation": "clientes.cliente.v1.obtener", "data": {"clienteId": "cli-1"}, "options": {"timeoutMs": 5000}, "title": "(mismo error) el mensaje que llega es el GENÉRICO: no cita ni el secreto ni la ruta ni el valor", "expect": {"error.message": {"match": "^(?!.*(SECRETO|hunter2|/srv/crm)).*interno.*$"}}},
+            {"agent": "dueno", "cmd": "stats", "title": "…y el texto de la excepción SÍ queda en el log de quien responde, con el `id` de la petición, para poder encontrarlo", "expect": {"logs": {"anyMatch": "SECRETO-hunter2"}}},
+            {"agent": "dueno", "cmd": "behavior", "operation": "clientes.cliente.v1.obtener", "behavior": {"kind": "big", "bytes": 1100000}, "title": "el handler de {responder}: devuelve una respuesta de 1,1 MB, que no cabe", "expect": {"ok": true}},
+            {"agent": "llama", "cmd": "call", "operation": "clientes.cliente.v1.obtener", "data": {"clienteId": "cli-1"}, "options": {"timeoutMs": 5000}, "title": "{caller} lo recibe: devuelve una respuesta de 1,1 MB, que no cabe", "expect": {"ok": false, "error.class": "permanent", "error.code": "RPC_MESSAGE_TOO_LARGE", "error.message": {"match": "1048576|1 MiB|límite"}, "ms": {"lte": 2500}}},
+            {"agent": "dueno", "cmd": "behavior", "operation": "clientes.cliente.v1.obtener", "behavior": {"kind": "no-object"}, "title": "el handler de {responder}: devuelve algo que no es un objeto", "expect": {"ok": true}},
+            {"agent": "llama", "cmd": "call", "operation": "clientes.cliente.v1.obtener", "data": {"clienteId": "cli-1"}, "options": {"timeoutMs": 5000}, "title": "{caller} lo recibe: devuelve algo que no es un objeto", "expect": {"ok": false, "error.class": "permanent", "error.code": "INVALID_SCHEMA", "ms": {"lte": 2500}}},
+            {"agent": "dueno", "cmd": "behavior", "operation": "clientes.cliente.v1.obtener", "behavior": {"kind": "echo"}, "title": "control: con un handler normal, la misma llamada funciona", "expect": {"ok": true}},
+            {"agent": "llama", "cmd": "call", "operation": "clientes.cliente.v1.obtener", "data": {"clienteId": "cli-1"}, "title": "control: contesta", "expect": {"ok": true, "data.instancia": "dueno"}}
+          ]
+        }
+      ]
+    },
+    {
+      "id": "I3",
+      "title": "Firma Ed25519 entre {caller} y {responder}: `require` en los dos sentidos y los tres códigos de rechazo",
+      "spec": "11-request-reply.md §7.4, §5.2; 07-signing.md §7",
+      "plan": "PLAN Fase 3 (ola 2: interoperabilidad entre SDKs)",
+      "covers": ["A-146"],
+      "needs": ["sdk-node/dist", "cargo"],
+      "matrix": {"caller": ["node", "rust"], "responder": ["node", "rust"]},
+      "rationale": "La firma cubre los bytes que cada SDK serializa, y esos bytes tienen que ser los mismos para que el otro SDK la verifique: aquí un SDK firma la petición y verifica la respuesta del otro con claves Ed25519 reales (PEM, el formato que aceptan los dos). En `require` los tres fallos —firma ausente, clave desconocida, firma que no corresponde— llegan como un error permanente con SU código, no como un RPC_INVALID_REPLY ni un timeout. Cada subescenario usa su propio dueño y lo para antes del siguiente: un grupo de cola reparte entre todos los que escuchan.",
+      "observed": {"server": "nats-server 2.14.5", "date": "2026-11-26", "result": "Las cuatro combinaciones pasan: con `require` en los dos lados, ida y vuelta firmadas y verificadas con claves Ed25519 PEM; sin firma de quien llama, el dueño responde MISSING_SIGNATURE (permanent) y NO ejecuta el handler; con el dueño sin firmar y quien llama en `require`, MISSING_SIGNATURE en quien llama; sin la clave pública de quien llama, UNKNOWN_SIGNING_KEY; con una clave equivocada, INVALID_SIGNATURE."},
+      "steps": [
+        {
+          "op": "sdk_script",
+          "agents": [
+            {"id": "dueno1", "sdk": "{responder}", "as": "crm-api", "tenant": "acme", "signing": "require"},
+            {"id": "llama1", "sdk": "{caller}", "as": "facturacion-api", "tenant": "globex", "signing": "require"},
+            {"id": "dueno2", "sdk": "{responder}", "as": "crm-api", "tenant": "acme", "signing": "require"},
+            {"id": "llama2", "sdk": "{caller}", "as": "facturacion-api", "tenant": "globex"},
+            {"id": "dueno3", "sdk": "{responder}", "as": "crm-api", "tenant": "acme"},
+            {"id": "llama3", "sdk": "{caller}", "as": "facturacion-api", "tenant": "globex", "signing": "require"},
+            {"id": "dueno4", "sdk": "{responder}", "as": "crm-api", "tenant": "acme", "signing": {"verify": "require", "knows": ["crm-api"]}},
+            {"id": "llama4", "sdk": "{caller}", "as": "facturacion-api", "tenant": "globex", "signing": "require"},
+            {"id": "dueno5", "sdk": "{responder}", "as": "crm-api", "tenant": "acme", "signing": {"verify": "require", "swap": {"facturacion-api": "crm-api"}}},
+            {"id": "llama5", "sdk": "{caller}", "as": "facturacion-api", "tenant": "globex", "signing": "require"}
+          ],
+          "script": [
+            {"agent": "dueno1", "cmd": "respond", "operation": "clientes.cliente.v1.obtener", "title": "{responder} atiende `obtener` (los DOS con la firma en `require`: ida y vuelta firmadas y verificadas)", "expect": {"ok": true}},
+            {"agent": "llama1", "cmd": "call", "operation": "clientes.cliente.v1.obtener", "data": {"clienteId": "cli-1"}, "options": {"timeoutMs": 5000}, "title": "{caller} llama: los DOS con la firma en `require`: ida y vuelta firmadas y verificadas", "expect": {"ok": true, "data.instancia": "dueno1", "data.tenant": "globex"}},
+            {"agent": "dueno1", "cmd": "stop", "operation": "clientes.cliente.v1.obtener", "title": "(se retira)", "expect": {"ok": true}},
+            {"agent": "dueno2", "cmd": "respond", "operation": "clientes.cliente.v1.obtener", "title": "{responder} atiende `obtener` (quien llama NO firma y el dueño exige firma: el dueño rechaza con un error `permanent` MISSING_SIGNATURE (y no ejecuta))", "expect": {"ok": true}},
+            {"agent": "llama2", "cmd": "call", "operation": "clientes.cliente.v1.obtener", "data": {"clienteId": "cli-1"}, "options": {"timeoutMs": 5000}, "title": "{caller} llama: quien llama NO firma y el dueño exige firma: el dueño rechaza con un error `permanent` MISSING_SIGNATURE (y no ejecuta)", "expect": {"ok": false, "error.class": "permanent", "error.code": "MISSING_SIGNATURE", "ms": {"lte": 2500}}},
+            {"agent": "dueno2", "cmd": "stop", "operation": "clientes.cliente.v1.obtener", "title": "(se retira)", "expect": {"ok": true}},
+            {"agent": "dueno2", "cmd": "stats", "title": "…y el handler no llegó a ejecutarse", "expect": {"total": 0}},
+            {"agent": "dueno3", "cmd": "respond", "operation": "clientes.cliente.v1.obtener", "title": "{responder} atiende `obtener` (el dueño NO firma y quien llama exige firma: quien llama rechaza la respuesta con MISSING_SIGNATURE)", "expect": {"ok": true}},
+            {"agent": "llama3", "cmd": "call", "operation": "clientes.cliente.v1.obtener", "data": {"clienteId": "cli-1"}, "options": {"timeoutMs": 5000}, "title": "{caller} llama: el dueño NO firma y quien llama exige firma: quien llama rechaza la respuesta con MISSING_SIGNATURE", "expect": {"ok": false, "error.class": "permanent", "error.code": "MISSING_SIGNATURE"}},
+            {"agent": "dueno3", "cmd": "stop", "operation": "clientes.cliente.v1.obtener", "title": "(se retira)", "expect": {"ok": true}},
+            {"agent": "dueno4", "cmd": "respond", "operation": "clientes.cliente.v1.obtener", "title": "{responder} atiende `obtener` (el dueño no conoce la clave pública de quien llama: UNKNOWN_SIGNING_KEY)", "expect": {"ok": true}},
+            {"agent": "llama4", "cmd": "call", "operation": "clientes.cliente.v1.obtener", "data": {"clienteId": "cli-1"}, "options": {"timeoutMs": 5000}, "title": "{caller} llama: el dueño no conoce la clave pública de quien llama: UNKNOWN_SIGNING_KEY", "expect": {"ok": false, "error.class": "permanent", "error.code": "UNKNOWN_SIGNING_KEY"}},
+            {"agent": "dueno4", "cmd": "stop", "operation": "clientes.cliente.v1.obtener", "title": "(se retira)", "expect": {"ok": true}},
+            {"agent": "dueno5", "cmd": "respond", "operation": "clientes.cliente.v1.obtener", "title": "{responder} atiende `obtener` (el dueño cree que la clave de quien llama es OTRA: INVALID_SIGNATURE)", "expect": {"ok": true}},
+            {"agent": "llama5", "cmd": "call", "operation": "clientes.cliente.v1.obtener", "data": {"clienteId": "cli-1"}, "options": {"timeoutMs": 5000}, "title": "{caller} llama: el dueño cree que la clave de quien llama es OTRA: INVALID_SIGNATURE", "expect": {"ok": false, "error.class": "permanent", "error.code": "INVALID_SIGNATURE"}},
+            {"agent": "dueno5", "cmd": "stop", "operation": "clientes.cliente.v1.obtener", "title": "(se retira)", "expect": {"ok": true}}
+          ]
+        }
+      ]
+    },
+    {
+      "id": "I4",
+      "title": "{responder} deja de atender: {caller} recibe `RPC_UNAVAILABLE` en milisegundos",
+      "spec": "11-request-reply.md §4.3, §5.5, §12.9",
+      "plan": "PLAN Fase 3 (ola 2: interoperabilidad entre SDKs)",
+      "covers": ["A-56", "A-59", "A-147"],
+      "needs": ["sdk-node/dist", "cargo"],
+      "matrix": {"caller": ["node", "rust"], "responder": ["node", "rust"]},
+      "rationale": "El ciclo de aceptación de cada SDK (S30, S31) para y llama con el MISMO SDK. Aquí el que para y el que llama son distintos: la suscripción de uno al subject exacto y el `no responders` que espera el otro (conexión con `headers` y `no_responders` en CONNECT) tienen que encajar entre implementaciones.",
+      "observed": {"server": "nats-server 2.14.5", "date": "2026-11-26", "result": "Las cuatro combinaciones pasan: tras `Responder.stop()` del dueño, 7 de 7 llamadas dan RPC_UNAVAILABLE (retryable) con mediana de pocos ms, venga el SDK que venga."},
+      "steps": [
+        {
+          "op": "sdk_script",
+          "agents": [
+            {"id": "dueno", "sdk": "{responder}", "as": "crm-api", "tenant": "acme"},
+            {"id": "llama", "sdk": "{caller}", "as": "facturacion-api", "tenant": "globex"}
+          ],
+          "script": [
+            {"agent": "dueno", "cmd": "respond", "operation": "clientes.cliente.v1.obtener", "title": "{responder} atiende `obtener`", "expect": {"ok": true}},
+            {"agent": "llama", "cmd": "call", "operation": "clientes.cliente.v1.obtener", "data": {"clienteId": "cli-1"}, "title": "control: contesta", "expect": {"ok": true}},
+            {"agent": "dueno", "cmd": "stop", "operation": "clientes.cliente.v1.obtener", "title": "{responder} para de forma ordenada", "expect": {"ok": true}},
+            {"agent": "llama", "cmd": "call_repeat", "operation": "clientes.cliente.v1.obtener", "repeat": 7, "data": {"clienteId": "cli-1"}, "options": {"timeoutMs": 5000}, "title": "{caller} recibe RPC_UNAVAILABLE en < 100 ms (la mediana de 7), retryable: `no responders` se entiende igual venga del SDK que venga", "expect": {"codes": {"RPC_UNAVAILABLE": 7}, "p50Ms": {"lte": 100}, "maxMs": {"lte": 1500}, "last.error.class": "retryable"}}
+          ]
+        }
+      ]
+    },
+    {
+      "id": "I5",
+      "title": "Los reintentos de {caller} llegan a {responder} con el mismo `id`",
+      "spec": "11-request-reply.md §4.5",
+      "plan": "PLAN Fase 3 (ola 2: interoperabilidad entre SDKs)",
+      "covers": ["A-61", "A-147"],
+      "needs": ["sdk-node/dist", "cargo"],
+      "matrix": {"caller": ["node", "rust"], "responder": ["node", "rust"]},
+      "rationale": "`RPC_TIMEOUT` es ambiguo: la operación pudo ejecutarse. Por eso quien responde deduplica por el `id` de la petición y un reintento DEBE reutilizarlo, con los mismos bytes. Un SDK que generara un `id` nuevo por intento no se notaría hasta que una orden se ejecutara dos veces: aquí se mide, con un responder lento y un timeout corto, que los tres intentos llegan con el mismo `id`.",
+      "observed": {"server": "nats-server 2.14.5", "date": "2026-11-26", "result": "Las cuatro combinaciones pasan: con `timeoutMs: 250, retries: 2` contra un dueño de 900 ms, quien llama acaba con RPC_TIMEOUT (retryable) y el dueño recibió TRES intentos con el MISMO `id` (`uniqueRequestIds` = 1)."},
+      "steps": [
+        {
+          "op": "sdk_script",
+          "agents": [
+            {"id": "dueno", "sdk": "{responder}", "as": "crm-api", "tenant": "acme"},
+            {"id": "llama", "sdk": "{caller}", "as": "facturacion-api", "tenant": "globex"}
+          ],
+          "script": [
+            {"agent": "dueno", "cmd": "respond", "operation": "clientes.cliente.v1.obtener", "behavior": {"kind": "echo", "afterMs": 900}, "title": "{responder} atiende `obtener`, pero tarda 900 ms", "expect": {"ok": true}},
+            {"agent": "llama", "cmd": "call", "operation": "clientes.cliente.v1.obtener", "data": {"clienteId": "cli-1"}, "options": {"timeoutMs": 250, "retries": 2}, "title": "{caller} llama con `timeoutMs: 250` y `retries: 2`: tres intentos y RPC_TIMEOUT (retryable)", "expect": {"ok": false, "error.code": "RPC_TIMEOUT", "error.class": "retryable"}},
+            {"agent": "dueno", "cmd": "stats", "title": "{responder} recibió los TRES intentos con el MISMO `id` (el reintento reutiliza el `id` y los bytes: así quien responde puede deduplicar)", "until": {"total": {"gte": 3}}, "expect": {"total": 3, "uniqueRequestIds": 1}}
+          ]
+        }
+      ]
+    }
+  ]
+}

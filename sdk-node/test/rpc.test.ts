@@ -63,6 +63,7 @@ import {
   type RpcErrorData,
 } from "../src/index.js";
 import { contextFromEvent, runWithContext } from "../src/context.js";
+import { esErrorDeUnaPeticionIlegible } from "../src/rpc.js";
 import { normalizeDeniedSubject } from "../src/security.js";
 import { ConexionFalsa, RedEnMemoria, sleep, type MensajeFalso } from "./rpc-fakes.js";
 
@@ -255,10 +256,12 @@ describe("bytes exactos — conformance/cases/cross-sdk-rpc-envelope.json y 11-r
   test("`retryAfterMs` solo va con `retryable`, y `poison` no viaja: el constructor del error los rechaza", () => {
     const i = fixture("rpc-error-handler").input;
     const e = (error: Record<string, unknown>) => () => buildRpcError({ ...i, error } as never);
-    assert.throws(e({ class: "poison", code: "X", message: "m" }), TypeError);
-    assert.throws(e({ class: "permanent", code: "X", message: "m", retryAfterMs: 5 }), TypeError);
-    assert.throws(e({ class: "retryable", code: "x_minuscula", message: "m" }), TypeError);
-    assert.throws(e({ class: "retryable", code: "X", message: "" }), TypeError);
+    // Un código estable (INVALID_RPC_CALL, 04-errors.md §7), no un `TypeError` sin código: el arnés cruzado lo compara entre SDKs.
+    const invalida = (x: unknown) => x instanceof InvalidRpcCallError && x.code === "INVALID_RPC_CALL" && x.fluxClass === ErrorClass.PERMANENT;
+    assert.throws(e({ class: "poison", code: "X", message: "m" }), invalida);
+    assert.throws(e({ class: "permanent", code: "X", message: "m", retryAfterMs: 5 }), invalida);
+    assert.throws(e({ class: "retryable", code: "x_minuscula", message: "m" }), invalida);
+    assert.throws(e({ class: "retryable", code: "X", message: "" }), invalida);
     assert.doesNotThrow(e({ class: "retryable", code: "X", message: "m", retryAfterMs: 0 }));
   });
 });
@@ -892,6 +895,84 @@ describe("request() — las cinco comprobaciones de la respuesta (§4.3) → RPC
     }
   });
 
+  describe("la excepción única de la comprobación 4 (§4.3): el error de una petición que quien responde no pudo leer", () => {
+    const ID_ERROR = "01924f91-5d13-7b85-a3e1-6a7b8c9d0e22";
+    /** Lo que contesta un responder EN BRUTO a una petición ilegible (§5.2): `correlationid` = su propio `id` y `tenantid: system`. */
+    const errorIlegible = (req: FluxEvent & Record<string, unknown>, data: object = { class: "permanent", code: "MALFORMED_JSON", message: "la petición no es un CloudEvent válido" }, muta: (e: Record<string, unknown>) => void = () => {}) => {
+      const e = {
+        specversion: "1.0", id: ID_ERROR, source: "/produccion/crm-api", type: "com.flux.rpc.error.v1",
+        time: "2026-08-20T10:41:07.333Z", datacontenttype: "application/json",
+        dataschema: "https://schemas.internal/system/rpc/error/1.0.0.json",
+        correlationid: ID_ERROR, tenantid: "system", producerversion: "2.1.0", dataclassification: "internal",
+        causationid: req.id, data,
+      } as Record<string, unknown>;
+      muta(e);
+      return JSON.stringify(e);
+    };
+
+    test("SÍ pasa: quien llama ve el código del sobre (MALFORMED_JSON, INVALID_RPC_CALL…) como PermanentError, no RPC_INVALID_REPLY", async () => {
+      for (const code of ["MALFORMED_JSON", "MISSING_REQUIRED_EXTENSION", "INVALID_RPC_CALL", "WRONG_ATTRIBUTE_TYPE"]) {
+        const red = new RedEnMemoria();
+        responderCon(red, (req) => errorIlegible(req, { class: "permanent", code, message: "la petición no se pudo leer" }));
+        const { bus, metricas } = await servicio(red);
+        await assert.rejects(bus.request(OP, PETICION, { timeoutMs: 1000 }), (e: RpcPermanentError) => {
+          assert.ok(e instanceof RpcPermanentError, `${e.name}: ${e.message}`);
+          assert.equal(e.code, code);
+          assert.equal(e.fluxClass, ErrorClass.PERMANENT);
+          return true;
+        });
+        // es un error del que responde, no un incidente de respuesta ajena: cuenta como `permanent`, no `invalid_reply`
+        assert.equal(metricas.snapshot().counters.get(`flux_rpc_client_requests_total{operation="${OP}",outcome="permanent"}`), 1);
+        assert.equal(metricas.snapshot().counters.get(`flux_rpc_client_requests_total{operation="${OP}",outcome="invalid_reply"}`), undefined);
+      }
+    });
+
+    /** Debe dar RPC_INVALID_REPLY: la excepción es ESTRECHA. */
+    async function noPasa(contesta: (req: FluxEvent & Record<string, unknown>) => string) {
+      const red = new RedEnMemoria();
+      responderCon(red, contesta);
+      const { bus } = await servicio(red);
+      await assert.rejects(bus.request(OP, PETICION, { timeoutMs: 1000 }), (e: Error & { code?: string }) => {
+        assert.equal(e.code, "RPC_INVALID_REPLY", `${e.name}: ${e.message}`);
+        return true;
+      });
+    }
+
+    test("la comprobación 3 SIGUE en pie: sin `causationid`, o con el de otra petición, es RPC_INVALID_REPLY", async () => {
+      await noPasa((req) => errorIlegible(req, undefined, (e) => { delete e.causationid; }));
+      await noPasa((req) => errorIlegible(req, undefined, (e) => { e.causationid = "01924f91-0000-7000-8000-000000000000"; }));
+    });
+
+    test("es ESTRECHA: solo un ERROR con `tenantid: system` Y `correlationid` igual a su propio `id`", async () => {
+      // `tenantid: system` pero con un `correlationid` que no es el suyo ni el de la petición
+      await noPasa((req) => errorIlegible(req, undefined, (e) => { e.correlationid = "otro-flujo"; }));
+      // `correlationid` propio pero con un tenant que no es `system` ni el de la petición
+      await noPasa((req) => errorIlegible(req, undefined, (e) => { e.tenantid = "globex"; }));
+      // una RESPUESTA (no un error) con la misma forma: no es lo que la excepción cubre
+      await noPasa((req) => JSON.stringify({
+        ...JSON.parse(texto(encodeRpcMessage(respuestaBuena(req)))), id: ID_ERROR, correlationid: ID_ERROR, tenantid: "system",
+      }));
+    });
+
+    test("la quinta comprobación SIGUE en pie: el `data` del error ilegible debe cumplir el esquema del error", async () => {
+      await noPasa((req) => errorIlegible(req, { class: "poison", code: "MALFORMED_JSON", message: "m" }));
+      await noPasa((req) => errorIlegible(req, { class: "permanent", code: "malformed_json", message: "m" }));
+    });
+
+    test("CONTROL: un error legítimo de una petición LEÍDA sigue exigiendo heredar `correlationid` y `tenantid`", async () => {
+      await noPasa((req) => errorIlegible(req, undefined, (e) => { e.correlationid = req.correlationid; e.tenantid = "globex"; }));
+      await noPasa((req) => errorIlegible(req, undefined, (e) => { e.correlationid = "otra-cadena"; e.tenantid = req.tenantid; }));
+    });
+
+    test("el predicado: la forma exacta, y solo para un error", () => {
+      const e = { id: ID_ERROR, correlationid: ID_ERROR, tenantid: "system" } as unknown as FluxEvent;
+      assert.equal(esErrorDeUnaPeticionIlegible(e, true), true);
+      assert.equal(esErrorDeUnaPeticionIlegible(e, false), false, "una respuesta no es un error");
+      assert.equal(esErrorDeUnaPeticionIlegible({ ...e, tenantid: "acme" } as FluxEvent, true), false);
+      assert.equal(esErrorDeUnaPeticionIlegible({ ...e, correlationid: "x" } as FluxEvent, true), false);
+    });
+  });
+
   test("el acuse de un stream (`{\"stream\":…,\"seq\":…}`, A-18/A-67) es RPC_INVALID_REPLY y APUNTA a `flux doctor`", async () => {
     const e = await conRespuesta(() => '{"stream":"TRAMPA","seq":1}', true);
     assert.match(e.message, /rpc\.>/);
@@ -1339,6 +1420,26 @@ describe("respond() — los errores del handler (§5.3)", () => {
     const { data } = await lanza(new PoisonError("no me puedo leer", { code: "MALFORMED_JSON" }));
     assert.equal(data.class, "permanent");
     assert.equal(data.code, "MALFORMED_JSON");
+    // Sin código propio, `PERMANENT` (§5.3): el código por defecto es el de la clase con la que viaja, no el de la que no viaja. Node
+    // contestaba `POISON`, que Rust no.
+    assert.deepEqual((await lanza(new PoisonError("no me puedo leer"))).data, { class: "permanent", code: "PERMANENT", message: "no me puedo leer" });
+  });
+
+  test("un mensaje solo de espacios es como uno vacío: se sustituye (§5.3); los espacios Unicode cuentan, U+FEFF no", async () => {
+    const porDefecto = "el servicio rechazó la petición";
+    for (const m of ["", " ", "  \t\n", "\u00a0\u2003\u3000"]) {
+      assert.equal((await lanza(new PermanentError(m, { code: "VACIO" }))).data.message, porDefecto, JSON.stringify(m));
+    }
+    assert.equal((await lanza(new PermanentError(" a ", { code: "X" }))).data.message, " a ");
+  });
+
+  test("`message` se acota en PUNTOS DE CÓDIGO (como `maxLength` de JSON Schema), no en unidades UTF-16: 1000 emojis caben, 1001 se truncan a 999 + «…»", async () => {
+    const caben = (await lanza(new PermanentError("😀".repeat(1000), { code: "X" }))).data.message;
+    assert.equal([...caben].length, 1000);
+    assert.equal(caben, "😀".repeat(1000), "no se recorta nada");
+    const largo = (await lanza(new PermanentError("😀".repeat(1001), { code: "X" }))).data.message;
+    assert.equal([...largo].length, 1000);
+    assert.equal(largo, `${"😀".repeat(999)}…`);
   });
 
   test("un error que el CLASIFICADOR reconoce (un 503, ECONNRESET) → su clase y su código, con mensaje GENÉRICO: el texto de la excepción no viaja", async () => {
@@ -1427,7 +1528,13 @@ describe("respond() — lo que no cumple (§5.2): SIEMPRE se contesta con un err
     const conId = await servir({ nc: s.nc } as Servicio, JSON.stringify({ id: "abc-123", specversion: "1.0" }), "_INBOX.llama.a");
     assert.equal(conId?.causationid, "abc-123");
     assert.equal((conId?.data as RpcErrorData).code, "MISSING_REQUIRED_ATTRIBUTE");
-    for (const [n, id] of [["b", 42], ["c", ""], ["d", "x".repeat(300)], ["e", null], ["f", { a: 1 }]] as const) {
+    // Una cadena válida: no vacía, de 128 caracteres (puntos de código) como máximo y sin caracteres de control. Los DOS SDKs aplican
+    // la misma regla (Node aceptaba hasta 256 y controles; Rust, hasta 128 y sin controles).
+    for (const [n, id] of [["g", "x".repeat(128)], ["h", "😀".repeat(128)]] as const) {
+      const ev = await servir({ nc: s.nc } as Servicio, JSON.stringify({ id, specversion: "1.0" }), `_INBOX.llama.${n}`);
+      assert.equal(ev?.causationid, id, `el id de ${n} sí es válido`);
+    }
+    for (const [n, id] of [["b", 42], ["c", ""], ["d", "x".repeat(300)], ["e", null], ["f", { a: 1 }], ["i", "x".repeat(129)], ["j", "😀".repeat(129)], ["k", "a\u0001b"], ["l", "a\u007fb"], ["m", "a\nb"]] as const) {
       const ev = await servir({ nc: s.nc } as Servicio, JSON.stringify({ id, specversion: "1.0" }), `_INBOX.llama.${n}`);
       assert.ok(ev, `id ${JSON.stringify(id).slice(0, 10)}`);
       assert.ok(!("causationid" in ev), `el id ${JSON.stringify(id).slice(0, 10)} no es una cadena válida`);
@@ -1757,7 +1864,14 @@ describe("firma — la petición y la respuesta van firmadas; con `require`, la 
 
   test("un `time` ilegible se trata como fuera de ventana con `require` (NaN no es «dentro»)", async () => {
     const s = await atiende(undefined, requireCrm());
-    const ev = await servir({ nc: s.nc } as Servicio, firmada(llamante, "facturacion-api-1", 0, { time: "ayer por la tarde" }));
+    // Un `time` que ni siquiera es un instante no sale de un SDK (el constructor lo rechaza): lo escribe quien firma a mano.
+    const base = buildRpcRequest({
+      operation: OP, tenantId: "acme", aggregateId: "cli-1", id: ID_PETICION, source: "/produccion/facturacion-api",
+      time: new Date().toISOString(), correlationid: ID_PETICION, producerversion: "3.4.1",
+      classification: "internal", data: PETICION, dataschema: rpcDataschema(OP, "request"),
+    });
+    const ilegible = encodeRpcMessage(createSigner({ privateKeyPem: llamante.privateKeyPem, keyId: "facturacion-api-1" })!.sign({ ...base, time: "ayer por la tarde" } as FluxEvent));
+    const ev = await servir({ nc: s.nc } as Servicio, ilegible);
     assert.equal((ev?.data as RpcErrorData).code, "STALE_REQUEST");
   });
 
@@ -2202,10 +2316,11 @@ describe("las constantes del SDK son las de protocol.json → rpc", () => {
     assert.deepEqual(rpc.caller.replyChecks.length, 5, "las cinco comprobaciones");
   });
 
-  test("la capacidad `rpc` ya está definida en protocol.json con la evidencia que exige, y este SDK todavía NO la declara (lo hace la integración)", () => {
+  test("la capacidad `rpc` está definida en protocol.json con la evidencia que exige, y este SDK la declara citando ESTOS dos ficheros", () => {
     assert.ok(protocolo.capabilities.definitions.rpc);
     assert.ok(protocolo.capabilities.definitions.rpc.requires.includes("exact-subscription-per-operation"));
-    assert.ok(!protocolo.capabilities.sdks.node.capabilities.includes("rpc"));
+    assert.ok(protocolo.capabilities.sdks.node.capabilities.includes("rpc"));
+    assert.deepEqual(protocolo.capabilities.sdks.node.evidence.rpc, ["sdk-node/test/rpc.test.ts", "sdk-node/test/integration/rpc.test.ts"]);
   });
 
   test("CADA código de la capacidad aparece como literal en este fichero (check-sdk-codes.mjs exige que la evidencia los nombre)", () => {

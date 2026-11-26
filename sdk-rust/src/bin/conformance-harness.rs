@@ -28,11 +28,11 @@ use chrono::{DateTime, Utc};
 use flux::signing::{Signer, SigningOptions, VerificationMode, Verifier};
 use flux::{
     build_event, build_rpc_error, build_rpc_reply, build_rpc_request, build_state_event,
-    build_state_tombstone, data_to_raw, parse_event, resolve_timeout_ms, rpc_dataschema,
-    rpc_subject, serialize, state_dataschema, state_subject, to_dlq_event, to_state_dlq_event,
-    BuildEventInput, DataClassification, DlqInfo, DlqReason, ErrorClass, Event, FluxError, ReplyTo,
-    RpcErrorBody, RpcErrorInput, RpcReplyInput, RpcRequestInput, RpcRequestRef, RpcSide,
-    StateEventInput, StateTombstoneInput,
+    build_state_tombstone, canonical_data, data_to_raw, parse_event, parse_rpc_time, parse_time,
+    resolve_timeout_ms, rpc_dataschema, rpc_subject, serialize, state_dataschema, state_subject,
+    to_dlq_event, to_state_dlq_event, BuildEventInput, DataClassification, DlqInfo, DlqReason,
+    ErrorClass, Event, FluxError, ReplyTo, RpcErrorBody, RpcErrorInput, RpcReplyInput,
+    RpcRequestInput, RpcRequestRef, RpcSide, StateEventInput, StateTombstoneInput,
 };
 use serde::Deserialize;
 use serde_json::value::RawValue;
@@ -231,9 +231,13 @@ struct RpcRespuestaEntrada {
     classification: String,
     #[serde(default)]
     traceparent: Option<String>,
-    #[serde(default)]
-    tracestate: Option<String>,
     data: Box<RawValue>,
+}
+
+/// Distingue `"clave": null` (presente, y con un valor que casi siempre es inválido) de la clave ausente, que
+/// serde confunde en un `Option`.
+fn presente<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<Value>, D::Error> {
+    Value::deserialize(d).map(Some)
 }
 
 /// El `error` de `rpc-error`.
@@ -242,8 +246,9 @@ struct RpcCuerpoErrorEntrada {
     class: String,
     code: String,
     message: String,
-    /// Como `timeoutMs`: un entero escrito con `.0` o con exponente es un entero para JavaScript.
-    #[serde(default, rename = "retryAfterMs")]
+    /// Como `timeoutMs`: un entero escrito con `.0` o con exponente es un entero para JavaScript. `null` NO es
+    /// «ausente» (como en el arnés de Node): es inválido, y por eso se lee con `presente`.
+    #[serde(default, rename = "retryAfterMs", deserialize_with = "presente")]
     retry_after_ms: Option<Value>,
 }
 
@@ -257,8 +262,6 @@ struct RpcErrorEntrada {
     producerversion: String,
     #[serde(default)]
     traceparent: Option<String>,
-    #[serde(default)]
-    tracestate: Option<String>,
     error: RpcCuerpoErrorEntrada,
 }
 
@@ -346,10 +349,15 @@ fn construir(e: &EventoEntrada) -> Result<Event, Fallo> {
     })?)
 }
 
+/// El `time` de un evento o de una entrada de estado: lo normaliza el SDK (`parse_time`), que rechaza lo que no
+/// es un instante con `WRONG_ATTRIBUTE_TYPE`.
 fn instante(s: &str) -> Result<DateTime<Utc>, Fallo> {
-    DateTime::parse_from_rfc3339(s)
-        .map(|t| t.with_timezone(&Utc))
-        .map_err(|e| Fallo::nuevo("HARNESS_INPUT", format!("`{s}` no es RFC 3339: {e}")))
+    Ok(parse_time(s)?)
+}
+
+/// El `time` de una petición, una respuesta o un error: lo mismo, con `INVALID_RPC_CALL`.
+fn instante_rpc(s: &str) -> Result<DateTime<Utc>, Fallo> {
+    Ok(parse_rpc_time(s)?)
 }
 
 /// Un número JSON que se escribió con parte decimal pero es un entero (`5000.0`, `2e3`): para
@@ -533,17 +541,22 @@ fn ejecutar(e: &Entrada, texto: &str) -> Result<Value, Fallo> {
         "rpc-request" => {
             let p: RpcPeticionEntrada = entrada_de_estado(texto)?;
             let dataschema = rpc_dataschema(BASE_ESQUEMAS, &p.operation, RpcSide::Request)?;
+            // §4.1, paso 0: operación → `data` objeto → clasificación. La clasificación llega como texto y el SDK la
+            // espera ya tipada, así que se comprueba aquí en su turno (con una inválida Y un `data` que no es un objeto
+            // gana INVALID_RPC_CALL, no INVALID_DATACLASSIFICATION).
+            canonical_data(&p.data).map_err(|m| Fallo::nuevo("INVALID_RPC_CALL", m))?;
+            let classification = clasificacion(&p.classification)?;
             let evento = build_rpc_request(RpcRequestInput {
                 operation: p.operation,
                 tenant_id: p.tenant_id,
                 aggregate_id: p.aggregate_id,
                 id: p.id,
                 source: p.source,
-                time: instante(&p.time)?,
+                time: instante_rpc(&p.time)?,
                 correlationid: p.correlationid,
                 causationid: p.causationid,
                 producerversion: p.producerversion,
-                classification: clasificacion(&p.classification)?,
+                classification,
                 dataschema,
                 traceparent: p.traceparent,
                 tracestate: p.tracestate,
@@ -555,16 +568,18 @@ fn ejecutar(e: &Entrada, texto: &str) -> Result<Value, Fallo> {
         "rpc-reply" => {
             let r: RpcRespuestaEntrada = entrada_de_estado(texto)?;
             let dataschema = rpc_dataschema(BASE_ESQUEMAS, &r.request.operation, RpcSide::Reply)?;
+            // Igual que en `rpc-request`: operación → `data` objeto → clasificación.
+            canonical_data(&r.data).map_err(|m| Fallo::nuevo("INVALID_RPC_CALL", m))?;
+            let classification = clasificacion(&r.classification)?;
             let evento = build_rpc_reply(RpcReplyInput {
                 request: r.request.into(),
                 id: r.id,
                 source: r.source,
-                time: instante(&r.time)?,
+                time: instante_rpc(&r.time)?,
                 producerversion: r.producerversion,
-                classification: clasificacion(&r.classification)?,
+                classification,
                 dataschema,
                 traceparent: r.traceparent,
-                tracestate: r.tracestate,
                 data: r.data,
             })?;
             Ok(json!({ "ok": true, "bytes": b64_encode(&serialize(&evento)?) }))
@@ -608,10 +623,9 @@ fn ejecutar(e: &Entrada, texto: &str) -> Result<Value, Fallo> {
                 reply_to: ReplyTo::Request(r.request.into()),
                 id: r.id,
                 source: r.source,
-                time: instante(&r.time)?,
+                time: instante_rpc(&r.time)?,
                 producerversion: r.producerversion,
                 traceparent: r.traceparent,
-                tracestate: r.tracestate,
                 error: RpcErrorBody {
                     class: clase,
                     code: r.error.code,

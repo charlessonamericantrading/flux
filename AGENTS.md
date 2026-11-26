@@ -34,7 +34,7 @@ https://raw.githubusercontent.com/charlessonamericantrading/flux/main/protocol.j
 
 1. **Nunca inventes un subject.** Formato exacto, 4 tokens:
    `<dominio>.<agregado>.v<major>.<evento>` — minúsculas, `kebab-case`,
-   dominio plural, agregado singular, evento en **pasado**.
+   dominio plural, agregado singular, evento en **pasado**. La versión mayor, de 1 a 4 dígitos (`v1`…`v9999`).
    ✅ `pedidos.pedido.v1.creado` ❌ `pedidos.crear-pedido` ❌ `Pedidos.Pedido.V1.Creado`
 
 2. **Nunca escribas el envelope a mano.** El SDK rellena `id`, `source`, `time`,
@@ -236,6 +236,8 @@ Estas no dan error: dan comportamiento incorrecto. Un agente las comete casi sie
 | `put` solo publica | **Es condicional**: lee la secuencia (`DIRECT.GET`), no escribe si la versión no avanza y publica con `Nats-Expected-Last-Subject-Sequence`. Un `publish` de core a un subject de estado sobrescribe **sin chequeo ni acuse**. El conflicto de secuencia tiene **dos** códigos: `10071` (un nodo) y `10164` (cluster, bajo carrera): reconoce los dos o no reintentarás en producción. Reintenta con **el mismo `id`**. |
 | El estado se recupera desde la DLQ | **No se reproduce**: `dlq.state.>` no lleva el dato (`data` es `{ key, revision }`) y republicar un valor viejo pisaría uno nuevo. `flux dlq replay` lo rechaza; la recuperación es `flux state resync`. |
 | Un estado con PII es «lo mismo que un evento con PII» | No: el estado va `confidential` con `x-pii` y **se puede borrar** (`delete` sustituye el valor por una lápida). Pero el borrado **físico** en disco y las **claves** y **tenants** (visibles en `STREAM.INFO`) no los cubre: la clave es un id opaco, nunca un email. |
+| Un `data` con espacios, `\u00f1` o una clave repetida sale igual en todos los SDKs | **Solo si el constructor lo reescribe a la forma canónica** (la de `JSON.stringify` con UTF-8 literal: sin espacios, `ñ` literal, una clave repetida una vez; [01-envelope.md §4.1](specification/01-envelope.md)). **No tienen forma común** y no se admiten en `data` si los bytes importan: enteros fuera de ±2^53 (Node los redondea), flotantes y exponentes (`4995.00` es `4995` en JavaScript), claves que son índices de array (`"1"`), sustitutos UTF-16 sueltos. El dinero va en enteros. |
+| `dlqerror` mide «1024 caracteres» | **1024 bytes UTF-8**, cortado sin partir un carácter ([04-errors.md §3](specification/04-errors.md)): Node contaba unidades UTF-16 y Rust bytes. Un `message` de error de rpc mide 1000 **caracteres Unicode**. |
 | Una petición a algo que no escucha nadie espera su timeout | **No**: `no responders` llega en ~1 ms (A-56)… **si la conexión lo pidió** en CONNECT (`headers` y `no_responders`); sin ello, silencio y timeout (A-57). Y con una suscripción `rpc.<dominio>.>` el servicio *sí* tiene interés en lo que no atiende: timeout (A-64). Una suscripción **por operación, exacta**. |
 | Un stream que captura `rpc.>` es inocuo | **Contesta a cada petición con su acuse** `{"stream":…,"seq":n}`, y casi siempre antes que la respuesta real (394 de 400, A-67). El que responde ejecuta igualmente y el stream **guarda cada petición**, datos personales incluidos. Un filtro `>` solo se crea sin acuse y convierte `no responders` en un timeout. `flux doctor` lo comprueba. |
 | Suscribirse al propio inbox (`_INBOX.<servicio>.>`) por la misma conexión que hace las peticiones | **El broker deja de enviar `no responders`** (A-101): `RPC_UNAVAILABLE` pasa a ser un timeout de 5 s en 6 de 6 peticiones. Usa el buzón único de la librería; si necesitas otra suscripción, otra conexión. |
@@ -310,7 +312,8 @@ await bus.state.watch("clientes.cliente.v1", async (entrada) => {         // fot
 ### Petición/respuesta — [11-request-reply.md](specification/11-request-reply.md)
 
 Una **orden o un cálculo con respuesta inmediata** entre dos servicios, por core NATS: no se persiste, no tiene stream ni
-DLQ. **Ningún SDK la declara todavía**: la spec y las herramientas llegan antes que las implementaciones.
+DLQ. **La declaran Node y Rust** (columna *Capacidades* del [`README.md`](README.md)); los otros cinco SDKs no la tienen
+y el arnés cruzado los marca `N/A: no declara rpc`.
 
 ```ts
 const r = await bus.request("clientes.cliente.v1.calcular-descuento",

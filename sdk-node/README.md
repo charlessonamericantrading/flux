@@ -1,11 +1,10 @@
 # @flux/sdk — Node.js / TypeScript
 
 Cliente delgado del [flux Event Protocol v1](../README.md).
-**Nivel de conformidad: L3** (gobernado). Capacidades opcionales: `signing`, `security` y el
-[estado replicado](#estado-replicado) (`bus.state`), que **todavía no está declarado** en
-`protocol.json` → `capabilities`: se declara cuando el arnés cruzado reproduzca los vectores de estado.
-La [petición/respuesta](#peticionrespuesta) (`bus.request`, `bus.respond`) está implementada y probada contra un broker
-real, pero **tampoco está declarada**: la declaración se hace al integrar, con el arnés cruzado y los permisos juntos.
+**Nivel de conformidad: L3** (gobernado). Capacidades opcionales, declaradas en `protocol.json` →
+`capabilities`: `signing`, `security`, el [estado replicado](#estado-replicado) (`bus.state`: `state`) y la
+[petición/respuesta](#peticionrespuesta) (`bus.request`, `bus.respond`: `rpc`). El arnés cruzado
+(`conformance/cross-sdk.mjs`) reproduce, byte a byte, los vectores de estado y de rpc, y este SDK es su referencia.
 
 El SDK resuelve infraestructura, no negocio. Si te encuentras metiendo lógica de
 dominio aquí, va en tu servicio.

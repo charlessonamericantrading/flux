@@ -61,11 +61,20 @@ class ProtocolTest {
     }
 
     @Test
+    @DisplayName("el major admite hasta cuatro digitos")
+    void parseSubjectAdmiteHastaCuatroDigitosDeMajor() {
+        // 02-naming.md §1: el tope de 4 digitos es el de protocol.json; v10000 no es un subject.
+        assertEquals(9999, Protocol.parseSubject("pedidos.pedido.v9999.creado").major());
+        assertFalse(Protocol.isValidSubject("pedidos.pedido.v10000.creado"));
+    }
+
+    @Test
     @DisplayName("los antipatrones de la spec no pasan la validacion")
     void parseSubjectRechazaFormatosInvalidos() {
         List<String> invalidos = List.of(
                 "pedidos.pedido.V1.creado",   // version en mayuscula
                 "pedidos.pedido.v0.creado",   // major debe ser >= 1
+                "pedidos.pedido.v99999.creado", // el major lleva de 1 a 4 digitos
                 "pedidos.pedido.1.creado",    // falta la 'v'
                 "pedidos.pedido_v1.creado",   // guion bajo prohibido
                 "pedidos..v1.creado",         // token vacio

@@ -134,12 +134,12 @@ protocolo a v2.
 
 | SDK | Nivel | Tests | Verificado | Capacidades |
 |---|---|---|---|---|
-| [Node / TypeScript](sdk-node/) | **L3** | 105 | ✅ | `signing` `security` `state` |
+| [Node / TypeScript](sdk-node/) | **L3** | 105 | ✅ | `signing` `security` `state` `rpc` |
 | [Python](sdk-python/) | **L3** | 205 | ✅ | `signing` |
 | [Go](sdk-go/) | **L3** | 162 | ✅ (también con `-race`) | `signing` |
 | [Java](sdk-java/) | **L3** | 144 | ✅ (Maven en el runner) | `signing` |
 | [.NET](sdk-dotnet/) | **L3** | 189 | ✅ | `signing` |
-| [Rust](sdk-rust/) | L2 | 175 | ✅ (incl. 14 contra NATS real) | `signing` `security` `state` |
+| [Rust](sdk-rust/) | L2 | 175 | ✅ (incl. 14 contra NATS real) | `signing` `security` `state` `rpc` |
 | [PHP](sdk-php/) | **L3** | 304 | ✅ incl. 3 de integración contra NATS real | `signing` |
 | [PHP](sdk-php/) | L2 | 201 | ✅ (transporte no — ver abajo) | `signing` |
 
@@ -167,8 +167,9 @@ El **gateway de borde** ([`gateway/`](gateway/), [`12-edge.md`](specification/12
 clientes HTTP como servicios flux normales (`"via": "gateway"` en el manifiesto, con sus propios permisos). Es normativo solo el formato de la
 entrega saliente (`Flux-Signature`, `Idempotency-Key`) y el `id` determinista de un hecho importado ([`01-envelope.md` §2.6.1](specification/01-envelope.md)).
 
-Hoy solo Node y Rust declaran `security` y `state`, y **ningún SDK declara `rpc` todavía**: la especificación y sus casos medidos
-llegan antes que las implementaciones. Un SDK no anuncia una capacidad hasta que la ha ejecutado contra un broker real.
+Hoy solo Node y Rust declaran `security`, `state` y `rpc`: los otros cinco salen **N/A** en las operaciones de estado y de
+petición/respuesta del arnés cruzado (`node conformance/cross-sdk.mjs`), y uno que **declara** una capacidad y no tiene la
+operación en su arnés **falla**. Un SDK no anuncia una capacidad hasta que la ha ejecutado contra un broker real.
 
 ---
 
