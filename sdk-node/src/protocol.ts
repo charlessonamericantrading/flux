@@ -6,6 +6,8 @@
  * es lo que consumen los demás SDKs y los agentes.
  */
 
+import { ReservedDomainError } from "./state-errors.js";
+
 const NS = 1_000_000n;
 const ns = (ms: number) => Number(BigInt(ms) * NS);
 
@@ -35,6 +37,27 @@ export const nanos = ns;
 
 // ─── Naming ──────────────────────────────────────────────────────────────────
 
+/**
+ * Dominios que NO son dominios — 02-naming.md §1.3, protocol.json `naming.reservedDomains`.
+ *
+ * Cada uno es un espacio de nombres del protocolo (`dlq.`, `state.`, `rpc.`), y un dominio con
+ * ese nombre colisionaría con él **en el broker**: con `STATE_CLIENTES` (`state.clientes.>`)
+ * creado, un `EVT_STATE` (`state.>`) falla con `subjects overlap with an existing stream`
+ * (err 10065, A-43). Peor: un evento publicado en `state.` no pasaría por el chequeo de
+ * secuencia del estado, y uno de core sobrescribe sin acuse (A-45).
+ */
+export const RESERVED_DOMAINS: readonly string[] = ["dlq", "state", "rpc", "system"];
+
+/**
+ * Lanza `RESERVED_DOMAIN` si el primer token de un subject o un contrato es un dominio
+ * reservado. Se comprueba ANTES que la forma: `dlq.pedidos.pedido.v1.creado` tiene cinco tokens
+ * y «debe tener cuatro» no diría qué pasa de verdad.
+ */
+export function assertNotReservedDomain(subjectOrContract: string, what: "subject" | "contrato" = "subject"): void {
+  const domain = String(subjectOrContract).split(".")[0];
+  if (RESERVED_DOMAINS.includes(domain)) throw new ReservedDomainError(domain, RESERVED_DOMAINS, what);
+}
+
 /** `<dominio>.<agregado>.v<major>.<evento>` — 02-naming.md §1 */
 export const SUBJECT_PATTERN =
   /^[a-z0-9]+(-[a-z0-9]+)*\.[a-z0-9]+(-[a-z0-9]+)*\.v[1-9][0-9]*\.[a-z0-9]+(-[a-z0-9]+)*$/;
@@ -54,6 +77,9 @@ export class InvalidSubjectError extends Error {
 }
 
 export function parseSubject(subject: string): ParsedSubject {
+  // Todo lo que recibe un subject —publish, subscribe, durableName…— pasa por aquí: un dominio
+  // reservado se rechaza antes de tocar la red (10-state.md §2.7).
+  assertNotReservedDomain(subject);
   if (subject !== subject.toLowerCase()) {
     // Se comprueba antes que el patrón para dar un mensaje útil: los subjects de NATS
     // son case-sensitive y una mayúscula crea un subject fantasma SIN ningún error.
