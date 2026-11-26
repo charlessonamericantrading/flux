@@ -205,6 +205,12 @@ Además de comparar, el runner comprueba lo que la **spec** dice de los bytes de
 UTF-8 literal salvo los escapes de control, la DLQ de estado sin la firma y con solo `{ key,
 revision }`…): que todos coincidan con Node no prueba que Node acierte.
 
+**`ajustesVectors`** (93) fijan lo decidido en «Ajustes». Son de **cualquier** operación de estado o de petición/respuesta (`state-*`,
+`rpc-*`: la operación manda, no la capacidad) y los ejecuta **`conformance/ajustes.mjs`**, un runner aparte de `cross-sdk.mjs`, para los SDKs de
+`ajustesSdks` (hoy Node y Rust). Dicen qué esperan como los de estado (`sha256`, `expectSubject`, `expect`, `differsFrom`) y los que coinciden con
+la spec llevan **su** SHA-256. Un vector con **`dataTexto`** quiere que `data` llegue como **texto crudo** (con espacios, escapes
+o una clave repetida: lo que un objeto JSON no puede expresar): el runner lo inyecta sin reserializar.
+
 `vectors.json` repite los fixtures y los 23 `subjectVectors` del caso `cross-sdk-state-envelope.json`
 (el caso los documenta; el runner los ejecuta). Dos copias se desincronizan en silencio, así que el
 runner **aborta** (exit 2) si dejan de coincidir.
@@ -244,20 +250,74 @@ CI los ejecuta todos (`.github/workflows/spec.yml`, job `cross-sdk`): los que **
 `pending`) falla igual aunque se ejecute con `--only`: excluir un SDK de una ejecución no es quitarle el
 arnés.
 
-## Divergencias conocidas, sin vector
+## Ajustes: lo que Node y Rust hacían distinto fuera de los vectores, ya decidido
 
-Medidas explorando los arneses de Node y de Rust con entradas fuera de los vectores. **No son vectores**
-porque la spec no dice cuál de los dos acierta (o porque la entrada no es una que un SDK reciba de
-verdad); un vector así decidiría la spec desde un fichero de pruebas, y dejaría CI en rojo.
+Explorando los arneses de Node y de Rust con **361 entradas** fuera de los vectores (`explorar-divergencias.mjs`,
+abajo) aparecieron **157** salidas distintas. Cada una se clasificó: **(a)** un SDK incumple la spec → se arregla; **(b)** la
+spec calla o es ambigua → se decide, se escribe en la spec y `protocol.json`, y se arreglan los dos; **(c)** es una diferencia
+de lenguaje que ningún SDK puede evitar → se documenta como norma («Lo que no se admite»). Lo decidido tiene su vector en
+`ajustesVectors` (93 vectores), que ejecuta `node conformance/ajustes.mjs` para los SDKs de `ajustesSdks` —hoy Node y Rust— y que **pasan idénticos**:
 
-| Entrada | Node | Rust | Qué falta |
+| Entrada | Node antes | Rust antes | Decisión | Ahora | Spec |
+|---|---|---|---|---|---|
+| `dlqerror` de 1500 × `é`, o con un emoji en el corte | 1024 **unidades UTF-16** (2693 bytes en total) | 1024 **bytes**; en el envío de un POISON, 1024 **caracteres** | **1024 bytes UTF-8 sin partir un carácter** | 512 `é`; el emoji que no cabe se descarta entero | 04-errors.md §3 |
+| `message` de un error de rpc: 1000 emojis | lo **rechaza** (cuenta 2000 unidades UTF-16) | lo acepta | `maxLength` cuenta **caracteres Unicode** (puntos de código) | lo aceptan los dos; 1001, ninguno | 11-request-reply.md §3.3 |
+| Versión mayor `v99999999999999999999`, `v4294967296`, `v10000` | la **acepta**, y escribe el `type` `v100000000000000000000` | la rechaza (o la conserva, según el sitio) | **1 a 4 dígitos** (`v1`…`v9999`) | los dos la rechazan; `v9999` la aceptan | 02-naming.md §1 |
+| `id` o `source` vacíos (y `correlationid`, `producerversion`, `tenantId`) | construye el sobre | los rechaza **sin código** | se rechazan, con el código del parser (`MISSING_REQUIRED_ATTRIBUTE` / `_EXTENSION`; `INVALID_RPC_CALL` en rpc) | los dos | 01-envelope.md §3.1 |
+| `time` no canónico (`…39Z`, `…+02:00`, `…412345Z`) | lo **copia** tal cual | lo normaliza | se **normaliza** a 3 decimales y `Z` (UTC, truncando) o se rechaza | los dos normalizan | 01-envelope.md §2.2 |
+| `time` que no es un instante (`ayer`, mes 13, sin zona, segundo 60, año fuera de 0000–9999) | lo **copia** | `HARNESS_INPUT` (o `+10000-01-01…`) | `WRONG_ATTRIBUTE_TYPE` (`INVALID_RPC_CALL` en rpc) | los dos | 01-envelope.md §2.2 |
+| `data` con espacios, `\u00f1`, `\/`, `\u007f` o una clave repetida | lo **compacta** y escribe UTF-8 literal (`JSON.parse` + `stringify`) | lo guarda **tal cual** (texto crudo) | la **forma canónica** es la de `JSON.stringify` con UTF-8 literal | Rust la reescribe; los bytes son los de la spec | 01-envelope.md §4.1 |
+| Un error que se construye mal (`class: poison`, `code` en minúsculas, `message` vacío o de 1001, `retryAfterMs` inválido) | `TypeError` **sin código** | `INVALID_RPC_CALL` | código estable del conjunto cerrado de 04-errors.md §7 | `INVALID_RPC_CALL` en los dos | 04-errors.md §7 |
+| `retryAfterMs: null` | `INVALID_RPC_CALL` | lo confundía con la clave **ausente** | `null` no es «ausente» | `INVALID_RPC_CALL` en los dos | — |
+| `rpc-request`/`rpc-reply` con una clasificación inválida **y** un `data` que no es un objeto | `INVALID_RPC_CALL` | `INVALID_DATACLASSIFICATION` (el arnés convertía la clasificación antes de llamar al SDK) | el orden de §4.1 paso 0: operación → `data` objeto → clasificación | `INVALID_RPC_CALL` en los dos | 11-request-reply.md §4.1 |
+| `rpc-error` con una operación mal formada o con el prefijo `rpc.` | `INVALID_RPC_CALL` / `RESERVED_DOMAIN` | construye el error sin mirarla | se valida como en `rpc-request` | los dos | 11-request-reply.md §2.2 |
+| `rpc-reply` / `rpc-error` con `tracestate` | no lo escribe | lo **escribe** | §3.2 no lo prevé: la respuesta y el error llevan solo `traceparent` | los dos lo omiten | 11-request-reply.md §3.2 |
+| `rpc-request` con la versión mayor `v99999999999999999999` | `type` `…request.v100000000000000000000` | `type` `…request.v99999999999999999999` | tope de 4 dígitos | `INVALID_RPC_CALL` en los dos | 02-naming.md §1 |
+
+**Sin vector**, porque la operación del arnés cruzado es general (`build`, `dlq`, `parse`) y los otros cinco SDKs no están
+alineados todavía: lo comprueban los tests unitarios de Node (`sdk-node/test/ajustes.test.ts`) y de Rust (`envelope.rs`, `rpc.rs`).
+
+| Entrada | Node antes | Rust antes | Decisión | Ahora |
+|---|---|---|---|---|
+| `build` con un dominio reservado (`rpc.pedido.v1.creado`) | `RESERVED_DOMAIN` | lo **construye** | un constructor puro tampoco escribe en `rpc.`, `state.`, `dlq.` ni `system.` | los dos `RESERVED_DOMAIN` |
+| `build` con una clasificación fuera del enum | la **acepta** | `INVALID_DATACLASSIFICATION` | la rechaza | los dos |
+| `parse` con un BOM, o un byte que no es UTF-8 | lo **acepta** (`TextDecoder` come el BOM y sustituye lo inválido) | `MALFORMED_JSON` | no es JSON (RFC 8259 §8.1): `MALFORMED_JSON` | los dos |
+| `parse` con `"subject": 5`, `"causationid": 7`, `"dlqattempts": "1"`… | lo **acepta** | `INVALID_ATTRIBUTE_TYPE` | los tipos son exactos también en lo no obligatorio | los dos `INVALID_ATTRIBUTE_TYPE` |
+| Error del handler: `PoisonError` sin código | `POISON` | `PERMANENT` | `PERMANENT` (`poison` no viaja; 11-request-reply.md §5.3) | los dos `PERMANENT` |
+| Error del handler con un mensaje solo de espacios | lo envía | lo sustituye por «error del servicio» | se sustituye por «el servicio rechazó la petición» | los dos |
+| `id` de una petición ilegible que se cita como `causationid` | hasta 256 caracteres, con controles | hasta 128, sin controles | **128 caracteres, sin controles** (§5.2) | los dos |
+
+### Lo que no se admite
+
+Diferencias de **lenguaje**, no de SDK: ningún vector las iguala, porque ningún SDK puede evitarlas. Están en la spec
+([01-envelope.md §4.1](../../specification/01-envelope.md)) y `explorar-divergencias.mjs` las comprueba en los dos sentidos (marca `NO[…]`):
+
+| Entrada | Node | Rust | Qué hacer |
 |---|---|---|---|
-| `dlqerror` > 1024 con no-ASCII (`state-dlq`, y `dlq` igual): 1500 × `é` | corta a 1024 **unidades UTF-16** (2693 bytes en total) | corta a 1024 **bytes** (1669 bytes); el primer byte que difiere es el 1593 | la spec no fija **cómo** se trunca `dlqerror`: Node cuenta unidades UTF-16, Python puntos de código, Go runas y Rust bytes |
-| `contract` con un major > 2^32 (`clientes.cliente.v4294967296`) | lo acepta | lo rechaza (sin código) | la spec dice «entero ≥ 1» sin tope; el `u32` de Rust no es de la spec |
-| `contract` con un major > 2^53 (`…v99999999999999999999`) | lo acepta y escribe `type` `…v100000000000000000000` (pasa por `Number`) | lo rechaza | ídem; en Node, además, el `type` ya no coincide con el contrato |
-| `id` o `source` vacíos en `state-build` | construye los bytes (un evento que su propio `parseEvent` rechazaría como `MISSING_REQUIRED_ATTRIBUTE`) | los rechaza (sin código) | los constructores puros de Node no comprueban que `id` y `source` no estén vacíos (los rellena el SDK en `put`, que no se ha medido aquí) |
-| `contract` mal formado (`clientes.cliente`, `v0`, mayúsculas…) | rechaza con `InvalidStateContractError` (sin código) | rechaza (sin código: `ERROR`) | [04-errors.md §6](../../specification/04-errors.md) no tiene código para esto; es un hueco de la spec, no de un SDK |
-| `time` no canónico (`…39.4123Z`, `…39Z`, con `+02:00`) | lo copia tal cual | lo normaliza a UTC con 3 decimales | el arnés **exige** `time` canónico: Rust recibe un instante y Node, una cadena |
+| Un **entero fuera de ±(2^53−1)** en `data` (`9007199254740993`) | lo redondea al `double` más cercano | lo conserva | Va como **cadena** |
+| Un **flotante o un exponente** (`4995.00`, `1E+2`, `1e21`, `-0`, `0.0`) | lo reescribe (`4995`, `100`, `1e+21`, `0`) | no toca los números (§2.5) | El dinero va en **enteros** (`totalCents`) |
+| Una **clave que es un índice de array** (`"1"`) | JavaScript la ordena primero | respeta el orden dado | Claves con letras (`camelCase`) |
+| Un **sustituto UTF-16 suelto** (`"\ud83d"`) en un texto | lo admite y lo escribe escapado | lo rechaza (no es UTF-8) | No existe en texto UTF-8 |
+| **Más de 128 niveles** de anidamiento | lo admite | lo rechaza | `data` plano |
+| Un número **fuera del rango de un `double`** (`1e400`, `rpc-timeout`) | `Infinity` (y `JSON.stringify` lo escribe `null`) | el JSON del arnés lo rechaza (`HARNESS_INPUT`) | No lo uses |
+| Un valor de **otro tipo JSON** del que pide la operación (`time: 5`, `operation: 5`, un error sin `class`, con una clave de más, o `code` que no es una cadena) | el SDK lo rechaza (`INVALID_RPC_CALL`) | el arnés lo rechaza al leer la entrada (`HARNESS_INPUT`): tipos cerrados | — (es del **arnés**, no de la API pública, que es tipada) |
+| `aggregateVersion` **`7.0`** o `1e0` | indistinguible de `7`: lo acepta | lo rechaza (`MISSING_AGGREGATE_VERSION`) | Ya documentado: [10-state.md §3.4](../../specification/10-state.md) |
+| Un **subject de evento** mal formado, o un `data` que no es un objeto, al construir un evento | `InvalidSubjectError` / `EnvelopeError` | `ERROR` | **Hueco de la spec**: ningún código estable (04-errors.md); cada SDK lo nombra a su manera |
+
+**Pendiente, sin cerrar:** una **clave repetida en la raíz de un mensaje recibido** (`{"id":"a","id":"b",…}`). Node (`JSON.parse`) se
+queda con la última y no lo nota; Rust la rechaza (`INVALID_ATTRIBUTE_TYPE`, por accidente del deserializador). La spec no dice
+nada. Propuesta: POISON `MALFORMED_JSON` en todos (I-JSON, RFC 7493, exige nombres únicos), que en Node pide un escáner del
+texto. Va marcada `NO[RAIZ_REPETIDA]` en `explorar-divergencias.mjs`.
+
+### Explorar divergencias
+
+```bash
+FLUX_HARNESS_RUST=sdk-rust/target/debug/conformance-harness node conformance/harness/explorar-divergencias.mjs
+```
+
+Alimenta a los dos arneses con las mismas ~360 entradas y dice cuáles difieren. Sale con 1 si hay una divergencia **sin** marca
+(una regresión) o una marca que ya no hace falta. No está en CI (necesita los dos SDKs compilados): se ejecuta al tocar `data`,
+`time`, los límites de longitud o los constructores del sobre.
 
 ## Registro de arneses
 
