@@ -427,8 +427,14 @@
         "$comment": "Las entregas de un pull consumer viajan por el inbox. Con un _INBOX.> comun, un servicio sin concesion sobre un dominio lee sus eventos (medido en NATS 2.14.5, Apendice A-2 del plan v1.1). El nombre de servicio no admite puntos, asi que el prefijo de uno nunca es prefijo de otro. No es una opcion del SDK: una opcion es una forma de olvidarlo."
       },
       "subscribeToDomainSubjects": "never",
+      "createGrantedByDefault": false,
+      "devOnlyPatterns": [
+        "eventConsumerCreate",
+        "dlqReaderCreate"
+      ],
+      "createComment": "CONSUMER.CREATE NO se concede por defecto: en produccion los durables los crea flux provision y el SDK de Node, si le deniegan el add, cae a CONSUMER.INFO. Concederlo dejaria que un durable borrado lo recrease el propio servicio con deliver_policy all (reentrega silenciosa de hasta 30 dias de eventos) y que un servicio comprometido cambiase el ack_wait o el backoff de su consumidor. gen-acl.mjs --dev lo concede, solo sobre el durable propio y con su filtro exacto.",
       "permissionPatterns": {
-        "$comment": "Permisos de PUBLICACION por categoria. Por cada subject exacto consumido: eventConsumerCreate, consumerInfo, consumerNext y ack de SU durable, y dlqPublish. El dueno de un dominio lee su DLQ con un durable propio: dlqReaderCreate, consumerInfo, consumerNext y ack. streamInfo cubre los streams que publica, los que consume y la DLQ de estos ultimos: subscribe() la comprueba y sin ese permiso falla.",
+        "$comment": "Permisos de PUBLICACION por categoria. Por cada subject exacto consumido: consumerInfo, consumerNext y ack de SU durable, y dlqPublish (y eventConsumerCreate solo con --dev). El dueno de un dominio lee su DLQ con un durable propio: consumerInfo, consumerNext y ack (y dlqReaderCreate solo con --dev). streamInfo cubre los streams que publica, los que consume y la DLQ de estos ultimos: subscribe() la comprueba y sin ese permiso falla.",
         "accountInfo": "^\\$JS\\.API\\.INFO$",
         "ownDomain": "^[a-z0-9]+(-[a-z0-9]+)*\\.>$",
         "streamInfo": "^\\$JS\\.API\\.STREAM\\.INFO\\.(EVT|DLQ)_[A-Z0-9_]+$",
@@ -471,7 +477,7 @@
       }
     },
     "provisioning": {
-      "$comment": "Los streams y durables los crea quien opera, no el servicio. flux provision lee el mismo manifiesto que gen-acl.mjs y crea lo que esas ACLs presuponen. Normativo en specification/06-security.md §3.6.",
+      "$comment": "Los streams y durables los crea quien opera, no el servicio (y, por defecto, ni siquiera tiene permiso para recrear su durable: acl.createGrantedByDefault). flux provision lee el mismo manifiesto que gen-acl.mjs y crea lo que esas ACLs presuponen. Normativo en specification/06-security.md §3.6.",
       "outsideSdkInProduction": true,
       "tool": "flux provision",
       "credentials": "operacion, nunca las de un servicio",

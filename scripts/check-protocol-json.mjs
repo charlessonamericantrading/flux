@@ -207,6 +207,8 @@ for (const literal of acl.neverGranted) {
   if (cazado) fallos.push(`security.acl: "${literal}" es denegable pero lo concede permissionPatterns.${cazado[0]}`);
 }
 if (p.security.subscribeScope !== "private-inbox-only") fallos.push(`security.subscribeScope debe ser "private-inbox-only", es ${JSON.stringify(p.security.subscribeScope)}`);
+if (acl.createGrantedByDefault !== false) fallos.push("security.acl.createGrantedByDefault debe ser false: CONSUMER.CREATE solo con --dev");
+if (JSON.stringify(acl.devOnlyPatterns) !== JSON.stringify(["eventConsumerCreate", "dlqReaderCreate"])) fallos.push("security.acl.devOnlyPatterns debe ser [eventConsumerCreate, dlqReaderCreate]");
 if (acl.subscribeToDomainSubjects !== "never") fallos.push("security.acl.subscribeToDomainSubjects debe ser \"never\"");
 if (acl.inbox.private !== true || acl.inbox.setBySdkFromServiceName !== true) fallos.push("security.acl.inbox: el inbox debe ser privado y fijado por el SDK");
 if (acl.ackSubject.format.split(".").length !== acl.ackSubject.tokens) fallos.push(`security.acl.ackSubject: el formato tiene ${acl.ackSubject.format.split(".").length} tokens y dice ${acl.ackSubject.tokens}`);
@@ -220,16 +222,28 @@ const servicioDePrueba = {
   owns: ["logistica"],
   subjects: ["facturacion.factura.v2.emitida", "pedidos.pedido.v1.cancelado", "pedidos.pedido.v1.creado"],
 };
+// El modo por defecto se prueba SIN pasar opciones: es lo que ejecuta quien no pide nada.
+for (const dev of [false, true]) {
+  const modo = dev ? "--dev" : "por defecto";
+  const emitidoModo = dev ? permisosDe(servicioDePrueba, { dev }) : permisosDe(servicioDePrueba);
+  for (const permiso of emitidoModo.publish) {
+    const categorias = patrones.filter(([, re]) => re.test(permiso)).map(([k]) => k);
+    if (categorias.length !== 1) fallos.push(`el generador (${modo}) emite "${permiso}", que encaja con ${categorias.length} categoría(s) de security.acl.permissionPatterns: [${categorias.join(", ")}]`);
+    if (denegable.test(permiso)) fallos.push(`el generador (${modo}) emite "${permiso}", que security.acl.neverGrantedPattern declara denegable`);
+    // CONSUMER.CREATE solo con --dev: es lo que protocol.json declara, y lo que el generador cumple.
+    if (!dev && categorias.some((k) => acl.devOnlyPatterns.includes(k))) fallos.push(`el generador (por defecto) emite "${permiso}", que solo debe concederse con --dev`);
+  }
+  const creates = emitidoModo.publish.filter((x) => patrones.some(([k, re]) => acl.devOnlyPatterns.includes(k) && re.test(x)));
+  const esperados = dev ? emitidoModo.durables.length : 0;
+  if (creates.length !== esperados) fallos.push(`el generador (${modo}) emite ${creates.length} permisos de CONSUMER.CREATE y debería emitir ${esperados} (uno por durable propio, solo con --dev)`);
+  for (const permiso of emitidoModo.subscribe) {
+    if (!new RegExp(acl.inbox.permissionPattern).test(permiso)) fallos.push(`el generador (${modo}) emite una suscripción "${permiso}" que no es el inbox privado`);
+  }
+  if (emitidoModo.subscribe.length !== 1) fallos.push(`el generador (${modo}) emite ${emitidoModo.subscribe.length} suscripciones; solo debe haber una (el inbox)`);
+  // En NATS `allow: []` significa «sin restricción»: ninguna lista puede salir vacía.
+  if (!emitidoModo.publish.length) fallos.push(`el generador (${modo}) emite una lista de publicación vacía, que NATS interpreta como «sin restricción»`);
+}
 const emitido = permisosDe(servicioDePrueba);
-for (const permiso of emitido.publish) {
-  const categorias = patrones.filter(([, re]) => re.test(permiso)).map(([k]) => k);
-  if (categorias.length !== 1) fallos.push(`el generador emite "${permiso}", que encaja con ${categorias.length} categoría(s) de security.acl.permissionPatterns: [${categorias.join(", ")}]`);
-  if (denegable.test(permiso)) fallos.push(`el generador emite "${permiso}", que security.acl.neverGrantedPattern declara denegable`);
-}
-for (const permiso of emitido.subscribe) {
-  if (!new RegExp(acl.inbox.permissionPattern).test(permiso)) fallos.push(`el generador emite una suscripción "${permiso}" que no es el inbox privado`);
-}
-if (emitido.subscribe.length !== 1) fallos.push(`el generador emite ${emitido.subscribe.length} suscripciones; solo debe haber una (el inbox)`);
 // …y el nombre del durable de DLQ que emite cumple el patrón que protocol.json le da.
 const dlqDurables = emitido.durables.filter((d) => d.kind === "dlq").map((d) => d.durable);
 if (!dlqDurables.length || !dlqDurables.every((d) => new RegExp(acl.dlqReaderDurable.pattern).test(d))) fallos.push(`los durables de DLQ que emite el generador (${dlqDurables.join(", ")}) no cumplen security.acl.dlqReaderDurable.pattern`);

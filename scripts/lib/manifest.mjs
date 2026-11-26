@@ -275,11 +275,20 @@ export function analizarManifiesto(manifiesto, bundleSubjects) {
  *   connect()            jetstreamManager(nc)                        → $JS.API.INFO
  *   publish()            #ensureStream(dominio)                      → STREAM.INFO.EVT_<DOM>
  *   subscribe()          #ensureStream + #ensureDlqStream            → STREAM.INFO.EVT_/DLQ_<DOM>
- *                        consumers.add(…)                            → CONSUMER.CREATE.<S>.<d>.<subject>
+ *                        consumers.add(…)  (solo con `dev`)          → CONSUMER.CREATE.<S>.<d>.<subject>
  *                        consumers.info(…)  (fallback y métricas)    → CONSUMER.INFO.<S>.<d>
  *                        consumers.get + consume()                   → CONSUMER.INFO + CONSUMER.MSG.NEXT
  *                        working() / ack() / nak() / term()          → $JS.ACK.<S>.<d>.<…>
  *                        #sendToDlq / #sendRawToDlq                  → publish dlq.<subject>
+ *
+ * CONSUMER.CREATE NO se concede por defecto (`dev: false`). En producción los durables los
+ * crea `flux provision` y al servicio le basta CONSUMER.INFO: el SDK de Node, si el broker le
+ * deniega el `add`, cae a `info` y sigue (medido). Concederlo tiene un coste real: un durable
+ * borrado lo recrearía el propio servicio con `deliver_policy: all` —reentregando hasta 30 días
+ * de eventos sin que nadie lo decida—, y un servicio comprometido podría cambiar el ack_wait, el
+ * max_deliver o el backoff de su propio consumidor. Sin CREATE, un durable que falta es un fallo
+ * ruidoso (NOT_PROVISIONED), no un replay silencioso. Con `dev: true` se concede, solo sobre el
+ * durable PROPIO y con su filtro exacto, para arrancar sin aprovisionar — 06-security.md §3.4.
  *
  * Devuelve:
  *   grupos     [{ titulo, publish: [...] }] — para que la config generada se pueda auditar a ojo
@@ -291,7 +300,7 @@ export function analizarManifiesto(manifiesto, bundleSubjects) {
  * filtro va en el cuerpo y ninguna ACL lo ve), `STREAM.MSG.GET.*`, y todo lo que cree,
  * modifique, borre o purgue streams y consumidores ajenos. Ver 06-security.md §3.
  */
-export function permisosDe(servicio) {
+export function permisosDe(servicio, { dev = false } = {}) {
   const grupos = [];
   const durables = [];
   const visto = new Set();
@@ -323,7 +332,7 @@ export function permisosDe(servicio) {
     const durable = durableName(servicio.name, s);
     durables.push({ stream, durable, filter: s, kind: "events" });
     grupo(`Consume ${s}  (durable ${durable})`, [
-      `$JS.API.CONSUMER.CREATE.${stream}.${durable}.${s}`,
+      ...(dev ? [`$JS.API.CONSUMER.CREATE.${stream}.${durable}.${s}`] : []),
       `$JS.API.CONSUMER.INFO.${stream}.${durable}`,
       `$JS.API.CONSUMER.MSG.NEXT.${stream}.${durable}`,
       `$JS.ACK.${stream}.${durable}.>`,
@@ -339,7 +348,7 @@ export function permisosDe(servicio) {
     const filter = `dlq.${d}.>`;
     durables.push({ stream, durable, filter, kind: "dlq" });
     grupo(`Lee la DLQ de "${d}"  (durable ${durable})`, [
-      `$JS.API.CONSUMER.CREATE.${stream}.${durable}.${filter}`,
+      ...(dev ? [`$JS.API.CONSUMER.CREATE.${stream}.${durable}.${filter}`] : []),
       `$JS.API.CONSUMER.INFO.${stream}.${durable}`,
       `$JS.API.CONSUMER.MSG.NEXT.${stream}.${durable}`,
       `$JS.ACK.${stream}.${durable}.>`,
@@ -350,6 +359,13 @@ export function permisosDe(servicio) {
   // El inbox es PRIVADO: `_INBOX.>` común haría que cualquiera leyese las entregas de
   // otro (A-2). El SDK fija el prefijo a partir del nombre de servicio — 06-security.md §3.
   const subscribe = [`_INBOX.${servicio.name}.>`];
+
+  // En NATS `allow: []` NO significa «nada»: significa «sin restricción» (medido: un usuario
+  // con listas vacías publica y se suscribe donde quiere). Una lista vacía sería la ACL más
+  // abierta posible escrita como la más cerrada, así que se prefiere no generar nada.
+  if (publish.length === 0 || subscribe.length === 0) {
+    throw new Error(`${servicio.name}: se generaría una lista de permisos vacía, que NATS interpreta como «sin restricción»`);
+  }
 
   return { grupos, publish, subscribe, durables };
 }

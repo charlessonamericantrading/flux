@@ -4,7 +4,7 @@
  * Contrato normativo: specification/06-security.md §2 y §3
  *
  *   node scripts/gen-acl.mjs <services.json> [--bundle <bundle.json>] [--nkeys <mapa.json>]
- *                            [--check] [--tenants] [--json]
+ *                            [--check] [--tenants] [--json] [--dev]
  *
  *   (sin flags)   imprime la config de nats-server: un bloque `accounts { … }` que se
  *                 incluye desde la config del servidor con `include "acl.conf"`. El
@@ -20,6 +20,9 @@
  *   --tenants     Modelo B: una account por tenant (09-multitenancy.md §2). Las claves de
  *                 `--nkeys` son `<servicio>@<tenant>`: NATS rechaza la misma nkey en dos
  *                 accounts ("Duplicate nkey").
+ *   --dev         concede además CONSUMER.CREATE de cada durable PROPIO (con su filtro
+ *                 exacto), para que el SDK pueda crearlo sin `flux provision`. NO es el
+ *                 default: ver más abajo y 06-security.md §3.4.
  *   --json        en vez de la config, `[ { name, publish, subscribe, … } ]`, un elemento
  *                 por servicio (por servicio y tenant con --tenants), para que los tests
  *                 asserten los permisos exactos sin parsear la config. Además de los tres
@@ -32,12 +35,18 @@
  * Escribirlas a mano garantiza que diverjan del diseño en el primer mes.
  *
  * Qué genera para cada servicio (el detalle y el porqué, en 06-security.md §3):
- *   · publish:   su dominio; y, por cada subject consumido, EXACTAMENTE los cuatro
- *                subjects de `$JS.API`/`$JS.ACK` de su durable, más `dlq.<subject>`.
+ *   · publish:   su dominio; y, por cada subject consumido, EXACTAMENTE los tres
+ *                subjects de `$JS.API`/`$JS.ACK` de su durable (INFO, MSG.NEXT y ACK;
+ *                cuatro con --dev, que añade CREATE), más `dlq.<subject>`.
  *   · subscribe: solo su inbox privado `_INBOX.<servicio>.>`. Ningún subject de dominio:
  *                los SDKs consumen por pull, y lo que confina es `$JS.API`.
  *   · nunca:     `CONSUMER.DURABLE.CREATE.*`, `STREAM.MSG.GET.*`, ni crear, modificar,
  *                borrar o purgar streams. Se deniegan por omisión.
+ *   · CONSUMER.CREATE no se concede por defecto: en producción los durables los crea
+ *                `flux provision`. Un durable borrado lo recrearía el propio servicio con
+ *                deliver_policy `all`, reentregando hasta 30 días de eventos sin que nadie lo
+ *                decida; sin el permiso falla ruidosamente (NOT_PROVISIONED). `--dev` lo
+ *                concede, solo sobre el durable propio y con su filtro exacto.
  *
  * v1 de este generador concedía `_INBOX.>` y subscripción a los subjects consumidos, y
  * nada sobre `$JS.API`: con eso un servicio no podía consumir (H1) y, aun así, leía
@@ -73,7 +82,7 @@ const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 
 const USO =
   "uso: node scripts/gen-acl.mjs <services.json> [--bundle <bundle.json>] [--nkeys <mapa.json>]\n" +
-  "                              [--check] [--tenants] [--json]";
+  "                              [--check] [--tenants] [--json] [--dev]";
 
 // ─── Argumentos ──────────────────────────────────────────────────────────────
 
@@ -84,6 +93,7 @@ function leerArgumentos(argv) {
     if (a === "--check") o.check = true;
     else if (a === "--tenants") o.tenants = true;
     else if (a === "--json") o.json = true;
+    else if (a === "--dev") o.dev = true;
     else if (a === "--bundle" || a === "--nkeys") {
       const v = argv[++i];
       if (v === undefined || v.startsWith("--")) usoErroneo(`${a} necesita un valor`);
@@ -206,7 +216,7 @@ async function cargarClaves(ruta, necesarias) {
 }
 
 if (args.check) {
-  const durables = servicios.reduce((n, s) => n + permisosDe(s).durables.length, 0);
+  const durables = servicios.reduce((n, s) => n + permisosDe(s, { dev: !!args.dev }).durables.length, 0);
   console.log(
     `✓ manifiesto válido: ${servicios.length} servicio(s), ${dueñoDe.size} dominio(s), ` +
       `${durables} durable(s) a aprovisionar` +
@@ -222,7 +232,7 @@ if (args.json) {
   const filas = [];
   for (const t of args.tenants ? tenants : [null]) {
     for (const s of servicios) {
-      const perm = permisosDe(s);
+      const perm = permisosDe(s, { dev: !!args.dev });
       filas.push({
         name: s.name,
         ...(t && { tenant: t, account: `${env.toUpperCase()}_${up(t)}` }),
@@ -249,7 +259,7 @@ function lineaNkey(id, placeholder) {
 
 /** Un usuario: sus comentarios, su nkey y sus permisos, con cada grupo comentado. */
 function renderUsuario(svc, { id, placeholder, titulo }) {
-  const perm = permisosDe(svc);
+  const perm = permisosDe(svc, { dev: !!args.dev });
   const l = [];
   l.push(``);
   l.push(`      # ${titulo}`);
@@ -287,6 +297,16 @@ function cabeceraComun() {
     `#     cualquiera leer las entregas de otro: las de un pull consumer viajan por el inbox.`,
     `#   · Nunca se concede CONSUMER.DURABLE.CREATE.*, STREAM.MSG.GET.* ni crear, modificar,`,
     `#     borrar o purgar streams. Se deniegan por omisión.`,
+    ...(args.dev
+      ? [
+          `#   · MODO --dev: se concede además CONSUMER.CREATE de cada durable PROPIO, con su filtro`,
+          `#     exacto, para arrancar sin \`flux provision\`. NO usar en producción.`,
+        ]
+      : [
+          `#   · CONSUMER.CREATE no se concede (producción): los durables los crea \`flux provision\`.`,
+          `#     Un durable borrado falla en alto (NOT_PROVISIONED) en vez de recrearse con`,
+          `#     deliver_policy all y reentregar el historial. \`--dev\` lo concede.`,
+        ]),
     `#`,
     `# Los streams y los durables que estos permisos presuponen NO los crea el servicio:`,
     `# se aprovisionan con \`flux provision\`, con credenciales de operación que no están en`,
