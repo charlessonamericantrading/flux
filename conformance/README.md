@@ -11,7 +11,8 @@ conformance/
 ├── cases/
 │   ├── broker-invariants.json   ← invariantes de NATS de las que depende el protocolo
 │   ├── consumer-config.json     ← la config canónica sobrevive al servidor sin alterarse
-│   ├── security-acl.json        ← los permisos generados, ejecutados contra un broker con TLS (S1–S29)
+│   ├── security-acl.json        ← los permisos generados, ejecutados contra un broker con TLS (S1–S34; S30–S34, con los SDKs reales)
+│   ├── interop-rpc.json         ← petición/respuesta entre los SDKs de Node y de Rust, bajo los permisos generados (I1–I5)
 │   ├── state-broker.json        ← estado replicado: lo que hace el BROKER (A-31 … A-49), con ACL y cluster
 │   ├── state-semantics.json     ← estado replicado: el algoritmo de put/delete/get y la foto de watch (A-50)
 │   ├── cross-sdk-state-envelope.json ← la entrada de estado, la lápida y la DLQ de estado, byte a byte
@@ -20,7 +21,10 @@ conformance/
 ├── fixtures/
 │   └── acl-v1.conf              ← la ACL v1 de gen-acl.mjs, congelada y rota a propósito (caso S9)
 ├── security.mjs                 ← runner de security-acl.json: los casos son DATOS
-├── security/                    ← su intérprete, el ciclo del SDK de Node (S10) y los mutantes del generador (mutantes.mjs)
+├── security/                    ← su intérprete, el entorno compartido (entorno.mjs), el ciclo del SDK de Node (S10), los
+│                                  participantes de los SDKs reales (participante-node.mjs; el de Rust, en sdk-rust/examples/) y los
+│                                  mutantes del generador (mutantes.mjs) y de los SDKs (mutantes-sdk.mjs)
+├── interop-rpc.mjs              ← runner de interop-rpc.json: los casos son DATOS, con `matrix` (quien llama × quien responde)
 ├── state-broker.mjs             ← runner de los tres ficheros de estado: los casos son DATOS
 ├── cross-sdk.mjs                ← runner de la conformidad cruzada: los siete SDKs, byte a byte
 ├── harness/                     ← su contrato (README.md), los vectores y la clave de prueba
@@ -114,12 +118,12 @@ permiso. S21 a S29 son los de la **petición/respuesta** ([06-security.md §3.9]
 publica solo en el subject exacto de cada operación y la denegación es rápida, solo el dueño atiende (ni `rpc.>`, ni el grupo
 de cola de otro), la respuesta no la lee otro servicio, `allow_responses` admite UNA respuesta y caduca, un dueño sin
 suscripción parece caído, la minimalidad de cada permiso, el ciclo de aceptación (dos instancias, 100 peticiones
-concurrentes, `no responders` al parar) y la trampa de la segunda suscripción al inbox, con clientes `@nats-io/*` en bruto
-(los SDKs `rpc` repetirán el ciclo con su propia librería). S25 tarda ~1 min: espera la caducidad de `allow_responses` de verdad.
+concurrentes, `no responders` al parar) y la trampa de la segunda suscripción al inbox, con clientes `@nats-io/*` en bruto.
+S25 tarda ~1 min: espera la caducidad de `allow_responses` de verdad.
 Los pasos `save` / `{ "ref": … }` llevan la secuencia de una escritura condicional a la siguiente. S10 y S11 son la
 excepción deliberada: el SDK de Node y el de Rust, sin modificar, hacen un ciclo completo
 (publicar, consumir, ack, reintento, DLQ) **contra la ACL generada**, y el runner mira después,
-desde el broker, lo que dejaron. S9 vuelve a ejecutar S1 y S6 contra la ACL v1 congelada y exige
+desde el broker, lo que dejaron. **S30 a S34 repiten la petición/respuesta con los SDKs reales** (ver más abajo). S9 vuelve a ejecutar S1 y S6 contra la ACL v1 congelada y exige
 que **fallen** como se documenta (H1 y H2): un test que solo se ha visto en verde no demuestra
 nada. Los pasos marcados `control` demuestran que las sondas pueden fallar.
 
@@ -145,6 +149,49 @@ aplica a la copia UN cambio de texto —`rpc.<dominio>.>` a quien llama, `rpc.>`
 quitar `allow_responses` o su `expires`, el inbox común…— y ejecuta la suite con `FLUX_GEN_ACL` apuntando a esa copia: cada
 mutante declara los casos que DEBEN fallar, y antes se comprueba que sin mutar esos casos pasan. Un ancla que ya no aparece en el
 generador es un error, no un mutante que «no cambia nada y pasa».
+
+### Los SDKs reales: S30 a S34 y la interoperabilidad (I1 a I5)
+
+S21 a S29 miden el broker con clientes en bruto. Lo que importa de verdad es que **los SDKs** funcionen bajo esos permisos, y eso solo
+se ve con ellos conectados: lo que se mide es lo que el SDK hace con SU conexión (qué suscripciones abre, qué permisos usa, cuánto
+tarda en decir `no responders`). Por eso el vocabulario gana una operación, `sdk_script`
+([`security/sdk-escenario.mjs`](security/sdk-escenario.mjs)): lanza **cada instancia como un proceso** con un SDK real —
+[`security/participante-node.mjs`](security/participante-node.mjs) y [`sdk-rust/examples/rpc_participant.rs`](../sdk-rust/examples/rpc_participant.rs),
+que hablan el **mismo protocolo** por stdin/stdout y solo usan la API pública del SDK—, con la nkey de un servicio del manifiesto (o de
+una **variante** suya con un permiso de menos), y les da órdenes en el orden de un guion. Cada paso del guion compara lo que el agente
+contestó, más lo que el orquestador mira por su cuenta —las violaciones de permiso que el `nats-server` anotó (`serverViolations`) y las
+suscripciones reales de cada conexión por su puerto de monitorización (`broker_subs`, `/connz`)—, con su `expect`.
+
+- **S30 (Node) y S31 (Rust)**: el ciclo de [11-request-reply.md §12.9](../specification/11-request-reply.md): dos instancias reparten 100
+  peticiones concurrentes (cada una, ejecutada una vez), al parar ambas `RPC_UNAVAILABLE` en < 100 ms (la **mediana** de 7 llamadas: una sola
+  medición engaña), y quitar cada permiso concedido —publicar en la operación, el inbox privado, la suscripción del dueño,
+  `allow_responses`— **se nota con el código que toca**. Más un servicio de solo llamada (sin ninguna suscripción de dominio).
+- **S32 (Node) y S33 (Rust)**: A-101 con el SDK real. Un servicio que **consume por pull** (con 40 eventos de tráfico) o que observa
+  **estado** (`watch`) y llama por la misma conexión recibe `RPC_UNAVAILABLE` en milisegundos; y el broker confirma que **una sola**
+  suscripción de la conexión casa con el `reply`: el buzón único de la librería. Se mide, no se lee.
+- **S34 (Node)**: `allow_responses { max: 1 }` con un responder «tramposo» (su conexión publica dos veces cada respuesta): la segunda se
+  deniega y el SDK lo registra. Solo Node: el SDK de Rust no expone la conexión.
+- **I1 a I5** ([`interop-rpc.mjs`](interop-rpc.mjs)): el SDK de Node llama a Rust y al revés (y los dos de control: cada caso con `matrix`
+  se expande en cuatro) —el sobre, los tenants distintos, el `aggregateId`, el UTF-8; los errores `retryable` y `permanent` con su `code`; lo
+  desconocido con un mensaje genérico; la respuesta que no cabe; la firma `require` y sus tres códigos; la parada ordenada; y que un
+  reintento reutiliza el `id`—. Comparte el entorno con la suite de seguridad ([`security/entorno.mjs`](security/entorno.mjs)): los mismos
+  permisos generados, no una ACL escrita a mano.
+
+```bash
+(cd conformance && npm install) && (cd cli && npm install) && (cd sdk-node && npm install && npm run build)
+NATS_SERVER=/ruta/a/nats-server node conformance/interop-rpc.mjs            # 5 casos × 4 combinaciones (~30 s)
+node conformance/interop-rpc.mjs --only "I2[node→rust]" -v                   # una combinación, con lo observado
+node conformance/security.mjs --only S30,S31,S32,S33,S34 -v
+node conformance/security/mutantes-sdk.mjs                                   # 11 mutantes de SDK: los casos DEBEN fallar con cada uno
+node conformance/security/mutantes-sdk.mjs --no-rust                         # sin los que compilan Rust (~1 min cada uno)
+node conformance/security/mutantes.mjs --sdk                                 # un GENERADOR estropeado también debe romper S30 y S34
+```
+
+`mutantes-sdk.mjs` es el equivalente de `mutantes.mjs` para el **SDK**: copia `sdk-node/dist` (o `sdk-rust`) a un temporal, le aplica UN
+cambio de texto —que abra una suscripción `_INBOX.<servicio>.>` en `connect()`, en el pull o en el `watch` (A-101), una respuesta que no hereda
+el tenant, el texto de una excepción desconocida reenviado, un reintento con otro `id`, un responder que no verifica la firma— y ejecuta los
+casos con `FLUX_SDK_NODE_DIST` / `FLUX_SDK_RUST_DIR` apuntando a la copia. Cada mutante declara los casos que DEBEN fallar (y que solo
+fallan los suyos: el del pull no rompe el `watch`), y antes se comprueba que sin mutar pasan.
 
 `scripts/verify-acl.mjs` **se queda**: no es redundante con esta suite. Verifica el generador (sus
 errores, `--nkeys`, `--tenants`), `flux provision` (idempotencia, diferencias, nunca borra), la

@@ -146,7 +146,8 @@ jobs:
         run: |
           GOBIN="$PWD/bin" go install github.com/nats-io/nats-server/v2@v2.14.5
           echo "NATS_SERVER=$PWD/bin/nats-server" >> "$GITHUB_ENV"
-      # S11 compila y lanza `cargo run --example acl_cycle` en sdk-rust.
+      # S11 compila y lanza `cargo run --example acl_cycle` en sdk-rust; S31 y S33, el participante de petición/respuesta
+      # (`--example rpc_participant --features signing`).
       - uses: dtolnay/rust-toolchain@stable
       # La suite usa la CLI (`flux provision`) y el SDK de Node (S10, desde dist/).
       - run: npm install --no-audit --no-fund
@@ -166,7 +167,8 @@ jobs:
         run: node conformance/security.mjs
       # Una prueba que solo se ha visto en verde no demuestra nada: se estropea el GENERADOR de ACL a propósito (`rpc.<dominio>.>` a
       # quien llama, `rpc.>` o un permiso de publicación sobre inboxes al dueño, sin `allow_responses` o sin su `expires`, el inbox
-      # común…) y los casos S21 a S29 DEBEN fallar con cada uno de los 13 mutantes. Sin mutar, el subconjunto pasa.
+      # común…) y los casos S21 a S29 DEBEN fallar con cada uno de los 13 mutantes. Sin mutar, el subconjunto pasa. (Los casos con
+      # SDKs reales, S30 y S34, hacen lo mismo con `--sdk` en el job `interop-rpc`: en paralelo, para no alargar este.)
       - name: Los casos detectan un generador de ACL estropeado (deben FALLAR)
         env:
           FLUX_REQUIRE_BROKER: '1'
@@ -203,6 +205,60 @@ jobs:
             fi
             echo "✓ el mutante $m fue detectado"
           done
+
+  # Petición/respuesta entre los SDKs REALES de Node y de Rust (conformance/interop-rpc.mjs): el mismo entorno que la suite de
+  # seguridad —nats-server con TLS, la ACL que genera gen-acl.mjs, `flux provision`— y cada instancia, un PROCESO con un SDK de
+  # verdad: Node llama a Rust y al revés (y los dos de control), con tenants distintos, firma `require`, errores retryable y
+  # permanent, una respuesta que no cabe y un handler que lanza lo desconocido. Va en su propio job para no alargar el de seguridad
+  # (~12 min): corre en paralelo. Los S30 a S34 (el ciclo de §12.9 y A-101 con cada SDK) corren en el de seguridad.
+  interop-rpc:
+    name: Interoperabilidad de petición/respuesta — los SDKs de Node y de Rust contra un NATS real
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+          cache: false
+      - name: Compilar nats-server 2.14.5
+        run: |
+          GOBIN="$PWD/bin" go install github.com/nats-io/nats-server/v2@v2.14.5
+          echo "NATS_SERVER=$PWD/bin/nats-server" >> "$GITHUB_ENV"
+      # El participante de Rust (`--example rpc_participant --features signing`) lo compila el propio runner.
+      - uses: dtolnay/rust-toolchain@stable
+      - run: npm install --no-audit --no-fund
+        working-directory: conformance
+      - run: npm install --no-audit --no-fund
+        working-directory: cli
+      - run: npm install --no-audit --no-fund
+        working-directory: sdk-node
+      - run: npm run build
+        working-directory: sdk-node
+      - name: Ejecutar la suite de interoperabilidad entre SDKs
+        env:
+          FLUX_REQUIRE_BROKER: '1'
+          FLUX_TEST_PORTS: '4650-4699'
+        run: node conformance/interop-rpc.mjs
+      # Una prueba que solo se ha visto en verde no demuestra nada: se estropea el SDK a propósito —que abra una suscripción a su
+      # inbox por la conexión con la que pide (A-101: `RPC_UNAVAILABLE` pasa a ser un timeout) en `connect()`, en el pull o en el
+      # `watch`; una respuesta que no hereda el tenant; que reenvíe el texto de una excepción desconocida; un reintento con otro
+      # `id`; un responder que no verifica la firma— y los casos DEBEN fallar con cada uno de los 11 mutantes. Sin mutar, pasan.
+      - name: Los casos detectan un SDK estropeado (deben FALLAR)
+        env:
+          FLUX_REQUIRE_BROKER: '1'
+          FLUX_TEST_PORTS: '4650-4699'
+        run: node conformance/security/mutantes-sdk.mjs
+      # Y al revés: un GENERADOR de ACL estropeado (a quien llama `rpc.<dominio>.>`, sin `allow_responses`, el inbox común, un permiso de
+      # publicación sobre inboxes, `max: 3`…) también tiene que romper a los SDKs reales: S30 (el ciclo de §12.9 con el de Node) y
+      # S34 (`allow_responses` con un responder tramposo) DEBEN fallar con cada uno de los 11 mutantes.
+      - name: Los casos con SDKs reales detectan un generador de ACL estropeado (deben FALLAR)
+        env:
+          FLUX_REQUIRE_BROKER: '1'
+          FLUX_TEST_PORTS: '4650-4699'
+        run: node conformance/security/mutantes.mjs --sdk
 
   protocol-json-valid:
     name: protocol.json coherente
