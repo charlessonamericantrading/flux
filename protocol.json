@@ -1186,8 +1186,16 @@
       },
       "java": {
         "capabilities": [
-          "signing"
-        ]
+          "signing",
+          "security"
+        ],
+        "evidence": {
+          "security": [
+            "sdk-java/src/test/java/com/flux/SecurityIntegrationTest.java",
+            "sdk-java/src/test/java/com/flux/TlsIntegrationTest.java",
+            "sdk-java/src/test/java/com/flux/SecurityUnitTest.java"
+          ]
+        }
       },
       "dotnet": {
         "capabilities": [

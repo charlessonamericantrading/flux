@@ -12,6 +12,9 @@
 package com.flux;
 
 import com.flux.FluxErrors.Classification;
+import com.flux.SecurityErrors.NotProvisionedException;
+import com.flux.SecurityErrors.PermissionDeniedException;
+import com.flux.SecurityErrors.ResourceKind;
 import io.nats.client.Connection;
 import io.nats.client.ConsumerContext;
 import io.nats.client.JetStream;
@@ -22,6 +25,7 @@ import io.nats.client.Nats;
 import io.nats.client.Options;
 import io.nats.client.StreamContext;
 import io.nats.client.api.AckPolicy;
+import io.nats.client.api.ConsumerInfo;
 import io.nats.client.api.ConsumerConfiguration;
 import io.nats.client.api.DeliverPolicy;
 import io.nats.client.api.DiscardPolicy;
@@ -40,11 +44,15 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.Callable;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
+import javax.net.ssl.SSLContext;
 
 /**
  * El cliente de flux: publica y consume eventos.
@@ -87,16 +95,44 @@ public final class FluxBus implements AutoCloseable {
 
     // ─── Opciones de conexion ────────────────────────────────────────────────
 
-    /** Credenciales de NATS. NUNCA versionadas — 06-security.md §2. */
+    /**
+     * Credenciales de NATS. NUNCA versionadas — 06-security.md §2. Se admite UN solo metodo:
+     *
+     * <table>
+     *   <caption>Metodos</caption>
+     *   <tr><td>{@code .creds} (JWT + nkey), el recomendado</td><td>{@link #credsFile(String)} o {@link #credsContent(String)}</td></tr>
+     *   <tr><td>nkey</td><td>{@link #nkeySeed(String)}</td></tr>
+     *   <tr><td>token</td><td>{@link #token(String)}</td></tr>
+     *   <tr><td>usuario y contrasena</td><td>{@link #userPassword(String, String)}</td></tr>
+     * </table>
+     *
+     * <p>Todo lo mal formado lanza {@code INVALID_CREDENTIALS} en {@code connect()}, ANTES de abrir ningun
+     * socket: un valor vacio (casi siempre una variable de entorno sin definir) no degrada a «sin
+     * credenciales».
+     */
     public static final class Credentials {
         private String credsFile;
+        private String credsContent;
+        private String nkeySeed;
         private String token;
         private String user;
         private String password;
 
-        /** Ruta a un fichero {@code .creds}. Es la forma recomendada. */
+        /** Ruta a un fichero {@code .creds}. Es la forma recomendada: se relee en cada (re)conexion, y rotar no exige reiniciar. */
         public Credentials credsFile(String v) {
             this.credsFile = v;
+            return this;
+        }
+
+        /** El contenido de un {@code .creds}, por ejemplo leido de un gestor de secretos. */
+        public Credentials credsContent(String v) {
+            this.credsContent = v;
+            return this;
+        }
+
+        /** Semilla de una nkey de USUARIO ({@code SU…}). */
+        public Credentials nkeySeed(String v) {
+            this.nkeySeed = v;
             return this;
         }
 
@@ -109,6 +145,30 @@ public final class FluxBus implements AutoCloseable {
             this.user = user;
             this.password = password;
             return this;
+        }
+
+        String credsFile() {
+            return credsFile;
+        }
+
+        String credsContent() {
+            return credsContent;
+        }
+
+        String nkeySeed() {
+            return nkeySeed;
+        }
+
+        String token() {
+            return token;
+        }
+
+        String user() {
+            return user;
+        }
+
+        String password() {
+            return password;
         }
     }
 
@@ -158,26 +218,27 @@ public final class FluxBus implements AutoCloseable {
 
     /** Configuracion de la conexion al bus. */
     public static final class ConnectOptions {
-        private String servers = "nats://localhost:4222";
-        private String service;
-        private String environment;
-        private String version;
-        private String tenantId;
-        private TenantIsolation tenantIsolation = TenantIsolation.OFF;
-        private Validation.Options validation;
-        private long pendingPollMillis = DEFAULT_PENDING_POLL_MILLIS;
-        private Signing.SigningOptions signing;
-        private MetricsSink metrics = MetricsSink.NONE;
-        private FluxEvent.DataClassification classification;
-        private final Map<String, String> schemas = new HashMap<>();
-        private String schemaBaseUrl;
-        private Classifier.ClassifierOptions classifierOptions;
-        private int streamReplicas = 1;
-        private Credentials credentials;
-        private EventContext.TraceparentSupplier traceparentSupplier;
-        private PoisonListener onPoison;
-        private DlqListener onDlq;
-        private System.Logger logger;
+        String servers = "nats://localhost:4222";
+        String service;
+        String environment;
+        String version;
+        String tenantId;
+        TenantIsolation tenantIsolation = TenantIsolation.OFF;
+        Validation.Options validation;
+        long pendingPollMillis = DEFAULT_PENDING_POLL_MILLIS;
+        Signing.SigningOptions signing;
+        MetricsSink metrics = MetricsSink.NONE;
+        FluxEvent.DataClassification classification;
+        final Map<String, String> schemas = new HashMap<>();
+        String schemaBaseUrl;
+        Classifier.ClassifierOptions classifierOptions;
+        int streamReplicas = 1;
+        Credentials credentials;
+        TlsOptions tls;
+        EventContext.TraceparentSupplier traceparentSupplier;
+        PoisonListener onPoison;
+        DlqListener onDlq;
+        System.Logger logger;
 
         /** {@code nats://host:4222}, o varios separados por coma para HA. */
         public ConnectOptions servers(String v) {
@@ -321,6 +382,17 @@ public final class FluxBus implements AutoCloseable {
             return this;
         }
 
+        /**
+         * TLS — 06-security.md §2: es OBLIGATORIO en produccion. {@code new TlsOptions()} exige TLS con las CA
+         * del sistema; {@link TlsOptions#caFile(String)} fija una CA propia. El SDK siempre verifica el host
+         * (los SAN del certificado). Sin esta opcion no hay TLS, y un broker que lo exige se rechaza con
+         * {@code CONNECTION_REJECTED}.
+         */
+        public ConnectOptions tls(TlsOptions v) {
+            this.tls = v;
+            return this;
+        }
+
         /** Ver {@link EventContext.TraceparentSupplier}. */
         public ConnectOptions traceparentSupplier(EventContext.TraceparentSupplier v) {
             this.traceparentSupplier = v;
@@ -358,6 +430,18 @@ public final class FluxBus implements AutoCloseable {
         private FluxEvent.DataClassification classification;
         private Instant time;
         private String partitionKey;
+        private String externalKey;
+
+        /**
+         * La clave del hecho en el SISTEMA EXTERNO que lo origino (el id del evento de una pasarela de pagos).
+         * El {@code id} del evento se DERIVA de ella y de {@link #time(Instant)} en vez de generarse: es siempre
+         * el mismo, y por eso un consumidor puede deduplicar los reenvios de un tercero durante horas
+         * — 01-envelope.md §2.6.1. Exige {@code time}: el instante del hecho EXTERNO, no «ahora».
+         */
+        public PublishOptions externalKey(String v) {
+            this.externalKey = v;
+            return this;
+        }
 
         /**
          * Id del agregado. Va al atributo {@code subject} de CloudEvents, NO al subject de
@@ -517,18 +601,20 @@ public final class FluxBus implements AutoCloseable {
     /** Periodo por defecto del sondeo de {@code num_pending} — 08-observability.md §2.3. */
     public static final long DEFAULT_PENDING_POLL_MILLIS = 15_000L;
 
-    private final Connection connection;
-    private final JetStream jetStream;
-    private final JetStreamManagement jsm;
-    private final ConnectOptions options;
-    private final Classifier classifier;
-    private final MetricsSink metrics;
-    private final Signing.Signer signer;
-    private final Signing.Verifier verifier;
+    final Connection connection;
+    final JetStream jetStream;
+    final JetStreamManagement jsm;
+    final ConnectOptions options;
+    /** Lo que jnats notifica: denegaciones de permisos, errores del broker, durables borrados. */
+    final FluxListener listener;
+    final Classifier classifier;
+    final MetricsSink metrics;
+    final Signing.Signer signer;
+    final Signing.Verifier verifier;
     /** {@code null} salvo en L3. Ver {@link Validation#create}. */
-    private final Validation.Validator validator;
-    private final boolean validateOnConsume;
-    private final String source;
+    final Validation.Validator validator;
+    final boolean validateOnConsume;
+    final String source;
     private final Set<Subscription> subscriptions =
             Collections.newSetFromMap(new ConcurrentHashMap<>());
     private final Set<String> ensuredStreams = ConcurrentHashMap.newKeySet();
@@ -542,7 +628,7 @@ public final class FluxBus implements AutoCloseable {
      * plazo a TODAS las suscripciones a la vez, que es justo la reentrega concurrente que el
      * WIP existe para evitar — 03-delivery.md §2.1.
      */
-    private final ScheduledExecutorService wipScheduler = Executors.newScheduledThreadPool(2, r -> {
+    final ScheduledExecutorService wipScheduler = Executors.newScheduledThreadPool(2, r -> {
         Thread t = new Thread(r, "flux-wip");
         t.setDaemon(true);
         return t;
@@ -558,14 +644,15 @@ public final class FluxBus implements AutoCloseable {
      *
      * <p>Si el sondeo esta desactivado no se crea el hilo: quien no lo usa no lo paga.
      */
-    private final ScheduledExecutorService pendingScheduler;
+    final ScheduledExecutorService pendingScheduler;
 
     private FluxBus(Connection connection, JetStream jetStream, JetStreamManagement jsm,
-                    ConnectOptions options) {
+                    ConnectOptions options, FluxListener listener) {
         this.connection = connection;
         this.jetStream = jetStream;
         this.jsm = jsm;
         this.options = options;
+        this.listener = listener;
         this.classifier = new Classifier(options.classifierOptions);
         this.metrics = options.metrics;
         // Las claves se decodifican UNA vez, en connect(): un PEM mal escrito debe romper
@@ -600,9 +687,14 @@ public final class FluxBus implements AutoCloseable {
     /**
      * Conecta al bus.
      *
-     * <p>Reconecta indefinidamente con backoff y JITTER: sin jitter, mil servicios
-     * reconectan en el mismo milisegundo y tiran el cluster que acaba de levantarse
-     * — 03-delivery.md §6.
+     * <p>Reconecta indefinidamente con backoff y JITTER: sin jitter, mil servicios reconectan en el mismo
+     * milisegundo y tiran el cluster que acaba de levantarse — 03-delivery.md §6.
+     *
+     * <p>La PRIMERA conexion es otro caso (03-delivery.md §6.1): espera a un broker que aun no ha arrancado,
+     * pero FALLA de inmediato ante lo que esperar no arregla —credenciales rechazadas, un certificado que no
+     * verifica, un TLS exigido que el servidor no ofrece— con uno de los tres codigos de 04-errors.md §5.3
+     * ({@code CONNECTION_REJECTED}, {@code INVALID_CREDENTIALS}, {@code INVALID_TLS_OPTIONS}), todos
+     * PERMANENT.
      */
     public static FluxBus connect(ConnectOptions options) {
         if (options == null || options.service == null || options.environment == null
@@ -615,40 +707,126 @@ public final class FluxBus implements AutoCloseable {
         // que solo publica nunca descubriria que su nombre incumple el patron.
         Protocol.validateService(options.service);
 
+        // Todo lo que se puede comprobar SIN RED se comprueba aqui, ANTES de abrir ningun socket: un valor mal
+        // formado debe fallar con su nombre, y no degradarse a «sin credenciales» o a «sin TLS».
+        String inboxPrefix = Security.inboxPrefixFor(options.service);
+        Security.Auth auth = Security.credentials(options.credentials);
+        SSLContext sslContext = Security.sslContext(options.tls);
+
+        FluxListener listener = new FluxListener(options.service, options.logger);
         Options.Builder builder = new Options.Builder()
-                .servers(options.servers.split(","))
+                .servers(serverList(options.servers))
                 .connectionName(options.service + "@" + options.environment)
                 .maxReconnects(-1)
-                .reconnectWait(Duration.ofSeconds(1))
-                .reconnectJitter(Duration.ofMillis(500))
-                .reconnectJitterTls(Duration.ofSeconds(1));
+                .reconnectWait(RECONNECT_WAIT)
+                .reconnectJitter(RECONNECT_JITTER)
+                .reconnectJitterTls(RECONNECT_JITTER_TLS)
+                // Inbox PRIVADO, siempre y no configurable: ver Security.inboxPrefixFor().
+                .inboxPrefix(inboxPrefix)
+                // Una peticion sin respuesta se cancela a los 5 s por defecto —con la MISMA excepcion que un
+                // `no responders`—: con un timeout de 25 s la confundiriamos con RPC_UNAVAILABLE (A-203).
+                .requestCleanupInterval(Duration.ofSeconds(60))
+                .errorListener(listener)
+                .connectionListener(listener);
+        if (auth != null) {
+            auth.apply(builder);
+        }
+        if (sslContext != null) {
+            builder.sslContext(sslContext);
+        }
 
-        Credentials credentials = options.credentials;
-        if (credentials != null) {
-            if (credentials.credsFile != null) {
-                builder.credentialPath(credentials.credsFile);
-            } else if (credentials.token != null) {
-                builder.token(credentials.token.toCharArray());
-            } else if (credentials.user != null) {
-                builder.userInfo(credentials.user, credentials.password);
+        Connection connection = connectWhenAvailable(builder, listener, options.servers, sslContext);
+        try {
+            return new FluxBus(connection, connection.jetStream(), connection.jetStreamManagement(), options,
+                    listener);
+        } catch (IOException e) {
+            try {
+                connection.close();
+            } catch (InterruptedException ie) {
+                Thread.currentThread().interrupt();
+            }
+            throw new FluxBusException("flux: no se pudo abrir JetStream en \"" + options.servers + "\"", e);
+        }
+    }
+
+    private static final Duration RECONNECT_WAIT = Duration.ofSeconds(1);
+    private static final Duration RECONNECT_JITTER = Duration.ofMillis(500);
+    private static final Duration RECONNECT_JITTER_TLS = Duration.ofSeconds(1);
+
+    private static String[] serverList(String servers) {
+        List<String> out = new ArrayList<>();
+        for (String s : servers.split(",")) {
+            if (!s.trim().isEmpty()) {
+                out.add(s.trim());
             }
         }
+        return out.toArray(new String[0]);
+    }
 
-        try {
-            // connectReconnectOnConnect y no connect: un servicio que arranca antes que el
-            // broker no debe morir en el primer intento. Es el equivalente del
-            // waitOnFirstConnect de Node y del RetryOnFailedConnect de Go.
-            Connection connection = Nats.connectReconnectOnConnect(builder.build());
-            return new FluxBus(connection, connection.jetStream(), connection.jetStreamManagement(),
-                    options);
-        } catch (InterruptedException e) {
-            // Restaurar el flag es obligatorio: tragarselo deja el hilo marcado como no
-            // interrumpido y rompe cualquier apagado ordenado aguas arriba.
-            Thread.currentThread().interrupt();
-            throw new FluxBusException("flux: conexion interrumpida", e);
-        } catch (IOException e) {
-            throw new FluxBusException("flux: no se pudo conectar a \"" + options.servers + "\"", e);
+    /**
+     * Espera a que el broker este disponible —un servicio que arranca antes que NATS es lo normal en un
+     * compose— pero NO espera lo que no va a cambiar.
+     *
+     * <p>{@code Nats.connectReconnectOnConnect} reintenta cualquier error, sin limite y sin avisar. Medido contra
+     * NATS 2.14.5 con jnats 2.20.5 (A-200): con una CA que no firmo el certificado, un servidor sin TLS ante un
+     * {@code tls} pedido o un TLS exigido que no se configuro, {@code connect()} no falla: se CUELGA; y con una
+     * credencial rechazada devuelve una conexion CERRADA, sin excepcion, que el servicio usaria sin saberlo.
+     * Aqui el bucle es del SDK, con {@code Nats.connect} (un solo intento) y la clasificacion de
+     * {@link Security#permanentConnectError}. Las reconexiones posteriores siguen siendo de la libreria
+     * ({@code maxReconnects(-1)}).
+     */
+    private static Connection connectWhenAvailable(Options.Builder builder, FluxListener listener, String servers,
+                                                   SSLContext tls) {
+        Options built = builder.build();
+        while (true) {
+            FluxListener.Attempt attempt = listener.beginAttempt();
+            try {
+                return Nats.connect(built);
+            } catch (InterruptedException e) {
+                // Restaurar el flag es obligatorio: tragarselo deja el hilo marcado como no
+                // interrumpido y rompe cualquier apagado ordenado aguas arriba.
+                Thread.currentThread().interrupt();
+                throw new FluxBusException("flux: conexion interrumpida", e);
+            } catch (IOException e) {
+                try {
+                    // La causa llega por el oyente, y la libreria la notifica ANTES del cierre del intento.
+                    attempt.awaitClosed(1500);
+                } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                    throw new FluxBusException("flux: conexion interrumpida", ie);
+                }
+                SecurityErrors.ConnectionRejectedException permanent =
+                        Security.permanentConnectError(e, attempt.exceptions(), servers, tls != null);
+                if (permanent == null && tls != null && attempt.exceptions().stream()
+                        .anyMatch(t -> t instanceof TimeoutException)) {
+                    // Solo un timeout, con TLS configurado: puede ser un broker mudo (se espera) o uno que exige un
+                    // certificado de cliente que no se presento (no se espera). La libreria no los distingue.
+                    javax.net.ssl.SSLException rejection = Security.probeTlsRejection(tls, serverList(servers)[0]);
+                    if (rejection != null) {
+                        permanent = Security.permanentConnectError(e, List.of(rejection), servers, true);
+                    }
+                }
+                if (permanent != null) {
+                    throw permanent;
+                }
+                listener.log(System.Logger.Level.DEBUG, "el broker aun no esta disponible (" + e.getMessage()
+                        + "): se reintenta");
+                try {
+                    // Con jitter: mil servicios que esperan a un NATS que arranca no deben llamar a la vez
+                    // — 03-delivery.md §6.
+                    long jitter = (long) (Math.random() * RECONNECT_JITTER.toMillis());
+                    Thread.sleep(RECONNECT_WAIT.toMillis() + jitter);
+                } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                    throw new FluxBusException("flux: conexion interrumpida", ie);
+                }
+            }
         }
+    }
+
+    /** Cuantas suscripciones de eventos tiene abiertas. Package-private: es para los tests. */
+    int subscriptionCount() {
+        return subscriptions.size();
     }
 
     /** Informa si la conexion sigue viva. Es el healthcheck que exige 03-delivery.md §6. */
@@ -675,6 +853,8 @@ public final class FluxBus implements AutoCloseable {
             Thread.currentThread().interrupt();
         } catch (Exception e) {
             log(System.Logger.Level.WARNING, "fallo al drenar la conexion: " + e.getMessage());
+        } finally {
+            listener.denials.close();
         }
     }
 
@@ -718,8 +898,11 @@ public final class FluxBus implements AutoCloseable {
 
         // UUIDv7: monotonico en el tiempo, asi que ordenar por `id` dentro de un mismo
         // `source` equivale a ordenar por instante de generacion — util al reconstruir
-        // historiales desde la DLQ (01-envelope.md §2.4).
-        String id = Protocol.uuidV7();
+        // historiales desde la DLQ (01-envelope.md §2.4). De un hecho IMPORTADO el id se DERIVA de la
+        // clave externa y del instante del hecho: es siempre el mismo (01-envelope.md §2.6.1).
+        String id = po.externalKey != null
+                ? ExternalId.eventId(source, po.externalKey, po.time)
+                : Protocol.uuidV7();
 
         Envelope.BuildEventInput input = new Envelope.BuildEventInput()
                 .subject(subject)
@@ -791,14 +974,34 @@ public final class FluxBus implements AutoCloseable {
             // NO deduplica reentregas de consumo. Un nak reentrega el mismo mensaje con el
             // mismo Nats-Msg-Id y eso es correcto y deseado. Nunca sustituye a la
             // idempotencia del consumidor — 03-delivery.md §3.
-            jetStream.publish(subject, payload,
-                    io.nats.client.PublishOptions.builder().messageId(event.id()).build());
-        } catch (IOException | JetStreamApiException e) {
+            //
+            // Asincrona y competida con la denegacion: una publicacion denegada NO falla en jnats, espera su
+            // timeout (A-201). Un publish a un dominio ajeno lo deniega el broker, no este codigo, y es
+            // PERMANENT: como un 403, no debe reintentarse.
+            final byte[] body = payload;
+            final String messageId = event.id();
+            listener.denials.race(options.service, subject, null, () -> jetStream.publishAsync(subject, body,
+                    io.nats.client.PublishOptions.builder().messageId(messageId).build()), PUBLISH_ACK_TIMEOUT_MILLIS);
+        } catch (PermissionDeniedException denied) {
             metrics.eventPublished(subject, MetricsSink.PublishOutcome.ERROR);
-            throw new FluxBusException("flux: fallo al publicar en \"" + subject + "\"", e);
+            throw denied;
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            metrics.eventPublished(subject, MetricsSink.PublishOutcome.ERROR);
+            throw new FluxBusException("flux: publicacion interrumpida en \"" + subject + "\"", e);
+        } catch (Exception e) {
+            metrics.eventPublished(subject, MetricsSink.PublishOutcome.ERROR);
+            throw new FluxBusException("flux: fallo al publicar en \"" + subject + "\"", unwrap(e));
         }
         metrics.eventPublished(subject, MetricsSink.PublishOutcome.OK);
         return event;
+    }
+
+    /** Cuanto se espera el acuse de una publicacion antes de darla por fallida. */
+    private static final long PUBLISH_ACK_TIMEOUT_MILLIS = 5_000;
+
+    private static Throwable unwrap(Throwable e) {
+        return e instanceof java.util.concurrent.ExecutionException && e.getCause() != null ? e.getCause() : e;
     }
 
     /** Resuelve la URI de {@code dataschema} del subject. */
@@ -853,6 +1056,8 @@ public final class FluxBus implements AutoCloseable {
                 subject, options.tenantIsolation, so.tenantId, options.tenantId);
 
         ensureStream(parsed.domain());
+        // La DLQ se comprueba AL ARRANCAR, no cuando llega el primer mensaje envenenado: descubrirlo entonces es
+        // el peor momento. Sin el permiso de consulta, la comprobacion falla con PERMISSION_DENIED.
         ensureDlqStream(parsed.domain());
 
         String durable = so.durable != null ? so.durable
@@ -876,13 +1081,21 @@ public final class FluxBus implements AutoCloseable {
 
         String stream = Protocol.streamName(parsed.domain());
         try {
-            StreamContext streamContext = jetStream.getStreamContext(stream);
-            ConsumerContext consumerContext = streamContext.createOrUpdateConsumer(requested);
+            // INFO antes de crear (06-security.md §3.4): en produccion lo aprovisiona `flux provision` y la ACL del
+            // servicio NO concede CONSUMER.CREATE.
+            ConsumerInfo found = ensureConsumer(stream, durable, subject, requested);
 
             // El servidor no siempre devuelve lo que se le pide. Requisito L2.
-            ConsumerConfiguration effective = consumerContext.getConsumerInfo().getConsumerConfiguration();
-            assertConfigHonored(durable, requested, effective);
+            assertConfigHonored(durable, requested, found.getConsumerConfiguration());
 
+            // Un pull denegado no da error: el consumidor quedaria inerte y parece sano (A-20). Se comprueba
+            // ANTES de devolver, no por la ausencia de eventos semanas despues (06-security.md §3.7).
+            String pull = "$JS.API.CONSUMER.MSG.NEXT." + stream + "." + durable;
+            listener.denials.forget(pull);
+            ensurePullAllowed(stream, durable);
+
+            ConsumerContext consumerContext = api(List.of("$JS.API.CONSUMER.INFO." + stream + "." + durable), null,
+                    () -> jetStream.getConsumerContext(stream, durable));
             MessageConsumer consumer = consumerContext.consume(msg -> {
                 try {
                     dispatch(msg, subject, durable, handler, tenantFilter);
@@ -903,9 +1116,130 @@ public final class FluxBus implements AutoCloseable {
                     new Subscription(subject, durable, consumer, startPendingPoll(stream, subject, durable));
             subscriptions.add(subscription);
             return subscription;
+        } catch (PermissionDeniedException | NotProvisionedException e) {
+            throw e;
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new FluxBusException("flux: suscripcion interrumpida en \"" + subject + "\"", e);
         } catch (IOException | JetStreamApiException e) {
             throw new FluxBusException(
                     "flux: no se pudo crear el consumidor \"" + durable + "\" en \"" + stream + "\"", e);
+        }
+    }
+
+    /**
+     * Toma el consumidor durable si existe y, solo si no existe, lo crea.
+     *
+     * <p>Se pregunta ANTES de crear: en produccion lo aprovisiona {@code flux provision}, y entonces el SDK no
+     * necesita permiso de creacion. Crear primero provocaba una denegacion espuria en cada arranque (una
+     * {@code Publish Violation} en el log del servidor) y obligaba a conceder {@code CONSUMER.CREATE} a quien no
+     * lo usa nunca. Que el consumidor ya exista con otra config no es un error de aqui: lo decide
+     * {@link #assertConfigHonored}.
+     *
+     * <ul>
+     *   <li>{@code INFO} denegado → {@code PERMISSION_DENIED}: ni siquiera se sabe si falta.
+     *   <li>{@code INFO} dice «no existe» y {@code CREATE} esta denegado → {@code NOT_PROVISIONED}: falta y no
+     *       puedo crearlo. Esa PAREJA, y no la denegacion sola, es lo que significa (04-errors.md §5).
+     * </ul>
+     */
+    ConsumerInfo ensureConsumer(String stream, String durable, String filter, ConsumerConfiguration requested)
+            throws IOException, JetStreamApiException {
+        String info = "$JS.API.CONSUMER.INFO." + stream + "." + durable;
+        try {
+            return api(List.of(info), null, () -> jsm.getConsumerInfo(stream, durable));
+        } catch (JetStreamApiException e) {
+            if (e.getApiErrorCode() == JS_STREAM_NOT_FOUND) {
+                throw new NotProvisionedException(ResourceKind.STREAM, stream, null, options.service, info,
+                        "el stream \"" + stream + "\" no existe (el broker contesto `stream not found` al consultar el "
+                                + "consumidor \"" + durable + "\"). En produccion se aprovisiona con `flux provision "
+                                + "<services.json>`, usando credenciales de operacion, no las del servicio "
+                                + "(06-security.md §3.6).", e);
+            }
+            if (e.getApiErrorCode() != JS_CONSUMER_NOT_FOUND) {
+                throw e;
+            }
+        }
+        try {
+            return api(List.of("$JS.API.CONSUMER.CREATE." + stream + "." + durable + "." + filter,
+                    "$JS.API.CONSUMER.DURABLE.CREATE." + stream + "." + durable), null,
+                    () -> jsm.addOrUpdateConsumer(stream, requested));
+        } catch (PermissionDeniedException denied) {
+            throw new NotProvisionedException(ResourceKind.CONSUMER, durable, stream, options.service,
+                    denied.subject(), null, denied);
+        } catch (JetStreamApiException addError) {
+            // Otra instancia del servicio pudo crearlo entre la pregunta y la creacion.
+            try {
+                return api(List.of(info), null, () -> jsm.getConsumerInfo(stream, durable));
+            } catch (JetStreamApiException | IOException again) {
+                throw addError;
+            }
+        }
+    }
+
+    /**
+     * Comprueba que el servicio PUEDE pedir mensajes de su consumidor, o falla con
+     * {@code PERMISSION_DENIED} nombrando el subject denegado.
+     *
+     * <p>Un pull denegado no da error: el servidor descarta el mensaje y manda un {@code -ERR} aparte
+     * (A-20). Con jnats, el primer pull lo emite la propia libreria al consumir y su denegacion llega por el
+     * oyente DESPUES; esperar «un poco» y mirar seria una carrera. Lo determinista es no depender del pull de
+     * la libreria: se pregunta lo mismo sobre EL MISMO subject con una peticion propia y se compite su
+     * respuesta con la denegacion. El cuerpo es un JSON truncado, {@code {}, a proposito: el servidor lo
+     * contesta {@code 400 Bad Request} al instante, sin apuntar la peticion como pendiente y sin sacar ningun
+     * mensaje del consumidor —cualquier pull valido podria llevarse uno, que quedaria sin ack hasta
+     * {@code ack_wait}—. Medido (A-204): {@code 400 Bad Request - unexpected end of JSON input} en ~7 ms.
+     *
+     * <p>Si la sonda no obtiene respuesta ni denegacion no se falla: se avisa por el logger y se sigue. No poder
+     * comprobarlo no es lo mismo que estar denegado.
+     */
+    void ensurePullAllowed(String stream, String durable) throws InterruptedException {
+        String subject = "$JS.API.CONSUMER.MSG.NEXT." + stream + "." + durable;
+        String hint = "Es pedir mensajes del consumidor \"" + durable + "\" del stream \"" + stream + "\": sin ese "
+                + "permiso el consumidor se quedaria inerte, sin recibir nada y sin ningun error, y por eso "
+                + "subscribe() falla en vez de arrancar (06-security.md §3.7).";
+        try {
+            io.nats.client.Message reply = listener.denials.race(options.service, subject, hint,
+                    () -> connection.request(subject, "{".getBytes()), PULL_PROBE_TIMEOUT_MILLIS);
+            if (reply.getStatus() == null || reply.getStatus().getCode() != 400) {
+                log(System.Logger.Level.WARNING, "no se pudo comprobar el permiso de pull de \"" + durable
+                        + "\" en \"" + stream + "\": la sonda no obtuvo el 400 esperado ("
+                        + reply.getStatus() + "). Si la ACL no concede `" + subject + "`, el consumidor se quedara "
+                        + "inerte y solo lo dira este logger");
+            }
+        } catch (PermissionDeniedException denied) {
+            throw denied;
+        } catch (InterruptedException e) {
+            throw e;
+        } catch (Exception e) {
+            log(System.Logger.Level.WARNING, "no se pudo comprobar el permiso de pull de \"" + durable + "\" en \""
+                    + stream + "\": " + unwrap(e) + ". Si la ACL no concede `" + subject + "`, el consumidor se "
+                    + "quedara inerte y solo lo dira este logger");
+        }
+    }
+
+    private static final long PULL_PROBE_TIMEOUT_MILLIS = 5_000;
+
+    @FunctionalInterface
+    interface Api<T> {
+        T call() throws IOException, JetStreamApiException;
+    }
+
+    /**
+     * Una peticion a la API de JetStream, vigilada: si el broker deniega alguno de {@code subjects} falla en
+     * milisegundos con {@code PERMISSION_DENIED} en vez de esperar el timeout de la libreria (A-201).
+     */
+    <T> T api(List<String> subjects, String hint, Api<T> call) throws IOException, JetStreamApiException {
+        try {
+            return listener.denials.guard(options.service, subjects, hint, call::call);
+        } catch (IOException | JetStreamApiException | RuntimeException e) {
+            throw e;
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            throw new FluxBusException("flux: peticion a JetStream interrumpida", e);
+        } catch (TimeoutException e) {
+            throw new IOException("flux: la peticion a JetStream no termino", e);
+        } catch (Exception e) {
+            throw new FluxBusException("flux: fallo inesperado en una peticion a JetStream", e);
         }
     }
 
@@ -920,7 +1254,14 @@ public final class FluxBus implements AutoCloseable {
      */
     static void assertConfigHonored(String durable, ConsumerConfiguration requested,
                                     ConsumerConfiguration effective) {
-        List<ConsumerConfigMismatchException.Difference> diffs = new ArrayList<>();
+        assertConfigHonored(durable, requested, effective, List.of());
+    }
+
+    /** Como la anterior, mas las diferencias propias de quien llama (el estado: politica de entrega y filtro). */
+    static void assertConfigHonored(String durable, ConsumerConfiguration requested,
+                                    ConsumerConfiguration effective,
+                                    List<ConsumerConfigMismatchException.Difference> extra) {
+        List<ConsumerConfigMismatchException.Difference> diffs = new ArrayList<>(extra);
 
         if (!equalDurations(requested.getAckWait(), effective.getAckWait())) {
             diffs.add(new ConsumerConfigMismatchException.Difference(
@@ -1478,12 +1819,14 @@ public final class FluxBus implements AutoCloseable {
             return;
         }
         try {
-            jsm.getStreamInfo(name);
+            api(List.of("$JS.API.STREAM.INFO." + name), null, () -> jsm.getStreamInfo(name));
+        } catch (PermissionDeniedException e) {
+            // Ni siquiera se puede CONSULTAR: no se sabe si falta, asi que no es NOT_PROVISIONED (04-errors.md §5).
+            throw e;
         } catch (JetStreamApiException e) {
             // Se distingue "no existe" de cualquier otro fallo de la API por el codigo y no
-            // por "hubo excepcion": un error de permisos tambien llega aqui, y tratarlo como
-            // "no existe" produciria un intento de creacion que falla con un mensaje que no
-            // menciona los permisos.
+            // por "hubo excepcion": tratarlo como "no existe" produciria un intento de creacion que falla con un
+            // mensaje que no explica lo que paso de verdad.
             if (e.getApiErrorCode() != JS_STREAM_NOT_FOUND) {
                 throw new FluxBusException("flux: no se pudo consultar el stream \"" + name + "\"", e);
             }
@@ -1496,7 +1839,12 @@ public final class FluxBus implements AutoCloseable {
 
     private void createStream(String name, StreamConfiguration config) {
         try {
-            jsm.addStream(config);
+            api(List.of("$JS.API.STREAM.CREATE." + name), null, () -> jsm.addStream(config));
+        } catch (PermissionDeniedException denied) {
+            // «Falta y no puedo crearlo»: el stream no existe (STREAM.INFO dijo 10059) y el broker deniega crearlo.
+            // En produccion se aprovisiona FUERA del SDK, y sin este error lo que se veria es un timeout.
+            throw new NotProvisionedException(ResourceKind.STREAM, name, null, options.service, denied.subject(), null,
+                    denied);
         } catch (JetStreamApiException e) {
             if (e.getApiErrorCode() != JS_STREAM_NAME_IN_USE) {
                 throw new FluxBusException("flux: no se pudo crear el stream \"" + name + "\"", e);
@@ -1516,6 +1864,8 @@ public final class FluxBus implements AutoCloseable {
 
     private static final int JS_STREAM_NAME_IN_USE = 10058;
 
+    private static final int JS_CONSUMER_NOT_FOUND = 10014;
+
     // ─── utilidades ──────────────────────────────────────────────────────────
 
     private static String firstNonEmpty(String... candidates) {
@@ -1531,7 +1881,7 @@ public final class FluxBus implements AutoCloseable {
         return value == null || value.isEmpty() ? null : value;
     }
 
-    private void log(System.Logger.Level level, String message) {
+    void log(System.Logger.Level level, String message) {
         if (options.logger != null) {
             options.logger.log(level, "[flux] " + message);
         }
