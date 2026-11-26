@@ -70,6 +70,16 @@ export function table(rows, headers) {
 
 const stripAnsi = (s) => s.replace(/\x1b\[[0-9;]*m/g, "");
 
+/**
+ * Sale DESPUÉS de vaciar stdout y stderr. `process.exit()` justo tras un `console.log` grande a una
+ * tubería corta la salida (medido: 146 176 bytes de 200 000 con `node x.mjs | …`): un `--json` de una
+ * respuesta de 900 KB llegaría truncado, y un JSON truncado no es un JSON.
+ */
+export async function salir(code) {
+  await Promise.all([process.stdout, process.stderr].map((s) => new Promise((r) => s.write("", r))));
+  process.exit(code);
+}
+
 export function die(message, code = 1) {
   console.error(`${FAIL} ${message}`);
   process.exit(code);
