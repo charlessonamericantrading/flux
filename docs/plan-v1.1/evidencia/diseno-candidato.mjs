@@ -1,14 +1,16 @@
 #!/usr/bin/env node
 /**
- * EVIDENCIA 3, 4 y 5 del plan v1.1 — las tres decisiones de diseño, comprobadas contra
- * un nats-server real ANTES de escribir la spec.
+ * EVIDENCIA 4 y 5 del plan v1.1 — dos decisiones de diseño, comprobadas contra un nats-server
+ * real ANTES de escribir la spec.
  *
- *   3. ACL candidata: inbox privado + permisos `$JS.API` exactos.
  *   4. Estado replicado: stream con un valor por clave.
  *   5. Petición/respuesta por core NATS.
  *
+ * La evidencia 3 (la ACL candidata: inbox privado + permisos `$JS.API` exactos) ya es la suite
+ * de seguridad: `conformance/cases/security-acl.json`, que ejecuta `conformance/security.mjs`.
+ *
  * Experimento ad-hoc. Cada línea de salida debe acabar convertida en un caso de
- * `conformance/cases/` con su `observed`. Se lanza con `ejecutar.sh`.
+ * `conformance/cases/` con su `observed` (Fases 2 y 3). Se lanza con `ejecutar.sh`.
  */
 
 import { createRequire } from "node:module";
@@ -42,91 +44,12 @@ async function intento(etiqueta, fn) {
 const ops = await conn("ops");
 const jsmOps = await jetstreamManager(ops);
 const jsOps = jetstream(ops);
-await jsmOps.streams.add({ name: "EVT_PEDIDOS", subjects: ["pedidos.>"] });
-await jsmOps.streams.add({ name: "EVT_FACTURACION", subjects: ["facturacion.>"] });
-await jsOps.publish("pedidos.pedido.v1.creado", enc.encode('{"pedidoId":"ped-1"}'));
 
-const acks = [];
-const subAck = ops.subscribe("$JS.ACK.>");
-(async () => {
-  for await (const m of subAck) acks.push(m.subject);
-})();
-
-// ─────────────────────────────────────────────────────────────────────────────
-console.log("EVIDENCIA 3 — ACL candidata: inbox privado + permisos $JS.API exactos");
-
-const DURABLE = "fx-fact__pedidos_pedido_v1_creado";
+// Dos servicios del experimento (con su inbox privado, como en la ACL generada):
+//   fx-fact    no es dueño de `clientes`: intenta escribir su estado y llamar a su operación
+//   fx-chis    no tiene concedido nada ajeno: intenta llamar a una operación que no es suya
 const fact = await conn("fx-fact", { inboxPrefix: "_INBOX.fx-fact" });
-const jsmF = await intento("jetstreamManager()", () => jetstreamManager(fact, { timeout: 1500 }));
-
-await intento("crear el consumidor con el filtro concedido", async () => {
-  await jsmF.consumers.add("EVT_PEDIDOS", {
-    durable_name: DURABLE,
-    filter_subject: "pedidos.pedido.v1.creado",
-    ack_policy: AckPolicy.Explicit,
-  });
-});
-await intento("consumir + WIP + ack", async () => {
-  const c = await jetstream(fact).consumers.get("EVT_PEDIDOS", DURABLE);
-  const it = await c.consume({ max_messages: 1 });
-  for await (const m of it) {
-    m.working();
-    m.ack();
-    it.stop();
-    return dec.decode(m.data);
-  }
-});
-await esperar(300);
-await intento("el ack quedó registrado", async () => {
-  const i = await jsmOps.consumers.info("EVT_PEDIDOS", DURABLE);
-  return `ack_floor=${i.ack_floor.stream_seq} pending=${i.num_ack_pending}`;
-});
-console.log("     formato del subject de ack:", acks[0]);
-
-await intento("[debe fallar] mismo subject de API, pero filtro más amplio en el cuerpo", async () => {
-  const r = await fact.request(
-    `$JS.API.CONSUMER.CREATE.EVT_PEDIDOS.${DURABLE}.pedidos.pedido.v1.creado`,
-    enc.encode(
-      JSON.stringify({
-        stream_name: "EVT_PEDIDOS",
-        config: { durable_name: DURABLE, filter_subject: "pedidos.>", ack_policy: "explicit" },
-      }),
-    ),
-    { timeout: 1500 },
-  );
-  const j = JSON.parse(dec.decode(r.data));
-  if (j.error) throw new Error(j.error.description);
-  return `ACEPTADO con filtro ${j.config?.filter_subject}`;
-});
-await intento("[debe fallar] API antigua DURABLE.CREATE (el filtro va solo en el cuerpo)", async () => {
-  await fact.request("$JS.API.CONSUMER.DURABLE.CREATE.EVT_PEDIDOS.otro", enc.encode("{}"), {
-    timeout: 800,
-  });
-});
-await intento("[debe fallar] leer el stream directamente (STREAM.MSG.GET)", async () => {
-  await fact.request("$JS.API.STREAM.MSG.GET.EVT_PEDIDOS", enc.encode('{"seq":1}'), {
-    timeout: 800,
-  });
-});
-
 const chis = await conn("fx-chis", { inboxPrefix: "_INBOX.fx-chis" });
-const violaciones = [];
-(async () => {
-  for await (const s of chis.status()) if (s.type === "error") violaciones.push(String(s.error?.message));
-})();
-chis.subscribe("_INBOX.>");
-chis.subscribe("_INBOX.fx-fact.>");
-await chis.flush();
-await esperar(300);
-console.log(
-  "  fx-chis espiando inbox:",
-  violaciones.length === 2 ? "DENEGADO (2 violaciones)" : `¡¡PERMITIDO!! ${JSON.stringify(violaciones)}`,
-);
-await intento("[debe fallar] fx-chis pide mensajes del consumidor de fx-fact", async () => {
-  await chis.request(`$JS.API.CONSUMER.MSG.NEXT.EVT_PEDIDOS.${DURABLE}`, enc.encode('{"batch":1}'), {
-    timeout: 800,
-  });
-});
 
 // ─────────────────────────────────────────────────────────────────────────────
 console.log("\nEVIDENCIA 4 — ESTADO: stream con un valor por clave");
