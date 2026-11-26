@@ -203,13 +203,13 @@ La imagen no lleva configuración ni secretos: se monta `gateway.json` y los sec
 ## Pruebas
 
 ```bash
-FLUX_REQUIRE_BROKER=1 NATS_SERVER=…/nats-server npm test      # 170+ pruebas; de extremo a extremo contra un NATS real con los permisos GENERADOS
+FLUX_REQUIRE_BROKER=1 NATS_SERVER=…/nats-server npm test      # ~200 pruebas; de extremo a extremo contra un NATS real con los permisos GENERADOS
 FLUX_REQUIRE_BROKER=1 NATS_SERVER=…/nats-server node test/mutantes.mjs   # rompe a propósito lo importante: cada mutante DEBE hacer fallar las pruebas
 ```
 
 `npm test` incluye: la aceptación (`demo.sh` con `curl`), el mismo webhook ×3 con y sin la ventana de JetStream, token malo, token de otro cliente sobre un recurso no concedido (lo deniega el broker, con la violación en el log del servidor), cuerpo
 demasiado grande, firma de webhook inválida o fuera de tiempo, reintento tras un `503`, un `4xx` a la DLQ, `confidential` ausente de los registros, la parada ordenada y el ejecutable como proceso. Las medidas del
-[Apéndice A](../docs/plan-v1.1/PLAN.md#apéndice-a--evidencia) (A-150 a A-162) las reproduce `test/medidas.test.mjs`. `test/mutantes.mjs` ejecuta decenas de mutantes (comparar el token con `===`, no verificar el HMAC, id aleatorio en el
+[Apéndice A](../docs/plan-v1.1/PLAN.md#apéndice-a--evidencia) (A-150 a A-166) las reproducen `test/medidas.test.mjs` y las de extremo a extremo. `test/mutantes.mjs` ejecuta 72 mutantes (la CI los reparte en tres trabajos con `--parte n/3`) (comparar el token con `===`, no verificar el HMAC, id aleatorio en el
 webhook, firmar sin el instante, no renovarlo en los reintentos, un `4xx` que se reintenta, `data` en los registros, una identidad NATS compartida…).
 
 ## Lo que no hace

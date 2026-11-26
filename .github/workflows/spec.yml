@@ -301,9 +301,9 @@ jobs:
       - run: npm run build
 
   gateway:
-    name: Gateway de borde — extremo a extremo contra NATS real (ACLs generadas), mutantes e imagen
+    name: Gateway de borde — extremo a extremo contra NATS real (ACLs generadas) e imagen
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -343,15 +343,6 @@ jobs:
             exit 1
           fi
           echo "✓ sin nats-server las pruebas del gateway fallan"
-      # «Una prueba que pasa con el código roto no vale»: cada garantía importante (comparar el token con ===, no verificar el HMAC,
-      # id aleatorio en el webhook, firmar sin el instante, no renovarlo en los reintentos, un 4xx que se reintenta, `data` en los
-      # registros…) se ROMPE en una copia de src/ y sus pruebas DEBEN fallar.
-      - name: Los mutantes del gateway DEBEN hacer fallar las pruebas
-        working-directory: gateway
-        env:
-          FLUX_REQUIRE_BROKER: '1'
-          FLUX_TEST_PORTS: 6900-6999
-        run: node test/mutantes.mjs
       # La imagen se construye con la raíz como contexto (depende de sdk-node) y arranca con la configuración de ejemplo validada.
       - name: La imagen del gateway se construye y valida una configuración
         run: |
@@ -361,6 +352,46 @@ jobs:
             -e TIENDA_WEB_NKEY_SEED=x -e CATALOGO_WEB_NKEY_SEED=x -e PASARELA_WEB_NKEY_SEED=x \
             -e TIENDA_WEB_ENTREGA_SECRETO=x -e PASARELA_HOOK_SECRETO=x -e GITHUB_HOOK_SECRETO=x \
             flux-gateway --check --config /etc/flux/gateway.json
+
+  # «Una prueba que pasa con el código roto no vale»: cada garantía importante del gateway (comparar el token con ===, no verificar el
+  # HMAC, id aleatorio en el webhook, firmar sin el instante, no renovarlo en los reintentos, un 4xx que se reintenta, `data` en los
+  # registros, una identidad NATS compartida…) se ROMPE en una copia de src/ y sus pruebas DEBEN fallar. Son decenas y los de extremo a
+  # extremo arrancan un broker: se reparten en tres trabajos para no alargar el feedback del resto.
+  gateway-mutantes:
+    name: Los mutantes del gateway DEBEN hacer fallar las pruebas (${{ matrix.parte }}/3)
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        parte: [1, 2, 3]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+          cache: false
+      - name: Compilar nats-server 2.14.5
+        run: |
+          GOBIN="$PWD/bin" go install github.com/nats-io/nats-server/v2@v2.14.5
+          echo "NATS_SERVER=$PWD/bin/nats-server" >> "$GITHUB_ENV"
+      - run: npm ci --no-audit --no-fund && npm run build
+        working-directory: sdk-node
+      - run: npm ci --no-audit --no-fund
+        working-directory: conformance
+      - run: npm ci --no-audit --no-fund
+        working-directory: cli
+      - run: npm ci --no-audit --no-fund
+        working-directory: gateway
+      - name: Mutantes, parte ${{ matrix.parte }} de 3
+        working-directory: gateway
+        env:
+          FLUX_REQUIRE_BROKER: '1'
+          FLUX_TEST_PORTS: 6900-6999
+        run: node test/mutantes.mjs --parte ${{ matrix.parte }}/3
 
   # Los tests de estos SDKs LEEN protocol.json para no divergir de la spec. Eso es
   # deliberado, pero significa que un cambio en protocol.json puede romperlos — y

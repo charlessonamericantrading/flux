@@ -9,6 +9,7 @@
  *
  *   node test/mutantes.mjs                 todos (varios minutos: los de extremo a extremo arrancan un broker)
  *   node test/mutantes.mjs --solo token    solo los que contengan «token» en el nombre
+ *   node test/mutantes.mjs --parte 2/3     la segunda de tres partes (la CI los reparte en tres trabajos)
  *   node test/mutantes.mjs --lista         los nombres
  *
  * Primero comprueba que las pruebas PASAN sobre la copia sin estropear (si no, un «fallo» no demostraría nada).
@@ -136,6 +137,12 @@ if (args.includes("--lista")) {
   process.exit(0);
 }
 const solo = args.includes("--solo") ? args[args.indexOf("--solo") + 1] : undefined;
+// `--parte n/m`: solo los mutantes de la parte n de m (la CI los reparte en varios trabajos: son decenas y los de extremo a extremo arrancan un broker).
+const parte = args.includes("--parte") ? /^([1-9][0-9]*)\/([1-9][0-9]*)$/.exec(args[args.indexOf("--parte") + 1] ?? "") : null;
+if (args.includes("--parte") && (!parte || Number(parte[1]) > Number(parte[2]))) {
+  console.error("--parte necesita `n/m` con n ≤ m, por ejemplo --parte 1/3");
+  process.exit(2);
+}
 
 function ejecutar(srcDir, pruebas) {
   const r = spawnSync(process.execPath, ["--test", "--test-force-exit", "--test-reporter=tap", "--test-concurrency=1", ...pruebas.map((p) => path.join(AQUI, p))], {
@@ -150,22 +157,22 @@ function ejecutar(srcDir, pruebas) {
 rmSync(TMP, { recursive: true, force: true });
 mkdirSync(TMP, { recursive: true });
 
+const elegidos = MUTANTES.filter((m) => !solo || m.nombre.includes(solo)).filter((_, i) => !parte || i % Number(parte[2]) === Number(parte[1]) - 1);
 // 0. Las pruebas pasan sobre la copia SIN estropear.
-const todasLasPruebas = [...new Set(MUTANTES.flatMap((m) => m.pruebas))].filter((p) => !solo || MUTANTES.some((m) => m.nombre.includes(solo) && m.pruebas.includes(p)));
+const pruebasDeEstaParte = () => [...new Set(elegidos.flatMap((m) => m.pruebas))];
 {
   const limpia = path.join(TMP, "limpia");
   cpSync(SRC, limpia, { recursive: true });
-  const r = ejecutar(limpia, todasLasPruebas);
+  const r = ejecutar(limpia, pruebasDeEstaParte());
   if (r.codigo !== 0) {
     console.error(`✗ las pruebas NO pasan sobre el código sin estropear (exit ${r.codigo}): un «fallo» de un mutante no demostraría nada.\n${r.salida.split("\n").slice(-40).join("\n")}`);
     process.exit(2);
   }
-  console.log(`✓ las pruebas pasan sobre el código sin estropear (${todasLasPruebas.join(", ")})\n`);
+  console.log(`✓ las pruebas pasan sobre el código sin estropear (${pruebasDeEstaParte().join(", ")})\n`);
 }
 
 let detectados = 0;
 const supervivientes = [];
-const elegidos = MUTANTES.filter((m) => !solo || m.nombre.includes(solo));
 for (const [i, m] of elegidos.entries()) {
   const dir = path.join(TMP, String(i));
   cpSync(SRC, dir, { recursive: true });
