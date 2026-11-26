@@ -370,7 +370,7 @@
         ]
       },
       "state_race": {
-        "doc": "`instances` instancias del dueño escriben las versiones `from`..`to` de UNA clave, repartidas al azar y con pausas aleatorias.",
+        "doc": "`instances` instancias del dueño escriben las versiones `from`..`to` de UNA clave, repartidas al azar y con pausas aleatorias de hasta `pauseMs` ms (4 si no se da; `0` = sin pausas: la carrera más intensa, la que hace salir un 10164 en un R3). Los SDKs, que escriben con su propia API, pueden ignorar `pauseMs`.",
         "args": [
           "contract",
           "tenant",
@@ -378,6 +378,9 @@
           "instances",
           "from",
           "to"
+        ],
+        "optional": [
+          "pauseMs"
         ],
         "observes": [
           "finalVersion",

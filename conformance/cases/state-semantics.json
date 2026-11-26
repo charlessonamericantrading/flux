@@ -601,7 +601,7 @@
       "observed": {
         "server": "nats-server 2.14.5",
         "date": "2026-11-26",
-        "result": "Cluster de 3 nodos locales, 3 instancias, versiones 1..40 repartidas al azar con pausas: la clave termina en la 40 y ningún error es distinto de STATE_CONFLICT. Con una referencia que solo reconozca el 10071 el caso falla (mutante only-10071)."
+        "result": "Cluster de 3 nodos locales, 6 instancias, versiones 1..120 repartidas al azar y SIN pausas (`pauseMs: 0`): la clave termina en la 120 y ningún error es distinto de STATE_CONFLICT. Con una referencia que solo reconozca el 10071 el caso falla (mutante only-10071). Un conflicto SECUENCIAL en un R3 sigue siendo un 10071: el 10164 solo sale con publicaciones simultáneas en vuelo, por eso la carrera tiene que ser intensa; con 3 instancias, 40 versiones y pausas de hasta 4 ms, un run de CI no vio ningún 10164 y el mutante pasó sin ser detectado."
       },
       "steps": [
         {
@@ -624,11 +624,12 @@
           "contract": "clientes.cliente.v1",
           "tenant": "acme",
           "key": "carrera",
-          "instances": 3,
+          "instances": 6,
           "from": 1,
-          "to": 40,
+          "to": 120,
+          "pauseMs": 0,
           "expect": {
-            "finalVersion": 40,
+            "finalVersion": 120,
             "other": 0
           }
         }

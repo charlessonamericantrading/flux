@@ -11,12 +11,13 @@ import { readFile } from "node:fs/promises";
 import { connect, credsAuthenticator } from "@nats-io/transport-node";
 import { jetstream, jetstreamManager } from "@nats-io/jetstream";
 
-import { c, die, OK } from "./ui.mjs";
+import { c, die, OK, salir } from "./ui.mjs";
 import { doctor } from "./doctor.mjs";
 import { dlqList, dlqInspect, dlqReplay } from "./dlq.mjs";
 import { tail } from "./tail.mjs";
 import { comandoProvision } from "./provision.mjs";
 import { comandoState } from "./state.mjs";
+import { comandoCall, INBOX } from "./call.mjs";
 
 const SUBJECT_RE =
   /^[a-z0-9]+(-[a-z0-9]+)*\.[a-z0-9]+(-[a-z0-9]+)*\.v[1-9][0-9]*\.[a-z0-9]+(-[a-z0-9]+)*$/;
@@ -28,6 +29,7 @@ ${c.bold("USO")}
 
 ${c.bold("COMANDOS")}
   ${c.cyan("doctor")}                    Audita streams y consumidores contra el protocolo
+                              (también: ningún stream captura una operación rpc.*.*.*.*)
   ${c.cyan("tail")} <patrón>             Eventos en vivo (consumidor efímero, no consume)
   ${c.cyan("dlq ls")} <dominio>          Resumen de la DLQ agrupado por causa
   ${c.cyan("dlq inspect")} <dominio>     Detalle de eventos muertos
@@ -38,6 +40,8 @@ ${c.bold("COMANDOS")}
   ${c.cyan("state resync")} <servicio> <contrato>
                               Recupera un observador de estado: borra y recrea su durable
                               (simulación por defecto; nunca toca el stream ni las claves)
+  ${c.cyan("call")} <operacion>          Una petición a mano, para depurar: construye el sobre como un SDK
+                              y muestra la respuesta o el error con su código estable
   ${c.cyan("validate")} <subject>        Comprueba un subject contra el protocolo
   ${c.cyan("provision")} <services.json> Crea los streams y durables que exige el manifiesto
                               (idempotente, informa de diferencias, nunca borra)
@@ -57,6 +61,18 @@ ${c.bold("OPCIONES DE state")}
       --confirm             resync: ejecuta (sin él, simulación)
       --yes                 resync: no pide la confirmación interactiva
 
+${c.bold("OPCIONES DE call")}
+      --data <json>         El cuerpo (un objeto JSON), o @fichero.json, o @- para stdin (obligatorio)
+      --tenant <t>          El tenant de la petición (obligatorio: la CLI no asume uno, ni \`system\`)
+      --env <entorno>       El entorno de \`source\` (/<entorno>/flux-cli)  (o \$FLUX_ENV; obligatorio)
+      --timeout <ms>        De 1 a 25000, por defecto 5000. Fuera de rango es un error: no se recorta
+      --aggregate-id <id>   El agregado sobre el que se pide (\`subject\` del sobre, no el de NATS)
+      --classification <c>  public | internal (por defecto) | confidential | restricted
+      --bundle <fichero>    Bundle de esquemas (por defecto schemas/bundle.json): valida \`data\` sin red
+      --no-validate         No valida \`data\` ni la respuesta contra su esquema (para probar al responder)
+      --json                Salida para máquinas (también en doctor)
+      --show-data           Imprime el data de una respuesta confidential o restricted
+
 ${c.bold("OPCIONES DE provision")}
       --dry-run             Muestra qué se crearía; no crea nada
       --replicas <n>        Réplicas de los streams (por defecto 1; producción: 3)
@@ -64,6 +80,9 @@ ${c.bold("OPCIONES DE provision")}
 
 ${c.bold("EJEMPLOS")}
   flux doctor
+  flux doctor --json
+  flux call clientes.cliente.v1.calcular-descuento --tenant acme --env produccion \\
+       --data '{"clienteId":"cli-1","totalCents":9990,"moneda":"EUR"}' --timeout 2000
   flux tail 'pedidos.>' --since 5m
   flux tail 'pedidos.pedido.v1.creado' --full
   flux dlq ls pedidos
@@ -84,8 +103,8 @@ ${c.bold("PROVISION")}
 ${c.bold("SEGURIDAD")}
   El payload de eventos con dataclassification confidential o restricted NO se
   imprime: una terminal acaba en un log. Usa --show-data si de verdad lo necesitas.
-  Vale también para el estado (confidential es la clasificación por defecto de un put)
-  y para --json y --full.
+  Vale también para el estado (confidential es la clasificación por defecto de un put),
+  para --json y --full, y para la respuesta de \`flux call\`.
 `;
 
 function parseArgs(argv) {
@@ -108,6 +127,12 @@ function parseArgs(argv) {
     else if (a === "--show-data") opts.showData = true;
     else if (a === "--confirm") opts.confirm = true;
     else if (a === "--yes") opts.yes = true;
+    else if (a === "--data") opts.data = argv[++i];
+    else if (a === "--env") opts.env = argv[++i];
+    else if (a === "--timeout") opts.timeout = argv[++i];
+    else if (a === "--aggregate-id") opts.aggregateId = argv[++i];
+    else if (a === "--classification") opts.classification = argv[++i];
+    else if (a === "--no-validate") opts.validate = false;
     else if (a.startsWith("-")) die(`opción desconocida: ${a}`);
     else opts._.push(a);
   }
@@ -240,21 +265,38 @@ if (opts.creds) {
 }
 
 const url = opts.server ?? process.env.NATS_URL ?? "nats://127.0.0.1:4222";
-let nc;
-try {
-  nc = await connect({
-    servers: url,
-    name: "flux-cli",
-    ...(authenticator && { authenticator }),
-  });
-} catch (e) {
-  die(
-    `no se pudo conectar a ${url}\n  ${e.message}\n\n` +
-      `  Levanta un NATS con JetStream:  ${c.cyan("docker compose up -d")}\n` +
-      `  O apunta a otro servidor:       ${c.cyan("flux <cmd> --server nats://host:4222")}`,
-    2,
-  );
+
+/** Abre la conexión de la CLI; si no puede, dice cómo se arregla y sale con 2. */
+async function abrirConexion(extra = {}) {
+  try {
+    return await connect({
+      servers: url,
+      name: "flux-cli",
+      ...(authenticator && { authenticator }),
+      ...extra,
+    });
+  } catch (e) {
+    die(
+      `no se pudo conectar a ${url}\n  ${e.message}\n\n` +
+        `  Levanta un NATS con JetStream:  ${c.cyan("docker compose up -d")}\n` +
+        `  O apunta a otro servidor:       ${c.cyan("flux <cmd> --server nats://host:4222")}`,
+      2,
+    );
+  }
 }
+
+// `call` va por core NATS y no necesita JetStream (ni su API: quien llama puede no tener permiso
+// sobre ella): se valida todo lo que se puede sin red y solo entonces se abre la conexión, con el
+// inbox PRIVADO de la CLI (06-security.md §3.3).
+if (cmd === "call") {
+  try {
+    await salir(await comandoCall(sub, opts, { conectar: () => abrirConexion({ inboxPrefix: INBOX }) }));
+  } catch (e) {
+    die(e.message);
+  }
+}
+
+const nc = await abrirConexion();
 
 const jsm = await jetstreamManager(nc);
 const js = jetstream(nc);
@@ -262,10 +304,19 @@ const js = jetstream(nc);
 try {
   switch (cmd) {
     case "doctor": {
-      const r = await doctor(jsm, { verbose: opts.verbose });
+      const r = await doctor(jsm, { verbose: opts.verbose, json: opts.jsonOut });
       const errores = r.findings.filter((f) => f.level === "error").length;
+      if (opts.jsonOut) {
+        console.log(
+          JSON.stringify(
+            { ok: errores === 0, streams: r.streams, consumers: r.consumers, rpc: r.rpc, findings: r.findings },
+            null,
+            2,
+          ),
+        );
+      }
       await nc.drain();
-      process.exit(errores ? 1 : 0);
+      await salir(errores ? 1 : 0);
       break;
     }
 

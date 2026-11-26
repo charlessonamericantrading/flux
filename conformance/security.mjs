@@ -11,13 +11,15 @@
  *
  * Los casos son DATOS (`cases/security-acl.json`): este fichero no sabe qué es S1. Orquesta el
  * entorno —PKI efímera con openssl, nkeys de prueba, la config que genera `gen-acl.mjs`, un
- * nats-server con TLS, `flux provision`— y delega la ejecución de cada paso en
- * `security/interprete.mjs`. Lo único que hace por su cuenta son las dos operaciones que
+ * nats-server con TLS, `flux provision`— (`security/entorno.mjs`, que comparte con `interop-rpc.mjs`) y delega la ejecución de
+ * cada paso en `security/interprete.mjs` (S21 a S29, la petición/respuesta, con clientes `@nats-io/*` en bruto; y S30 a S34,
+ * la misma con los SDKs REALES como procesos: la operación `sdk_script`, `security/sdk-escenario.mjs`).
+ * Lo único que hace por su cuenta son las dos operaciones que
  * necesitan procesos aparte: `sdk_cycle` (S10 y S11, los SDKs reales) y `regression` (S9, la ACL
  * v1 congelada en un segundo servidor).
  *
- * Habla NATS directamente, sin ningún SDK de flux (salvo en S10 y S11, que existen justo para
- * lo contrario): un runner construido sobre un SDK heredaría las suposiciones que debe
+ * Habla NATS directamente, sin ningún SDK de flux (salvo en S10, S11 y S30 a S34, que existen justo
+ * para lo contrario): un runner construido sobre un SDK heredaría las suposiciones que debe
  * verificar.
  *
  * Entorno
@@ -26,43 +28,36 @@
  *                          FALLO, no un salto con aviso. En CI siempre: un job verde que no
  *                          ejecutó nada aparenta cobertura.
  *   FLUX_TEST_PORTS        rango de puertos, `desde-hasta` (por defecto 4600-4649)
+ *   FLUX_GEN_ACL           otro `gen-acl.mjs` (una copia estropeada a propósito) en lugar del real: solo lo usa
+ *                          `security/mutantes.mjs`, para comprobar que la suite DETECTA un generador que concede de más
+ *   FLUX_SDK_NODE_DIST,    otro `dist/` del SDK de Node, u otra copia de `sdk-rust` (estropeados a propósito): solo
+ *   FLUX_SDK_RUST_DIR      `security/mutantes-sdk.mjs`, para comprobar que la suite DETECTA un SDK que se aparta del contrato
  *
  * Sale con 0 si todo lo ejecutado cumple, 1 si algo falla, 2 si el entorno está mal montado.
  */
 
-import { spawn, spawnSync } from "node:child_process";
-import { statSync } from "node:fs";
-import { readFile, writeFile } from "node:fs/promises";
+import { spawn } from "node:child_process";
+import { readFile } from "node:fs/promises";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { crearPki, opensslDisponible } from "../scripts/lib/pki.mjs";
+import { opensslDisponible } from "../scripts/lib/pki.mjs";
 import {
   Banco,
-  CLI,
-  EJEMPLO,
   ROOT,
   conUsuarios,
-  conectar,
-  credsDe,
   dec,
-  gen,
-  jetstream,
-  jetstreamManager,
   nuevaClave,
   permisosJson,
   sleep,
-  usuarioConf,
   usuarioOpsConf,
 } from "../scripts/lib/nats-harness.mjs";
+import { baseCtx, crearEntorno, levantar } from "./security/entorno.mjs";
+import { exigido, falta, sinRequisitoGlobal } from "./security/requisitos.mjs";
+import { imprimirPaso as imprimirPasoInforme } from "./security/informe.mjs";
 import {
   Interprete,
-  actoresDe,
-  claveVariante,
-  esVariante,
   evaluar,
-  normalizarActor,
-  permisosDeVariante,
   validarCaso,
 } from "./security/interprete.mjs";
 
@@ -109,51 +104,6 @@ function usoErroneo(m) {
 
 const args = leerArgumentos(process.argv.slice(2));
 
-// ─── Requisitos: se saltan con aviso, o FALLAN con FLUX_REQUIRE_BROKER ───────
-
-/** `FLUX_REQUIRE_BROKER` definida y no vacía, `0` o `false`. */
-const exigido = (() => {
-  const v = (process.env.FLUX_REQUIRE_BROKER ?? "").trim().toLowerCase();
-  return v !== "" && v !== "0" && v !== "false";
-})();
-
-/** Qué falta de lo que la suite necesita, o `undefined`. */
-function falta(que) {
-  switch (que) {
-    case "nats-server": {
-      const bin = process.env.NATS_SERVER ?? "nats-server";
-      const r = spawnSync(bin, ["--version"], { encoding: "utf8" });
-      return r.error || r.status !== 0
-        ? `no se pudo ejecutar nats-server («${bin}»). Define NATS_SERVER con su ruta; sin Docker: GOBIN=$PWD/bin go install github.com/nats-io/nats-server/v2@v2.14.5`
-        : undefined;
-    }
-    case "openssl":
-      return opensslDisponible().ok ? undefined : "no hay `openssl` en el PATH (la PKI efímera de TLS lo necesita)";
-    case "sdk-node/dist":
-      return statSync(path.join(ROOT, "sdk-node", "dist", "index.js"), { throwIfNoEntry: false })?.isFile()
-        ? undefined
-        : "no existe sdk-node/dist: ejecuta (cd sdk-node && npm install && npm run build)";
-    case "cargo":
-      return spawnSync("cargo", ["--version"], { encoding: "utf8" }).status === 0 ? undefined : "no hay `cargo` en el PATH (el SDK de Rust no se puede compilar)";
-    default:
-      return `requisito desconocido «${que}»`;
-  }
-}
-
-/** Sale: con aviso y 0, o —con FLUX_REQUIRE_BROKER— con el error y 1. */
-function sinRequisitoGlobal(motivo) {
-  if (exigido) {
-    console.error(
-      `✗ ${motivo}.\n  FLUX_REQUIRE_BROKER está activada: la suite de seguridad es obligatoria, y saltarla daría un CI verde sin haber ejecutado nada contra el broker.`,
-    );
-    process.exit(1);
-  }
-  console.warn(
-    `\nAVISO: se SALTA la suite de seguridad: ${motivo}.\n       Define NATS_SERVER, o FLUX_REQUIRE_BROKER=1 para que su ausencia sea un fallo.\n`,
-  );
-  process.exit(0);
-}
-
 // ─── Carga de los casos ──────────────────────────────────────────────────────
 
 const suite = JSON.parse(await readFile(CASOS, "utf8"));
@@ -189,63 +139,6 @@ const banco = new Banco({
 const R = { casos: [], inicio: Date.now() };
 const seccion = (t) => console.log(`\n${t}`);
 const nota = (t) => console.log(`  · ${t}`);
-
-/** Lo observado, en una línea. */
-function lineaObservado(o) {
-  if (!o) return "";
-  const partes = [];
-  if (o.outcome !== undefined) partes.push(String(o.outcome));
-  for (const k of ["stream", "subject", "leaked", "victimRead", "count", "ackPending", "numPending", "ackTokens", "deliveryCount", "violation", "childExit", "serverViolationLines"]) {
-    if (o[k] !== undefined && o[k] !== null && o[k] !== "") partes.push(`${k}=${typeof o[k] === "object" ? JSON.stringify(o[k]) : o[k]}`);
-  }
-  if (o.reply?.error) partes.push(`error ${o.reply.error.err_code ?? ""} «${o.reply.error.description}»`);
-  if (o.text) partes.push(`«${String(o.text).split("\n")[0].slice(0, 130)}»`);
-  if (typeof o.ms === "number") partes.push(`${o.ms} ms`);
-  return partes.join(" · ");
-}
-
-function imprimirPaso(p) {
-  if (p.omitido) {
-    console.log(`  - ${p.descripcion}\n      omitido: ${p.omitido}`);
-    return;
-  }
-  const marca = p.ok ? "✓" : "✗";
-  const control = p.control ? " (control)" : "";
-  console.log(`  ${marca} ${p.descripcion}${control}`);
-  if (p.knownDeviation) console.log(`      ⚠ desviación conocida: ${p.knownDeviation}`);
-  if (!p.ok || args.verbose) console.log(`      → ${lineaObservado(p.observado)}`);
-  for (const f of p.fallos ?? []) console.log(`      ✗ ${f}`);
-  if (args.verbose && p.note) console.log(`      · ${p.note}`);
-}
-
-// ─── Servidor, identidades y aprovisionamiento ───────────────────────────────
-
-/**
- * Levanta un nats-server con TLS y la ACL dada, conecta `ops` y aprovisiona con `flux provision`.
- * Devuelve el contexto del intérprete, o lanza.
- */
-async function levantar(nombre, { acl, identidades, ops, pki }) {
-  const top =
-    `tls {\n  cert_file: "${pki.servidorCert}"\n  key_file: "${pki.servidorKey}"\n  timeout: 2\n}\n`;
-  const srv = await banco.arrancar(nombre, acl, { top, servidorNombre: `flux-security-${nombre}` });
-  const url = `tls://127.0.0.1:${srv.port}`;
-
-  const nc = await conectar(url, { nombre: "ops", seed: ops.seed, tls: { caFile: pki.ca }, etiqueta: "flux-security" });
-  const opsConn = { nc, jsm: await jetstreamManager(nc), js: jetstream(nc) };
-
-  // `flux provision` con credenciales de operación, por TLS con la CA efímera. La CLI no tiene
-  // una opción `--ca`, así que la CA llega por el mecanismo de Node (NODE_EXTRA_CA_CERTS): un
-  // operador con una CA privada tendría que hacer lo mismo.
-  const credsOps = path.join(banco.tmp, `ops-${nombre}.creds`);
-  await writeFile(credsOps, credsDe(ops.seed), { mode: 0o600 });
-  const r = spawnSync(process.execPath, [CLI, "provision", EJEMPLO, "--server", url, "--creds", credsOps], {
-    encoding: "utf8",
-    cwd: ROOT,
-    env: { ...process.env, NO_COLOR: "1", NODE_EXTRA_CA_CERTS: pki.ca },
-  });
-  const provision = { codigo: r.status, salida: r.stdout, errores: r.stderr };
-  return { srv, url, ops: opsConn, provision, identidades, pki };
-}
 
 // ─── S10 y S11: los SDKs reales ──────────────────────────────────────────────
 
@@ -410,7 +303,7 @@ async function ejecutarRegresion(p, ctx) {
   // La v1 no tiene nkeys: cada servicio entra con usuario y contraseña, como en el fixture.
   const identidades = new Map([["ops", ops], ...nombres.map((n) => [n, { user: n, pass: "pw" }])]);
   const acl = conUsuarios(fixture, usuarioOpsConf(ops.pub));
-  const v1 = await levantar("v1", { acl, identidades, ops, pki: ctx.pki });
+  const v1 = await levantar(banco, "v1", { acl, identidades, ops, pki: ctx.pki });
   try {
     // Sin los streams y los durables aprovisionados, S1 fallaría por otra causa y la regresión
     // daría por detectado un H1 que no es el documentado.
@@ -438,16 +331,6 @@ async function ejecutarRegresion(p, ctx) {
   }
 }
 
-const baseCtx = (l, ctxPrincipal) => ({
-  url: l.url,
-  caFile: l.pki.ca,
-  otraCa: l.pki.otraCa,
-  ops: l.ops,
-  canon: ctxPrincipal.canon,
-  identidades: l.identidades,
-  variantes: new Map(),
-});
-
 // ─── Principal ───────────────────────────────────────────────────────────────
 
 async function main() {
@@ -462,75 +345,22 @@ async function main() {
   }
   if (args.acl) nota(`ACL bajo prueba: ${args.acl} (no la generada)`);
 
-  // ── Identidades ────────────────────────────────────────────────────────────
-  const generada = !args.acl;
-  const prod = permisosJson();
-  const dev = permisosJson("--dev");
-  const ops = nuevaClave();
-  const canon = JSON.parse(await readFile(path.join(ROOT, "protocol.json"), "utf8")).consumer;
-
-  const identidades = new Map([["ops", ops]]);
-  const variantes = new Map();
-  let acl;
-  if (generada) {
-    for (const s of prod) identidades.set(s.name, nuevaClave());
-    const mapa = path.join(tmp, "nkeys.json");
-    await writeFile(mapa, JSON.stringify(Object.fromEntries(prod.map((s) => [s.name, identidades.get(s.name).pub]))));
-    const g = gen(EJEMPLO, "--nkeys", mapa);
-    if (g.codigo !== 0) throw new Error(`gen-acl.mjs falló:\n${g.errores}`);
-
-    // Las variantes que los casos piden: los permisos generados, estropeados a propósito.
-    let extra = "";
-    for (const caso of suite.cases) {
-      for (const paso of caso.steps) {
-        for (const a of actoresDe(paso).map(normalizarActor).filter(esVariante)) {
-          const clave = claveVariante(a);
-          if (variantes.has(clave)) continue;
-          // Una variante imposible (quita un permiso que el generador ya no concede) no aborta la
-          // suite: hace fallar los pasos que la usan, con el motivo. Es justo lo que ocurre si
-          // alguien quita un permiso del generador.
-          try {
-            const k = nuevaClave();
-            const perms = permisosDeVariante(a, { prod, dev });
-            variantes.set(clave, k);
-            extra += usuarioConf(k.pub, perms.publish, perms.subscribe);
-          } catch (e) {
-            variantes.set(clave, { error: e.message });
-          }
-        }
-      }
-    }
-    extra += usuarioOpsConf(ops.pub);
-    acl = conUsuarios(g.salida, extra);
-  } else {
-    // La ACL antigua entra con usuario y contraseña (no tiene nkeys): `<servicio>` / `pw`.
-    for (const s of prod) identidades.set(s.name, { user: s.name, pass: "pw" });
-    acl = conUsuarios(await readFile(path.resolve(args.acl), "utf8"), usuarioOpsConf(ops.pub));
-  }
-
-  // ── PKI, servidor, aprovisionamiento ───────────────────────────────────────
-  const pki = await crearPki(tmp, { dias: 2 });
-  const l = await levantar("principal", { acl, identidades, ops, pki });
+  // ── Identidades, ACL generada, PKI, servidor y aprovisionamiento (security/entorno.mjs) ──────────
+  const { l, contexto, interprete, generada, prod, variantes, provision } = await crearEntorno({ banco, suite, aclFichero: args.acl });
   nota(`nats-server con TLS en ${l.url}; ${prod.length} servicios${generada ? `, ${[...variantes.values()].filter((v) => !v.error).length} variante(s) de prueba` : ""} + ops`);
 
-  const durables = prod.reduce((n, s) => n + s.durables.length, 0);
-  // EVT_ y DLQ_ por dominio, y STATE_ por cada dominio con estado.
-  const streams = 2 * new Set(prod.flatMap((s) => s.owns)).size + new Set(prod.flatMap((s) => s.stateOwns)).size;
-  const creados = /(\d+) creado/.exec(l.provision.salida)?.[1];
-  const provisionOk = l.provision.codigo === 0 && Number(creados) === streams + durables;
-  console.log(`  ${provisionOk ? "✓" : "✗"} flux provision por TLS con credenciales de operación: ${creados ?? "0"} recursos creados (esperados: ${streams} streams + ${durables} durables)`);
-  if (!provisionOk) {
-    console.log(`      ${(l.provision.salida + l.provision.errores).trim().split("\n").join("\n      ")}`);
+  console.log(
+    `  ${provision.ok ? "✓" : "✗"} flux provision por TLS con credenciales de operación: ${provision.creados ?? "0"} recursos creados (esperados: ${provision.esperados.streams} streams + ${provision.esperados.durables} durables)`,
+  );
+  if (!provision.ok) {
+    console.log(`      ${(provision.salida + provision.errores).trim().split("\n").join("\n      ")}`);
     R.casos.push({ id: "provision", titulo: "flux provision", ok: false });
     return l;
   }
 
-  const contexto = { ...baseCtx(l, { canon }), generada, ops: l.ops, srv: l.srv, pki, canon, variantes };
-  const interprete = new Interprete(contexto);
-
   // ── Los casos ──────────────────────────────────────────────────────────────
   // Los que no aplican con --acl: S9 (trae su propia ACL) y los de los SDKs (necesitan nkeys).
-  const noAplicaConAcl = (c) => c.steps.some((s) => ["regression", "sdk_cycle"].includes(s.op));
+  const noAplicaConAcl = (c) => c.steps.some((s) => ["regression", "sdk_cycle", "sdk_script"].includes(s.op));
   for (const caso of suite.cases) {
     if (args.only && !args.only.has(caso.id)) continue;
     seccion(`${caso.id}  ${caso.title}${caso.covers?.length ? `   [${caso.covers.join(", ")}]` : ""}`);
@@ -548,7 +378,7 @@ async function main() {
     if (r.omitido) {
       console.log(`  ${exigido ? "✗" : "-"} ${exigido ? "FALTA un requisito" : "omitido"}: ${r.omitido}`);
     }
-    for (const p of r.pasos) imprimirPaso(p);
+    for (const p of r.pasos) imprimirPasoInforme(p, args.verbose);
     R.casos.push({ id: caso.id, titulo: caso.title, ok: r.ok, omitido: r.omitido, omitidos: r.omitidos });
   }
   return l;

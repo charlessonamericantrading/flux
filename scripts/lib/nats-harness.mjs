@@ -26,7 +26,11 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 export const ROOT = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
-export const GEN = path.join(ROOT, "scripts", "gen-acl.mjs");
+/**
+ * El generador bajo prueba. `FLUX_GEN_ACL` lo sustituye por otro (una COPIA estropeada a propósito: es como
+ * `conformance/security/mutantes.mjs` comprueba que la suite DETECTA un generador que concede de más o de menos).
+ */
+export const GEN = process.env.FLUX_GEN_ACL ? path.resolve(process.env.FLUX_GEN_ACL) : path.join(ROOT, "scripts", "gen-acl.mjs");
 export const CLI = path.join(ROOT, "cli", "src", "index.mjs");
 export const EJEMPLO = path.join(ROOT, "examples", "services.json");
 
@@ -206,10 +210,23 @@ export const credsDe = (seed) =>
  * Un usuario nkey con permisos dados, escrito como lo escribe `gen-acl.mjs`. OJO: una lista
  * vacía NO deniega nada —`allow: []` es «sin restricción»— (A-25).
  */
-export const usuarioConf = (pub, publish, subscribe) =>
+export const usuarioConf = (pub, publish, subscribe, allowResponses) =>
   `      { nkey: "${pub}"\n        permissions: {\n` +
   `          publish: { allow: [${publish.map((s) => `"${s}"`).join(", ")}] }\n` +
-  `          subscribe: { allow: [${subscribe.map((s) => `"${s}"`).join(", ")}] }\n        } },\n`;
+  `          subscribe: { allow: [${subscribe.map((s) => `"${s}"`).join(", ")}] }\n` +
+  allowResponsesConf(allowResponses) +
+  `        } },\n`;
+
+/**
+ * La línea `allow_responses` de un usuario, o nada. `true` es la forma desnuda (admite UNA respuesta y NO caduca:
+ * A-68); un objeto es `{ max, expires }`, que es lo que genera `gen-acl.mjs` para el dueño de una operación.
+ * Ausente o `null`: el usuario no puede responder a nadie.
+ */
+export function allowResponsesConf(ar) {
+  if (!ar) return "";
+  const v = ar === true ? "true" : `{ max: ${ar.max ?? 1}${ar.expires ? `, expires: "${ar.expires}"` : ""} }`;
+  return `          allow_responses: ${v}\n`;
+}
 
 /** Un usuario sin restricciones: el de operación, que aprovisiona. */
 export const usuarioOpsConf = (pub) => `      { nkey: "${pub}" },\n`;

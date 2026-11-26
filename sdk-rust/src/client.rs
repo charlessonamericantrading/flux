@@ -49,7 +49,7 @@ use crate::protocol::{
 };
 use crate::security::{
     connect_error_detail, fatal_connect_kind, parse_violation, validate_nkey_seed, Denial,
-    DenialLog, FatalConnect, TlsOptions,
+    DenialLog, DeniedAction, FatalConnect, TlsOptions,
 };
 
 // ─── Observabilidad ──────────────────────────────────────────────────────────
@@ -729,6 +729,9 @@ pub(crate) struct BusInner {
     pub(crate) inbox_prefix: String,
     /// `flux_consumer_pending` de los `watch` de estado: la suma de sus durables — 10-state.md §9.
     pub(crate) state_pending: crate::state::PendingSum,
+    /// Los responders de petición/respuesta vivos: `close()` los para, en orden, antes de cerrar —
+    /// 11-request-reply.md §5.5.
+    pub(crate) rpc: crate::rpc::RpcRegistry,
 }
 
 /// El cliente de flux: publica y consume eventos.
@@ -846,30 +849,12 @@ pub async fn connect(mut opts: ConnectOptions) -> Result<Bus, FluxError> {
         // manda un `-ERR` aparte. Sin escucharlo, el síntoma es un timeout de 5-30 s.
         .event_callback({
             let denials = Arc::clone(&denials);
+            let slow = Arc::new(SlowConsumerLog::default());
             let logger = opts.logger.clone();
             move |event| {
-                let denials = Arc::clone(&denials);
-                let logger = logger.clone();
-                async move {
-                    let async_nats::Event::ServerError(async_nats::ServerError::Other(text)) =
-                        event
-                    else {
-                        return;
-                    };
-                    if let Some(denial) = parse_violation(&text) {
-                        if let Some(log) = &logger {
-                            log(
-                                LogLevel::Error,
-                                &format!(
-                                    "[flux] el broker denegó {}: la ACL del servicio no lo \
-                                     concede (06-security.md §3)",
-                                    denial.describe()
-                                ),
-                            );
-                        }
-                        denials.record(denial);
-                    }
-                }
+                let (denials, slow, logger) =
+                    (Arc::clone(&denials), Arc::clone(&slow), logger.clone());
+                async move { handle_connection_event(&denials, &slow, logger.as_ref(), event) }
             }
         });
 
@@ -920,6 +905,7 @@ pub async fn connect(mut opts: ConnectOptions) -> Result<Bus, FluxError> {
             denials,
             inbox_prefix: inbox,
             state_pending: crate::state::PendingSum::default(),
+            rpc: crate::rpc::RpcRegistry::default(),
         }),
     })
 }
@@ -1083,7 +1069,9 @@ impl Bus {
 
     /// Detiene las suscripciones y drena la conexión.
     ///
-    /// Drena en vez de cerrar: los acks pendientes no se pierden en silencio.
+    /// Drena en vez de cerrar: los acks pendientes no se pierden en silencio. Los **responders** de
+    /// petición/respuesta se paran antes —dejar de escuchar y esperar a lo que está en vuelo, hasta
+    /// 25 s—: cerrar la conexión de golpe pierde la petición que se atiende.
     ///
     /// # Errores
     ///
@@ -1096,6 +1084,9 @@ impl Bus {
         for s in stops {
             let _ = s.send(true);
         }
+        // Los que responden peticiones, ANTES de cerrar: dejar de escuchar, esperar a lo que está en
+        // vuelo y solo entonces drenar. Cerrar de golpe pierde lo que se atiende (A-62, 11-request-reply.md §5.5).
+        self.inner.rpc.stop_all().await;
         self.inner
             .metrics
             .connection_state(ConnectionState::Disconnected);
@@ -2018,7 +2009,8 @@ impl Bus {
         let mut encoded = base64(raw);
         encoded.truncate(700_000);
 
-        let mut envelope = build_event(BuildEventInput {
+        // `system` es un dominio reservado: lo emite el propio SDK, no una aplicación.
+        let mut envelope = crate::envelope::build_event_internal(BuildEventInput {
             subject: "system.poison.v1.capturado".to_string(),
             data: data_to_raw(&json!({
                 "originalSubject": subject,
@@ -2042,7 +2034,8 @@ impl Bus {
         envelope.dlqreason = Some(DlqReason::Poison);
         envelope.dlqattempts = Some(1);
         envelope.dlqconsumer = Some(consumer.to_string());
-        envelope.dlqerror = Some(error.chars().take(1024).collect());
+        // 1024 BYTES UTF-8 sin partir un carácter (04-errors.md §3), no 1024 caracteres.
+        envelope.dlqerror = Some(crate::envelope::truncate_utf8_bytes(error, 1024));
         envelope.dlqtime = Some(now);
 
         let payload = serialize(&envelope)?;
@@ -2372,6 +2365,95 @@ fn is_stream_not_found(e: &async_nats::jetstream::context::GetStreamError) -> bo
     )
 }
 
+/// Cuenta los mensajes que `async-nats` descarta por una cola de suscripción llena y limita el aviso a
+/// uno por segundo: un consumidor desbordado descarta miles por segundo y un log por mensaje enterraría la
+/// causa bajo su propio volumen.
+#[derive(Default)]
+struct SlowConsumerLog {
+    last: Mutex<Option<std::time::Instant>>,
+    dropped: std::sync::atomic::AtomicU64,
+}
+
+impl SlowConsumerLog {
+    /// Anota un descarte. `Some(n)` si toca avisar, con los descartes desde el último aviso.
+    fn note(&self) -> Option<u64> {
+        let n = self
+            .dropped
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            + 1;
+        let mut last = lock(&self.last);
+        let now = std::time::Instant::now();
+        if last.is_some_and(|t| now.duration_since(t) < Duration::from_secs(1)) {
+            return None;
+        }
+        *last = Some(now);
+        self.dropped.store(0, std::sync::atomic::Ordering::Relaxed);
+        Some(n)
+    }
+}
+
+/// Lo que el SDK hace con los avisos de la conexión de `async-nats`:
+///
+/// - **`-ERR 'Permissions Violation …'`**: el broker no devuelve un error cuando una ACL deniega algo:
+///   descarta el mensaje y manda un `-ERR` aparte. Sin escucharlo, el síntoma es un timeout de 5-30 s. Se
+///   registra en el [`DenialLog`] —que lo compite con la respuesta de cada petición— y en el log.
+/// - **`SlowConsumer`**: la cola de una suscripción de core NATS está llena (65 536 mensajes por defecto)
+///   y la librería **descarta** lo que llega, sin más aviso (A-92). Un responder desbordado parecería sano
+///   mientras sus llamantes ven `RPC_TIMEOUT`.
+fn handle_connection_event(
+    denials: &DenialLog,
+    slow: &SlowConsumerLog,
+    logger: Option<&LogFn>,
+    event: async_nats::Event,
+) {
+    match event {
+        async_nats::Event::ServerError(async_nats::ServerError::Other(text)) => {
+            let Some(denial) = parse_violation(&text) else {
+                return;
+            };
+            if let Some(log) = logger {
+                let pista = denial_hint(&denial);
+                log(
+                    LogLevel::Error,
+                    &format!(
+                        "[flux] el broker denegó {}: la ACL del servicio no lo concede \
+                         (06-security.md §3).{pista}",
+                        denial.describe()
+                    ),
+                );
+            }
+            denials.record(denial);
+        }
+        async_nats::Event::SlowConsumer(_) => {
+            let (Some(log), Some(n)) = (logger, slow.note()) else {
+                return;
+            };
+            log(
+                LogLevel::Error,
+                &format!(
+                    "[flux] una suscripción tiene su cola llena y está DESCARTANDO mensajes ({n} desde el \
+                     último aviso): el consumidor no da abasto y `async-nats` solo guarda 65 536 por \
+                     suscripción. Si atiende una operación de petición/respuesta, quien llama ve \
+                     RPC_TIMEOUT; core NATS no reentrega (11-request-reply.md §5.6)"
+                ),
+            );
+        }
+        _ => {}
+    }
+}
+
+/// Una pista para el log cuando lo denegado es **publicar en un inbox**: es lo que hace un dueño al
+/// CONTESTAR una petición, y sin `allow_responses` en su ACL quien llama solo ve un timeout (A-68,
+/// 11-request-reply.md §7.2).
+fn denial_hint(denial: &Denial) -> &'static str {
+    if denial.action == DeniedAction::Publish && denial.subject.starts_with("_INBOX.") {
+        " Si es la respuesta a una petición, a la ACL del dueño le falta `allow_responses` (mejor \
+         `{ max: 1, expires: 30s }`): quien llama verá un RPC_TIMEOUT (11-request-reply.md §7.2)."
+    } else {
+        ""
+    }
+}
+
 pub(crate) fn permission_denied(operation: String, denial: &Denial) -> FluxError {
     FluxError::PermissionDenied {
         operation,
@@ -2620,6 +2702,78 @@ mod tests {
     /// `async-nats` 0.50 interpreta un `&str` como UNA dirección: una lista con comas no se entiende
     /// ni cuando todas sus direcciones son válidas (medido). Aquí se separa, y se comprueba **que
     /// lo que sale lo entiende `async-nats`** (el otro sentido: sin separar, no).
+    /// Un consumidor desbordado descarta miles de mensajes por segundo: el aviso sale a lo sumo una vez por
+    /// segundo y cuenta lo descartado desde el anterior.
+    #[test]
+    fn el_aviso_de_cola_llena_se_limita_a_uno_por_segundo() {
+        let slow = SlowConsumerLog::default();
+        assert_eq!(slow.note(), Some(1), "el primero avisa");
+        for _ in 0..1_000 {
+            assert_eq!(slow.note(), None, "los siguientes, dentro del segundo, no");
+        }
+        *lock(&slow.last) = std::time::Instant::now().checked_sub(Duration::from_secs(2));
+        assert_eq!(
+            slow.note(),
+            Some(1_001),
+            "al pasar el segundo avisa con la cuenta acumulada"
+        );
+    }
+
+    #[test]
+    fn el_aviso_de_cola_llena_llega_al_logger_y_solo_el_slow_consumer_lo_provoca() {
+        let (log, lineas) = {
+            let lineas = Arc::new(Mutex::new(Vec::<String>::new()));
+            let destino = Arc::clone(&lineas);
+            let log: LogFn =
+                Arc::new(move |_n: LogLevel, m: &str| lock(&destino).push(m.to_string()));
+            (log, lineas)
+        };
+        let (denials, slow) = (DenialLog::new(), SlowConsumerLog::default());
+        handle_connection_event(
+            &denials,
+            &slow,
+            Some(&log),
+            async_nats::Event::SlowConsumer(7),
+        );
+        handle_connection_event(&denials, &slow, Some(&log), async_nats::Event::Connected);
+        handle_connection_event(&denials, &slow, Some(&log), async_nats::Event::Draining);
+        let lineas = lock(&lineas);
+        assert_eq!(lineas.len(), 1, "{lineas:?}");
+        assert!(
+            lineas[0].contains("DESCARTANDO") && lineas[0].contains("65 536"),
+            "{}",
+            lineas[0]
+        );
+    }
+
+    #[test]
+    fn una_denegacion_de_la_conexion_se_registra_y_pide_allow_responses_si_es_un_inbox() {
+        let (denials, slow) = (DenialLog::new(), SlowConsumerLog::default());
+        let lineas = Arc::new(Mutex::new(Vec::<String>::new()));
+        let destino = Arc::clone(&lineas);
+        let log: LogFn = Arc::new(move |_n: LogLevel, m: &str| lock(&destino).push(m.to_string()));
+        for texto in [
+            "Permissions Violation for Publish to \"_INBOX.llama.abc.1\"",
+            "Permissions Violation for Publish to \"pedidos.pedido.v1.creado\"",
+            "Authorization Violation",
+        ] {
+            handle_connection_event(
+                &denials,
+                &slow,
+                Some(&log),
+                async_nats::Event::ServerError(async_nats::ServerError::Other(texto.to_string())),
+            );
+        }
+        let lineas = lock(&lineas);
+        assert_eq!(
+            lineas.len(),
+            2,
+            "lo que no es una denegación no se registra: {lineas:?}"
+        );
+        assert!(lineas[0].contains("allow_responses"), "{}", lineas[0]);
+        assert!(!lineas[1].contains("allow_responses"), "{}", lineas[1]);
+    }
+
     #[test]
     fn la_lista_de_servidores_se_separa_por_comas() {
         use async_nats::ToServerAddrs;

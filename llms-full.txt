@@ -54,7 +54,7 @@ https://raw.githubusercontent.com/charlessonamericantrading/flux/main/protocol.j
 
 1. **Nunca inventes un subject.** Formato exacto, 4 tokens:
    `<dominio>.<agregado>.v<major>.<evento>` — minúsculas, `kebab-case`,
-   dominio plural, agregado singular, evento en **pasado**.
+   dominio plural, agregado singular, evento en **pasado**. La versión mayor, de 1 a 4 dígitos (`v1`…`v9999`).
    ✅ `pedidos.pedido.v1.creado` ❌ `pedidos.crear-pedido` ❌ `Pedidos.Pedido.V1.Creado`
 
 2. **Nunca escribas el envelope a mano.** El SDK rellena `id`, `source`, `time`,
@@ -254,8 +254,11 @@ Estas no dan error: dan comportamiento incorrecto. Un agente las comete casi sie
 | `put` solo publica | **Es condicional**: lee la secuencia (`DIRECT.GET`), no escribe si la versión no avanza y publica con `Nats-Expected-Last-Subject-Sequence`. Un `publish` de core a un subject de estado sobrescribe **sin chequeo ni acuse**. El conflicto de secuencia tiene **dos** códigos: `10071` (un nodo) y `10164` (cluster, bajo carrera): reconoce los dos o no reintentarás en producción. Reintenta con **el mismo `id`**. |
 | El estado se recupera desde la DLQ | **No se reproduce**: `dlq.state.>` no lleva el dato (`data` es `{ key, revision }`) y republicar un valor viejo pisaría uno nuevo. `flux dlq replay` lo rechaza; la recuperación es `flux state resync`. |
 | Un estado con PII es «lo mismo que un evento con PII» | No: el estado va `confidential` con `x-pii` y **se puede borrar** (`delete` sustituye el valor por una lápida). Pero el borrado **físico** en disco y las **claves** y **tenants** (visibles en `STREAM.INFO`) no los cubre: la clave es un id opaco, nunca un email. |
+| Un `data` con espacios, `\u00f1` o una clave repetida sale igual en todos los SDKs | **Solo si el constructor lo reescribe a la forma canónica** (la de `JSON.stringify` con UTF-8 literal: sin espacios, `ñ` literal, una clave repetida una vez; [01-envelope.md §4.1](specification/01-envelope.md)). **No tienen forma común** y no se admiten en `data` si los bytes importan: enteros fuera de ±2^53 (Node los redondea), flotantes y exponentes (`4995.00` es `4995` en JavaScript), claves que son índices de array (`"1"`), sustitutos UTF-16 sueltos. El dinero va en enteros. |
+| `dlqerror` mide «1024 caracteres» | **1024 bytes UTF-8**, cortado sin partir un carácter ([04-errors.md §3](specification/04-errors.md)): Node contaba unidades UTF-16 y Rust bytes. Un `message` de error de rpc mide 1000 **caracteres Unicode**. |
 | Una petición a algo que no escucha nadie espera su timeout | **No**: `no responders` llega en ~1 ms (A-56)… **si la conexión lo pidió** en CONNECT (`headers` y `no_responders`); sin ello, silencio y timeout (A-57). Y con una suscripción `rpc.<dominio>.>` el servicio *sí* tiene interés en lo que no atiende: timeout (A-64). Una suscripción **por operación, exacta**. |
 | Un stream que captura `rpc.>` es inocuo | **Contesta a cada petición con su acuse** `{"stream":…,"seq":n}`, y casi siempre antes que la respuesta real (394 de 400, A-67). El que responde ejecuta igualmente y el stream **guarda cada petición**, datos personales incluidos. Un filtro `>` solo se crea sin acuse y convierte `no responders` en un timeout. `flux doctor` lo comprueba. |
+| Suscribirse al propio inbox (`_INBOX.<servicio>.>`) por la misma conexión que hace las peticiones | **El broker deja de enviar `no responders`** (A-101): `RPC_UNAVAILABLE` pasa a ser un timeout de 5 s en 6 de 6 peticiones. Usa el buzón único de la librería; si necesitas otra suscripción, otra conexión. |
 | `RPC_TIMEOUT` = la operación no ocurrió | **Ambiguo**: un responder lento la ejecuta y su respuesta llega tarde al inbox (A-61); uno que muere con la petición la pierde (A-62); la que sale justo al irse el último, en un cluster, también (A-70). Por eso se deduplica por `id`. |
 | Una petición denegada por la ACL falla rápido | Con `@nats-io/*` sí (~1 ms, A-66); con **`async-nats` (Rust) solo da un timeout** y el `-ERR` por el evento de la conexión (A-72). El SDK escucha el aviso y lanza `PERMISSION_DENIED`. |
 | `allow_responses: true` basta y es estrecho | Admite **una** respuesta por petición y **no caduca** (A-68). Acótalo: `{ max: 1, expires: 30s }`. Sin él, el dueño no puede contestar y quien llama ve un timeout. |
@@ -327,7 +330,8 @@ await bus.state.watch("clientes.cliente.v1", async (entrada) => {         // fot
 ### Petición/respuesta — [11-request-reply.md](specification/11-request-reply.md)
 
 Una **orden o un cálculo con respuesta inmediata** entre dos servicios, por core NATS: no se persiste, no tiene stream ni
-DLQ. **Ningún SDK la declara todavía**: la spec y las herramientas llegan antes que las implementaciones.
+DLQ. **La declaran Node y Rust** (columna *Capacidades* del [`README.md`](README.md)); los otros cinco SDKs no la tienen
+y el arnés cruzado los marca `N/A: no declara rpc`.
 
 ```ts
 const r = await bus.request("clientes.cliente.v1.calcular-descuento",
@@ -645,7 +649,10 @@ rápido con `PERMISSION_DENIED` y un ciclo completo contra un broker real con lo
 petición/respuesta, en los dos sentidos —una operación atendida por dos instancias reparte las peticiones, y al
 parar ambas quien llama recibe `RPC_UNAVAILABLE` en menos de 100 ms—. `security` no es requisito, pero **sin ella el
 SDK no puede ejecutar** el ciclo bajo la configuración segura (el inbox privado es lo que impide leer las
-respuestas ajenas). **Ningún SDK la declara todavía**: la evidencia llega con las fases de los SDKs.
+respuestas ajenas). La declaran **Node** y **Rust** ([`protocol.json`](../protocol.json) → `capabilities`): su evidencia
+son los tests contra un broker real que cita cada uno y el arnés cruzado, que ejecuta `rpc-request`, `rpc-reply`,
+`rpc-error`, `rpc-operation` y `rpc-timeout` en **cada SDK que la declara** y **falla** si uno no los cumple, o si
+declara la capacidad sin su arnés; los demás salen `N/A: no declara rpc`.
 
 Una capacidad nueva se añade aquí con su nombre, su documento normativo y la evidencia que la
 acredita, y ningún SDK la declara hasta que pasa esa evidencia.
@@ -729,6 +736,11 @@ español producido por .NET no coincide byte a byte con el de Node o Go. Hace fa
 > `json.dumps(ensure_ascii=False)` y `encoding/json` de Go emiten UTF-8 literal. Un
 > ecosistema que solo hable inglés tampoco lo notaría nunca.
 
+**Qué se escapa y qué no.** Solo `"`, `\` y los caracteres de control U+0000–U+001F (con su forma
+corta —`\b \f \n \r \t`— y, si no la hay, `\u00xx` con los cuatro dígitos en **minúscula**). Todo lo demás va
+**literal**, incluidos U+007F (DEL), U+2028 y U+2029, `<`, `>`, `&` y `/` (`\/` no se conserva). Es lo que escribe
+`JSON.stringify`, y lo que fija la forma canónica de `data` ([§4.1](#41-la-forma-canónica-de-data)).
+
 ## 2. Atributos de contexto — núcleo CloudEvents
 
 | Atributo | Tipo | Obl. | Regla flux |
@@ -788,6 +800,26 @@ para el mismo instante**. Eso rompe:
 Un SDK **DEBE** formatear explícitamente y **NO DEBE** usar el formateador ISO por
 defecto de su lenguaje. Verificado byte a byte entre Node, Python y Go.
 
+**El `time` que da quien llama.** El SDK lo pone él mismo y la API pública no lo recibe; pero los constructores del
+sobre (los que ejecuta el arnés de conformidad, y quien construya un transporte propio) reciben un `time` de fuera.
+Copiarlo tal cual dejaría pasar `…39Z` o `…+02:00` —otros bytes— o un valor que ni siquiera es un instante. Por eso un
+constructor **normaliza** lo que le dan a la forma canónica o lo **rechaza**:
+
+- Se admite un `date-time` de RFC 3339: `T` o `t` (o un espacio) entre fecha y hora; `Z` o `z`, o un desfase
+  `±hh:mm`; decimales opcionales y de **cualquier** longitud. Se convierte a UTC y se escribe con **exactamente 3
+  decimales y `Z`**; los decimales de más de tres se **truncan** (`.9999` es `.999`), no se redondean.
+  `2026-08-20T12:25:39.412+02:00`, `2026-08-20T10:25:39.4120Z` y `2026-08-20T10:25:39.412345Z` dan los mismos
+  bytes que `2026-08-20T10:25:39.412Z`.
+- **No** se admite: algo que no es un instante (`ayer`, `2026-13-20…`, `2026-02-30…`, sin zona horaria, solo fecha, un
+  desfase `+24:00`), **un segundo 60** (un segundo intercalar no existe en UTC de POSIX, y el `Date` de JavaScript lo
+  desplazaría al minuto siguiente: dos SDKs darían dos instantes), ni un instante cuyo año en UTC caiga fuera de
+  0000–9999 (`+10000-01-01…` y `-0001-12-31…` dejarían de ser RFC 3339).
+- Un `time` rechazado es **`WRONG_ATTRIBUTE_TYPE`** (CloudEvents tipa `time` como `Timestamp`); en petición/respuesta,
+  `INVALID_RPC_CALL` ([04-errors.md §7](04-errors.md)).
+
+Node copiaba lo que le daban y Rust lo normalizaba: el mismo `time` daba dos secuencias de bytes. Los vectores
+`ajuste-*-time-*` lo fijan para Node y Rust; **pendiente en Python, Go, Java, .NET y PHP** (Fase 6): hoy no los recorren.
+
 ### 2.3 Comparación de nombres de atributo: case-sensitive
 
 Los nombres de atributo se comparan **respetando mayúsculas**. `{"ID": "..."}` **no**
@@ -811,6 +843,13 @@ propaga un tipo inesperado hasta que alguien compara `tenantid` con `===`.
 
 Un SDK **DEBE** desactivar la coerción de tipos de su deserializador.
 
+Lo mismo vale para los atributos **no obligatorios** y para `dataschema`: un `"subject": 5`, un
+`"causationid": 7` o un `"dlqattempts": "seis"` no se propagan. Es un mensaje ininterpretable —**POISON**— con el código
+**`INVALID_ATTRIBUTE_TYPE`**, que se comprueba **después** de todos los demás de §3.1 y de los atributos raíz
+desconocidos (el orden es parte del contrato). `null` en un opcional es «ausente» (§3.3); `dlqattempts` es un entero de 0
+a 2^32 − 1 y `dlqreason`, uno de `retryable`, `permanent` o `poison`. Rust, Java y .NET ya lo hacían; Node dejaba pasar el
+valor.
+
 ### 2.5 Fidelidad numérica del payload
 
 Un SDK **NO DEBE** reescribir los números de `data` al deserializar y volver a
@@ -823,6 +862,10 @@ esto tanto como del orden de claves (§6).
 
 > La forma más simple de no tener este problema: **no metas decimales en `data`.** Los
 > importes van como entero en la unidad mínima (§4), y ahí no hay nada que normalizar.
+
+Esta regla es del camino que **consume y reenvía** (replay, DLQ): los bytes recibidos salen igual. Un SDK que **construye** un
+`data` nuevo emite su forma canónica ([§4.1](#41-la-forma-canónica-de-data)), y los números que un lenguaje no puede escribir
+como otro no tienen forma común: ahí está documentado qué no se admite.
 
 ### 2.6 Unicidad
 
@@ -876,6 +919,12 @@ todos los SDKs **DEBEN** devolver el mismo ante la misma entrada:
 El código acaba en la extensión `dlqerror` del evento en la DLQ y en las métricas. Si
 dos SDKs emiten códigos distintos para el mismo fallo, agrupar por causa deja de
 funcionar en cuanto el ecosistema es polyglot — que es siempre.
+
+**Los constructores rechazan lo mismo que el parser, con el mismo código.** Un `id`, `source` o `dataschema` vacío
+(`MISSING_REQUIRED_ATTRIBUTE`) o una extensión obligatoria vacía (`MISSING_REQUIRED_EXTENSION`) no sale de un
+constructor del SDK: un evento que su propio parser rechazaría no se construye. Node los aceptaba y Rust los rechazaba sin
+código. En petición/respuesta el conjunto de códigos es cerrado y el rechazo es `INVALID_RPC_CALL`
+([04-errors.md §7](04-errors.md)).
 
 | Extensión | Tipo | Descripción |
 |---|---|---|
@@ -935,6 +984,40 @@ atributo raíz desconocido, en lugar de dejarlo pasar.
 - **NO DEBE** contener `null` para significar "ausente". Se omite el campo.
 - **DEBERÍA** ser autocontenido: el consumidor no debería necesitar llamar de vuelta
   al productor para actuar.
+
+### 4.1 La forma canónica de `data`
+
+Dos SDKs que reciben el **mismo** `data` deben escribir **los mismos bytes**: el orden de claves y los bytes son
+normativos para el replay, la firma y la dedupe por hash (§6). Hasta aquí no lo eran: Rust guardaba `data` como texto
+crudo y escribía lo que le daban —con espacios, con `\u00f1`, con una clave repetida—, y Node lo pasaba por
+`JSON.parse` y `JSON.stringify`, que lo normaliza. La forma **canónica** es la de Node, la de `JSON.stringify` con UTF-8
+literal:
+
+- **Sin espacios** ni saltos de línea entre elementos.
+- Las claves **en el orden en que se dan**; una clave **repetida** conserva la posición de la primera aparición y el valor
+  de la última (`{"a":1,"b":3,"a":2}` es `{"a":2,"b":3}`).
+- Las cadenas, **UTF-8 literal** salvo lo que ordena §1.1: `\u00f1` es `ñ`, `\/` es `/`, `\u007f` es DEL, un par
+  sustituto escapado es el carácter; `"`, `\` y U+0000–U+001F siguen escapados.
+- Los **números**, como los escribe cada lenguaje, **sin tocarlos** (§2.5): `4995` sale `4995`.
+
+Un constructor reescribe lo que recibe a esta forma; un SDK que consume y reenvía conserva los bytes (§2.5). Node y Rust la
+cumplen y la fijan los vectores `ajuste-data-*`; **pendiente en Python, Go, Java, .NET y PHP** (Fase 6): no se han medido contra
+esos vectores y no se garantiza que escriban esta forma.
+
+**Qué NO se admite en `data`** porque no tiene forma común entre lenguajes —no hay vector que lo iguale y **nada** garantiza que
+dos SDKs coincidan—, así que si los bytes importan (firma, replay, dedupe por hash) **no lo uses**:
+
+| Entrada | Qué pasa | Qué hacer |
+|---|---|---|
+| Un **entero fuera de ±(2^53 − 1)** (`9007199254740993`) | JavaScript lo **redondea** al `double` más cercano (`…992`); Rust lo conserva | Va como **cadena** (`"9007199254740993"`) o se parte en dos campos |
+| Un **flotante** o un exponente (`4995.00`, `1E+2`, `1e21`, `-0`, `0.0`) | JavaScript lo reescribe (`4995`, `100`, `1e+21`, `0`, `0`); Rust y Python escriben `4995.00`, `1E+2`… | **El dinero va en enteros** (`totalCents`, §4): un importe no es un flotante |
+| Una clave que es un **índice de array** (`"1"`, `"42"`) | JavaScript las ordena primero y en orden numérico, **por encima** del orden en que se dieron | Claves con letras (`camelCase`, §4) |
+| Un **sustituto UTF-16 suelto** (`"\ud83d"`) | JavaScript lo admite y lo escribe escapado; Rust lo **rechaza** (no es UTF-8) | No hay texto con un sustituto suelto |
+| Más de **128 niveles** de anidamiento | Rust lo rechaza; JavaScript admite más | `data` plano (§4: autocontenido, objetos poco profundos) |
+| Un número **fuera del rango de un `double`** (`1e400`) | JavaScript lo lee como `Infinity` y `JSON.stringify` lo escribe `null`; Rust lo rechaza | No lo uses |
+
+La tabla no es una lista de fallos de un SDK: son **diferencias de lenguaje** que ningún SDK puede evitar. Quien las necesite
+tiene dos salidas: representarlas como cadena, o no firmar ni deduplicar por hash esos eventos.
 
 ```json
 {
@@ -1049,7 +1132,7 @@ Se optimizan para **legibilidad y filtrabilidad**, no para brevedad.
 |---|---|---|
 | `dominio` | Bounded context. Sustantivo plural, `kebab-case`. | `pedidos`, `facturacion`, `logistica` |
 | `agregado` | Raíz de agregado. Sustantivo **singular**, `kebab-case`. | `pedido`, `factura`, `linea-envio` |
-| `v<major>` | Versión mayor del contrato. Literal `v` + entero ≥ 1. | `v1`, `v2` |
+| `v<major>` | Versión mayor del contrato. Literal `v` + un entero de **1 a 4 dígitos**, ≥ 1 y sin ceros a la izquierda (`v1`…`v9999`). | `v1`, `v2`, `v9999` |
 | `evento` | Hecho en **pasado**, `kebab-case`. | `creado`, `cancelado`, `pago-fallido` |
 
 ```
@@ -1075,6 +1158,17 @@ logistica.envio.v1.entrega-fallida
   > Ver [`conformance/run.mjs`](../conformance/run.mjs), casos
   > `core-publish-to-wrong-case-is-silent` y `jetstream-publish-to-wrong-case-errors`.
 - **NO DEBE** contener `_`, espacios, `*` ni `>`. Solo `[a-z0-9-]` dentro de cada token.
+- **La versión mayor tiene tope: `^v[1-9][0-9]{0,3}$`**, de `v1` a `v9999`. `v10000` no es un subject. Sin tope, el
+  patrón admitía `v99999999999999999999`, y dos SDKs daban **dos veredictos para el mismo subject**: Node lo aceptaba y
+  escribía en el `type` `v100000000000000000000` (el entero pasaba por un `Number`, que redondea), y Rust rechazaba lo que no
+  cabía en un `u32`. Nadie necesita diez mil versiones mayores —cada una es una doble publicación de ≥ 90 días
+  ([05-compatibility.md](05-compatibility.md))—, y con el tope el valor cabe en cualquier entero de cualquier lenguaje. El
+  tope vive en **todo** patrón que lleva la versión (el `type`, el contrato de estado, la operación de petición/respuesta, los
+  permisos de la ACL): `protocol.json` → `naming.subject.majorVersion` y la comprobación `check-protocol-json.mjs`.
+  **Estado por SDK:** los siete SDKs llevan el tope en su patrón de subject y su test de unidad rechaza `v99999`; Node,
+  Rust y `flux call` lo llevan además en el `type`, el estado y la operación de petición/respuesta. El resto de lo decidido
+  al medir Node contra Rust (`dlqerror` en bytes, `data` canónico, `time` normalizado, atributos vacíos, UTF-8 estricto…)
+  está **pendiente en Python, Go, Java, .NET y PHP** (Fase 6): ver los apartados que lo dicen.
 - El plural del dominio y el singular del agregado son deliberados: leído en voz alta,
   `pedidos.pedido` es "el agregado *pedido*, del dominio *pedidos*".
 
@@ -1780,6 +1874,18 @@ solo hay que borrar las extensiones `dlq*` y republicar en el subject original. 
 un wrapper habría que desenvolver, y cada consumidor de la DLQ tendría que conocer dos
 formatos. El replay se convierte en `jq 'del(.dlq*)'`.
 
+**`dlqerror` mide 1024 bytes UTF-8 como máximo, y se corta sin partir un carácter.** Es un texto libre que acaba en
+un almacén de 90 días, no un campo con esquema: lo que cuenta es el tamaño que ocupa, **en bytes**, no «caracteres».
+Si no cabe, el SDK conserva los caracteres **enteros** que caben —el corte cae en la frontera del último carácter que
+entra— y descarta el resto: `a`×1023 + `é` (1025 bytes) queda en `a`×1023; `a`×1021 + `😀` + `b` queda en `a`×1021;
+`a`×1022 + `é` (exactamente 1024 bytes) se conserva entero. No se añade `…`: el prefijo `<código>:` ya está al
+principio y es lo que agrupa el panel. Sin esta regla, tres SDKs daban tres cortes distintos del mismo texto (Node
+contaba 1024 unidades UTF-16 —2693 bytes con 1500 `é`—, Rust 1024 bytes, Python puntos de código y Go runas), y el
+**mismo** evento muerto no tenía los mismos bytes en la DLQ, que es de lo que depende el replay verbatim
+([01-envelope.md §6](01-envelope.md)). Los vectores `ajuste-dlqerror-*` de
+[`conformance/harness/vectors.json`](../conformance/harness/vectors.json) lo fijan para Node y Rust; **pendiente en
+Python, Go, Java, .NET y PHP** (Fase 6), que deben alinearse con ellos.
+
 `dlqattempts` es el número de entrega en que el evento murió, **no** una propiedad de
 su clase. Un PERMANENT suele registrar `1` porque no gasta reintentos, pero si el
 handler falló dos veces con errores transitorios y a la tercera lanzó un PERMANENT,
@@ -1971,7 +2077,7 @@ lanzaba un error sin código mientras Rust lanzaba `InvalidSubject`, que no es d
 | Código | Clase | Se lanza en | Se emite cuando |
 |---|---|---|---|
 | `INVALID_TENANT_FOR_STATE` | **PERMANENT** | `put`, `get`, `delete`, `watch` | El tenant no cumple `^[a-z0-9]+(-[a-z0-9]+)*$` con 64 caracteres como máximo, o no se puede resolver ninguno: el estado **no** cae en `system` por defecto ([10-state.md §2.4](10-state.md)) |
-| `INVALID_STATE_CONTRACT` | **PERMANENT** | `put`, `get`, `delete`, `watch` | El contrato no es `<dominio>.<agregado>.v<major>` —el subject sin `state.`, sin tenant y sin clave—: no son tres tokens, un token no es `kebab-case` en minúsculas o la versión no es `v` y un entero ≥ 1 (`clientes.cliente`, `clientes.cliente.v1.creado`, `Clientes.cliente.v1`). Un dominio reservado **no** es este código: es `RESERVED_DOMAIN`, que se evalúa antes ([10-state.md §2.2](10-state.md)) |
+| `INVALID_STATE_CONTRACT` | **PERMANENT** | `put`, `get`, `delete`, `watch` | El contrato no es `<dominio>.<agregado>.v<major>` —el subject sin `state.`, sin tenant y sin clave—: no son tres tokens, un token no es `kebab-case` en minúsculas o la versión no es `v` y un entero de 1 a 4 dígitos (`v1`…`v9999`, [02-naming.md §1](02-naming.md)) (`clientes.cliente`, `clientes.cliente.v1.creado`, `Clientes.cliente.v1`). Un dominio reservado **no** es este código: es `RESERVED_DOMAIN`, que se evalúa antes ([10-state.md §2.2](10-state.md)) |
 | `INVALID_STATE_KEY` | **PERMANENT** | `put`, `get`, `delete` | La clave no cumple `^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$`: un punto, un comodín, un espacio, vacía, de más de 128 caracteres, o que empieza por `_` ([10-state.md §2.3](10-state.md)) |
 | `MISSING_AGGREGATE_VERSION` | **PERMANENT** | `put`, `delete` (y al consumir) | `data` no tiene `aggregateVersion`, o no es un entero ≥ 1 y ≤ 2^53 − 1 ([10-state.md §3.4](10-state.md)) |
 | `STATE_SUBJECT_MISMATCH` | **POISON** | Al consumir: `watch` y `get` | El `tenantid`, el `subject` o el `type` del sobre no coinciden con el subject de NATS en el que llegó la entrada ([10-state.md §5.4](10-state.md)) |
@@ -2042,7 +2148,7 @@ cada SDK inventa.
 | `STALE_REQUEST` | **PERMANENT** | quien responde, **en un error** | Con la firma en modo `require`, el `time` de la petición se aleja más de **300 s** del reloj de quien responde, por delante o por detrás ([11-request-reply.md §7.4](11-request-reply.md)) |
 | `RPC_INVALID_REPLY` | **PERMANENT** | `request` | Lo que llega **no es la respuesta a esta petición**: no es un CloudEvent válido, su `type` no es el de la respuesta ni `com.flux.rpc.error.v1`, su `causationid` no es el `id` de la petición, o su `correlationid`/`tenantid` no los hereda. Es lo que ve quien llama cuando un stream captura `rpc.>` y contesta con su acuse |
 | `RPC_MESSAGE_TOO_LARGE` | **PERMANENT** | `request`; quien responde, **en un error** | El mensaje serializado no cabe en el mínimo entre 1 MiB y el `max_payload` del broker. En la respuesta es la única forma de que quien llama se entere: publicarla lanzaría **en quien responde** y quien llama solo vería un timeout |
-| `INVALID_RPC_CALL` | **PERMANENT** | `request`, `respond`; quien responde, **en un error** | La llamada o el registro está mal formado y se sabe **sin red**: la operación no cumple el patrón (cuatro tokens, sin el prefijo `rpc.`, minúsculas y `kebab-case`), `timeoutMs` no es un entero entre 1 y 25 000, o `data` no es un objeto. En quien responde, además: un `type` que no es el de la petición de esa operación |
+| `INVALID_RPC_CALL` | **PERMANENT** | `request`, `respond`; quien responde, **en un error** | La llamada o el registro está mal formado y se sabe **sin red**: la operación no cumple el patrón (cuatro tokens, sin el prefijo `rpc.`, minúsculas y `kebab-case`), `timeoutMs` no es un entero entre 1 y 25 000, o `data` no es un objeto. **Lo mismo vale para los constructores del sobre** (el arnés cruzado los ejecuta: `rpc-request`, `rpc-reply`, `rpc-error`): un atributo que rellena el SDK (`id`, `source`, `tenantid`, `correlationid`, `producerversion`) que llega **vacío**, un `time` que no es un instante RFC 3339, o un error cuyo `class`/`code`/`message`/`retryAfterMs` no cumple el esquema del error (`message` de más de 1000 **caracteres Unicode**, no unidades UTF-16): un código estable, **nunca** una excepción sin código ([11-request-reply.md §3.3](11-request-reply.md)). En quien responde, además: un `type` que no es el de la petición de esa operación |
 
 **Por qué estas clases.**
 
@@ -2393,7 +2499,8 @@ justo lo que un humano no mantiene.
 El manifiesto de ownership ([`examples/services.json`](../examples/services.json)) es
 la fuente, y [`scripts/gen-acl.mjs`](../scripts/gen-acl.mjs) deriva la configuración. Cada servicio
 declara `name`, `owns`, `consumes` y, si observa estado replicado, `watches`
-([§3.8](#38-estado-replicado-watches-y-sus-permisos)).
+([§3.8](#38-estado-replicado-watches-y-sus-permisos)); y, si hace o atiende peticiones, `calls` y `serves`
+([§3.9](#39-peticiónrespuesta-calls-serves-y-sus-permisos)).
 
 ```bash
 node scripts/gen-acl.mjs examples/services.json                       # genera (bloque `accounts`, incluible con `include`)
@@ -2421,7 +2528,7 @@ El generador rechaza los manifiestos que rompen el modelo, no solo los mal forma
 | Un servicio suscrito a su propio dominio | Suele indicar que ese flujo debería ser una llamada interna, no un evento |
 | Nombre de servicio fuera de `[a-z0-9-]`, o repetido | Alimenta los nombres de durable consumer y el prefijo del inbox — [02-naming.md §4](02-naming.md) |
 | Dos subjects que dan el mismo durable | Los puntos y los guiones del subject pasan a `_`: el segundo `consumers.add` reutilizaría el durable del primero con otro filtro, sin error |
-| Una clave desconocida en un servicio, o ser dueño (o consumir, u observar) un dominio reservado (`dlq`, `state`, `rpc`, `system`) | Una errata no puede ser «un servicio sin permisos», y el «dueño» de `state` recibiría `state.>` — y las reglas de `watches`, en [§3.8](#38-estado-replicado-watches-y-sus-permisos) |
+| Una clave desconocida en un servicio, o ser dueño (o consumir, observar, llamar o atender) un dominio reservado (`dlq`, `state`, `rpc`, `system`) | Una errata no puede ser «un servicio sin permisos», y el «dueño» de `state` recibiría `state.>` — y las reglas de `watches`, en [§3.8](#38-estado-replicado-watches-y-sus-permisos), y las de `calls` y `serves`, en [§3.9](#39-peticiónrespuesta-calls-serves-y-sus-permisos) |
 | Con `--nkeys`: un servicio sin clave, una clave repetida, o una semilla | Sin clave no hay identidad; repetida es una credencial compartida (§2); una semilla es un secreto y nunca va a una config |
 
 Con `--tenants` (Modelo B, [09-multitenancy.md](09-multitenancy.md)) los permisos de cada
@@ -2465,7 +2572,9 @@ ese subject—, así que:
   suscripción directa a `inventario.>` sí fue denegada.
 
 **Regla: un servicio no recibe ningún permiso de suscripción sobre subjects de dominio.**
-Su lista de suscripción es `_INBOX.<servicio>.>` y nada más.
+Su lista de suscripción es `_INBOX.<servicio>.>` y nada más. La única excepción es el **dueño de una operación**
+de petición/respuesta, que añade `rpc.<dominio>.>` ([§3.9](#39-peticiónrespuesta-calls-serves-y-sus-permisos)): `rpc.`
+no es un dominio de eventos, ningún stream lo captura y el SDK se suscribe al subject exacto de cada operación.
 
 ### 3.3 El inbox es privado
 
@@ -2511,7 +2620,7 @@ Por qué cada uno, y por qué con esa forma:
 | `CONSUMER.CREATE.<S>.<d>.<subject>` — **solo con `--dev`** | `consumers.add`: crea el durable o confirma el existente | **El filtro va en el subject**: así es la única forma de que *una ACL vea el filtro*. Con el mismo subject y otro filtro en el cuerpo el servidor responde `Consumer create request did not match filtered subject from create subject` (A-4): no se puede ampliar el consumo por esa vía |
 | `CONSUMER.INFO.<S>.<d>` | `consumers.get`, el sondeo de `num_pending`, y **lo primero que `subscribe()` pregunta**: *info antes de crear* | Sin él `subscribe()` no puede saber si el durable existe y falla con `PERMISSION_DENIED` ([§3.7](#37-las-denegaciones-se-ven)); **no** es `NOT_PROVISIONED`, porque no se sabe si falta |
 | `CONSUMER.MSG.NEXT.<S>.<d>` | Pedir mensajes | Es lo que confina el consumo: sin este permiso, el consumidor existe pero no entrega a nadie —y **`subscribe()` falla con `PERMISSION_DENIED`**, en vez de dejarlo inerte ([§3.7](#37-las-denegaciones-se-ven))—. Pedir mensajes del durable *de otro servicio* es una violación (A-8) |
-| `$JS.ACK.<S>.<d>.>` | `ack`, `nak`, `term` y *work-in-progress* | Medido (A-3): `$JS.ACK.EVT_PEDIDOS.<durable>.1.1.1.<ts>.0`, nueve tokens. El `>` final es porque lo que sigue al durable lo pone el broker |
+| `$JS.ACK.<S>.<d>.>` | `ack`, `nak`, `term` y *work-in-progress* | Medido (A-3): `$JS.ACK.EVT_PEDIDOS.<durable>.1.1.1.<ts>.0`, nueve tokens. El `>` final es porque lo que sigue al durable lo pone el broker. **Un servicio con `allow_responses` (el dueño de una operación) confirma una entrega aunque este permiso le falte** (A-109, [§3.9](#39-peticiónrespuesta-calls-serves-y-sus-permisos)) |
 
 > **Riesgo declarado.** La forma del subject de ack es del servidor: con un dominio de
 > JetStream, o en otra versión, puede llevar tokens delante del stream. Si cambia, la ACL
@@ -2773,6 +2882,109 @@ para cada dominio con estado:
 
 Un dominio **sin** contratos de estado conserva su `DLQ_<DOM>` de la 1.0 y no recibe ningún permiso de estado:
 1.1 es aditiva.
+
+### 3.9 Petición/respuesta: `calls`, `serves` y sus permisos
+
+La petición/respuesta ([11-request-reply.md](11-request-reply.md)) viaja por **core NATS**: no hay consumidores, ni
+`$JS.API`, ni `$JS.ACK`. Sus permisos son de otra forma. Los fija `protocol.json` → `rpc.acl` (derivados de A-66, A-68,
+A-71 y A-73, medidos a mano contra un broker), los **genera** [`gen-acl.mjs`](../scripts/gen-acl.mjs) y los **ejecutan**
+contra un nats-server real [`verify-acl.mjs`](../scripts/verify-acl.mjs) (secciones 1c, 3, 4c, 5c, 6c y 8) y los casos S21 a
+S29 de la suite de seguridad, en los dos sentidos: lo concedido funciona y lo no concedido se deniega, y **rápido**. Todo lo
+de [§3.1 a §3.7](#31-dlq) rige igual: inbox privado, nada de `_INBOX.>`, y las denegaciones se ven.
+
+#### El manifiesto
+
+```jsonc
+{ "services": [
+  { "name": "crm-api",         "owns": ["clientes"],
+    "serves": ["clientes.cliente.v1.calcular-descuento", "clientes.cliente.v1.obtener"] },   // el dueño atiende
+  { "name": "facturacion-api", "owns": ["facturacion"],
+    "calls":  ["clientes.cliente.v1.calcular-descuento"] }                                    // quien llama
+] }
+```
+
+`calls` y `serves` son listas de **operaciones**: el nombre de la operación ([11-request-reply.md §2.2](11-request-reply.md)),
+cuatro tokens y **sin el prefijo `rpc.`**, que pone el SDK. Cada una necesita su par `request`/`reply` en
+`schemas/rpc/…` (índice `rpc` de `schemas/bundle.json`), como un `consumes` necesita su esquema.
+
+| El generador rechaza | Por qué |
+|---|---|
+| Una operación con el prefijo `rpc.` (`rpc.clientes.cliente.v1.obtener`) o de otro dominio reservado (`state.…`) | `rpc` es un dominio reservado (`RESERVED_DOMAIN`): el prefijo lo pone el SDK, y el mensaje dice cómo escribirla |
+| Un comodín (`clientes.cliente.v1.*`, `clientes.>`) | `calls` concede publicar en el subject **exacto** de cada operación: con un comodín, quien llama podría llamar a todas. En `serves`, el comodín ya es el permiso (`rpc.<dominio>.>`), no la entrada |
+| Una operación que no existe en el bundle, o una que no cumple el patrón (tres tokens, mayúsculas) | Sin su par de esquemas no hay contrato; casi siempre es una errata o un esquema que falta (el mensaje lista las del contrato y dónde crear el par) |
+| Atender una operación de un dominio que no es del servicio | **Solo el dueño responde**: con dos servicios sobre la misma operación los dos la ejecutan y quien llama ve **una** respuesta (A-60) |
+| Llamar a una operación que **nadie atiende** (`serves`), a un dominio sin dueño, o a una operación **propia** | Quien llama solo vería `no responders` (`RPC_UNAVAILABLE`); una llamada a lo propio es una llamada de función, no una petición por el bus |
+| Una operación repetida, o `calls`/`serves` que no es una lista | Un permiso se concede una vez; una errata no puede ser «sin permisos» |
+
+#### Qué recibe cada rol
+
+| Rol | Publicar | Suscribirse | `allow_responses` |
+|---|---|---|---|
+| **Quien llama** (`calls`) | `rpc.<operación>`, el subject **exacto** de cada una. Nada más de `rpc.` | Solo su inbox privado `_INBOX.<servicio>.>` | No |
+| **El dueño** (`serves`) | **Ningún** permiso sobre `rpc.` ni sobre inboxes | Su inbox y `rpc.<dominio>.>`, **uno por dominio servido** | `{ max: 1, expires: 30s }` |
+| Cualquier otro, y un dueño que no declara `serves` | Nada de `rpc.` | Solo su inbox | No |
+
+Un servicio que **solo llama** no recibe ninguna suscripción de dominio. Con el ejemplo de arriba:
+
+```jsonc
+// facturacion-api — llama a calcular-descuento
+"publish":   [ …, "rpc.clientes.cliente.v1.calcular-descuento" ],              // el subject EXACTO, y nada más
+"subscribe": [ "_INBOX.facturacion-api.>" ]
+
+// crm-api — dueño de clientes; atiende calcular-descuento y obtener
+"publish":   [ … ]                                                              // ni un permiso `rpc.` ni de inboxes
+"subscribe": [ "_INBOX.crm-api.>", "rpc.clientes.>" ],
+"allow_responses": { max: 1, expires: "30s" }
+```
+
+**Cada permiso, y por qué es esa forma exacta** (lo medido, en la suite como S21 a S29):
+
+| Permiso | Para qué | Lo que impide la forma |
+|---|---|---|
+| `rpc.<operación>` (quien llama) | Publicar la petición | Una llamada a lo no concedido falla en **~1 ms** con `Permissions Violation for Publish to "rpc.…"`, aunque sea otra operación del mismo dominio, de otro dominio o del propio dueño (A-66, A-100; S21). Con `rpc.<dominio>.>` llamaría a todas las del dominio; con `rpc.>`, a las de todos |
+| `rpc.<dominio>.>` (el dueño) | Suscribirse. El SDK usa el subject **exacto** de cada operación (A-64): lo que se concede no es lo que se usa | Quien llama no se suscribe ni a la operación, ni a su dominio, ni a `rpc.>`: leería las peticiones de todos, con sus datos personales. **Suplantar el grupo de cola del dueño** tampoco: `Permissions Violation … using queue "crm-api"`. Ni siquiera el dueño recibe `rpc.>` ni un comodín por token (A-102; S22) |
+| Su inbox `_INBOX.<servicio>.>` | Recibir la respuesta | Sin el privado, cualquiera lee las respuestas ajenas, que pueden llevar datos personales: espía de `_INBOX.>` y del inbox de quien llama, ninguna admitida (A-71, A-103; S23). Un servicio que no fija su inbox (el prefijo aleatorio de la librería) no puede ni pedir |
+| `allow_responses: { max: 1, expires: 30s }` | Que el dueño conteste, **sin** ningún permiso de publicación sobre inboxes | De dos respuestas a la misma petición llega una y el broker deniega la otra; una respuesta a un inbox que no es el `reply` de la petición recibida, también; el dueño no puede escribir por su cuenta ni en el inbox de quien llama ni en el suyo (A-68, A-104; S24). Con `_INBOX.>` de publicación desaparece el `max: 1` |
+| …su `expires` | Que el permiso temporal caduque | **30 s, por encima del timeout máximo de una llamada (25 s)**: una respuesta legítima nunca llega después, y una tardía se deniega (A-105; S25: a los 24 s llega, a los 31 s se deniega). `allow_responses: true` admite una respuesta y **no caduca** (A-68) |
+
+**Nunca**, a ningún rol: `rpc.>`, `rpc.<dominio>.>` ni un comodín por token **para publicar**; `rpc.>`, `rpc.*.>` ni `>`
+**para suscribirse**; un permiso de publicación sobre `_INBOX.`; un `allow_responses` sin acotar. `protocol.json` lo
+fija (`callerNeverPublish`, `ownerNeverSubscribe`, `ownerPublishOnInboxes: "never"`) y `check-protocol-json.mjs` **ejecuta
+el generador** sobre servicios de prueba para comprobarlo, con 49 mutaciones (un generador que concede `rpc.<dominio>.>`
+a quien llama, `rpc.>` o publicar en inboxes al dueño, o un `allow_responses` sin acotar, se detecta). La suite lo mide
+además con `conformance/security/mutantes.mjs`: copia el generador, le aplica un error real y exige que los casos fallen.
+
+#### Cómo se ve cada permiso que falta
+
+Es la minimalidad de §3.4, para la petición/respuesta (S27): sin cualquiera de los cuatro, el fallo es el que toca y **no
+parece un servicio sano**. Lo que **DEBE** hacer el SDK con cada uno es la tabla de [§3.7](#37-las-denegaciones-se-ven) y
+[11-request-reply.md §7.1](11-request-reply.md).
+
+| Falta… | Qué ve quien llama | Qué ve el dueño |
+|---|---|---|
+| El permiso de publicación sobre la operación | Denegada en ~1 ms con `@nats-io/*` (con `async-nats`, solo un timeout y el `-ERR` por el evento de la conexión: A-72) | — |
+| Su inbox privado | La librería ve denegada la suscripción de su inbox y **la petición falla en ms** con el subject del inbox; la petición ya salió y **llega al dueño** (A-107) | Contesta a un inbox que nadie lee |
+| La suscripción del dueño | **`no responders`** en ~2 ms: parece un servicio caído (A-73, A-106) | El `-ERR` con el subject y `using queue "<servicio>"`; la suscripción **no lanza** |
+| `allow_responses` | Un timeout | Recibe y **ejecuta**; su respuesta se deniega (un `-ERR` por cada una) |
+
+#### Dos medidas que importan a quien escriba un SDK
+
+- **`allow_responses` admite también el ack.** El `reply` de una entrega de un pull consumer es su subject de ack, y con
+  `allow_responses` el servidor admite **una** publicación al `reply` de cada mensaje recibido: el dueño de una operación
+  confirma (`ack`, `nak`, `term`) una entrega **aunque le falte el permiso `$JS.ACK…`** (A-109). No es una fuga —solo
+  puede confirmar lo que ya recibió—, pero **oculta** un permiso que falta: `working()` seguido de `ack()` publica **dos**
+  veces al mismo `reply`, la segunda se deniega y la entrega queda pendiente. El permiso sigue concediéndose, y la
+  minimalidad de §3.4 se mide **sin** `allow_responses`.
+- **No abras una segunda suscripción a tu propio inbox por la misma conexión que pide.** Una suscripción más —`_INBOX.<servicio>.>`—
+  que case con el `reply` de la petición hace que el estado 503 de `no responders` **no llegue a la librería** y se convierta
+  en un timeout: `RPC_UNAVAILABLE` (inmediato, RETRYABLE) pasaría a `RPC_TIMEOUT` (ambiguo). Medido: 6 de 6 peticiones,
+  con la suscripción antes o después de la primera; por **otra** conexión, o con un subject que no casa, llega (A-101; S29).
+
+#### Modelo B
+
+Con `--tenants` los permisos de cada servicio son **los mismos**, y el espacio `rpc.` es **de la account**: una petición de
+`facturacion-api@globex` a una operación que solo atiende `crm-api@acme` recibe `no responders` en milisegundos
+(`verify-acl.mjs`, sección 8).
 
 ## 4. Multi-tenant
 
@@ -3654,8 +3866,9 @@ CloudEvents ([01-envelope.md §2.1](01-envelope.md)), que aquí vale la clave.
 El **nombre de contrato** de un estado es `<dominio>.<agregado>.v<major>` (`clientes.cliente.v1`):
 el subject sin `state.`, sin tenant y sin clave. Es lo que recibe `state.watch` y lo que figura
 en las métricas. Una cadena que no tiene esa forma —`clientes.cliente` sin versión,
-`clientes.cliente.v1.creado` con cuatro tokens, `Clientes.cliente.v1` con mayúsculas— es
-**`INVALID_STATE_CONTRACT`** (PERMANENT); un dominio reservado ([§2.7](#27-dominios-reservados)),
+`clientes.cliente.v1.creado` con cuatro tokens, `Clientes.cliente.v1` con mayúsculas,
+`clientes.cliente.v10000` con una versión de cinco dígitos —el tope es `v9999`,
+[02-naming.md §1](02-naming.md)— es **`INVALID_STATE_CONTRACT`** (PERMANENT); un dominio reservado ([§2.7](#27-dominios-reservados)),
 `RESERVED_DOMAIN`, que se evalúa antes (§3.6).
 
 **Por qué el tenant va en el subject y no solo en el sobre.** Con el tenant solo en el sobre, dos
@@ -4250,7 +4463,8 @@ PERMANENT, o agota sus reintentos, manda la entrada a la **DLQ de estado**.
   ahí tres meses y **el derecho de supresión no se cumpliría**. El resto del sobre queda como
   estaba, también `dataclassification`.
 - **`dlqerror` NO DEBE contener valores de `data`**: código, y como mucho la ruta del campo
-  (`INVALID_SCHEMA: /pais …`, nunca el valor). Es la misma razón, vista desde el texto.
+  (`INVALID_SCHEMA: /pais …`, nunca el valor). Es la misma razón, vista desde el texto. Y mide
+  **1024 bytes UTF-8 como máximo**, cortado sin partir un carácter ([04-errors.md §3](04-errors.md)).
 - **Un error que no es de flux no deja su mensaje en la DLQ.** Lo que lanza un driver de base de
   datos (`duplicate key value violates unique constraint … Key (email)=(ana@example.com)`) cita la
   fila entera, y la DLQ guarda 90 días. Un error **de flux** —los del SDK y los que lanza la
@@ -4668,6 +4882,7 @@ llamada: `timeoutMs`, `tenantId`, `classification`). **Todo lo demás lo rellena
 | `dataclassification` | La de la llamada; si no, la de la conexión (§3.6) |
 | `partitionkey` | El `aggregateId`, si se da: la misma convención que en los eventos, aunque aquí no particione nada |
 | `traceparent` | El contexto de trazas activo |
+| `tracestate` | El del evento o la petición **en curso**, junto a su `traceparent`; ausente si no hay |
 | `data` | Un **objeto** JSON ([01-envelope.md §4](01-envelope.md)) |
 
 **Una llamada hecha dentro de un handler continúa la cadena**: dentro de un handler de eventos o de otra
@@ -4691,6 +4906,7 @@ La respuesta **hereda** de la petición y **no se escribe a mano**:
 | `subject`, `partitionkey` | Los de la petición, si los traía |
 | `dataclassification` | La de la operación; si no, la de la conexión. Un error, `internal` |
 | `traceparent` | El contexto del que responde, **de la misma traza** |
+| `tracestate` | **Ausente**: la respuesta y el error llevan solo `traceparent`. Rust lo escribía si se lo daban y Node no |
 | `data` | Lo que devuelve el handler: un **objeto** |
 
 Va dirigida al subject de respuesta (`reply`) de la petición, que es un inbox privado y único por llamada
@@ -4711,7 +4927,7 @@ Cuando el handler falla, o cuando el SDK de quien responde rechaza la petición,
 |---|---|
 | `class` | **`retryable` o `permanent`**, y nada más. `poison` **no viaja** (más abajo) |
 | `code` | Identificador **estable** (`errors.codePattern`): el que agrupa el panel y el que ramifica la aplicación. Nunca el mensaje |
-| `message` | Qué falló y cómo se arregla. **NO DEBE** contener valores de `data` (acaba en logs) ni —para un error no lanzado a propósito— el texto de una excepción |
+| `message` | Qué falló y cómo se arregla. De **1 a 1000 caracteres Unicode** (puntos de código, como `maxLength` de JSON Schema: mil emojis caben; el «tamaño» en unidades UTF-16 de JavaScript o en bytes no cuenta). **NO DEBE** contener valores de `data` (acaba en logs) ni —para un error no lanzado a propósito— el texto de una excepción. Quien responde **trunca** el de la aplicación que no cabe a 999 caracteres + `…`, y sustituye uno vacío o solo de espacios por «el servicio rechazó la petición» |
 | `retryAfterMs` | Opcional, entero ≥ 0, **solo con `retryable`**: una sugerencia para el *primer* reintento, como en [04-errors.md §2.2](04-errors.md) |
 
 - **`dataclassification: internal`**, siempre, y `dataschema` fijo:
@@ -4896,8 +5112,23 @@ Cada fila está medida contra un broker real (los casos son los de [§2](#2-mode
 1. Es un **CloudEvent válido** (parsea, con las cuatro extensiones y los tipos exactos).
 2. Su `type` es **el de la respuesta de esa operación** o `com.flux.rpc.error.v1`.
 3. Su `causationid` es **el `id` de la petición**.
-4. Su `correlationid` y su `tenantid` **son los de la petición**.
+4. Su `correlationid` y su `tenantid` **son los de la petición**. **Excepción única**: el error de una petición que
+   el que responde no pudo leer ([§5.2](#52-lo-que-no-cumple-y-qué-se-contesta)) lleva `correlationid` propio y
+   `tenantid` = `system`; ahí quien llama **no** aplica esta comprobación, y le basta la 3 (su `causationid` es el
+   `id` de la petición, que solo él conoce) para atribuirlo y ver el código del sobre (`INVALID_RPC_CALL`,
+   `MALFORMED_JSON`…) en vez de `RPC_INVALID_REPLY`. Sin esa excepción, un error legítimo sería rechazado por la
+   comprobación que existe para detectar lo ilegítimo. **La forma es estrecha a propósito**: la excepción exige que sea
+   un **error** (`com.flux.rpc.error.v1`), con `tenantid` = `system` **y** `correlationid` **igual al `id` del propio
+   error**. Un `tenantid: system` cualquiera, un `correlationid` cualquiera o una respuesta que no es un error siguen
+   siendo `RPC_INVALID_REPLY`; y las comprobaciones 3 y 5 siguen en pie. Medida contra un broker real con un responder en
+   bruto (Node, Rust y `flux call`; A-120).
 5. Si es un error, su `data` cumple el esquema del error (`class` ∈ `retryable | permanent`, `code` y `message`).
+
+**El SDK NO DEBE suscribirse, por la misma conexión que pide, a un subject que case con el `reply` de sus
+peticiones** (`_INBOX.<servicio>.>` o `_INBOX.<servicio>.*.*`): el servidor ve interés y **no envía el
+`no responders`**, de modo que `RPC_UNAVAILABLE` se convierte en `RPC_TIMEOUT` (A-101: 6 de 6 peticiones, con la
+suscripción antes o después). Con otra conexión de la misma identidad sí llega. Usa el buzón único que ya crea la
+librería para las peticiones.
 
 Una respuesta que no es de esta petición es **un incidente** —un productor roto, un stream mal puesto,
 algo hostil— y no un fallo que esperar: de ahí PERMANENT y su propio `outcome` en la métrica (§10). Si el
@@ -4978,8 +5209,10 @@ para un fallo que no se arregla esperando —el modo de fallo que la taxonomía 
 
 - **Si la petición ni siquiera se puede leer**, no hay `correlationid` ni `tenantid` que heredar: el error lleva
   `correlationid` = su propio `id`, `tenantid` = `system` (es un aviso de plataforma sobre un mensaje que no se
-  pudo atribuir) y `causationid` = el `id` de la petición **solo si es una cadena válida**. *Decidido
-  provisionalmente.*
+  pudo atribuir) y `causationid` = el `id` de la petición **solo si es una cadena válida**: **no vacía, de 128
+  caracteres Unicode como máximo y sin caracteres de control** (U+0000–U+001F ni U+007F–U+009F). Es lo que el error cita:
+  un valor que quien llama no reconocería como suyo, o que llena un log, no se copia. Node aceptaba hasta 256 y
+  controles; Rust, hasta 128 y sin ellos. *Decidido provisionalmente.*
 - **El mensaje cita rutas, no valores**, con una frase que diga **qué** estaba mal —«la petición no cumple…» o
   «la respuesta no cumple…»— porque quien llama recibe el mismo `INVALID_SCHEMA` en los dos casos y debe saber a
   quién arreglar. Es la regla de [10-state.md §3.6](10-state.md), por la misma razón.
@@ -4990,9 +5223,10 @@ para un fallo que no se arregla esperando —el modo de fallo que la taxonomía 
 
 | El handler… | Se responde | `code` | `message` |
 |---|---|---|---|
-| lanza `RetryableError` | `retryable` (con `retryAfterMs` si lo da) | el suyo, o el del clasificador | el de la aplicación |
+| lanza `RetryableError` | `retryable` (con `retryAfterMs` si lo da) | el suyo, o `RETRYABLE` | el de la aplicación |
 | lanza `PermanentError` | `permanent` | el suyo, o `PERMANENT` | el de la aplicación |
-| lanza un error que el **clasificador reconoce** (un 503 de una dependencia, `ECONNRESET`) | su clase (`retryable` / `permanent`) | el del clasificador (`HTTP_503`) | **genérico** («dependencia no disponible») |
+| lanza un `PoisonError` (la calificación de quien *consume*, no de quien responde) | `permanent`: `poison` no viaja | el suyo, o **`PERMANENT`** —el código de la clase con la que viaja, no el de la que no viaja—: Node contestaba `POISON` y Rust `PERMANENT` | el de la aplicación |
+| lanza un error que el **clasificador reconoce** (un 503 de una dependencia, `ECONNRESET`) | su clase (`retryable` / `permanent`) | el del clasificador (`HTTP_503`) si cumple `errors.codePattern`; si no, `RETRYABLE` / `PERMANENT` | **genérico** («dependencia no disponible») |
 | lanza un error **desconocido** | **`permanent`** | `UNKNOWN` | **genérico**: «error interno del servicio» |
 | devuelve algo que no es un objeto | `permanent` | `INVALID_SCHEMA` | «la respuesta no es un objeto» |
 
@@ -5023,17 +5257,22 @@ El orden es **dejar de escuchar, esperar a lo que está en vuelo, cerrar**:
    la dio por perdida quien llamó).
 3. **Cerrar** la conexión.
 
-**Cerrar la conexión de golpe pierde lo que se atiende**: medido (A-62), con un handler de 400 ms, cerrar a los
+**Cerrar la conexión de golpe pierde lo que se atiende** —y el `drain()` de la **conexión entera** tampoco espera a los
+handlers: el que está en vuelo no puede publicar su respuesta y quien llama ve un timeout (A-83); hay que
+drenar **cada operación** y esperar a los handlers *antes* de cerrar—: medido (A-62), con un handler de 400 ms, cerrar a los
 100 ms deja la petición sin respuesta; con `unsubscribe` a los 100 ms, la petición en vuelo termina con su
 respuesta y la siguiente falla en ~1 ms con `no responders`.
 
-> **No medido.** Con latencia de red real, un `unsubscribe` que descarta lo ya enviado por el servidor
-> **PUEDE** perder una petición que viajaba; el *drain* de la librería espera al viaje de ida y vuelta que lo
-> evita. Localmente, 4 ejecuciones de 400 peticiones seguidas no perdieron ninguna con ninguno de los dos:
-> no hay una medida que fije cuál usar, y por eso se pide el drenaje. Y en un **cluster**, el interés
-> se propaga de forma asíncrona: la petición que sale justo cuando se va el último puede agotar su timeout en
-> vez de recibir `no responders` (A-70: 4 de 10 sin esperar, 0 de 10 a los 5 ms). Un SDK **DEBERÍA** esperar un
-> margen breve tras dejar de escuchar antes de cerrar.
+> **Medido con latencia de red real (A-91, `async-nats` 0.50).** El `drain` **no espera al `PONG`**: retira la
+> suscripción en cuanto escribe el `UNSUB`, y lo que el servidor ya envió y aún viaja **se pierde**; quien llama ve
+> `RPC_TIMEOUT`. Con la librería sola se pierden 0 / 4 / 13 / 23 mensajes con 0 / 5 / 15 / 30 ms por sentido, y
+> `unsubscribe` casi lo mismo (1 / 5 / 15 / 28): ninguno de los dos lo evita, y la API pública no ofrece otra
+> cosa. Con el SDK, 10 paradas bajo carga pierden de 1 a ~130 peticiones con 0 a 15 ms. **Por eso la parada
+> ordenada no basta bajo carga y con red**: lo que hay que hacer es **sacar la instancia del reparto antes de
+> pararla** (quitarla del balanceo o dejar de enviarle tráfico) y entonces parar. Localmente (0 ms) no se pierde
+> nada. Y en un **cluster**, el interés se propaga de forma asíncrona: la petición que sale justo cuando se va
+> el último puede agotar su timeout en vez de recibir `no responders` (A-70: 4 de 10 sin esperar, 0 de 10 a los 5
+> ms). Un SDK **DEBERÍA** esperar un margen breve tras dejar de escuchar antes de cerrar.
 
 ### 5.6 Tenants y concurrencia
 
@@ -5061,7 +5300,7 @@ no un código que cada SDK inventa. Se documentan en [04-errors.md §7](04-error
 | `STALE_REQUEST` | **PERMANENT** | quien responde (en un error) | Firma en `require` y `time` a más de 300 s |
 | `RPC_INVALID_REPLY` | **PERMANENT** | `request` | Lo que llega no es la respuesta a esta petición (§4.3) |
 | `RPC_MESSAGE_TOO_LARGE` | **PERMANENT** | `request`; quien responde (en un error) | El mensaje no cabe (§4.4, §5.4) |
-| `INVALID_RPC_CALL` | **PERMANENT** | `request`, `respond`; quien responde (en un error) | Operación mal formada, `timeoutMs` fuera de rango, `data` que no es un objeto; o, en quien responde, un `type` que no es el de la operación |
+| `INVALID_RPC_CALL` | **PERMANENT** | `request`, `respond`; quien responde (en un error); **los constructores del sobre** | Operación mal formada (la versión mayor, de 1 a 4 dígitos), `timeoutMs` fuera de rango, `data` que no es un objeto; o, en quien responde, un `type` que no es el de la operación. En un **constructor** (el arnés cruzado: `rpc-request`, `rpc-reply`, `rpc-error`): un atributo que rellena el SDK que llega vacío, un `time` que no es un instante RFC 3339, o un error que no cumple su esquema (§3.3): un código estable, nunca una excepción sin código |
 
 **Por qué estos seis y no menos.** `RPC_UNAVAILABLE` y `RPC_TIMEOUT` son las dos situaciones que **solo existe
 aquí** y con **clases distintas en la práctica**: la primera no gasta tiempo, la segunda sí y es ambigua.
@@ -5097,8 +5336,9 @@ suscripción es `PERMISSION_DENIED` (§7.1), no `NOT_PROVISIONED`.
 
 - **Nunca** a quien llama `rpc.>`, `rpc.<dominio>.>` ni un comodín por token: podría llamar a todo.
   `protocol.json` → `rpc.acl` fija los patrones (`callerPublish`, `ownerSubscribe`) y lo que nunca se concede.
-- **El generador** (`gen-acl.mjs`, las claves del manifiesto y los casos de seguridad) lo documentará
-  [06-security.md §3](06-security.md) cuando llegue; esta sección fija **lo medido** que debe producir.
+- **El generador** (`gen-acl.mjs`, las claves `calls` y `serves` del manifiesto y los casos de seguridad S21 a S29) está
+  documentado en [06-security.md §3.9](06-security.md#39-peticiónrespuesta-calls-serves-y-sus-permisos); esta sección fija
+  **lo medido** que produce.
 - **Una petición denegada**: con `@nats-io/*` falla en ~1 ms con `Permissions Violation for Publish to
   "rpc.clientes.cliente.v1.obtener"` (A-66); con `async-nats`, **agota su timeout** y el aviso solo se ve en el
   evento de la conexión (A-72). La regla de [06-security.md §3.7](06-security.md) rige aquí: el SDK **DEBE**
@@ -5291,7 +5531,8 @@ Un SDK declara la capacidad `rpc` ([00-protocol.md §5](00-protocol.md)) solo si
 1. `request` y `respond` según §4 y §5, y los **mismos bytes** que §3.5 para la petición, la respuesta y los dos
    errores (arnés cruzado: `rpc-request`, `rpc-reply`, `rpc-error`, `rpc-operation`, `rpc-timeout`).
 2. Los **seis** códigos de [04-errors.md §7](04-errors.md), con su clase, y `RESERVED_DOMAIN` en `request` y `respond`
-   (hoy solo lo comprueba `check-sdk-codes.mjs` en quien declara `state`, porque el código cuelga de esa capacidad).
+   (lo ejecuta el arnés cruzado en `rpc-operation` y `rpc-request`; `check-sdk-codes.mjs` solo comprueba el literal en quien
+   declara `state`, porque el código cuelga de esa capacidad).
 3. **Una suscripción exacta por operación** y el grupo de cola = nombre de servicio.
 4. La conexión anuncia **`headers` y `no_responders`**.
 5. **Valida la respuesta contra la petición** (las cinco comprobaciones de §4.3).
@@ -5318,8 +5559,9 @@ Declarado para que nadie asuma de más:
 - **No propaga el plazo** de quien llama al que responde: un handler puede seguir trabajando cuando ya nadie
   espera, y su efecto se aplica. La idempotencia por `id` cubre el caso peligroso.
 - **No hay contrapresión ni *load shedding*.** Core NATS no tiene acuse: un responder sobrecargado no puede decir
-  «ahora no», y quien llama solo ve `RPC_TIMEOUT`. No se ha medido el límite de mensajes pendientes por
-  suscripción (*slow consumer*).
+  «ahora no», y quien llama solo ve `RPC_TIMEOUT`. **La cola de una suscripción tiene un límite y, llena, descarta
+  sin error**: con `async-nats` 0.50 son **65 536** mensajes y los 4 463 que sobraron de 70 000 peticiones se
+  perdieron (A-92); el SDK de Rust lo avisa por su `logger`. No se midió con `nats.js`.
 - **No elige instancias por salud** (§2.4): una colgada se lleva su parte.
 - **No oculta la existencia de una operación** a quien tenga permiso de publicar en ella, y `no responders` dice
   si **hay** alguien escuchando.
@@ -5351,6 +5593,11 @@ serlo cuando haya servicios en producción:
 | 16 | El doctor compara contra `rpc.*.*.*.*` y marca también los filtros anchos sin acuse | §8 |
 | 17 | La compatibilidad se invierte para la petición: sin `x-extensible-enum`; el dueño despliega primero | §11.2 |
 | 18 | El SDK limita los handlers concurrentes (~256) | §5.6 |
+| 19 | La excepción de la comprobación 4 es **estrecha**: un error con `tenantid: system` y `correlationid` igual a su propio `id` | §4.3 |
+| 20 | `message` del error: 1000 **caracteres Unicode**, no unidades UTF-16 ni bytes | §3.3 |
+| 21 | El `id` que cita un error de una petición ilegible: no vacío, ≤ 128 caracteres, sin controles | §5.2 |
+| 22 | Un `PoisonError` del handler lleva `PERMANENT` si no trae código; un mensaje solo de espacios se sustituye | §5.3 |
+| 23 | Los constructores del sobre rechazan lo vacío, un `time` que no es un instante y un error mal formado con `INVALID_RPC_CALL` | §6 |
 
 
 ==============================================================================

@@ -619,6 +619,131 @@ hash. `state_dataschema(base, contrato)` deriva el `dataschema` de la URL base d
   y al morir el servidor al que está conectado el cliente se reconecta al otro **por la lista**. Los
   tests de cluster ya se conectan a los tres nodos.
 
+## Petición/respuesta
+
+[11-request-reply.md](../specification/11-request-reply.md). Extensión **opcional** de v1.1 (capacidad `rpc`,
+declarada en `protocol.json` → `capabilities` por Node y Rust: el arnés cruzado reproduce sus vectores byte a byte): una
+**orden** o un **cálculo** con respuesta inmediata entre dos servicios, por **core NATS** —sin stream, sin DLQ,
+sin persistir nada— y con el mismo sobre, tenant, clasificación de errores y permisos que el resto del protocolo.
+Sustituye a un `POST /accion` entre servicios propios. **Si lo que pides es un dato que otro sistema guarda, es
+[estado](#estado-replicado), no petición/respuesta.** No va detrás de una feature: no añade ninguna dependencia.
+
+```rust
+use serde_json::json;
+
+// El dueño atiende la operación: una suscripción por operación, con el servicio como grupo de cola.
+let responder = bus
+    .respond("clientes.cliente.v1.calcular-descuento", |peticion: flux::RpcRequest, ctx: flux::RpcContext| async move {
+        // OBLIGATORIO: deduplicar por `ctx.id`. Una orden puede llegar dos veces.
+        let p: Pedido = peticion.data_as()?;
+        Ok(json!({ "descuentoCents": 500, "moneda": p.moneda }))   // o `Err(FluxError::permanent(..).into())`
+    })
+    .await?;
+
+// Quien llama recibe el sobre de la respuesta; `data_as` decodifica su `data`.
+let respuesta = bus
+    .request_with(
+        "clientes.cliente.v1.calcular-descuento",
+        &json!({ "clienteId": "cli-1", "totalCents": 9990, "moneda": "EUR" }),
+        flux::RequestOptions::default().with_timeout_ms(2_000).with_aggregate_id("cli-1"),
+    )
+    .await?;
+let descuento: Descuento = respuesta.data_as()?;
+
+responder.stop().await;   // dejar de escuchar, esperar a lo que está en vuelo, y solo entonces cerrar
+```
+
+- **El nombre de la operación son cuatro tokens, sin `rpc.`**: `clientes.cliente.v1.calcular-descuento`. El prefijo lo
+  pone el SDK y pasarlo es `RESERVED_DOMAIN`; la operación va en **infinitivo**, no en pasado (`creado` es un evento).
+- **Solo escribes la operación, `data` y, opcionalmente, el `aggregate_id`.** `id`, `time`, `type`, `source`,
+  `correlationid`, `tenantid`, `traceparent`… los rellena el SDK, y **una llamada hecha dentro de un handler continúa
+  la cadena** (`correlationid` y `tenantid` heredados, `causationid` = el `id` de lo que está en curso).
+- **El timeout** es de 5 s por defecto y de **1 ms a 25 s** (por debajo del `ack_wait`): fuera de rango, o un número no
+  entero de milisegundos, es `INVALID_RPC_CALL` —no se recorta en silencio—.
+- **`request` hace un solo intento.** `RequestOptions::with_retries(n)` reintenta solo ante `RPC_UNAVAILABLE` y
+  `RPC_TIMEOUT`, con el **mismo `id` y los mismos bytes** (`time` incluido), y solo es seguro si quien responde
+  deduplica por el `id`: **un `RPC_TIMEOUT` no dice que la operación no se ejecutó**.
+- **`respond` falla al arrancar**, con `PERMISSION_DENIED` y el subject, si la ACL no concede la suscripción: un dueño
+  sin permiso parecería, para quien llama, un servicio caído (`RPC_UNAVAILABLE`).
+
+### Los seis códigos y lo que ve quien llama
+
+| Situación | Código | Clase |
+|---|---|---|
+| Nadie escucha (el broker contesta `no responders` en ~1 ms) | `RPC_UNAVAILABLE` | RETRYABLE, inmediato |
+| No llega respuesta a tiempo (la operación **puede** haberse ejecutado) | `RPC_TIMEOUT` | RETRYABLE |
+| La ACL deniega la petición | `PERMISSION_DENIED` | PERMANENT |
+| Lo que llega no es la respuesta a **esta** petición (cinco comprobaciones; también el acuse de un stream que captura `rpc.>`) | `RPC_INVALID_REPLY` | PERMANENT |
+| El mensaje no cabe en `min(1 MiB, max_payload)` (la respuesta, la comprueba quien responde y contesta con un error) | `RPC_MESSAGE_TOO_LARGE` | PERMANENT |
+| Operación mal formada, `timeout` fuera de rango, `data` que no es un objeto | `INVALID_RPC_CALL` | PERMANENT |
+| Con la firma en `require`, `time` a más de 300 s del reloj de quien responde (lo emite **quien responde**, en un error) | `STALE_REQUEST` | PERMANENT |
+| El que responde falló | `FluxError::Retryable` / `Permanent` con **su** `code` y `message` | su `class` |
+
+Un handler de eventos que llama a una operación **hereda la clasificación sin hacer nada**: si el otro servicio dice
+`retryable`, el evento se reentrega con su backoff; si dice `permanent`, va a la DLQ en la primera entrega. En quien
+responde, un error **desconocido** es `permanent` con código `UNKNOWN` y mensaje genérico —**el texto de la excepción no
+viaja**: va al `logger`, con el `id` de la petición—.
+
+### Lo que este SDK hace por `async-nats` y no te dice
+
+- **Una petición denegada no falla rápido con `async-nats`**: el servidor descarta el mensaje y el `-ERR` solo aparece en
+  el evento de la conexión, mientras la petición espera su timeout (A-72). `connect()` escucha ese evento y `request` lo
+  compite con la respuesta: `PERMISSION_DENIED` en ~0,3 ms, no `RPC_TIMEOUT` a los 5 s. Configura el `logger`: una
+  respuesta denegada por falta de `allow_responses` no tiene otra salida (el log del dueño, con la pista).
+- **`no responders` exige `headers` y `no_responders` en CONNECT**: `async-nats` 0.50 los pone siempre
+  (`connector.rs`), y un test lo comprueba con un servidor de mentira que lee el CONNECT.
+- **La suscripción es al subject exacto** y su grupo de cola es el nombre del servicio. Dos instancias se reparten las
+  peticiones; **dos servicios** sobre la misma operación ejecutan los dos (por eso solo el dueño responde: lo hace
+  cumplir la ACL). Una segunda `respond` sobre la misma operación en un mismo `Bus` es `INVALID_RPC_CALL`.
+- **No hay una señal positiva de «el servidor aceptó mi suscripción»** (el `flush()` de `async-nats` solo vacía el
+  búfer, y el dueño no puede publicar nada con lo que provocar un viaje de ida y vuelta): `respond` espera el aviso de
+  denegación hasta 100 ms. Medido, llega en ~0,3 ms (p99 ~1 ms, A-90). Es el único temporizador fijo del módulo, y es
+  de arranque.
+- **Parar es `Responder::stop()` o `Bus::close()`** —que para los responders en orden antes de drenar—: cerrar la
+  conexión de golpe pierde lo que se atiende (A-62). **Hay un límite que la librería no deja cerrar**: el `drain` de
+  `async-nats` 0.50 retira la suscripción de su tabla sin esperar al `PONG`, así que, con latencia de red, **la
+  petición que ya viajaba hacia la instancia que se va se pierde** (quien llama ve `RPC_TIMEOUT`): medido con 5 ms
+  por sentido, ~10 peticiones por parada con carga continua de 16 llamantes (A-91). Los reintentos con el mismo `id`
+  son la compensación, y una parada con la instancia ya fuera del balanceo la evita.
+- **La cola de la suscripción es acotada** (65 536 mensajes en `async-nats`) y, llena, **descarta** (A-92): el SDK limita
+  los handlers a 256 por operación (`RespondOptions::with_max_concurrent`), el exceso espera en esa cola, y el `logger`
+  recibe un aviso (`DESCARTANDO mensajes`) si se llena —un responder desbordado no puede parecer sano—.
+
+### Métricas
+
+`flux_rpc_client_requests_total{operation,outcome}`, `flux_rpc_server_requests_total{operation,outcome}` y
+`flux_rpc_duration_seconds{operation,role}` ([08-observability.md §2.5](../specification/08-observability.md)):
+`operation` es el nombre de la operación (sin `rpc.`) y **nunca** el tenant, el `id` ni quién llama. Los errores de
+programación (`INVALID_RPC_CALL`, `RESERVED_DOMAIN`) no se cuentan. `MetricsSink` tiene tres métodos nuevos con
+implementación vacía por defecto: añadirlos no rompe a quien ya implementa el trait.
+
+### Funciones puras, para el arnés cruzado
+
+`rpc_subject`, `resolve_timeout_ms`, `build_rpc_request`, `build_rpc_reply` y `build_rpc_error` construyen los **bytes**
+exactos de `11-request-reply.md` §3.5 **sin reloj ni UUID propios** (`id` y `time` vienen dados): los tests unitarios
+los comparan con los cuatro ejemplos del fixture `cross-sdk-rpc-envelope.json`, con su longitud y su SHA-256, y el
+arnés (`rpc-request`, `rpc-reply`, `rpc-error`, `rpc-operation`, `rpc-timeout`) los reproduce igual que el de Node.
+
+### Permisos exactos
+
+[`tests/rpc.rs`](tests/rpc.rs) carga como **datos** la ACL de `conformance/cases/rpc-semantics.json` → `acls.rpc` en un
+`nats-server` real y ejecuta con ella el ciclo de aceptación de la fase: **dos instancias del dueño reparten las
+peticiones, al parar ambas quien llama recibe `RPC_UNAVAILABLE` en menos de 100 ms, sin una sola violación**, y quitar
+cada permiso se nota (`publish` y `subscribe` de quien llama, `subscribe` y `allow_responses` del dueño). El dueño
+necesita `rpc.<dominio>.>` y `allow_responses` —mejor `{ max: 1, expires: 30s }`: el SDK contesta una vez—; quien llama,
+el subject **exacto** de cada operación y `_INBOX.<servicio>.>`.
+
+### Diferencias con Node
+
+- **El handler recibe `(RpcRequest, RpcContext)`** y devuelve `Result<R: Serialize, HandlerError>`; el sobre de la
+  petición está en `ctx.event`. `request` devuelve el **sobre** de la respuesta (`Event`) y `data_as::<T>()` lo tipa.
+- **La versión mayor de la operación no tiene tope** (`v99999999999999999999`): el patrón de `protocol.json` no lo tiene y
+  aquí no pasa por un `u32` ni por un número de coma flotante.
+- **`time` se normaliza** en el arnés (recibe un instante, no una cadena), y `data` viaja **sin reordenar ni
+  renormalizar**: `4995.00`, `1E+2` o un entero mayor que 2^53 salen tal cual. Con un valor `Serialize` no se nota.
+- **El mensaje de un error se mide en caracteres**, como el `maxLength` de JSON Schema (mil emojis son 1000), no en
+  unidades UTF-16.
+
 ## Seguridad: permisos, inbox, TLS y credenciales
 
 [06-security.md §2 y §3](../specification/06-security.md). Lo que sigue **está ejecutado
@@ -1130,9 +1255,11 @@ reintentaría 51 minutos lo que nunca se va a arreglar.
 | `client.rs` | `connect`, `Bus::publish`, `Bus::subscribe`, `Bus::close`, `Bus::replay_from_dlq`, `TenantIsolation`, `Credentials` |
 | `security.rs` | `TlsOptions`; el registro de denegaciones del broker y la validación de credenciales y de errores de conexión |
 | `state.rs` | Estado replicado: `Bus::state()`, `State::{put, delete, get, watch}`, `StateEntry`, `StateWrite`, los constructores puros (`state_subject`, `build_state_event`, `build_state_tombstone`, `to_state_dlq_event`) y sus tests unitarios |
+| `rpc.rs` | Petición/respuesta: `Bus::request`/`Bus::respond`, `Responder`, `RequestOptions`, los constructores puros (`rpc_subject`, `build_rpc_request`, `build_rpc_reply`, `build_rpc_error`) y sus tests unitarios (los bytes de la spec, el algoritmo de quien responde con un entorno de mentira y el de quien llama con un transporte en memoria) |
 | `tests/cross_sdk.rs` | Los fixtures compartidos de `conformance/cases/`, sin broker |
 | `tests/integration.rs` | Conformidad contra un NATS real |
 | `tests/security.rs` | Seguridad contra un `nats-server` real con ACLs, TLS, nkey y modo operador/JWT |
+| `tests/rpc.rs` | Petición/respuesta contra un `nats-server` real con la ACL de `acls.rpc`: el ciclo de §12.9, la petición denegada, el dueño sin permiso, el acuse de un stream, la respuesta que no cabe, la parada ordenada, la firma y la ventana de 300 s, L3, y las medidas A-90 a A-92 (`-- --ignored`) |
 | `tests/state.rs` | Estado replicado contra un `nats-server` real: los escenarios de `state-semantics.json` como datos (un nodo y un cluster de tres), permisos exactos por rol, DLQ de estado, validación L3 y firma |
 
 ## Desarrollo
@@ -1177,7 +1304,8 @@ cargo test --all-features --test integration     # 17 tests contra NATS real
 Los de seguridad y los de estado no necesitan Docker: arrancan su propio `nats-server` (ver
 [Seguridad](#seguridad-permisos-inbox-tls-y-credenciales) y
 [Estado replicado](#estado-replicado)). Los de estado usan los puertos de `FLUX_TEST_PORT_BASE`
-(por defecto 4500) más 50, hasta 6 a la vez —el cluster de tres nodos—. `tests/state.rs` ejecuta,
+(por defecto 4500) más 50, hasta 6 a la vez —el cluster de tres nodos—; los de petición/respuesta, los de
+`FLUX_TEST_PORTS=desde-hasta` o, si no está, `FLUX_TEST_PORT_BASE` (por defecto 4750) más 50. `tests/state.rs` ejecuta,
 además de sus propios casos, **`conformance/cases/state-semantics.json` como datos** con la API del SDK.
 
 ```bash

@@ -2,7 +2,7 @@
   "case": "cross-sdk-rpc-envelope",
   "title": "Todos los SDKs construyen la misma petición, la misma respuesta y los mismos errores de rpc, byte a byte",
   "spec": "specification/11-request-reply.md §3, §3.5; specification/01-envelope.md §6",
-  "verifiedAgainst": "conformance/rpc-broker.mjs (reconstruye los bytes desde `event` y compara el SHA-256), JSON.stringify de Node y json.dumps(ensure_ascii=False, separators) de Python",
+  "verifiedAgainst": "conformance/rpc-broker.mjs (reconstruye los bytes desde `event` y compara el SHA-256), JSON.stringify de Node y json.dumps(ensure_ascii=False, separators) de Python, y conformance/cross-sdk.mjs: los arneses de Node y de Rust producen estos bytes, con este SHA-256 y esta longitud",
   "verifiedOn": "2026-11-26",
   "rationale": "Es la parte de la fase 3 que se compara byte a byte entre lenguajes, como cross-sdk-envelope.json y cross-sdk-state-envelope.json: la petición (con `subject` = aggregateId y `partitionkey`, y `correlationid` = su propio id al no nacer de otro evento), la respuesta (que HEREDA `correlationid`, `tenantid`, `subject` y `partitionkey` y cuyo `causationid` es el `id` de la petición) y los dos errores `com.flux.rpc.error.v1`: el de un handler y el que fabrica el SDK de quien responde. Un SDK que reordene claves, escape el no-ASCII (`Otoño`, `Campaña`, `petición`: UTF-8 literal, 01-envelope.md §1.1) o ponga `data` en otro sitio rompe el replay verbatim, la firma y la deduplicación por hash. Los vectores de la operación fijan qué es un nombre válido y el CÓDIGO estable de cada rechazo (`INVALID_RPC_CALL`, o `RESERVED_DOMAIN` si el dominio es reservado), y los del timeout el rango.",
   "attributeOrder": [
@@ -32,7 +32,7 @@
     "data"
   ],
   "harness": {
-    "$comment": "Las operaciones que el arnés cruzado (conformance/harness/README.md) debe aprender; ahora no existen y NINGÚN SDK declara `rpc` hasta que las ejecute. Todas son deterministas: id, time y traceparent vienen dados. `rpc-request` da `bytes` (base64) igual que `build`; `rpc-operation` da `{ok, subject}` o `{ok:false, code}`.",
+    "$comment": "Las cinco operaciones que el arnés cruzado (conformance/harness/README.md) implementa en cada SDK que declara `rpc` (hoy Node y Rust): conformance/cross-sdk.mjs las ejecuta con los `rpcVectors` de conformance/harness/vectors.json, que repiten los cuatro fixtures de aquí (con su SHA-256 y su longitud), los `subjectVectors` y los `timeoutVectors`, y ABORTA si dejan de coincidir con este caso, con specification/11-request-reply.md §3.5 o con protocol.json → rpc. Quien declara `rpc` y no tiene una operación FALLA; quien no la declara sale «N/A: no declara rpc». Todas son deterministas: id, time y traceparent vienen dados. `rpc-request`, `rpc-reply` y `rpc-error` dan `bytes` (base64) igual que `build`; `rpc-operation` da `{ok, subject}` o `{ok:false, code}`; `rpc-timeout` da `{ok, effectiveMs}` o `{ok:false, code}`.",
     "ops": {
       "rpc-request": "entrada: { operation, tenantId, aggregateId?, id, source, time, correlationid, producerversion, classification, traceparent?, data } → bytes de la petición",
       "rpc-reply": "entrada: { request: { operation, id, correlationid, tenantid, subject? }, id, source, time, producerversion, classification, traceparent?, data } → bytes de la respuesta: hereda correlationid, tenantid y subject de `request`, y causationid = request.id",

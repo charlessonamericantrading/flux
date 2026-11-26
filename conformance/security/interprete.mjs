@@ -15,6 +15,7 @@ import { randomUUID } from "node:crypto";
 
 import net from "node:net";
 
+import { EscenarioSdk, validarEscenario } from "./sdk-escenario.mjs";
 import {
   connect,
   dec,
@@ -39,8 +40,8 @@ import {
 const CAMPOS_COMUNES = ["op", "as", "id", "title", "note", "control", "onlyWith", "knownDeviation", "expect", "save"];
 
 /** Campos de un actor. Los de variante derivan los permisos de los que genera `gen-acl.mjs`. */
-const CAMPOS_ACTOR = ["service", "inbox", "without", "extraPublish", "extraSubscribe", "replaceSubscribe", "dev"];
-const CAMPOS_VARIANTE = ["without", "extraPublish", "extraSubscribe", "replaceSubscribe", "dev"];
+const CAMPOS_ACTOR = ["service", "inbox", "instance", "without", "withoutSubscribe", "extraPublish", "extraSubscribe", "replaceSubscribe", "allowResponses", "dev"];
+const CAMPOS_VARIANTE = ["without", "withoutSubscribe", "extraPublish", "extraSubscribe", "replaceSubscribe", "allowResponses", "dev"];
 
 /**
  * Valida un caso contra el vocabulario del propio JSON. Una errata en una clave NO puede
@@ -80,6 +81,7 @@ export function validarCaso(caso, vocabulario) {
     for (const k of def.args ?? []) {
       if (paso[k] === undefined) throw new Error(`${donde(i)} (${paso.op}): falta el argumento obligatorio «${k}»`);
     }
+    if (paso.op === "sdk_script") validarEscenario(paso, donde(i));
     if (def.needsActor && paso.as === undefined) {
       throw new Error(`${donde(i)} (${paso.op}): falta \`as\` (quién lo hace)`);
     }
@@ -121,9 +123,9 @@ function resolverRefs(valor, guardados) {
   return valor;
 }
 
-/** Todos los actores que un paso menciona (`as`, `spy`, `victim`). */
+/** Todos los actores que un paso menciona (`as`, `spy`, `victim`, `caller` y los `owners` de un ciclo). */
 export function actoresDe(paso) {
-  return ["as", "spy", "victim"].map((k) => paso[k]).filter((a) => a !== undefined);
+  return [...["as", "spy", "victim", "caller"].map((k) => paso[k]), ...(paso.owners ?? []), ...(paso.agents ?? []).map((a) => a.as)].filter((a) => a !== undefined);
 }
 
 // ─── Actores ─────────────────────────────────────────────────────────────────
@@ -146,12 +148,17 @@ export function claveVariante(a) {
 
 /**
  * Los permisos de una variante: los que genera `gen-acl.mjs` para el servicio, menos
- * `without`, más `extraPublish`/`extraSubscribe`, o `replaceSubscribe` en lugar de la
- * suscripción. `dev` parte de la salida de `gen-acl.mjs --dev`.
+ * `without` (publicación) y `withoutSubscribe` (suscripción), más `extraPublish`/`extraSubscribe`, o
+ * `replaceSubscribe` en lugar de la suscripción; y `allowResponses` cambia el `allow_responses` del dueño
+ * (`null` lo quita, `true` pone la forma desnuda, `{ max, expires }` otra distinta). `dev` parte de la salida de
+ * `gen-acl.mjs --dev`.
  *
  * Un permiso que se quita y no existe LANZA: una variante que no cambia nada pasaría las mismas
  * pruebas que el servicio sin tocar, y el caso diría haber probado una denegación que nunca
- * ocurrió.
+ * ocurrió. Lo mismo con quitar un `allow_responses` que el servicio no tiene.
+ *
+ * Una lista de suscripción que se quedara VACÍA por quitar permisos no deniega nada (`allow: []` es «sin restricción»,
+ * A-25): se escribe con un subject que nadie usa, `_INBOX.variante-sin-concesion.>`.
  */
 export function permisosDeVariante(a, { prod, dev }) {
   const base = (a.dev ? dev : prod).find((s) => s.name === a.service);
@@ -161,9 +168,23 @@ export function permisosDeVariante(a, { prod, dev }) {
       throw new Error(`la variante quita «${p}», que no está entre los permisos que genera gen-acl.mjs para ${a.service}:\n  ${base.publish.join("\n  ")}`);
     }
   }
+  for (const p of a.withoutSubscribe ?? []) {
+    if (!base.subscribe.includes(p)) {
+      throw new Error(`la variante quita la suscripción «${p}», que no está entre las que genera gen-acl.mjs para ${a.service}:\n  ${base.subscribe.join("\n  ")}`);
+    }
+  }
   const publish = base.publish.filter((p) => !(a.without ?? []).includes(p)).concat(a.extraPublish ?? []);
-  const subscribe = a.replaceSubscribe ?? base.subscribe.concat(a.extraSubscribe ?? []);
-  return { publish, subscribe };
+  let subscribe = a.replaceSubscribe ?? base.subscribe.filter((p) => !(a.withoutSubscribe ?? []).includes(p)).concat(a.extraSubscribe ?? []);
+  // (`replaceSubscribe: []` SÍ escribe la lista vacía: es lo que mide S14, que `allow: []` no deniega nada.)
+  if (a.replaceSubscribe === undefined && subscribe.length === 0) subscribe = ["_INBOX.variante-sin-concesion.>"];
+  let allowResponses = base.allowResponses ?? null;
+  if (a.allowResponses !== undefined) {
+    if (a.allowResponses === null && !base.allowResponses) {
+      throw new Error(`la variante quita el allow_responses de ${a.service}, que gen-acl.mjs no le concede: no cambiaría nada`);
+    }
+    allowResponses = a.allowResponses;
+  }
+  return { publish, subscribe, allowResponses };
 }
 
 // ─── Evaluar lo observado contra lo esperado ─────────────────────────────────
@@ -179,6 +200,10 @@ function coincide(esperado, real) {
     if ("gte" in esperado) return typeof real === "number" && real >= esperado.gte;
     if ("not" in esperado) return !coincide(esperado.not, real);
     if ("present" in esperado) return (real !== undefined && real !== null) === esperado.present;
+    // Sobre una LISTA de cadenas (el log de un SDK, las violaciones del servidor): alguna casa / ninguna casa.
+    if ("anyMatch" in esperado) return Array.isArray(real) && real.some((x) => new RegExp(esperado.anyMatch).test(String(x)));
+    if ("noneMatch" in esperado) return Array.isArray(real) && !real.some((x) => new RegExp(esperado.noneMatch).test(String(x)));
+    if ("in" in esperado) return esperado.in.some((e) => igual(e, real));
   }
   return igual(esperado, real);
 }
@@ -218,8 +243,42 @@ function expandir(valor, vars) {
   return valor;
 }
 
+/**
+ * Lo que ve quien llama cuando su petición de core NO recibe respuesta, con los nombres de 11-request-reply.md §4.3:
+ * `denied` (el broker deniega la publicación: ~1 ms con `@nats-io/*`, A-66), `no_responders` (estado 503: nadie
+ * escucha, A-56) o `timeout` (ni respuesta ni aviso). La denegación llega a veces en `cause` y a veces en el propio
+ * mensaje.
+ */
+export function clasificarPeticion(e) {
+  const texto = [...new Set([e?.message, e?.cause?.message].filter(Boolean))].join(" | ") || String(e);
+  const nombre = `${e?.name ?? ""} ${e?.cause?.name ?? ""}`;
+  if (/Permissions Violation/i.test(texto) || /PermissionViolation/.test(nombre)) return { outcome: "denied", text: texto };
+  if (/no responders/i.test(texto) || /NoResponders/.test(nombre)) return { outcome: "no_responders", text: texto };
+  if (/timeout/i.test(texto) || /Timeout/.test(nombre)) return { outcome: "timeout", text: texto };
+  return { outcome: "error", text: texto };
+}
+
 /** Una operación que no se puede ejecutar en este modo (p. ej. con `--acl`): no es un fallo. */
 export class Omitido extends Error {}
+
+/**
+ * La identidad (nkey o usuario) con la que entra un actor: la del servicio, la de `ops` o la de una VARIANTE suya con
+ * permisos estropeados a propósito. La comparten el intérprete (clientes en bruto) y los escenarios con SDKs reales.
+ */
+export function identidadDeActor(ctx, a) {
+  let ident;
+  if (a.service === "ops") {
+    ident = ctx.identidades.get("ops");
+  } else if (esVariante(a)) {
+    ident = ctx.variantes.get(claveVariante(a));
+    if (!ident) throw new Omitido("una variante de permisos necesita los que genera gen-acl.mjs (no aplica con --acl)");
+    if (ident.error) throw new Error(`no se pudo construir la variante: ${ident.error}`);
+  } else {
+    ident = ctx.identidades.get(a.service);
+    if (!ident) throw new Error(`el servicio «${a.service}» no está en el manifiesto`);
+  }
+  return ident;
+}
 
 // ─── El intérprete ───────────────────────────────────────────────────────────
 
@@ -250,7 +309,9 @@ export class Interprete {
     const pasos = [];
     try {
       for (const paso of caso.steps) {
-        pasos.push(await this.#ejecutarPaso(paso, estado));
+        // Un escenario con SDKs reales da un paso por cada paso de su guion (cada uno con su `expect`).
+        if (paso.op === "sdk_script") pasos.push(...(await this.#escenarioSdk(paso, estado)));
+        else pasos.push(await this.#ejecutarPaso(paso, estado));
       }
     } finally {
       for (const a of estado.actores.values()) await a.nc.close().catch(() => {});
@@ -259,6 +320,19 @@ export class Interprete {
     const omitidos = pasos.filter((p) => p.omitido).length;
     // Un caso con TODOS los pasos omitidos no ha comprobado nada: se dice, no se da por bueno.
     return { id: caso.id, ok, pasos, omitidos, omitido: omitidos === pasos.length ? "todos los pasos omitidos" : undefined };
+  }
+
+  /** `sdk_script`: ver `sdk-escenario.mjs`. */
+  async #escenarioSdk(paso, estado) {
+    if (paso.onlyWith === "generated-acl" && !this.ctx.generada) {
+      return [{ id: paso.id, descripcion: paso.title ?? "sdk_script", ok: true, omitido: "necesita los permisos que genera gen-acl.mjs (no aplica con --acl)" }];
+    }
+    const escenario = new EscenarioSdk(this.ctx, identidadDeActor, normalizarActor);
+    try {
+      return await escenario.ejecutar(expandir(paso, { marker: estado.marker }), { marker: estado.marker, evaluar });
+    } catch (e) {
+      return [{ id: paso.id, descripcion: paso.title ?? "sdk_script", ok: false, observado: { outcome: "error" }, fallos: [e?.message ?? String(e)] }];
+    }
   }
 
   async #ejecutarPaso(paso, estado) {
@@ -301,6 +375,11 @@ export class Interprete {
       pull: () => `pull ${p.stream}/${p.durable}`,
       ack: () => `${p.kind ?? "ack"}`,
       consumer_state: () => `consumer_state ${p.stream}/${p.durable}`,
+      rpc_call: () => `rpc_call ${p.subject}`,
+      rpc_exchange: () =>
+        `rpc_exchange ${p.subject}: [${etiquetaActor(p.caller)}] llama, [${p.as !== undefined ? etiquetaActor(p.as) : "nadie"}] atiende` +
+        `${p.replies ? ` (respuestas: ${p.replies.map((r) => `${r.afterMs ?? 0} ms${r.to ? ` a ${r.to}` : ""}`).join(", ")})` : ""}`,
+      rpc_cycle: () => `rpc_cycle ${p.subject}: ${p.requests} peticiones a ${p.owners.length} instancias de ${normalizarActor(p.owners[0]).service}`,
       violations: () => `violations`,
       leak_probe: () => `leak_probe espía [${etiquetaActor(p.spy)}] suscrito a ${p.subscribe.join(", ")}; víctima [${etiquetaActor(p.victim)}] lee ${p.reads.durable}`,
       sdk_cycle: () => `sdk_cycle ${p.sdk}: ${p.producer} → ${p.consumer} (${p.subject})`,
@@ -316,17 +395,7 @@ export class Interprete {
     const clave = JSON.stringify(a);
     if (estado.actores.has(clave)) return estado.actores.get(clave);
 
-    let ident;
-    if (a.service === "ops") {
-      ident = this.ctx.identidades.get("ops");
-    } else if (esVariante(a)) {
-      ident = this.ctx.variantes.get(claveVariante(a));
-      if (!ident) throw new Omitido("una variante de permisos necesita los que genera gen-acl.mjs (no aplica con --acl)");
-      if (ident.error) throw new Error(`no se pudo construir la variante: ${ident.error}`);
-    } else {
-      ident = this.ctx.identidades.get(a.service);
-      if (!ident) throw new Error(`el servicio «${a.service}» no está en el manifiesto`);
-    }
+    const ident = identidadDeActor(this.ctx, a);
     const inbox = a.inbox ?? (a.service === "ops" ? "default" : "private");
     const inboxPrefix = inbox === "default" ? undefined : inbox === "private" ? `_INBOX.${a.service}` : inbox;
     const nc = await conectar(this.ctx.url, {
@@ -336,7 +405,7 @@ export class Interprete {
       tls: { caFile: this.ctx.caFile },
       etiqueta: "flux-security",
     });
-    const actor = { nc, nombre: a.service, ultimo: null };
+    const actor = { nc, nombre: a.service, ultimo: null, inboxPrefix };
     estado.actores.set(clave, actor);
     return actor;
   }
@@ -362,7 +431,7 @@ export class Interprete {
       case "subscribe": {
         const a = await this.#actor(p.as, estado);
         const antes = a.nc.violaciones.length;
-        const sub = a.nc.subscribe(p.subject);
+        const sub = a.nc.subscribe(p.subject, p.queue ? { queue: p.queue } : undefined);
         await a.nc.flush();
         await sleep(250);
         const nuevas = a.nc.violaciones.slice(antes);
@@ -478,6 +547,15 @@ export class Interprete {
 
       case "leak_probe":
         return this.#leakProbe(p, estado);
+
+      case "rpc_call":
+        return this.#rpc(p, estado, { quienLlama: p.as, dueño: null });
+
+      case "rpc_exchange":
+        return this.#rpc(p, estado, { quienLlama: p.caller, dueño: p.as === undefined ? null : await this.#actor(p.as, estado) });
+
+      case "rpc_cycle":
+        return this.#cicloRpc(p, estado);
 
       default:
         throw new Error(`la operación «${p.op}» no la ejecuta el intérprete`);
@@ -611,6 +689,201 @@ export class Interprete {
   }
 
   /**
+   * Una petición/respuesta de extremo a extremo, con lo que haría un SDK `rpc` pero SIN ningún SDK de flux
+   * (11-request-reply.md §4 y §5): el dueño (`as`, si lo hay) se suscribe al subject EXACTO de la operación con su
+   * nombre de servicio como grupo de cola y responde según `replies`; quien llama (`caller`, o `as` en `rpc_call`)
+   * pide por core con su inbox privado.
+   *
+   * `watchInbox`: `other-connection` (por defecto) cuenta por otra conexión; `same-connection`, por la misma, que es la trampa.
+   *
+   * `replies` es el PLAN de respuestas del dueño a cada petición: `{ afterMs, to }`, y por cada entrada publica un
+   * mensaje (`to` es el `reply` de la petición por defecto). Con dos entradas contesta DOS veces: es como se prueba
+   * `allow_responses: { max: 1 }`. Que el broker deniegue una publicación no lanza nada: el aviso llega por la
+   * conexión (A-19, A-28), y por eso se cuentan los `-ERR` del dueño (`ownerDenied`).
+   *
+   * Observa lo que ve quien llama (`outcome`: answered | denied | no_responders | timeout), cuántas respuestas
+   * llegaron DE VERDAD a su inbox (`delivered`, con una suscripción propia a su inbox privado), si el dueño pudo
+   * suscribirse (`subscription`) y qué leyó un espía, si lo hay (`leaked`, y qué suscripciones suyas denegó el broker:
+   * `spySubscriptions`).
+   */
+  async #rpc(p, estado, { quienLlama, dueño }) {
+    const llamante = await this.#actor(quienLlama, estado);
+    const marca = `SECRETO-${randomUUID()}`;
+    const planes = p.replies ?? [{ afterMs: 0 }];
+    const limpiar = [];
+    const o = { recibidas: 0, suscripcion: "none" };
+
+    // El dueño escucha EXACTAMENTE la operación, en su grupo de cola (el SDK no se suscribe al comodín: A-64).
+    let violacionesDueño0 = 0;
+    if (dueño) {
+      violacionesDueño0 = dueño.nc.violaciones.length;
+      const sub = dueño.nc.subscribe(p.subject, { queue: p.queue ?? dueño.nombre });
+      limpiar.push(() => sub.unsubscribe());
+      (async () => {
+        try {
+          for await (const m of sub) {
+            o.recibidas++;
+            if (!m.reply) continue;
+            planes.forEach((r, i) => {
+              setTimeout(() => {
+                try {
+                  dueño.nc.publish(r.to ?? m.reply, enc.encode(JSON.stringify({ n: i + 1, marker: marca })));
+                } catch {
+                  /* la conexión ya se cerró */
+                }
+              }, r.afterMs ?? 0);
+            });
+          }
+        } catch {
+          /* suscripción denegada: el iterador lanza (A-8f) */
+        }
+      })();
+      await dueño.nc.flush();
+      await sleep(250);
+      o.suscripcion = dueño.nc.violaciones.slice(violacionesDueño0).some((v) => v.includes(`Subscription to "${p.subject}"`)) ? "denied" : "permitted";
+    }
+
+    // Un espía, si lo hay, mira lo que se le pida mientras tanto (A-71).
+    const visto = [];
+    let suscripcionesEspia;
+    if (p.spy !== undefined) {
+      const espia = await this.#actor(p.spy, estado);
+      const antes = espia.nc.violaciones.length;
+      for (const subject of p.spySubscribe ?? []) vigilar(espia.nc.subscribe(subject), marca, visto);
+      await espia.nc.flush();
+      await sleep(300);
+      const nuevas = espia.nc.violaciones.slice(antes);
+      suscripcionesEspia = Object.fromEntries((p.spySubscribe ?? []).map((s) => [s, nuevas.some((v) => v.includes(`Subscription to "${s}"`)) ? "denied" : "permitted"]));
+    }
+
+    // Cuántas respuestas llegan DE VERDAD al inbox de quien llama: una suscripción a su inbox privado, que su ACL
+    // permite, las ve todas. Va por OTRA conexión con la misma identidad: una segunda suscripción de la MISMA conexión que
+    // case con el `reply` (`_INBOX.<servicio>.>`) hace que el 503 de `no responders` no llegue a la librería y se
+    // convierta en un timeout (medido, A-101). `watchInbox: "same-connection"` lo hace a propósito, para observarlo.
+    let entregadas = 0;
+    const cuenta = p.watchInbox === "same-connection" ? llamante : await this.#actor({ ...normalizarActor(quienLlama), instance: "contador" }, estado);
+    const contador = cuenta.nc.subscribe(cuenta.inboxPrefix ? `${cuenta.inboxPrefix}.>` : "_INBOX.>");
+    limpiar.push(() => contador.unsubscribe());
+    (async () => {
+      try {
+        for await (const m of contador) if (dec.decode(m.data).includes(marca)) entregadas++;
+      } catch {
+        /* suscripción denegada (una variante sin su inbox) */
+      }
+    })();
+    await cuenta.nc.flush();
+    await sleep(150);
+
+    // La petición.
+    const v0 = llamante.nc.violaciones.length;
+    const t0 = Date.now();
+    let resultado;
+    try {
+      const r = await llamante.nc.request(p.subject, enc.encode(JSON.stringify(p.body ?? { marker: marca })), { timeout: p.timeoutMs ?? 1500 });
+      let json = null;
+      try {
+        json = JSON.parse(dec.decode(r.data));
+      } catch {
+        /* no era JSON */
+      }
+      resultado = { outcome: "answered", reply: json, text: "" };
+    } catch (e) {
+      resultado = clasificarPeticion(e);
+    }
+    const ms = Date.now() - t0;
+
+    // Lo que el dueño aún tenga que contestar (un plan con respuestas tardías) y lo que viaja.
+    const hasta = Math.max(0, ...planes.map((r) => r.afterMs ?? 0)) + 500;
+    if (dueño && hasta > ms) await sleep(hasta - ms);
+    else await sleep(300);
+
+    const deDueño = dueño ? dueño.nc.violaciones.slice(violacionesDueño0) : [];
+    const denegadas = deDueño.filter((v) => /Publish to "_INBOX\./.test(v));
+    for (const f of limpiar) f();
+    return {
+      outcome: resultado.outcome,
+      text: resultado.text,
+      reply: resultado.reply ?? null,
+      ms,
+      delivered: entregadas,
+      received: o.recibidas,
+      subscription: o.suscripcion,
+      ownerDenied: denegadas.length,
+      ownerViolations: deDueño.join(" | "),
+      callerViolations: llamante.nc.violaciones.slice(v0).join(" | "),
+      leaked: visto.length > 0,
+      via: [...new Set(visto)],
+      spySubscriptions: suscripcionesEspia,
+    };
+  }
+
+  /**
+   * El ciclo de la aceptación de la Fase 3 (11-request-reply.md §12.9) con permisos generados y SIN SDK: varias
+   * instancias del dueño (cada una, su conexión con la misma identidad) atienden la operación en el mismo grupo de
+   * cola; `requests` peticiones CONCURRENTES las reparten y cada una recibe UNA respuesta; después las instancias
+   * dejan de escuchar (UNSUB y flush, que es lo que hace el drenaje) y la siguiente petición da `no responders`
+   * al instante. Ejecuta `allow_responses` con muchas respuestas a la vez: ninguna se deniega.
+   */
+  async #cicloRpc(p, estado) {
+    const llamante = await this.#actor(p.caller, estado);
+    const dueños = await Promise.all(p.owners.map((o) => this.#actor(o, estado)));
+    const marca = `CICLO-${randomUUID()}`;
+    const porInstancia = dueños.map(() => 0);
+    const antes = dueños.map((d) => d.nc.violaciones.length);
+    const subs = dueños.map((d, i) => {
+      const sub = d.nc.subscribe(p.subject, { queue: d.nombre });
+      (async () => {
+        try {
+          for await (const m of sub) {
+            porInstancia[i]++;
+            if (m.reply) d.nc.publish(m.reply, enc.encode(JSON.stringify({ instancia: i, marker: marca })));
+          }
+        } catch {
+          /* suscripción denegada */
+        }
+      })();
+      return sub;
+    });
+    await Promise.all(dueños.map((d) => d.nc.flush()));
+    await sleep(250);
+
+    const peticiones = await Promise.all(
+      Array.from({ length: p.requests }, async () => {
+        try {
+          const r = await llamante.nc.request(p.subject, enc.encode(JSON.stringify({ marker: marca })), { timeout: p.timeoutMs ?? 3000 });
+          return JSON.parse(dec.decode(r.data)).marker === marca ? "answered" : "wrong";
+        } catch (e) {
+          return clasificarPeticion(e).outcome;
+        }
+      }),
+    );
+    await sleep(300);
+    const denegadas = dueños.flatMap((d, i) => d.nc.violaciones.slice(antes[i])).filter((v) => /Publish to "_INBOX\./.test(v));
+
+    // Parar: dejar de escuchar, y comprobar que el servidor lo ha procesado (el PONG llega tras el UNSUB).
+    for (const sub of subs) sub.unsubscribe();
+    await Promise.all(dueños.map((d) => d.nc.flush()));
+    const t0 = Date.now();
+    let parado;
+    try {
+      await llamante.nc.request(p.subject, enc.encode(JSON.stringify({ marker: marca })), { timeout: 2000 });
+      parado = { outcome: "answered" };
+    } catch (e) {
+      parado = clasificarPeticion(e);
+    }
+    return {
+      outcome: "ok",
+      answered: peticiones.filter((x) => x === "answered").length,
+      failed: peticiones.filter((x) => x !== "answered").length,
+      byInstance: porInstancia,
+      minShare: Math.min(...porInstancia),
+      ownerDenied: denegadas.length,
+      stopOutcome: parado.outcome,
+      stopMs: Date.now() - t0,
+    };
+  }
+
+  /**
    * El escenario de A-2 / A-22: un espía se suscribe a lo que el generador no le concede
    * mientras una víctima LEGÍTIMA consume por pull. Si el espía recibe el contenido, hay fuga.
    * La víctima puede ser `ops` con el prefijo de inbox de otro servicio: lo que importa de ella
@@ -656,7 +929,10 @@ export const etiquetaActor = (as) => {
   const a = typeof as === "string" ? { service: as } : as;
   if (!a) return "?";
   const extras = [
+    a.instance !== undefined && `instancia ${a.instance}`,
     a.without?.length && `sin ${a.without.length} permiso(s)`,
+    a.withoutSubscribe?.length && `sin ${a.withoutSubscribe.length} suscripción(es)`,
+    a.allowResponses !== undefined && `allow_responses=${JSON.stringify(a.allowResponses)}`,
     a.extraPublish?.length && `+${a.extraPublish.length} publish`,
     a.extraSubscribe?.length && `+${a.extraSubscribe.length} subscribe`,
     a.replaceSubscribe && `subscribe=${JSON.stringify(a.replaceSubscribe)}`,

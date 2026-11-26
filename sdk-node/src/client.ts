@@ -42,8 +42,16 @@ import {
 import { ErrorClass, PoisonError, type Classification } from "./errors.js";
 import { ConsumerConfigMismatchError, TenantIsolationError } from "./client-errors.js";
 import { StateClient } from "./state.js";
-import { createClassifier, type ClassifierOptions } from "./classify.js";
+import {
+  RpcClient,
+  type RequestOptions,
+  type RespondOptions,
+  type Responder,
+  type RpcHandler,
+} from "./rpc.js";
+import { createClassifier, createDetailedClassifier, type ClassifierOptions } from "./classify.js";
 import { NO_METRICS, type MetricsSink } from "./metrics.js";
+import { truncateUtf8Bytes } from "./text.js";
 import {
   createSigner,
   createVerifier,
@@ -56,6 +64,7 @@ import {
   schemaUriFor,
   SchemaValidationError,
   type ValidationOptions,
+  type Validator,
 } from "./validation.js";
 import {
   contextFromEvent,
@@ -240,11 +249,12 @@ export class FluxBus {
   readonly #jsm: JetStreamManager;
   readonly #opts: ConnectOptions;
   readonly #classify: (e: unknown) => Classification;
+  readonly #classifyDetailed: (e: unknown) => { classification: Classification; recognized: boolean };
   readonly #source: string;
   readonly #metrics: MetricsSink;
   readonly #subscriptions = new Set<{ stop: () => void }>();
   readonly #ensured = new Set<string>();
-  #validate: ((e: FluxEvent, subject: string) => void) | null = null;
+  #validate: Validator | null = null;
   #signer: Signer | null = null;
   #verifier: Verifier | null = null;
   /** Código del último fallo de firma, para que #dispatch sepa clasificar. */
@@ -254,6 +264,11 @@ export class FluxBus {
    * normalizado. Ver #watchPermissionViolations.
    */
   readonly #denied = new Map<string, "publish" | "subscribe">();
+  /**
+   * Quien espera una respuesta y quiere enterarse si el broker le deniega PUBLICAR en su subject, por subject EXACTO
+   * (sin normalizar). Ver `#watchDenied`.
+   */
+  readonly #denialWaiters = new Map<string, Set<(subject: string) => void>>();
 
   /**
    * Estado replicado — la capacidad `state` (specification/10-state.md): `put`, `delete`, `get`
@@ -261,6 +276,12 @@ export class FluxBus {
    * sustituye a `GET /clientes/123`, a la carga inicial y al polling de datos.
    */
   readonly state: StateClient;
+
+  /**
+   * Petición/respuesta — la capacidad `rpc` (specification/11-request-reply.md): `request` y `respond`.
+   * Se expone como los métodos del bus (`bus.request`, `bus.respond`), no como un sub-objeto.
+   */
+  readonly #rpc: RpcClient;
 
   constructor(
     nc: NatsConnection,
@@ -273,6 +294,7 @@ export class FluxBus {
     this.#jsm = jsm;
     this.#opts = opts;
     this.#classify = createClassifier(opts.classifier);
+    this.#classifyDetailed = createDetailedClassifier(opts.classifier);
     this.#source = sourceUri(opts.environment, opts.service);
     this.#metrics = opts.metrics ?? NO_METRICS;
     this.#metrics.connectionState(1);
@@ -303,6 +325,24 @@ export class FluxBus {
         return () => void this.#subscriptions.delete(entry);
       },
     });
+    this.#rpc = new RpcClient({
+      nc,
+      options: opts,
+      source: this.#source,
+      metrics: this.#metrics,
+      classify: (e) => this.#classifyDetailed(e),
+      validator: () => this.#validate,
+      signer: () => this.#signer,
+      verify: (event) => {
+        this.#pendingSignatureFailure = null;
+        this.#verifier?.check(event); // `require` lanza; `warn` solo anota el fallo
+        const fallo = this.#pendingSignatureFailure;
+        this.#pendingSignatureFailure = null;
+        return fallo;
+      },
+      watchDenied: (subject) => this.#watchDenied(subject),
+      now: () => Date.now(),
+    });
   }
 
   /**
@@ -323,6 +363,8 @@ export class FluxBus {
           if (s.type !== "error") continue;
           const v = permissionViolation(s.error);
           if (!v) continue;
+          // Quien espera una respuesta se entera ANTES de la deduplicación: cada petición denegada necesita su aviso.
+          if (v.operation === "publish") for (const avisa of this.#denialWaiters.get(v.subject) ?? []) avisa(v.subject);
           const subject = normalizeDeniedSubject(v.subject);
           if (this.#denied.has(subject)) continue; // se avisa una vez por subject
           this.#denied.set(subject, v.operation);
@@ -332,7 +374,10 @@ export class FluxBus {
             ? " Sin permiso de ack, cada evento se procesa y se REENTREGA cada ack_wait, sin fin y sin error."
             : subject.startsWith("$JS.API.CONSUMER.MSG.NEXT.")
               ? " Sin permiso de pull, el consumidor no recibe nada y parece sano."
-              : "";
+              : subject.startsWith("_INBOX.") && v.operation === "publish"
+                ? " Es la RESPUESTA a una petición: sin `allow_responses` en su ACL el dueño no puede contestar, y quien llama solo" +
+                  " verá un timeout (RPC_TIMEOUT). Acótalo: `{ max: 1, expires: 30s }` (11-request-reply.md §7.2)."
+                : "";
           this.#opts.logger?.error(
             `[flux] el broker denegó ${v.operation === "publish" ? "publicar en" : "suscribirse a"} ` +
               `"${subject}" a "${this.#opts.service}": falta ese permiso en su ACL.${efecto} ` +
@@ -343,6 +388,75 @@ export class FluxBus {
         // El iterador termina con la conexión; no hay nada que vigilar después.
       }
     })();
+  }
+
+  /**
+   * Un aviso para quien espera una respuesta: se rechaza con `PERMISSION_DENIED` si el broker deniega PUBLICAR en `subject`.
+   * Con `@nats-io/*` la propia petición ya falla en ~1 ms (A-66) y esto no hace falta; con una librería que no entrega la
+   * denegación —`async-nats`, A-72— quien llama solo vería un timeout (RETRYABLE), y el handler que llama reintentaría
+   * 51 minutos algo que nunca va a funcionar. El SDK DEBE escuchar el `-ERR` y competirlo con la respuesta (06-security.md
+   * §3.7, 11-request-reply.md §7.1).
+   */
+  #watchDenied(subject: string): { promise: Promise<never>; cancel(): void } {
+    let avisa: ((s: string) => void) | undefined;
+    const promise = new Promise<never>((_, reject) => {
+      avisa = (denegado) =>
+        reject(
+          new PermissionDeniedError(this.#opts.service, "publish", denegado, {
+            hint:
+              `Quien llama necesita permiso de PUBLICACIÓN sobre el subject EXACTO de cada operación concedida (nunca \`rpc.>\` ni ` +
+              `\`rpc.<dominio>.>\`): es la clave \`calls\` del manifiesto de \`gen-acl.mjs\`. La petición se descartó y el broker ` +
+              `lo avisó aparte (11-request-reply.md §7.1).`,
+          }),
+        );
+    });
+    // Si nadie compite con ella, no debe terminar como «rechazo sin atender».
+    promise.catch(() => {});
+    const waiters = this.#denialWaiters.get(subject) ?? new Set();
+    this.#denialWaiters.set(subject, waiters);
+    waiters.add(avisa!);
+    return {
+      promise,
+      cancel: () => {
+        waiters.delete(avisa!);
+        if (waiters.size === 0 && this.#denialWaiters.get(subject) === waiters) this.#denialWaiters.delete(subject);
+      },
+    };
+  }
+
+  // ─── petición/respuesta ────────────────────────────────────────────────────
+
+  /**
+   * Una **orden** o un **cálculo** con respuesta inmediata a otro servicio (specification/11-request-reply.md). Resuelve con
+   * el `data` de la respuesta; un error del que responde se lanza como `RetryableError` o `PermanentError` con su `code`,
+   * de modo que un handler de eventos que llama a una operación hereda la clasificación sin hacer nada.
+   *
+   * ```ts
+   * const r = await bus.request("clientes.cliente.v1.calcular-descuento",
+   *   { clienteId: "cli-1", totalCents: 9990, moneda: "EUR" }, { timeoutMs: 2000, aggregateId: "cli-1" });
+   * ```
+   *
+   * **Si lo que pides es un dato que otro sistema guarda, es estado** (`bus.state.get` / `watch`), no una petición.
+   * `RPC_TIMEOUT` **no** dice que la operación no se ejecutó: quien responde deduplica por el `id` de la petición.
+   */
+  request<R = Record<string, unknown>>(operation: string, data: object, options?: RequestOptions): Promise<R> {
+    return this.#rpc.request<R>(operation, data, options);
+  }
+
+  /**
+   * Atiende una operación: una suscripción al subject EXACTO, con el nombre del servicio como grupo de cola (dos instancias se
+   * reparten las peticiones). El handler recibe `(petición, ctx)` y devuelve el resultado; lanzar `PermanentError` o
+   * `RetryableError` responde un error. **Deduplica por `ctx.id`**: una orden puede llegar dos veces.
+   *
+   * Falla con `PERMISSION_DENIED` si la ACL no concede la suscripción: un dueño sin permiso parecería un servicio caído.
+   * Devuelve un `Responder`; `stop()` para de forma ordenada (`bus.close()` también).
+   */
+  respond<Req = Record<string, unknown>, Res extends object = Record<string, unknown>>(
+    operation: string,
+    handler: RpcHandler<Req, Res>,
+    options?: RespondOptions,
+  ): Promise<Responder> {
+    return this.#rpc.respond<Req, Res>(operation, handler, options);
   }
 
   // ─── publish ───────────────────────────────────────────────────────────────
@@ -852,7 +966,7 @@ export class FluxBus {
       dlqreason: "poison" as const,
       dlqattempts: 1,
       dlqconsumer: consumer,
-      dlqerror: error.slice(0, 1024),
+      dlqerror: truncateUtf8Bytes(error, 1024),
       dlqtime: new Date().toISOString(),
       data: {
         originalSubject: subject,
@@ -954,6 +1068,9 @@ export class FluxBus {
   }
 
   async close(): Promise<void> {
+    // Primero los responders: dejar de escuchar, esperar a lo que está en vuelo y SOLO entonces cerrar. Un `drain()` de la
+    // conexión con un handler en vuelo pierde su respuesta (la publicación lanza `closed connection`: A-62, A-83).
+    await this.#rpc.stopAll();
     for (const s of this.#subscriptions) s.stop();
     this.#subscriptions.clear();
     this.#metrics.connectionState(0);
@@ -962,19 +1079,20 @@ export class FluxBus {
 }
 
 /**
- * Conecta al bus. Reconecta indefinidamente con backoff y jitter: sin jitter, mil
- * servicios reconectan en el mismo milisegundo y tiran el cluster que acaba de
- * levantarse — 03-delivery.md §6.
+ * Las opciones que `connect()` le pasa a la librería de NATS. Todo lo que se puede comprobar sin red se comprueba
+ * AQUÍ, ANTES de dialar: un valor mal formado debe fallar con su nombre, y no degradarse a «sin credenciales» o a «sin
+ * TLS» —que es lo que pasaba con `credentials.creds`—.
+ *
+ * Aparte de `connect()` para que se pueda comprobar QUÉ pide la conexión: la petición/respuesta necesita que la librería
+ * anuncie `headers` y `no_responders` en CONNECT, y sin ellos `RPC_UNAVAILABLE` es un timeout (A-57). La librería los
+ * pone sola cuando el servidor dice `headers: true` en su INFO, y no hay opción para quitarlos (A-79).
  */
-export async function connect(options: ConnectOptions): Promise<FluxBus> {
-  // Todo lo que se puede comprobar sin red se comprueba ANTES de dialar: un valor mal
-  // formado debe fallar aquí, con su nombre, y no degradarse a «sin credenciales» o a
-  // «sin TLS» — que es lo que pasaba con `credentials.creds`.
+export function natsOptionsFor(options: ConnectOptions): ConnectionOptions {
   const inboxPrefix = inboxPrefixFor(options.service);
   const authenticator = buildAuthenticator(options.credentials);
   const tls = buildTls(options.tls);
 
-  const natsOptions: ConnectionOptions = {
+  return {
     servers: options.servers,
     name: `${options.service}@${options.environment}`,
     maxReconnectAttempts: -1,
@@ -986,8 +1104,15 @@ export async function connect(options: ConnectOptions): Promise<FluxBus> {
     ...(authenticator && { authenticator }),
     ...(tls && { tls }),
   };
+}
 
-  const nc = await connectWhenAvailable(natsOptions);
+/**
+ * Conecta al bus. Reconecta indefinidamente con backoff y jitter: sin jitter, mil
+ * servicios reconectan en el mismo milisegundo y tiran el cluster que acaba de
+ * levantarse — 03-delivery.md §6.
+ */
+export async function connect(options: ConnectOptions): Promise<FluxBus> {
+  const nc = await connectWhenAvailable(natsOptionsFor(options));
   try {
     const jsm = await jetstreamManager(nc);
     const js = jetstream(nc);

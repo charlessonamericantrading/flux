@@ -9,6 +9,8 @@
 
 import { c, OK, FAIL, WARN, fmtDuration, table } from "./ui.mjs";
 import { auditarDlqDeEstado, auditarDurableEstado, auditarStreamEstado, dominioDeStream } from "./doctor-state.mjs";
+import { auditarStreamsRpc } from "./doctor-rpc.mjs";
+import { solapan } from "./rpc-model.mjs";
 
 const S = 1e9;
 
@@ -23,17 +25,31 @@ const SUBJECT_RE =
   /^[a-z0-9]+(-[a-z0-9]+)*\.[a-z0-9]+(-[a-z0-9]+)*\.v[1-9][0-9]*\.[a-z0-9]+(-[a-z0-9]+)*$/;
 const DURABLE_RE = /^[a-z0-9]+(-[a-z0-9]+)*__[a-z0-9_]+$/;
 
-export async function doctor(jsm, { verbose } = {}) {
+/**
+ * `json`: no imprime nada (lo hace quien llama con el resultado): la salida de una máquina no
+ * lleva tablas ni colores mezclados con el JSON.
+ */
+export async function doctor(jsm, { verbose, json } = {}) {
+  const out = json ? () => {} : (...a) => console.log(...a);
   const findings = [];
-  const add = (level, target, message, hint) =>
-    findings.push({ level, target, message, hint });
+  const add = (level, target, message, hint, extra) =>
+    findings.push({ level, target, message, hint, ...extra });
 
   const streams = [];
   for await (const s of jsm.streams.list()) streams.push(s);
 
+  // Petición/respuesta (11-request-reply.md §8): ningún stream captura una operación. Va PRIMERO y
+  // aunque no haya streams: «ninguno captura» es la respuesta correcta a una account vacía.
+  const rpc = auditarStreamsRpc(streams);
+  for (const f of rpc.findings) {
+    const { level, target, message, hint, ...extra } = f;
+    add(level, target, message, hint, extra);
+  }
+
   if (streams.length === 0) {
-    console.log(`${WARN} No hay streams en este servidor.`);
-    return { findings, streams: 0, consumers: 0 };
+    out(`${WARN} No hay streams en este servidor.`);
+    seccionRpc(out, rpc);
+    return { findings, streams: 0, consumers: 0, rpc };
   }
 
   const evtStreams = streams.filter((s) => s.config.name.startsWith("EVT_"));
@@ -47,7 +63,7 @@ export async function doctor(jsm, { verbose } = {}) {
   );
 
   // ─── Streams ───────────────────────────────────────────────────────────────
-  console.log(c.bold("\nStreams"));
+  out(c.bold("\nStreams"));
 
   for (const s of streams) {
     const n = s.config.name;
@@ -119,7 +135,7 @@ export async function doctor(jsm, { verbose } = {}) {
     }
   }
 
-  console.log(
+  out(
     table(
       streams.map((s) => [
         s.config.name,
@@ -159,7 +175,7 @@ export async function doctor(jsm, { verbose } = {}) {
   }
 
   // ─── Consumidores ──────────────────────────────────────────────────────────
-  console.log(c.bold("\nConsumidores"));
+  out(c.bold("\nConsumidores"));
   const rows = [];
   let nConsumers = 0;
 
@@ -254,7 +270,7 @@ export async function doctor(jsm, { verbose } = {}) {
     }
   }
 
-  console.log(
+  out(
     rows.length
       ? table(rows, ["STREAM", "DURABLE", "ACK", "ACK_WAIT", "MAX_DEL", "PEND", "ESTADO"])
       : c.gray("  (ninguno)"),
@@ -263,9 +279,9 @@ export async function doctor(jsm, { verbose } = {}) {
   // ─── DLQ ───────────────────────────────────────────────────────────────────
   const conMuertos = dlqStreams.filter((d) => d.state.messages > 0);
   if (conMuertos.length) {
-    console.log(c.bold("\nDLQ"));
+    out(c.bold("\nDLQ"));
     for (const d of conMuertos) {
-      console.log(
+      out(
         `  ${c.yellow(String(d.state.messages).padStart(6))} en ${d.config.name}  ${c.gray(
           `flux dlq ls ${d.config.name.slice(4).toLowerCase()}`,
         )}`,
@@ -279,46 +295,50 @@ export async function doctor(jsm, { verbose } = {}) {
     }
   }
 
+  // ─── Petición/respuesta ────────────────────────────────────────────────────
+  seccionRpc(out, rpc);
+
   // ─── Resumen ───────────────────────────────────────────────────────────────
   const errores = findings.filter((f) => f.level === "error");
   const avisos = findings.filter((f) => f.level === "warn");
   const infos = findings.filter((f) => f.level === "info");
 
-  console.log(c.bold("\nDiagnóstico"));
+  out(c.bold("\nDiagnóstico"));
   for (const f of [...errores, ...avisos, ...(verbose ? infos : [])]) {
     const icon = { error: FAIL, warn: WARN, info: c.blue("i") }[f.level];
-    console.log(`  ${icon} ${c.bold(f.target)}  ${f.message}`);
-    if (f.hint) console.log(`      ${c.gray(f.hint)}`);
+    out(`  ${icon} ${c.bold(f.target)}  ${f.message}`);
+    // Un hint puede ocupar varias líneas (qué hace el hallazgo / cómo se arregla): se sangran todas.
+    for (const linea of f.hint ? f.hint.split("\n") : []) out(`      ${c.gray(linea)}`);
   }
 
   if (!errores.length && !avisos.length) {
-    console.log(`  ${OK} ${streams.length} streams y ${nConsumers} consumidores conformes`);
+    out(`  ${OK} ${streams.length} streams y ${nConsumers} consumidores conformes`);
   } else {
-    console.log(
+    out(
       `\n  ${errores.length} error(es), ${avisos.length} aviso(s)` +
         (infos.length && !verbose ? c.gray(`, ${infos.length} nota(s) — usa -v`) : ""),
     );
   }
 
-  return { findings, streams: streams.length, consumers: nConsumers };
+  return { findings, streams: streams.length, consumers: nConsumers, rpc };
+}
+
+/** La línea de la petición/respuesta: el veredicto en una frase; el detalle y el arreglo van en el Diagnóstico. */
+function seccionRpc(out, rpc) {
+  out(c.bold("\nPetición/respuesta") + c.gray("  (11-request-reply.md §8)"));
+  if (rpc.ok) {
+    out(`  ${OK} ningún stream captura ${rpc.forma} —la forma de toda operación— (${rpc.revisados} stream(s) revisados)`);
+  } else {
+    out(
+      `  ${FAIL} ${rpc.capturas.length} stream(s) capturan operaciones: ` +
+        rpc.capturas.map((x) => `${x.stream} (${x.subjects.join(", ")})`).join("; ") +
+        c.gray("  — qué hace y cómo se arregla, en el diagnóstico"),
+    );
+  }
 }
 
 /** ¿Hay algún subject capturado por ambos conjuntos de patrones? */
 function overlap(a, b) {
-  for (const x of a) for (const y of b) if (subjectsIntersect(x, y)) return `${x} ∩ ${y}`;
+  for (const x of a) for (const y of b) if (solapan(x, y)) return `${x} ∩ ${y}`;
   return null;
-}
-
-function subjectsIntersect(a, b) {
-  const ta = a.split(".");
-  const tb = b.split(".");
-  for (let i = 0; i < Math.max(ta.length, tb.length); i++) {
-    const x = ta[i];
-    const y = tb[i];
-    if (x === ">" || y === ">") return true; // `>` traga el resto
-    if (x === undefined || y === undefined) return false;
-    if (x === "*" || y === "*") continue;
-    if (x !== y) return false;
-  }
-  return true;
 }

@@ -16,7 +16,9 @@ import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import {
+  OPERATION_RE,
   RESERVED_DOMAINS,
+  RPC_ALLOW_RESPONSES,
   SERVICE_KEYS,
   STATE_CONTRACT_RE,
   STATE_TENANT_MAX,
@@ -811,6 +813,41 @@ const CODIGOS_RPC = {
 
 /** ¿Hay algún subject concreto que casen a la vez dos patrones de NATS? `*` casa un token; `>`, uno o más al final.
  *  Es el algoritmo de `flux doctor` (11-request-reply.md §8): el runner de conformance lo mide contra un broker. */
+/**
+ * Las decisiones de los AJUSTES (conformance/harness/vectors.json → `ajustesVectors`): lo que la spec fijó tras medir las
+ * divergencias de Node y Rust fuera de los vectores. Cada afirmación de protocol.json se comprueba aquí contra lo que dicen la
+ * prosa y los vectores, y cada una tiene su mutación abajo.
+ */
+function fallosDeAjustes(doc) {
+  const f = [];
+  const eq = (a, b) => JSON.stringify(a) === JSON.stringify(b);
+  const ce = doc.cloudevents ?? {};
+  // 04-errors.md §3: `dlqerror` mide 1024 BYTES UTF-8, sin partir un carácter.
+  const dq = ce.optionalExtensions?.dlqerror ?? ce.optionalExtensions?.dlqerror;
+  if (dq?.maxBytes !== 1024 || dq?.truncation !== "utf8-bytes-never-split-a-character") f.push("cloudevents.optionalExtensions.dlqerror: 1024 BYTES UTF-8 como máximo, sin partir un carácter (no unidades UTF-16 ni puntos de código)");
+  // 01-envelope.md §2.2: el `time` que da quien llama se normaliza o se rechaza.
+  const bi = ce.requiredAttributes?.time?.builderInput ?? {};
+  if (bi.accepts !== "rfc3339-date-time" || bi.normalizesTo !== "exactly-3-decimals-and-Z-in-UTC" || bi.fractionBeyondMillis !== "truncated") f.push("cloudevents.requiredAttributes.time.builderInput: un constructor admite un date-time de RFC 3339, lo normaliza a 3 decimales y Z en UTC y TRUNCA los decimales de más");
+  if (bi.rejectsLeapSecond !== true || !eq(bi.yearRangeUtc, [0, 9999])) f.push("cloudevents.requiredAttributes.time.builderInput: no admite un segundo 60 ni un año en UTC fuera de 0000–9999");
+  if (bi.invalidCode !== "WRONG_ATTRIBUTE_TYPE" || bi.invalidCodeInRpc !== "INVALID_RPC_CALL") f.push("cloudevents.requiredAttributes.time.builderInput: un time inválido es WRONG_ATTRIBUTE_TYPE (INVALID_RPC_CALL en petición/respuesta)");
+  // 01-envelope.md §4.1: la forma canónica de `data`.
+  const cf = doc.data?.canonicalForm ?? {};
+  if (cf.reference !== "ecmascript-json-stringify-with-literal-utf8" || cf.insignificantWhitespace !== false || cf.numbers !== "untouched") f.push("data.canonicalForm: la de JSON.stringify con UTF-8 literal, sin espacios y con los números SIN tocar (01-envelope.md §2.5)");
+  if (cf.keyOrder !== "as-given-repeated-key-keeps-first-position-and-last-value") f.push("data.canonicalForm.keyOrder: las claves en el orden en que se dan; una repetida conserva la posición de la primera y el valor de la última");
+  const NO_PORTABLES = ["integer-outside-2^53-1", "float-or-exponent-notation", "array-index-like-key", "lone-utf16-surrogate", "nesting-over-128", "number-outside-double-range"];
+  if (!eq(cf.notPortable, NO_PORTABLES)) f.push(`data.canonicalForm.notPortable debe listar lo que no tiene forma común entre lenguajes: ${JSON.stringify(NO_PORTABLES)}`);
+  // 11-request-reply.md §3.3: `message` de un error, en puntos de código.
+  const ml = doc.rpc?.error?.messageLength ?? {};
+  if (ml.unit !== "unicode-code-points" || ml.min !== 1 || ml.max !== 1000) f.push("rpc.error.messageLength: de 1 a 1000 caracteres UNICODE (puntos de código, como maxLength de JSON Schema), no unidades UTF-16");
+  // 11-request-reply.md §5.2: el `id` que cita el error de una petición ilegible.
+  const un = doc.rpc?.envelope?.errorFallbackWhenRequestUnreadable ?? {};
+  if (un.validIdMaxCodePoints !== 128 || un.validIdAllowsControlCharacters !== false) f.push("rpc.envelope.errorFallbackWhenRequestUnreadable: el `id` que cita el error es una cadena de 128 caracteres como máximo y sin caracteres de control");
+  // 11-request-reply.md §4.3.4: la excepción es ESTRECHA.
+  const ex = un.callerExemptedFromCheck4 ?? {};
+  if (ex.only !== "error-with-tenantid-system-and-correlationid-equal-to-own-id" || !eq(ex.checksStillApplied, ["causationid-is-request-id", "error-data-fits-error-schema"])) f.push("rpc.envelope.errorFallbackWhenRequestUnreadable.callerExemptedFromCheck4: solo un error con tenantid system y correlationid igual a su propio id; las comprobaciones 3 y 5 siguen");
+  return f;
+}
+
 function solapa(a, b) {
   const x = a.split("."), y = b.split(".");
   for (let i = 0; ; i++) {
@@ -1002,6 +1039,123 @@ function fallosDeRpc(doc) {
   return f;
 }
 
+
+// ─── La ACL de PETICIÓN/RESPUESTA y su generador — 06-security.md §3.9 ───────────────────────────
+// Como la de estado: una función PURA sobre el documento y sobre un EMISOR de permisos (por defecto, el generador real).
+// Sobre el protocol.json y el generador reales da cero fallos; sobre copias estropeadas a propósito —un documento con un
+// allow_responses sin acotar, un generador que concede `rpc.<dominio>.>` a quien llama o `rpc.>` al dueño— cada una da
+// al menos uno. Es lo que hace que `rpc.acl` sea lo que el generador PRODUCE y no una promesa.
+
+/** Los servicios de prueba: el dueño de dos operaciones, uno que solo llama a una, uno que solo llama (dueño de nada), uno
+ * mixto con dos dominios servidos, y uno sin peticiones. */
+const SERVICIOS_DE_RPC = [
+  { name: "crm-api", owns: ["clientes"], subjects: [], stateOwns: [], watches: [], calls: [], serves: ["clientes.cliente.v1.calcular-descuento", "clientes.cliente.v1.obtener"] },
+  { name: "pedidos-api", owns: ["pedidos"], subjects: [], stateOwns: [], watches: [], calls: ["clientes.cliente.v1.calcular-descuento"], serves: [] },
+  { name: "web-api", owns: [], subjects: [], stateOwns: [], watches: [], calls: ["clientes.cliente.v1.obtener", "logistica.linea-envio.v2.reservar-stock"], serves: [] },
+  { name: "mixto-api", owns: ["logistica", "envios"], subjects: [], stateOwns: [], watches: [], calls: ["clientes.cliente.v1.obtener"], serves: ["envios.envio.v1.recoger", "logistica.linea-envio.v2.reservar-stock"] },
+  { name: "sin-rpc-api", owns: ["inventario"], subjects: [], stateOwns: [], watches: [], calls: [], serves: [] },
+];
+
+/** @returns {string[]} */
+function fallosDeAclDeRpc(doc, emitir = permisosDe) {
+  const f = [];
+  const eq = (a, b) => JSON.stringify(a) === JSON.stringify(b);
+  const re = (src) => { try { return new RegExp(src); } catch { return /(?!)/; } };
+  const ac = doc.rpc?.acl ?? {};
+  const m = ac.manifest ?? {};
+  const ar = ac.ownerAllowResponses ?? {};
+
+  // ── El documento ──────────────────────────────────────────────────────────────────────────────
+  if (!eq(m.keys, ["calls", "serves"])) f.push(`rpc.acl.manifest.keys debe ser [calls, serves]; es ${JSON.stringify(m.keys)}`);
+  for (const k of m.keys ?? []) if (!(doc.security?.manifest?.serviceKeys ?? []).includes(k)) f.push(`security.manifest.serviceKeys no incluye «${k}»: el generador rechazaría una clave de rpc como una errata`);
+  if (m.entryPattern !== "rpc.operation.pattern") f.push("rpc.acl.manifest.entryPattern debe referir rpc.operation.pattern (una sola fuente)");
+  if (OPERATION_RE.source !== doc.rpc?.operation?.pattern) f.push(`manifest.mjs OPERATION_RE (${OPERATION_RE.source}) != rpc.operation.pattern (${doc.rpc?.operation?.pattern})`);
+  for (const k of ["reservedDomainsRejected", "wildcardsRejected", "duplicatesRejected", "nonListRejected", "operationMustExistInBundleRpcIndex", "tenantsModelBSamePermissions"]) {
+    if (m[k] !== true) f.push(`rpc.acl.manifest.${k} debe ser true`);
+  }
+  if (m.entryWithRpcPrefix !== "RESERVED_DOMAIN") f.push("rpc.acl.manifest.entryWithRpcPrefix debe ser RESERVED_DOMAIN: el prefijo `rpc.` lo pone el SDK y `rpc` es un dominio reservado");
+  if (!eq(m.calls?.grants, ["callerPublish"]) || m.calls?.domainMustHaveOwner !== true || m.calls?.ownDomainRejected !== true || m.calls?.operationMustBeServed !== true) {
+    f.push("rpc.acl.manifest.calls: concede solo callerPublish; el dominio debe tener dueño, no puede ser el propio y la operación debe estar atendida");
+  }
+  if (!eq(m.serves?.grants, ["ownerSubscribe", "ownerAllowResponses"]) || m.serves?.onlyOwnDomain !== true || m.serves?.subscribePerDomain !== true || m.serves?.noPublishOnInboxes !== true) {
+    f.push("rpc.acl.manifest.serves: concede ownerSubscribe y ownerAllowResponses, solo del dominio propio, una suscripción por dominio y ninguna publicación sobre inboxes");
+  }
+  const esperadoAr = { max: ar.maxReplies, expires: `${ar.recommendedExpiresSeconds}s` };
+  if (!eq(m.generatedAllowResponses, esperadoAr)) f.push(`rpc.acl.manifest.generatedAllowResponses debe ser ${JSON.stringify(esperadoAr)} (ownerAllowResponses); es ${JSON.stringify(m.generatedAllowResponses)}`);
+  if (!eq(RPC_ALLOW_RESPONSES, esperadoAr)) f.push(`manifest.mjs RPC_ALLOW_RESPONSES ${JSON.stringify(RPC_ALLOW_RESPONSES)} != rpc.acl.ownerAllowResponses ${JSON.stringify(esperadoAr)}`);
+
+  // ── El generador ──────────────────────────────────────────────────────────────────────────────
+  const pub = re(ac.callerPublish ?? "(?!)");
+  const sub = re(ac.ownerSubscribe ?? "(?!)");
+  const inboxRe = re(doc.security.acl.inbox.permissionPattern);
+  const patronesDeOtrasCategorias = [
+    ...Object.entries(doc.security.acl.permissionPatterns).filter(([k]) => !k.startsWith("$")).map(([k, v]) => [`security.acl.permissionPatterns.${k}`, re(v)]),
+    ...Object.entries(doc.state?.acl ?? {}).filter(([k, v]) => typeof v === "string" && !k.startsWith("$") && k !== "observerStreamInfoState").map(([k, v]) => [`state.acl.${k}`, re(v)]),
+  ];
+  for (const dev of [false, true]) {
+    const modo = dev ? "--dev" : "por defecto";
+    for (const svc of SERVICIOS_DE_RPC) {
+      const e = dev ? emitir(svc, { dev }) : emitir(svc);
+      const donde = `${svc.name} (${modo})`;
+      const inbox = `_INBOX.${svc.name}.>`;
+
+      // QUIEN LLAMA: un subject exacto por operación llamada, y nada más de rpc.
+      const llama = e.publish.filter((x) => /^rpc\b/.test(x));
+      const esperadas = svc.calls.map((op) => `rpc.${op}`);
+      if (!eq([...llama].sort(), [...esperadas].sort())) f.push(`${donde} concede para llamar ${JSON.stringify(llama)}; debería ser el subject EXACTO de cada operación llamada ${JSON.stringify(esperadas)}`);
+      for (const x of llama) {
+        if (!pub.test(x)) f.push(`${donde} emite «${x}», que no es el subject exacto de una operación (rpc.acl.callerPublish)`);
+        if (/[*>]/.test(x)) f.push(`${donde} emite «${x}», con un comodín: quien llama podría llamar a TODAS las operaciones`);
+        if ((ac.callerNeverPublish ?? []).includes(x)) f.push(`${donde} emite «${x}», que rpc.acl.callerNeverPublish prohíbe`);
+        const otras = patronesDeOtrasCategorias.filter(([, r]) => r.test(x)).map(([k]) => k);
+        if (otras.length) f.push(`${donde}: el permiso de rpc «${x}» encaja con una categoría que no es de rpc: [${otras.join(", ")}]`);
+      }
+      // …y ningún permiso de publicación sobre inboxes, ni quien llama ni el dueño (el dueño responde con allow_responses: A-68).
+      if (e.publish.some((x) => /^_INBOX\b/.test(x))) f.push(`${donde} concede publicar sobre un inbox (${e.publish.filter((x) => /^_INBOX\b/.test(x)).join(", ")}): el dueño responde con allow_responses, no con un permiso (A-68)`);
+      // Lo que ningún servicio recibe nunca.
+      if (e.publish.some((x) => x === "rpc.>" || /^rpc\.[^.]+\.>$/.test(x) || /^rpc\.\*/.test(x))) f.push(`${donde} concede un comodín de rpc para publicar: quien llama podría llamar a todo`);
+
+      // SUSCRIPCIÓN: el inbox privado y, solo para quien atiende, `rpc.<dominio>.>` de cada dominio servido.
+      const dominios = [...new Set(svc.serves.map((op) => op.split(".")[0]))].sort();
+      const esperadaSub = [inbox, ...dominios.map((d) => `rpc.${d}.>`)];
+      if (!eq(e.subscribe, esperadaSub)) f.push(`${donde} se suscribe a ${JSON.stringify(e.subscribe)}; debería ser su inbox privado y, solo si atiende operaciones, rpc.<dominio>.> de cada dominio servido: ${JSON.stringify(esperadaSub)}`);
+      for (const x of e.subscribe) {
+        if (x === inbox) continue;
+        if (!sub.test(x)) f.push(`${donde} se suscribe a «${x}», que no es rpc.<dominio>.> (rpc.acl.ownerSubscribe)`);
+        if ((ac.ownerNeverSubscribe ?? []).includes(x)) f.push(`${donde} se suscribe a «${x}», que rpc.acl.ownerNeverSubscribe prohíbe`);
+      }
+      if (e.subscribe.some((x) => x !== inbox && x.startsWith("_INBOX"))) f.push(`${donde} se suscribe a un inbox que no es el suyo: ${JSON.stringify(e.subscribe)}`);
+      if (e.subscribe.some((x) => x !== inbox && !inboxRe.test(x) && !/^rpc\./.test(x))) f.push(`${donde} se suscribe a «${e.subscribe.find((x) => x !== inbox && !/^rpc\./.test(x))}», que no es el inbox ni un subject de rpc`);
+
+      // ALLOW_RESPONSES: una respuesta por petición y que caduque, solo para quien atiende.
+      const real = e.allowResponses ?? null;
+      const debeTener = svc.serves.length ? esperadoAr : null;
+      if (!eq(real, debeTener)) f.push(`${donde} lleva allow_responses ${JSON.stringify(real)}; debería ser ${JSON.stringify(debeTener)} (${svc.serves.length ? "atiende operaciones: una respuesta por petición y que caduque" : "no atiende ninguna: un servicio que solo llama no responde a nadie"})`);
+    }
+
+    // Lo que el generador NO emite: se niega a generar permisos de un manifiesto que rompe el modelo.
+    const rechazos = {
+      "una llamada con el prefijo `rpc.` (dominio reservado)": { name: "x-api", owns: [], subjects: [], stateOwns: [], watches: [], calls: ["rpc.clientes.cliente.v1.obtener"], serves: [] },
+      "una llamada con comodín de token": { name: "x-api", owns: [], subjects: [], stateOwns: [], watches: [], calls: ["clientes.cliente.v1.*"], serves: [] },
+      "una llamada con `>` en el dominio": { name: "x-api", owns: [], subjects: [], stateOwns: [], watches: [], calls: ["clientes.>"], serves: [] },
+      "una llamada a un dominio de estado": { name: "x-api", owns: [], subjects: [], stateOwns: [], watches: [], calls: ["state.clientes.cliente.v1"], serves: [] },
+      "atender una operación de un dominio que no es suyo": { name: "x-api", owns: ["pedidos"], subjects: [], stateOwns: [], watches: [], calls: [], serves: ["clientes.cliente.v1.obtener"] },
+      "atender una operación sin ser dueño de nada": { name: "x-api", owns: [], subjects: [], stateOwns: [], watches: [], calls: [], serves: ["clientes.cliente.v1.obtener"] },
+      "atender con comodín": { name: "x-api", owns: ["clientes"], subjects: [], stateOwns: [], watches: [], calls: [], serves: ["clientes.cliente.v1.*"] },
+    };
+    for (const [que, svc] of Object.entries(rechazos)) {
+      let lanzo = false;
+      try {
+        if (dev) emitir(svc, { dev }); else emitir(svc);
+      } catch {
+        lanzo = true;
+      }
+      if (!lanzo) f.push(`el generador (${modo}) emite permisos para ${que}`);
+    }
+  }
+  return f;
+}
+
 const fallos = [];
 
 for (const [path, deben, noDeben] of CASES) {
@@ -1022,6 +1176,52 @@ for (const [path, deben, noDeben] of CASES) {
   }
   for (const ej of noDeben) {
     if (re.test(ej)) fallos.push(`${path}: DEBERÍA rechazar ${JSON.stringify(ej)}\n      patrón: ${JSON.stringify(src)}`);
+  }
+}
+
+// ── La versión mayor son de 1 a 4 dígitos (02-naming.md §1): `v1`…`v9999` ──────────────────────────────────────────────
+// Sin tope, Node escribía `v100000000000000000000` (pasaba por `Number`) y Rust rechazaba lo que no cabía en un `u32`: el mismo
+// subject, dos veredictos. El tope vive en CADA patrón donde aparece la versión (el subject, el `type`, el estado, la operación, la
+// ACL…), así que se comprueba en todos —no solo en el de los eventos— con una muestra por cada uno que se construye con la versión
+// que se pide, y el patrón que la acepte sin tope tiene que fallar aquí.
+{
+  const mayor = p.naming?.subject?.majorVersion;
+  if (mayor?.minDigits !== 1 || mayor?.maxDigits !== 4 || mayor?.max !== 9999) {
+    fallos.push("naming.subject.majorVersion debe ser { minDigits: 1, maxDigits: 4, max: 9999 }: la versión mayor es `v1`…`v9999` (02-naming.md §1)");
+  }
+  const MUESTRAS = {
+    "naming.subject.pattern": (v) => `pedidos.pedido.${v}.creado`,
+    "naming.type.pattern": (v) => `com.flux.pedidos.pedido.creado.${v}`,
+    "naming.durableConsumer.pattern": () => null, // no lleva la versión como token propio
+    "state.subject.pattern": (v) => `state.clientes.cliente.${v}.acme.cli-1`,
+    "state.contract.pattern": (v) => `clientes.cliente.${v}`,
+    "state.dlq.subject.pattern": (v) => `dlq.state.clientes.cliente.${v}`,
+    "state.type.value.pattern": (v) => `com.flux.state.clientes.cliente.${v}`,
+    "state.type.tombstone.pattern": (v) => `com.flux.state.clientes.cliente.deleted.${v}`,
+    "rpc.subject.pattern": (v) => `rpc.clientes.cliente.${v}.obtener`,
+    "rpc.operation.pattern": (v) => `clientes.cliente.${v}.obtener`,
+    "rpc.type.request.pattern": (v) => `com.flux.rpc.clientes.cliente.obtener.request.${v}`,
+    "rpc.type.reply.pattern": (v) => `com.flux.rpc.clientes.cliente.obtener.reply.${v}`,
+    "rpc.acl.callerPublish": (v) => `rpc.clientes.cliente.${v}.obtener`,
+  };
+  for (const [ruta, muestra] of Object.entries(MUESTRAS)) {
+    if (muestra("v1") === null) continue;
+    const src = get(ruta);
+    if (typeof src !== "string") { fallos.push(`${ruta}: no existe o no es una cadena (versión mayor)`); continue; }
+    const re = new RegExp(src);
+    for (const v of ["v1", "v9", "v10", "v9999"]) {
+      if (!re.test(muestra(v))) fallos.push(`${ruta}: DEBERÍA aceptar la versión mayor ${v} (${JSON.stringify(muestra(v))}): son de 1 a 4 dígitos`);
+    }
+    for (const v of ["v10000", "v99999", "v4294967296", "v99999999999999999999", "v0", "v01", "v"]) {
+      if (re.test(muestra(v))) fallos.push(`${ruta}: DEBERÍA rechazar la versión mayor ${v} (${JSON.stringify(muestra(v))}): el tope es 9999 y no hay ceros a la izquierda`);
+    }
+    // Autocomprobación: el mismo patrón SIN tope tiene que fallar esta comprobación (si no, no detectaría nada).
+    if (src.includes("[1-9][0-9]{0,3}")) {
+      const sinTope = new RegExp(src.replace("[1-9][0-9]{0,3}", "[1-9][0-9]*"));
+      if (!sinTope.test(muestra("v10000"))) fallos.push(`autocomprobación: ${ruta} sin tope de versión mayor NO aceptaría v10000: la comprobación de arriba no detectaría la mutación`);
+    } else {
+      fallos.push(`${ruta}: no lleva el tope de la versión mayor (\`[1-9][0-9]{0,3}\`)`);
+    }
   }
 }
 
@@ -1092,6 +1292,7 @@ fallos.push(...fallosDeConnect(p));
 fallos.push(...fallosDeEstado(p));
 fallos.push(...fallosDeAclDeEstado(p));
 fallos.push(...fallosDeRpc(p));
+fallos.push(...fallosDeAclDeRpc(p));
 if (!Object.hasOwn(p.errors.codes, p.security.provisioning.notProvisionedErrorCode)) fallos.push("security.provisioning.notProvisionedErrorCode no está en errors.codes");
 if (!Object.hasOwn(capDefs, p.security.sdk.capability)) fallos.push(`security.sdk.capability "${p.security.sdk.capability}" no está en capabilities.definitions`);
 
@@ -1305,7 +1506,7 @@ let mutacionesAcl = 0;
     "una excepción que no existe": (d) => { d.security.acl.neverGrantedExceptions.push("state.acl.noExiste"); },
     "la excepción del dueño admite DIRECT.GET.>": (d) => { d.state.acl.ownerDirectGet = "^\\$JS\\.API\\.DIRECT\\.GET\\.>$"; },
     "la excepción del dueño admite la forma de cuerpo": (d) => { d.state.acl.ownerDirectGet = "^\\$JS\\.API\\.DIRECT\\.GET\\.STATE_[A-Z0-9_]+(\\..*)?$"; },
-    "la excepción del observador sin el tenant fijado": (d) => { d.state.acl.observerDirectGet = "^\\$JS\\.API\\.DIRECT\\.GET\\.STATE_[A-Z0-9_]+\\.state\\.[a-z0-9]+(-[a-z0-9]+)*\\.[a-z0-9]+(-[a-z0-9]+)*\\.v[1-9][0-9]*\\.>$"; },
+    "la excepción del observador sin el tenant fijado": (d) => { d.state.acl.observerDirectGet = "^\\$JS\\.API\\.DIRECT\\.GET\\.STATE_[A-Z0-9_]+\\.state\\.[a-z0-9]+(-[a-z0-9]+)*\\.[a-z0-9]+(-[a-z0-9]+)*\\.v[1-9][0-9]{0,3}\\.>$"; },
     "neverGrantedPattern ya no caza DIRECT.GET": (d) => { d.security.acl.neverGrantedPattern = d.security.acl.neverGrantedPattern.replace("|\\$JS\\.API\\.DIRECT\\.GET(\\..*)?", ""); },
     "streamInfo admite STATE_": (d) => { d.security.acl.permissionPatterns.streamInfo = "^\\$JS\\.API\\.STREAM\\.INFO\\.(EVT|DLQ|STATE)_[A-Z0-9_]+$"; },
     "ownerPublish admite state.>": (d) => { d.state.acl.ownerPublish = "^state\\.([a-z0-9]+(-[a-z0-9]+)*\\.)?>$"; },
@@ -1384,10 +1585,10 @@ let mutacionesRpc = 0;
     "un stream de rpc": (d) => { d.rpc.transport.stream = "RPC_CLIENTES"; },
     "una DLQ de rpc": (d) => { d.rpc.transport.dlq = "dlq.rpc"; },
     "el subject de rpc con 4 tokens": (d) => { d.rpc.subject.format = "rpc.<dominio>.<agregado>.<operacion>"; d.rpc.subject.tokens = 4; },
-    "el subject de rpc admite comodines": (d) => { d.rpc.subject.pattern = "^rpc\\.[a-z0-9*>-]+\\.[a-z0-9-]+\\.v[1-9][0-9]*\\.[a-z0-9-]+$"; },
+    "el subject de rpc admite comodines": (d) => { d.rpc.subject.pattern = "^rpc\\.[a-z0-9*>-]+\\.[a-z0-9-]+\\.v[1-9][0-9]{0,3}\\.[a-z0-9-]+$"; },
     "el subject de rpc admite mayúsculas": (d) => { d.rpc.subject.pattern = d.rpc.subject.pattern.replaceAll("a-z", "A-Za-z"); },
     "la operación distinta de un subject de evento": (d) => { d.rpc.operation.pattern = "^[a-z]+\\.[a-z]+\\.v[1-9]\\.[a-z]+$"; },
-    "la operación admite el prefijo rpc.": (d) => { d.rpc.operation.pattern = "^(rpc\\.)?[a-z0-9]+(-[a-z0-9]+)*\\.[a-z0-9]+(-[a-z0-9]+)*\\.v[1-9][0-9]*\\.[a-z0-9]+(-[a-z0-9]+)*$"; },
+    "la operación admite el prefijo rpc.": (d) => { d.rpc.operation.pattern = "^(rpc\\.)?[a-z0-9]+(-[a-z0-9]+)*\\.[a-z0-9]+(-[a-z0-9]+)*\\.v[1-9][0-9]{0,3}\\.[a-z0-9]+(-[a-z0-9]+)*$"; },
     "el nombre de operación admite guiones bajos": (d) => { d.rpc.operationName.pattern = "^[a-z0-9]+([-_][a-z0-9]+)*$"; },
     "suscripción al comodín rpc.<dominio>.>": (d) => { d.rpc.queueGroup.subscription = "domain-wildcard"; d.rpc.queueGroup.wildcardSubscriptionForbidden = false; },
     "el grupo de cola no es el servicio": (d) => { d.rpc.queueGroup.name = "random"; },
@@ -1455,10 +1656,133 @@ let mutacionesRpc = 0;
   mutacionesRpc = Object.keys(mutaciones).length;
 }
 
+
+// Autocomprobación de `fallosDeAclDeRpc`: la misma disciplina, sobre el documento Y sobre el generador. Las equivocaciones
+// reales que 06-security.md §3.9 existe para impedir: conceder `rpc.<dominio>.>` o `rpc.>` a quien llama, un permiso de
+// publicación sobre inboxes al dueño, un allow_responses sin acotar o ausente, una suscripción de dominio a quien solo llama.
+let mutacionesAclRpc = 0;
+{
+  const base = fallosDeAclDeRpc(p);
+  if (base.length) fallos.push(`autocomprobación: fallosDeAclDeRpc ya falla sobre el protocol.json y el generador reales (${base.length}); no se puede autocomprobar`);
+  const delDocumento = {
+    "las claves de rpc fuera de serviceKeys": (d) => { d.security.manifest.serviceKeys = ["name", "owns", "consumes", "watches"]; },
+    "solo `calls`": (d) => { d.rpc.acl.manifest.keys = ["calls"]; },
+    "la entrada de rpc con su propio patrón": (d) => { d.rpc.acl.manifest.entryPattern = "^[a-z.]+$"; },
+    "el prefijo rpc. admitido en el manifiesto": (d) => { d.rpc.acl.manifest.entryWithRpcPrefix = "INVALID_RPC_CALL"; },
+    "los dominios reservados admitidos": (d) => { d.rpc.acl.manifest.reservedDomainsRejected = false; },
+    "los comodines admitidos": (d) => { d.rpc.acl.manifest.wildcardsRejected = false; },
+    "las operaciones repetidas admitidas": (d) => { d.rpc.acl.manifest.duplicatesRejected = false; },
+    "una operación sin su par en el bundle": (d) => { d.rpc.acl.manifest.operationMustExistInBundleRpcIndex = false; },
+    "quien llama concede también la suscripción del dueño": (d) => { d.rpc.acl.manifest.calls.grants = ["callerPublish", "ownerSubscribe"]; },
+    "una llamada a una operación que nadie atiende": (d) => { d.rpc.acl.manifest.calls.operationMustBeServed = false; },
+    "una llamada al propio dominio": (d) => { d.rpc.acl.manifest.calls.ownDomainRejected = false; },
+    "atender el dominio de otro": (d) => { d.rpc.acl.manifest.serves.onlyOwnDomain = false; },
+    "el dueño con permiso de publicación sobre inboxes (en el manifiesto)": (d) => { d.rpc.acl.manifest.serves.noPublishOnInboxes = false; },
+    "el dueño sin allow_responses": (d) => { d.rpc.acl.manifest.serves.grants = ["ownerSubscribe"]; },
+    "allow_responses generado con 2 respuestas": (d) => { d.rpc.acl.manifest.generatedAllowResponses.max = 2; },
+    "allow_responses generado sin caducidad": (d) => { delete d.rpc.acl.manifest.generatedAllowResponses.expires; },
+    "allow_responses generado que caduca antes del timeout": (d) => { d.rpc.acl.manifest.generatedAllowResponses.expires = "5s"; },
+    "allow_responses recomendado distinto del generado": (d) => { d.rpc.acl.ownerAllowResponses.recommendedExpiresSeconds = 60; },
+    "el Modelo B con otros permisos": (d) => { d.rpc.acl.manifest.tenantsModelBSamePermissions = false; },
+    "OPERATION_RE distinta de rpc.operation.pattern": (d) => { d.rpc.operation.pattern = d.rpc.operation.pattern.replace("v[1-9]", "v[0-9]"); },
+  };
+  for (const [nombre, estropea] of Object.entries(delDocumento)) {
+    const copia = structuredClone(p);
+    estropea(copia);
+    if (!fallosDeAclDeRpc(copia).length) fallos.push(`autocomprobación: la mutación del documento «${nombre}» NO la detecta fallosDeAclDeRpc`);
+  }
+  // Generadores estropeados: lo que haría un `permisosDe` que concede de más o de menos.
+  const sobre = (modifica) => (svc, opts) => {
+    const e = permisosDe(svc, opts);
+    const r = { ...e, publish: [...e.publish], subscribe: [...e.subscribe], allowResponses: e.allowResponses ? { ...e.allowResponses } : null };
+    modifica(r, svc, opts);
+    return r;
+  };
+  const delGenerador = {
+    "quien llama con `rpc.<dominio>.>`": sobre((r, s) => { if (s.name === "web-api") r.publish.push("rpc.clientes.>"); }),
+    "quien llama con `rpc.>`": sobre((r, s) => { if (s.name === "pedidos-api") r.publish.push("rpc.>"); }),
+    "quien llama con un comodín por token": sobre((r, s) => { if (s.name === "web-api") r.publish.push("rpc.clientes.cliente.v1.*"); }),
+    "quien llama con `rpc.*.*.*.*`": sobre((r, s) => { if (s.name === "web-api") r.publish.push("rpc.*.*.*.*"); }),
+    "quien llama con una operación de más": sobre((r, s) => { if (s.name === "pedidos-api") r.publish.push("rpc.clientes.cliente.v1.obtener"); }),
+    "quien llama sin su permiso": sobre((r, s) => { if (s.name === "web-api") r.publish = r.publish.filter((x) => x !== "rpc.clientes.cliente.v1.obtener"); }),
+    "quien llama con el prefijo duplicado": sobre((r, s) => { if (s.name === "pedidos-api") r.publish = r.publish.map((x) => x.replace(/^rpc\./, "rpc.rpc.")); }),
+    "quien llama con `_INBOX.>` para publicar": sobre((r, s) => { if (s.name === "web-api") r.publish.push("_INBOX.>"); }),
+    "quien llama con el inbox común": sobre((r, s) => { if (s.name === "web-api") r.subscribe = ["_INBOX.>"]; }),
+    "quien llama sin su inbox privado": sobre((r, s) => { if (s.name === "web-api") r.subscribe = []; }),
+    "quien solo llama con una suscripción de dominio": sobre((r, s) => { if (s.name === "web-api") r.subscribe.push("rpc.clientes.>"); }),
+    "quien solo llama con allow_responses": sobre((r, s) => { if (s.name === "web-api") r.allowResponses = { max: 1, expires: "30s" }; }),
+    "un dueño sin servir nada con rpc.<dominio>.>": sobre((r, s) => { if (s.name === "sin-rpc-api") r.subscribe.push("rpc.inventario.>"); }),
+    "el dueño con `rpc.>`": sobre((r, s) => { if (s.name === "crm-api") r.subscribe = [r.subscribe[0], "rpc.>"]; }),
+    "el dueño con `rpc.*.>`": sobre((r, s) => { if (s.name === "crm-api") r.subscribe.push("rpc.*.>"); }),
+    "el dueño con `>`": sobre((r, s) => { if (s.name === "crm-api") r.subscribe.push(">"); }),
+    "el dueño con el rpc.<dominio>.> de otro dominio": sobre((r, s) => { if (s.name === "crm-api") r.subscribe.push("rpc.pedidos.>"); }),
+    "el dueño sin su suscripción de dominio": sobre((r, s) => { if (s.name === "crm-api") r.subscribe = [r.subscribe[0]]; }),
+    "el dueño de dos dominios con uno solo": sobre((r, s) => { if (s.name === "mixto-api") r.subscribe = r.subscribe.filter((x) => x !== "rpc.envios.>"); }),
+    "el dueño con `_INBOX.>` para publicar": sobre((r, s) => { if (s.name === "crm-api") r.publish.push("_INBOX.>"); }),
+    "el dueño con permiso de publicación sobre el inbox de otro": sobre((r, s) => { if (s.name === "crm-api") r.publish.push("_INBOX.pedidos-api.>"); }),
+    "el dueño sin allow_responses": sobre((r, s) => { if (s.name === "crm-api") r.allowResponses = null; }),
+    "allow_responses: true": sobre((r, s) => { if (s.name === "crm-api") r.allowResponses = true; }),
+    "allow_responses con 10 respuestas": sobre((r, s) => { if (s.name === "crm-api") r.allowResponses = { max: 10, expires: "30s" }; }),
+    "allow_responses sin caducidad": sobre((r, s) => { if (s.name === "crm-api") r.allowResponses = { max: 1 }; }),
+    "allow_responses que caduca antes del timeout": sobre((r, s) => { if (s.name === "crm-api") r.allowResponses = { max: 1, expires: "5s" }; }),
+    "el dueño de un dominio reservado ya no se rechaza": (svc, opts) => {
+      if (svc.calls?.some((op) => op.startsWith("rpc.") || op.startsWith("state."))) return { publish: svc.calls.map((op) => `rpc.${op}`), subscribe: [`_INBOX.${svc.name}.>`], durables: [], grupos: [], allowResponses: null };
+      return permisosDe(svc, opts);
+    },
+    "atender el dominio de otro ya no se rechaza": (svc, opts) => {
+      if (svc.serves?.length && !svc.owns.includes(svc.serves[0].split(".")[0])) return { publish: ["$JS.API.INFO"], subscribe: [`_INBOX.${svc.name}.>`, `rpc.${svc.serves[0].split(".")[0]}.>`], durables: [], grupos: [], allowResponses: { max: 1, expires: "30s" } };
+      return permisosDe(svc, opts);
+    },
+    "un comodín ya no se rechaza": (svc, opts) => {
+      if ([...(svc.calls ?? []), ...(svc.serves ?? [])].some((op) => /[*>]/.test(op))) return { publish: ["$JS.API.INFO", ...(svc.calls ?? []).map((op) => `rpc.${op}`)], subscribe: [`_INBOX.${svc.name}.>`], durables: [], grupos: [], allowResponses: null };
+      return permisosDe(svc, opts);
+    },
+  };
+  for (const [nombre, emisor] of Object.entries(delGenerador)) {
+    if (!fallosDeAclDeRpc(p, emisor).length) fallos.push(`autocomprobación: el generador estropeado «${nombre}» NO lo detecta fallosDeAclDeRpc`);
+  }
+  mutacionesAclRpc = Object.keys(delDocumento).length + Object.keys(delGenerador).length;
+}
+
+// ── Los ajustes: el documento real y sus mutaciones ────────────────────────────────────────────────────────────────────────
+let mutacionesAjustes = 0;
+{
+  for (const f of fallosDeAjustes(p)) fallos.push(f);
+  const delDocumento = {
+    "dlqerror por unidades UTF-16": (d) => { d.cloudevents.optionalExtensions.dlqerror.truncation = "utf16-units"; },
+    "dlqerror sin tope en bytes": (d) => { d.cloudevents.optionalExtensions.dlqerror.maxBytes = 1000; },
+    "el time de un constructor se copia": (d) => { d.cloudevents.requiredAttributes.time.builderInput.accepts = "anything"; },
+    "los decimales de más se redondean": (d) => { d.cloudevents.requiredAttributes.time.builderInput.fractionBeyondMillis = "rounded"; },
+    "se admite un segundo 60": (d) => { d.cloudevents.requiredAttributes.time.builderInput.rejectsLeapSecond = false; },
+    "el año en UTC sin acotar": (d) => { d.cloudevents.requiredAttributes.time.builderInput.yearRangeUtc = [-1, 10000]; },
+    "un time inválido sin código": (d) => { d.cloudevents.requiredAttributes.time.builderInput.invalidCode = "ERROR"; },
+    "data con espacios": (d) => { d.data.canonicalForm.insignificantWhitespace = true; },
+    "los números de data se reescriben": (d) => { d.data.canonicalForm.numbers = "rewritten"; },
+    "una clave repetida conserva las dos": (d) => { d.data.canonicalForm.keyOrder = "as-given-repeated-key-kept"; },
+    "se quita un número no portable": (d) => { d.data.canonicalForm.notPortable.pop(); },
+    "message en unidades UTF-16": (d) => { d.rpc.error.messageLength.unit = "utf16-code-units"; },
+    "message de 1001": (d) => { d.rpc.error.messageLength.max = 1001; },
+    "el id citado sin tope": (d) => { d.rpc.envelope.errorFallbackWhenRequestUnreadable.validIdMaxCodePoints = 256; },
+    "el id citado con controles": (d) => { d.rpc.envelope.errorFallbackWhenRequestUnreadable.validIdAllowsControlCharacters = true; },
+    "la excepción de la comprobación 4 ancha": (d) => { d.rpc.envelope.errorFallbackWhenRequestUnreadable.callerExemptedFromCheck4.only = "any-error-with-tenantid-system"; },
+    "la excepción sin la comprobación 3": (d) => { d.rpc.envelope.errorFallbackWhenRequestUnreadable.callerExemptedFromCheck4.checksStillApplied = ["error-data-fits-error-schema"]; },
+  };
+  const base = fallosDeAjustes(p);
+  if (base.length) fallos.push(`autocomprobación: fallosDeAjustes ya falla sobre el protocol.json real (${base.length}); no se puede autocomprobar`);
+  else {
+    for (const [nombre, estropea] of Object.entries(delDocumento)) {
+      const copia = structuredClone(p);
+      estropea(copia);
+      if (!fallosDeAjustes(copia).length) fallos.push(`autocomprobación: la mutación «${nombre}» NO la detecta fallosDeAjustes`);
+    }
+    mutacionesAjustes = Object.keys(delDocumento).length;
+  }
+}
+
 if (fallos.length) {
   console.error(`\n✗ ${fallos.length} problema(s) en protocol.json\n`);
   for (const f of fallos) console.error(`  ✗ ${f}`);
   process.exit(1);
 }
 
-console.log(`✓ protocol.json coherente (${CASES.length} patrones + invariantes numéricas, de códigos, de capacidades y de estado · autocomprobación de estado: ${mutacionesEstado} mutaciones del documento y ${mutacionesAcl} de la ACL y su generador · de rpc: ${mutacionesRpc} mutaciones del documento, todas detectadas)`);
+console.log(`✓ protocol.json coherente (${CASES.length} patrones + invariantes numéricas, de códigos, de capacidades y de estado · autocomprobación de estado: ${mutacionesEstado} mutaciones del documento y ${mutacionesAcl} de la ACL y su generador · de rpc: ${mutacionesRpc} mutaciones del documento y ${mutacionesAclRpc} de su ACL y su generador · de los ajustes: ${mutacionesAjustes} mutaciones, todas detectadas)`);

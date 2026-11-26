@@ -9,7 +9,7 @@
 
 use std::collections::BTreeMap;
 
-use chrono::{DateTime, SecondsFormat, Utc};
+use chrono::{DateTime, Datelike, SecondsFormat, Timelike, Utc};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::value::RawValue;
@@ -101,6 +101,94 @@ impl From<crate::errors::ErrorClass> for DlqReason {
 #[must_use]
 pub fn format_time(t: DateTime<Utc>) -> String {
     t.to_rfc3339_opts(SecondsFormat::Millis, true)
+}
+
+/// El `time` que da quien llama a un constructor, como instante — 01-envelope.md §2.2.
+///
+/// Los constructores puros reciben `time` de fuera (el arnés de conformidad, un test, quien construya un
+/// transporte propio). Se admite lo que RFC 3339 llama `date-time` —`T` o `t` (o un espacio) entre la
+/// fecha y la hora, `Z` o `z` o un desfase `±hh:mm`, decimales opcionales y de cualquier longitud— y
+/// [`format_time`] lo **normaliza** a la forma canónica (3 decimales y `Z`, en UTC; los decimales de más
+/// de tres se truncan). Es lo mismo que admite el SDK de Node (`canonicalTime`).
+///
+/// No se admiten: un segundo 60 (no existe en UTC de POSIX, y `Date` de JavaScript lo desplazaría al
+/// minuto siguiente), ni un instante cuyo año en UTC cae fuera de 0000–9999 (`+10000-…`, `-0001-…`
+/// dejarían de ser RFC 3339).
+#[must_use]
+pub fn parse_instant(text: &str) -> Option<DateTime<Utc>> {
+    let t = DateTime::parse_from_rfc3339(text).ok()?;
+    // chrono representa el segundo intercalar con nanosegundos ≥ 10^9.
+    if t.nanosecond() >= 1_000_000_000 {
+        return None;
+    }
+    let utc = t.with_timezone(&Utc);
+    (0..=9999).contains(&utc.year()).then_some(utc)
+}
+
+/// [`parse_instant`] con el error de un constructor de **evento o de estado**: `WRONG_ATTRIBUTE_TYPE`
+/// (CloudEvents tipa `time` como `Timestamp`). Los de petición/respuesta dan `INVALID_RPC_CALL`.
+///
+/// # Errores
+///
+/// [`FluxError::InvalidEnvelope`] si `text` no es un instante RFC 3339 válido.
+pub fn parse_time(text: &str) -> Result<DateTime<Utc>, FluxError> {
+    parse_instant(text).ok_or_else(|| FluxError::InvalidEnvelope {
+        code: "WRONG_ATTRIBUTE_TYPE",
+        reason: invalid_time_reason(),
+    })
+}
+
+/// El mensaje de un `time` que no es un instante.
+pub(crate) fn invalid_time_reason() -> String {
+    "`time` debe ser un instante RFC 3339 (`2026-08-20T10:41:07.318Z`; se normaliza a 3 decimales \
+     y `Z`) y llegó un texto que no lo es (01-envelope.md §2.2)"
+        .to_string()
+}
+
+/// Los atributos que el SDK rellena no pueden llegar **vacíos** a un constructor de evento o de estado:
+/// una cadena vacía y una ausente son lo mismo (01-envelope.md §3.1, §3.3), y un evento que su propio
+/// parser rechazaría no se construye. `(nombre, valor, es_extensión)`; el código es el del parser:
+/// `MISSING_REQUIRED_ATTRIBUTE` o, para las extensiones obligatorias, `MISSING_REQUIRED_EXTENSION`.
+pub(crate) fn require_non_empty(fields: &[(&str, &str, bool)]) -> Result<(), FluxError> {
+    for (name, value, extension) in fields {
+        if value.is_empty() {
+            return Err(FluxError::InvalidEnvelope {
+                code: if *extension {
+                    "MISSING_REQUIRED_EXTENSION"
+                } else {
+                    "MISSING_REQUIRED_ATTRIBUTE"
+                },
+                reason: format!(
+                    "`{name}` es obligatorio y llegó vacío. Lo rellena el SDK a partir de ConnectOptions \
+                     y del evento en curso; si estás llamando a un constructor a mano, rellénalo con \
+                     una cadena no vacía (01-envelope.md §5)"
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// La forma canónica de `data` — 01-envelope.md §4.1: la que produce `JSON.stringify` de Node, con UTF-8
+/// literal. Sin espacios entre elementos; las claves en el orden en que se dan —una clave repetida
+/// conserva la posición de la primera y el valor de la última, como `JSON.parse`—; las cadenas con los
+/// caracteres no ASCII literales y solo `"`, `\` y los controles U+0000–U+001F escapados.
+///
+/// Un `data` de otra forma (con espacios, con `\u00e9` o `\/`, con una clave repetida) **no son los mismos
+/// bytes** y romperían el replay, la firma y la dedupe por hash: un constructor lo reescribe a esta
+/// forma, igual que Node al serializar.
+///
+/// Los **números no se reescriben** (§2.5: `4995.00` sigue siendo `4995.00`). No tienen forma común entre
+/// lenguajes los enteros fuera de ±(2^53−1) —Node los redondea—, los flotantes (`4995.00`, `1E+2`,
+/// `-0`: JavaScript los escribe `4995`, `100`, `0`), ni la profundidad de más de 128 niveles, las claves
+/// que son un índice de array (`"1"`: JavaScript las ordena primero) o un sustituto UTF-16 suelto: el
+/// dinero va en enteros (§4) y estos no se admiten en `data` si los bytes importan.
+///
+/// # Errores
+///
+/// El motivo, sin valores, si `raw` no es JSON o no es un objeto en la raíz.
+pub fn canonical_data(raw: &RawValue) -> Result<Box<RawValue>, String> {
+    crate::canonical::canonical_raw(raw)
 }
 
 // ─── El evento ───────────────────────────────────────────────────────────────
@@ -527,24 +615,26 @@ pub fn data_to_raw<T: Serialize + ?Sized>(data: &T) -> Result<Box<RawValue>, Flu
 /// [`FluxError::InvalidSubject`] si el subject no cumple el naming;
 /// [`FluxError::Envelope`] si falta algún atributo obligatorio.
 pub fn build_event(input: BuildEventInput) -> Result<Event, FluxError> {
-    let event_type = subject_to_type(&input.subject)?;
+    // Un dominio reservado se rechaza ANTES que la forma, como `publish`: el constructor puro no puede
+    // escribir en `rpc.`, `state.`, `dlq.` ni `system.` (02-naming.md §1.3).
+    crate::state::reject_reserved_domain(&input.subject)?;
+    build_event_internal(input)
+}
 
-    for (name, value) in [
-        ("id", &input.id),
-        ("source", &input.source),
-        ("dataschema", &input.dataschema),
-        ("correlationid", &input.correlationid),
-        ("tenantid", &input.tenantid),
-        ("producerversion", &input.producerversion),
-    ] {
-        if value.is_empty() {
-            return Err(FluxError::Envelope(format!(
-                "`{name}` es obligatorio y llegó vacío. Lo rellena el SDK a partir de \
-                 ConnectOptions; si estás llamando a build_event a mano, rellénalo \
-                 (01-envelope.md §5)"
-            )));
-        }
-    }
+/// [`build_event`] sin la comprobación del dominio reservado: lo que usa **el propio SDK** para los eventos de
+/// plataforma que él mismo emite (`system.poison.v1.capturado`). Una aplicación no tiene acceso: `pub(crate)`.
+pub(crate) fn build_event_internal(input: BuildEventInput) -> Result<Event, FluxError> {
+    let event_type = subject_to_type(&input.subject)?;
+    let data = canonical_data(&input.data).map_err(FluxError::Envelope)?;
+
+    require_non_empty(&[
+        ("id", &input.id, false),
+        ("source", &input.source, false),
+        ("dataschema", &input.dataschema, false),
+        ("correlationid", &input.correlationid, true),
+        ("tenantid", &input.tenantid, true),
+        ("producerversion", &input.producerversion, true),
+    ])?;
 
     // Por convención partitionkey = aggregateId, salvo que se pida otra cosa
     // explícitamente — 01-envelope.md §3.2.
@@ -577,7 +667,7 @@ pub fn build_event(input: BuildEventInput) -> Result<Event, FluxError> {
         dlqconsumer: None,
         dlqerror: None,
         dlqtime: None,
-        data: input.data,
+        data,
     })
 }
 
@@ -809,7 +899,7 @@ pub fn to_dlq_event(mut event: Event, info: &DlqInfo, now: DateTime<Utc>) -> Eve
     event.dlqreason = Some(info.reason);
     event.dlqattempts = Some(info.attempts);
     event.dlqconsumer = Some(info.consumer.clone());
-    event.dlqerror = Some(truncate_chars(&info.error, 1024));
+    event.dlqerror = Some(truncate_utf8_bytes(&info.error, 1024));
     event.dlqtime = Some(format_time(now));
     event
 }
@@ -834,7 +924,8 @@ pub fn strip_dlq_extensions(mut event: Event) -> Event {
     event
 }
 
-/// Recorta a `n` bytes sin partir un carácter multibyte.
+/// Recorta a `n` bytes UTF-8 sin partir un carácter multibyte: la regla de `dlqerror` (1024 bytes,
+/// 04-errors.md §3), la misma en Node (`truncateUtf8Bytes`).
 ///
 /// En Rust cortar un `&str` por un índice que no es frontera de carácter **entra en
 /// pánico**, así que aquí no hay opción: hay que buscar la frontera. El SDK de Node hace
@@ -842,7 +933,7 @@ pub fn strip_dlq_extensions(mut event: Event) -> Event {
 /// punto de corte de un mensaje con acentos puede diferir entre los tres. Es intencionado:
 /// partir un carácter produciría un `dlqerror` con U+FFFD, que es peor que un mensaje
 /// unos bytes más corto.
-fn truncate_chars(s: &str, n: usize) -> String {
+pub(crate) fn truncate_utf8_bytes(s: &str, n: usize) -> String {
     if s.len() <= n {
         return s.to_string();
     }
@@ -1172,8 +1263,121 @@ mod tests {
         ] {
             let mut inp = input();
             mutate(&mut inp);
-            assert!(matches!(build_event(inp), Err(FluxError::Envelope(_))));
+            // Con el código que daría el parser ante el mismo defecto (01-envelope.md §3.1).
+            let e = build_event(inp).unwrap_err();
+            assert!(matches!(e, FluxError::InvalidEnvelope { .. }), "{e:?}");
         }
+    }
+
+    /// Los atributos que el SDK rellena no pueden llegar vacíos, con el código del parser: `id`, `source` y
+    /// `dataschema` son atributos; `correlationid`, `tenantid` y `producerversion`, extensiones obligatorias.
+    #[test]
+    fn un_atributo_vacio_lleva_el_codigo_que_daria_el_parser() {
+        type Vacia = fn(&mut BuildEventInput);
+        let casos: [(&str, Vacia, &str); 6] = [
+            ("id", |i| i.id.clear(), "MISSING_REQUIRED_ATTRIBUTE"),
+            ("source", |i| i.source.clear(), "MISSING_REQUIRED_ATTRIBUTE"),
+            (
+                "dataschema",
+                |i| i.dataschema.clear(),
+                "MISSING_REQUIRED_ATTRIBUTE",
+            ),
+            (
+                "correlationid",
+                |i| i.correlationid.clear(),
+                "MISSING_REQUIRED_EXTENSION",
+            ),
+            (
+                "tenantid",
+                |i| i.tenantid.clear(),
+                "MISSING_REQUIRED_EXTENSION",
+            ),
+            (
+                "producerversion",
+                |i| i.producerversion.clear(),
+                "MISSING_REQUIRED_EXTENSION",
+            ),
+        ];
+        for (campo, vacia, code) in casos {
+            let mut inp = input();
+            vacia(&mut inp);
+            let e = build_event(inp).unwrap_err();
+            assert_eq!(e.code(), Some(code), "{campo}");
+            assert!(
+                e.to_string().contains(&format!("`{campo}`")),
+                "{campo}: {e}"
+            );
+        }
+    }
+
+    /// Un dominio reservado se rechaza ANTES que la forma, como `publish`: el constructor puro no escribe en `rpc.`.
+    #[test]
+    fn el_constructor_puro_rechaza_un_dominio_reservado() {
+        for subject in [
+            "rpc.pedido.v1.creado",
+            "state.pedido.v1.creado",
+            "dlq.pedido.v1.creado",
+            "system.pedido.v1.creado",
+        ] {
+            let mut inp = input();
+            inp.subject = subject.to_string();
+            assert_eq!(
+                build_event(inp).unwrap_err().code(),
+                Some("RESERVED_DOMAIN"),
+                "{subject}"
+            );
+        }
+    }
+
+    /// `time` se normaliza a la forma canónica (3 decimales y `Z`, UTC) o se rechaza (01-envelope.md §2.2).
+    #[test]
+    fn parse_instant_normaliza_y_rechaza() {
+        let canon = |t: &str| parse_instant(t).map(format_time);
+        for (entra, sale) in [
+            ("2026-08-20T10:41:07.318Z", "2026-08-20T10:41:07.318Z"),
+            ("2026-08-20T10:41:07Z", "2026-08-20T10:41:07.000Z"),
+            ("2026-08-20T10:41:07.3Z", "2026-08-20T10:41:07.300Z"),
+            ("2026-08-20T10:41:07.318927Z", "2026-08-20T10:41:07.318Z"),
+            ("2026-08-20T10:41:07.9999Z", "2026-08-20T10:41:07.999Z"),
+            ("2026-08-20T12:41:07.318+02:00", "2026-08-20T10:41:07.318Z"),
+            ("2026-08-20T05:11:07.318-05:30", "2026-08-20T10:41:07.318Z"),
+            ("2026-08-20T10:41:07.318-00:00", "2026-08-20T10:41:07.318Z"),
+            ("2026-08-20t10:41:07.318z", "2026-08-20T10:41:07.318Z"),
+            ("2028-02-29T10:41:07.318Z", "2028-02-29T10:41:07.318Z"),
+            ("0000-01-01T00:00:00.000Z", "0000-01-01T00:00:00.000Z"),
+            ("9999-12-31T23:59:59.999Z", "9999-12-31T23:59:59.999Z"),
+        ] {
+            assert_eq!(canon(entra).as_deref(), Some(sale), "{entra}");
+        }
+        for malo in [
+            "",
+            "ayer",
+            "2026-08-20",
+            "2026-08-20T10:41:07",
+            "2026-13-20T10:41:07.318Z",
+            "2026-02-30T10:41:07.318Z",
+            "2026-02-29T10:41:07.318Z",
+            "2026-08-20T24:00:00.000Z",
+            "2026-08-20T10:41:61.000Z",
+            "12026-08-20T10:41:07.318Z",
+            " 2026-08-20T10:41:07.318Z",
+            "2026-08-20T12:41:07.318+02",
+            "2026-08-20T12:41:07.318+0200",
+            "2026-08-20T12:41:07.318+24:00",
+            "2026-08-20T10:41:07,318Z",
+            "2026-08-20T10:41:07.Z",
+            // Un segundo intercalar no existe en UTC de POSIX ni en `Date`.
+            "2026-06-30T23:59:60.000Z",
+            // El año en UTC fuera de 0000–9999.
+            "9999-12-31T23:59:59.999-01:00",
+            "0000-01-01T00:30:00.000+01:00",
+        ] {
+            assert_eq!(canon(malo), None, "{malo:?}");
+        }
+        assert_eq!(
+            parse_time("ayer").unwrap_err().code(),
+            Some("WRONG_ATTRIBUTE_TYPE")
+        );
     }
 
     #[test]
@@ -1377,6 +1581,29 @@ mod tests {
         assert!(err.len() <= 1024);
         // Si se hubiese partido un carácter, esto entraría en pánico o daría U+FFFD.
         assert!(err.chars().all(|c| c == 'ñ'));
+    }
+
+    /// `dlqerror` mide 1024 BYTES UTF-8 sin partir un carácter (04-errors.md §3): los mismos casos que los vectores
+    /// `ajuste-dlqerror-*` y que `truncateUtf8Bytes` de Node.
+    #[test]
+    fn dlqerror_son_1024_bytes_utf8_sin_partir_un_caracter() {
+        let corta = |s: &str| truncate_utf8_bytes(s, 1024);
+        assert_eq!(corta(&"é".repeat(1500)), "é".repeat(512));
+        assert_eq!(corta(&format!("{}é", "a".repeat(1023))), "a".repeat(1023));
+        assert_eq!(
+            corta(&format!("{}é", "a".repeat(1022))),
+            format!("{}é", "a".repeat(1022))
+        );
+        assert_eq!(corta(&format!("{}€", "a".repeat(1022))), "a".repeat(1022));
+        assert_eq!(corta(&format!("{}😀b", "a".repeat(1021))), "a".repeat(1021));
+        assert_eq!(corta(&"😀".repeat(300)), "😀".repeat(256));
+        assert_eq!(corta("hola"), "hola");
+        assert_eq!(corta(""), "");
+        for s in ["é".repeat(1500), "😀".repeat(300), "日本語".repeat(500)] {
+            let c = corta(&s);
+            assert!(c.len() <= 1024);
+            assert!(s.starts_with(&c));
+        }
     }
 
     #[test]

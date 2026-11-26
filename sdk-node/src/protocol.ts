@@ -53,14 +53,17 @@ export const RESERVED_DOMAINS: readonly string[] = ["dlq", "state", "rpc", "syst
  * reservado. Se comprueba ANTES que la forma: `dlq.pedidos.pedido.v1.creado` tiene cinco tokens
  * y «debe tener cuatro» no diría qué pasa de verdad.
  */
-export function assertNotReservedDomain(subjectOrContract: string, what: "subject" | "contrato" = "subject"): void {
+export function assertNotReservedDomain(
+  subjectOrContract: string,
+  what: "subject" | "contrato" | "operación" = "subject",
+): void {
   const domain = String(subjectOrContract).split(".")[0];
   if (RESERVED_DOMAINS.includes(domain)) throw new ReservedDomainError(domain, RESERVED_DOMAINS, what);
 }
 
-/** `<dominio>.<agregado>.v<major>.<evento>` — 02-naming.md §1 */
+/** `<dominio>.<agregado>.v<major>.<evento>` — 02-naming.md §1. La versión mayor son de 1 a 4 dígitos (`v1`…`v9999`, sin ceros a la izquierda). */
 export const SUBJECT_PATTERN =
-  /^[a-z0-9]+(-[a-z0-9]+)*\.[a-z0-9]+(-[a-z0-9]+)*\.v[1-9][0-9]*\.[a-z0-9]+(-[a-z0-9]+)*$/;
+  /^[a-z0-9]+(-[a-z0-9]+)*\.[a-z0-9]+(-[a-z0-9]+)*\.v[1-9][0-9]{0,3}\.[a-z0-9]+(-[a-z0-9]+)*$/;
 
 export interface ParsedSubject {
   readonly domain: string;
@@ -94,7 +97,7 @@ export function parseSubject(subject: string): ParsedSubject {
       subject,
       n !== 4
         ? `debe tener exactamente 4 tokens (<dominio>.<agregado>.v<major>.<evento>), tiene ${n}`
-        : "formato esperado <dominio>.<agregado>.v<major>.<evento> en kebab-case",
+        : "formato esperado <dominio>.<agregado>.v<major>.<evento> en kebab-case (la versión mayor, de 1 a 4 dígitos: v1…v9999)",
     );
   }
   const [domain, aggregate, v, event] = subject.split(".");

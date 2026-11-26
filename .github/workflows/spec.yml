@@ -146,7 +146,8 @@ jobs:
         run: |
           GOBIN="$PWD/bin" go install github.com/nats-io/nats-server/v2@v2.14.5
           echo "NATS_SERVER=$PWD/bin/nats-server" >> "$GITHUB_ENV"
-      # S11 compila y lanza `cargo run --example acl_cycle` en sdk-rust.
+      # S11 compila y lanza `cargo run --example acl_cycle` en sdk-rust; S31 y S33, el participante de petición/respuesta
+      # (`--example rpc_participant --features signing`).
       - uses: dtolnay/rust-toolchain@stable
       # La suite usa la CLI (`flux provision`) y el SDK de Node (S10, desde dist/).
       - run: npm install --no-audit --no-fund
@@ -164,6 +165,14 @@ jobs:
         env:
           FLUX_REQUIRE_BROKER: '1'
         run: node conformance/security.mjs
+      # Una prueba que solo se ha visto en verde no demuestra nada: se estropea el GENERADOR de ACL a propósito (`rpc.<dominio>.>` a
+      # quien llama, `rpc.>` o un permiso de publicación sobre inboxes al dueño, sin `allow_responses` o sin su `expires`, el inbox
+      # común…) y los casos S21 a S29 DEBEN fallar con cada uno de los 13 mutantes. Sin mutar, el subconjunto pasa. (Los casos con
+      # SDKs reales, S30 y S34, hacen lo mismo con `--sdk` en el job `interop-rpc`: en paralelo, para no alargar este.)
+      - name: Los casos detectan un generador de ACL estropeado (deben FALLAR)
+        env:
+          FLUX_REQUIRE_BROKER: '1'
+        run: node conformance/security/mutantes.mjs
       # El estado replicado (10-state.md): los casos del broker, una ACL por tenant escrita a mano y un
       # cluster de tres nodos. Levanta sus propios servidores con el nats-server compilado arriba.
       - name: Ejecutar la suite de estado replicado
@@ -196,6 +205,60 @@ jobs:
             fi
             echo "✓ el mutante $m fue detectado"
           done
+
+  # Petición/respuesta entre los SDKs REALES de Node y de Rust (conformance/interop-rpc.mjs): el mismo entorno que la suite de
+  # seguridad —nats-server con TLS, la ACL que genera gen-acl.mjs, `flux provision`— y cada instancia, un PROCESO con un SDK de
+  # verdad: Node llama a Rust y al revés (y los dos de control), con tenants distintos, firma `require`, errores retryable y
+  # permanent, una respuesta que no cabe y un handler que lanza lo desconocido. Va en su propio job para no alargar el de seguridad
+  # (~12 min): corre en paralelo. Los S30 a S34 (el ciclo de §12.9 y A-101 con cada SDK) corren en el de seguridad.
+  interop-rpc:
+    name: Interoperabilidad de petición/respuesta — los SDKs de Node y de Rust contra un NATS real
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+          cache: false
+      - name: Compilar nats-server 2.14.5
+        run: |
+          GOBIN="$PWD/bin" go install github.com/nats-io/nats-server/v2@v2.14.5
+          echo "NATS_SERVER=$PWD/bin/nats-server" >> "$GITHUB_ENV"
+      # El participante de Rust (`--example rpc_participant --features signing`) lo compila el propio runner.
+      - uses: dtolnay/rust-toolchain@stable
+      - run: npm install --no-audit --no-fund
+        working-directory: conformance
+      - run: npm install --no-audit --no-fund
+        working-directory: cli
+      - run: npm install --no-audit --no-fund
+        working-directory: sdk-node
+      - run: npm run build
+        working-directory: sdk-node
+      - name: Ejecutar la suite de interoperabilidad entre SDKs
+        env:
+          FLUX_REQUIRE_BROKER: '1'
+          FLUX_TEST_PORTS: '4650-4699'
+        run: node conformance/interop-rpc.mjs
+      # Una prueba que solo se ha visto en verde no demuestra nada: se estropea el SDK a propósito —que abra una suscripción a su
+      # inbox por la conexión con la que pide (A-101: `RPC_UNAVAILABLE` pasa a ser un timeout) en `connect()`, en el pull o en el
+      # `watch`; una respuesta que no hereda el tenant; que reenvíe el texto de una excepción desconocida; un reintento con otro
+      # `id`; un responder que no verifica la firma— y los casos DEBEN fallar con cada uno de los 11 mutantes. Sin mutar, pasan.
+      - name: Los casos detectan un SDK estropeado (deben FALLAR)
+        env:
+          FLUX_REQUIRE_BROKER: '1'
+          FLUX_TEST_PORTS: '4650-4699'
+        run: node conformance/security/mutantes-sdk.mjs
+      # Y al revés: un GENERADOR de ACL estropeado (a quien llama `rpc.<dominio>.>`, sin `allow_responses`, el inbox común, un permiso de
+      # publicación sobre inboxes, `max: 3`…) también tiene que romper a los SDKs reales: S30 (el ciclo de §12.9 con el de Node) y
+      # S34 (`allow_responses` con un responder tramposo) DEBEN fallar con cada uno de los 11 mutantes.
+      - name: Los casos con SDKs reales detectan un generador de ACL estropeado (deben FALLAR)
+        env:
+          FLUX_REQUIRE_BROKER: '1'
+          FLUX_TEST_PORTS: '4650-4699'
+        run: node conformance/security/mutantes.mjs --sdk
 
   protocol-json-valid:
     name: protocol.json coherente
@@ -518,37 +581,57 @@ jobs:
           # va el JSON del arnés. Se sacan de en medio aquí.
           dotnet build sdk-dotnet/Flux.sln -v quiet
 
-      # No necesita broker: esto ejercita envelope, firma y parseo, no NATS. Compara
-      # las salidas de los siete SDKs BYTE A BYTE con los mismos vectores.
+      # No necesita broker: esto ejercita envelope, firma, parseo, estado y petición/respuesta, no NATS.
+      # Compara las salidas de los siete SDKs BYTE A BYTE con los mismos vectores. Las operaciones de una
+      # CAPACIDAD (state-*, rpc-*) las ejecuta cada SDK que la declara en protocol.json → capabilities, y
+      # FALLA el que la declara y no las cumple (bytes distintos, un código distinto, una operación que su
+      # arnés no implementa, un arnés sin registrar). `--exigir state,rpc` añade que el job no pueda quedar
+      # verde con un «N/A» en todos: si ningún SDK ejecutó la capacidad, falla.
       - name: Vectores idénticos en todos los SDKs
-        run: node conformance/cross-sdk.mjs --verbose
+        run: node conformance/cross-sdk.mjs --verbose --exigir state,rpc
 
-      # Las operaciones de estado (state-build, state-tombstone, state-subject, state-dlq) las ejecutan
-      # SOLO los SDKs que declaran `state` en protocol.json (Node y Rust): los otros cinco salen
-      # «N/A: no declara state» en el paso de arriba. Un runner que solo se ha visto en verde no demuestra
-      # que detecte nada: cada mutante estropea a propósito lo que un SDK entrega o declara (un byte, un
-      # tenant, una operación ausente, un arnés sin registrar) y el runner DEBE fallar. Con `--only` para no
-      # recompilar ni invocar lo que el mutante no toca.
-      - name: El runner detecta un byte, un tenant o una operación ausente (debe FALLAR)
+      # Los 93 vectores de «Ajustes» (conformance/harness/vectors.json → ajustesVectors): lo que se decidió donde la
+      # spec callaba o discrepaba (dlqerror en bytes, `maxLength` en puntos de código, versión mayor de 1 a 4
+      # dígitos, `id`/`source` vacíos, `time` canónico, `data` canónico). Son de CUALQUIER operación de estado o de
+      # rpc y de dos SDKs (`ajustesSdks`), por eso los ejecuta su propio runner y no cross-sdk.mjs.
+      - name: Los ajustes (93 vectores) dan lo decidido en Node y Rust
+        run: node conformance/ajustes.mjs
+
+      # Las operaciones de estado (state-build, state-tombstone, state-subject, state-dlq) y de petición/respuesta
+      # (rpc-request, rpc-reply, rpc-error, rpc-operation, rpc-timeout) las ejecutan SOLO los SDKs que declaran
+      # `state` o `rpc` en protocol.json (Node y Rust): los otros cinco salen «N/A: no declara …» en el paso de
+      # arriba. Un runner que solo se ha visto en verde no demuestra que detecte nada: cada mutante estropea a
+      # propósito lo que un SDK entrega o declara (un byte, un tenant, un timeout fuera de rango aceptado, un
+      # dominio reservado que no se rechaza, un `correlationid` que no se hereda, una operación ausente, un arnés
+      # sin registrar) y el runner DEBE fallar. Con `--only` para no recompilar ni invocar lo que el mutante no toca.
+      - name: El runner detecta un byte, un tenant, un timeout, un dominio reservado o una operación ausente (debe FALLAR)
         run: |
           for par in rust-un-byte:node,rust rust-tenant-cambiado:node,rust rust-ignora-tenant:node,rust \
                      rust-sin-state-subject:node,rust rust-sin-arnes-registrado:node,rust \
-                     python-declara-state:node,python; do
+                     python-declara-state:node,python \
+                     rust-rpc-un-byte:node,rust rust-rpc-timeout-recortado:node,rust \
+                     rust-rpc-dominio-reservado-aceptado:node,rust rust-rpc-correlationid-de-la-peticion:node,rust \
+                     rust-sin-rpc-operation:node,rust python-declara-rpc:node,python; do
             mutante="${par%%:*}"
             solo="${par#*:}"
-            if node conformance/cross-sdk.mjs --only "$solo" --mutant "$mutante" > /dev/null 2>&1; then
-              echo "✗ el mutante $mutante NO hizo fallar el runner: no vigila lo que dice vigilar"
+            # Debe terminar con 1 (una divergencia detectada), no con 2: un mutante mal escrito, o unos vectores
+            # que ni siquiera se cargan, también «fallan», y no demuestran que el runner vigile nada.
+            node conformance/cross-sdk.mjs --only "$solo" --mutant "$mutante" > /dev/null 2>&1 && codigo=0 || codigo=$?
+            if [ "$codigo" -ne 1 ]; then
+              echo "✗ el mutante $mutante terminó con $codigo y debía fallar con 1: el runner no vigila lo que dice vigilar"
               exit 1
             fi
             echo "✓ $mutante detectado"
           done
 
-      # El reverso: un SDK que NO declara `state` no es un fallo, pero tampoco un salto silencioso.
-      - name: Un SDK que no declara state sale N/A y NO falla
+      # El reverso: un SDK que NO declara una capacidad no es un fallo, pero tampoco un salto silencioso.
+      - name: Un SDK que no declara state ni rpc sale N/A y NO falla
         run: |
-          salida=$(node conformance/cross-sdk.mjs --only node,rust --mutant rust-no-declara-state)
-          echo "$salida" | grep -q "N/A: no declara state — rust" || { echo "✗ no imprimió el N/A"; exit 1; }
-          echo "✓ N/A visible y sin fallo"
+          for cap in state rpc; do
+            salida=$(node conformance/cross-sdk.mjs --only node,rust --mutant "rust-no-declara-$cap")
+            echo "$salida" | grep -q "N/A: no declara $cap — rust" || { echo "✗ no imprimió el N/A de $cap"; exit 1; }
+            echo "✓ $cap: N/A visible y sin fallo"
+          done
 
   conformance:
     name: Conformidad contra NATS real

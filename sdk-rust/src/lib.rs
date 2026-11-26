@@ -75,6 +75,12 @@
 //! `GET /clientes/123` y a la carga inicial—: [`Bus::state`], `put`, `delete`, `get` y `watch`.
 //! Extensión opcional de v1.1; ver [`state`] y `specification/10-state.md`.
 //!
+//! # Petición/respuesta
+//!
+//! Una **orden** o un **cálculo** con respuesta inmediata entre dos servicios, por core NATS y sin
+//! HTTP: [`Bus::request`] y [`Bus::respond`]. Un dato que guarda otro sistema **no** es esto: es
+//! estado. Extensión opcional de v1.1; ver [`rpc`] y `specification/11-request-reply.md`.
+//!
 //! # Las cuatro reglas que no se negocian
 //!
 //! 1. **Nunca inventes un subject.** `<dominio>.<agregado>.v<major>.<evento>`, 4 tokens,
@@ -98,6 +104,7 @@
 // donde corresponde —en CI, con `cargo clippy -- -D warnings`—, que es el único sitio
 // donde el toolchain está fijado.
 
+mod canonical;
 pub mod classify;
 pub mod client;
 pub mod context;
@@ -113,6 +120,13 @@ pub mod security;
 /// No va detrás de una feature: no arrastra ninguna dependencia nueva y un servicio que no lo
 /// use no paga nada por él.
 pub mod state;
+
+/// Petición/respuesta — **extensión OPCIONAL** de v1.1 (capacidad `rpc`): `request` y `respond`, una
+/// orden o un cálculo con respuesta inmediata por core NATS — `specification/11-request-reply.md`.
+///
+/// No va detrás de una feature: no arrastra ninguna dependencia nueva y un servicio que no lo use no
+/// paga nada por él.
+pub mod rpc;
 
 /// Firma Ed25519 de eventos — **extensión OPCIONAL**, detrás de la feature `signing`.
 ///
@@ -146,22 +160,25 @@ pub use client::{
 };
 pub use context::EventContext;
 pub use envelope::{
-    build_event, data_to_raw, format_time, parse_event, serialize, strip_dlq_extensions,
-    to_dlq_event, BuildEventInput, DataClassification, DlqInfo, DlqReason, Event,
-    ALLOWED_ROOT_ATTRIBUTES,
+    build_event, canonical_data, data_to_raw, format_time, parse_event, parse_instant, parse_time,
+    serialize, strip_dlq_extensions, to_dlq_event, BuildEventInput, DataClassification, DlqInfo,
+    DlqReason, Event, ALLOWED_ROOT_ATTRIBUTES,
 };
 pub use errors::{
     as_classified, describe, Classification, ConfigDifference, ErrorClass, Failure, FluxError,
     HandlerError, HandlerResult, RejectionReason, ResourceKind, SchemaNotFoundError,
-    SchemaValidationError, CONNECTION_REJECTED_CODE, INVALID_CREDENTIALS_CODE, INVALID_SCHEMA_CODE,
-    INVALID_STATE_CONTRACT_CODE, INVALID_STATE_KEY_CODE, INVALID_TENANT_FOR_STATE_CODE,
-    INVALID_TLS_OPTIONS_CODE, MISSING_AGGREGATE_VERSION_CODE, NOT_PROVISIONED_CODE,
-    PERMISSION_DENIED_CODE, RESERVED_DOMAIN_CODE, SCHEMA_NOT_FOUND_CODE, STATE_CONFLICT_CODE,
+    SchemaValidationError, CONNECTION_REJECTED_CODE, INVALID_CREDENTIALS_CODE,
+    INVALID_RPC_CALL_CODE, INVALID_SCHEMA_CODE, INVALID_STATE_CONTRACT_CODE,
+    INVALID_STATE_KEY_CODE, INVALID_TENANT_FOR_STATE_CODE, INVALID_TLS_OPTIONS_CODE,
+    MISSING_AGGREGATE_VERSION_CODE, NOT_PROVISIONED_CODE, PERMISSION_DENIED_CODE,
+    RESERVED_DOMAIN_CODE, RPC_INVALID_REPLY_CODE, RPC_MESSAGE_TOO_LARGE_CODE, RPC_TIMEOUT_CODE,
+    RPC_UNAVAILABLE_CODE, SCHEMA_NOT_FOUND_CODE, STALE_REQUEST_CODE, STATE_CONFLICT_CODE,
     STATE_SUBJECT_MISMATCH_CODE,
 };
 pub use metrics::{
     ConnectionState, ConsumeOutcome, DlqReasonLabel, InMemoryMetrics, MetricsSink, NoMetrics,
-    PublishOutcome, StateWriteOutcome, DURATION_BUCKETS,
+    PublishOutcome, RpcClientOutcome, RpcRole, RpcServerOutcome, StateWriteOutcome,
+    DURATION_BUCKETS,
 };
 pub use protocol::{
     dlq_stream_name, dlq_subject, durable_name, inbox_prefix, is_dlq_subject, is_reserved_domain,
@@ -170,6 +187,14 @@ pub use protocol::{
     DATA_CONTENT_TYPE, DEFAULT_ACK_WAIT, DEFAULT_MAX_ACK_PENDING, DEFAULT_MAX_DELIVER,
     DLQ_STREAM_MAX_AGE, DUPLICATE_WINDOW, MAX_MESSAGE_BYTES, PROTOCOL_NAME, PROTOCOL_VERSION,
     RESERVED_DOMAINS, SPEC_VERSION, STREAM_MAX_AGE,
+};
+pub use rpc::{
+    build_rpc_error, build_rpc_reply, build_rpc_request, parse_rpc_time, resolve_timeout_ms,
+    rpc_dataschema, rpc_subject, ReplyTo, RequestOptions, RespondOptions, Responder, RpcContext,
+    RpcErrorBody, RpcErrorInput, RpcHandler, RpcOperation, RpcReplyInput, RpcRequest,
+    RpcRequestInput, RpcRequestRef, RpcSide, DEFAULT_TIMEOUT_MS, MAX_CONCURRENT_HANDLERS,
+    MAX_TIMEOUT_MS, MIN_TIMEOUT_MS, RPC_ERROR_DATASCHEMA, RPC_ERROR_TYPE,
+    STALE_REQUEST_WINDOW_SECS,
 };
 pub use security::TlsOptions;
 #[cfg(feature = "signing")]
@@ -183,4 +208,4 @@ pub use state::{
     STATE_MAX_ATTEMPTS, STATE_TENANT_MAX_LEN, TOMBSTONE_DATASCHEMA,
 };
 #[cfg(feature = "validation")]
-pub use validation::{SchemaBundle, ValidationMode, ValidationOptions, Validator};
+pub use validation::{RpcSchemas, SchemaBundle, ValidationMode, ValidationOptions, Validator};

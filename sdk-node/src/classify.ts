@@ -128,6 +128,23 @@ export interface ClassifierOptions {
 export function createClassifier(
   options: ClassifierOptions = {},
 ): (e: unknown) => Classification {
+  const detallado = createDetailedClassifier(options);
+  return (e) => detallado(e).classification;
+}
+
+/**
+ * Lo que `createClassifier` decide y **si lo reconoció**. La petición/respuesta lo necesita: un
+ * error que el clasificador reconoce (un 503 de una dependencia, `ECONNRESET`) viaja con su clase y
+ * su código, y uno desconocido viaja como `permanent` `UNKNOWN` con un mensaje genérico
+ * (11-request-reply.md §5.3). `Classification` por sí sola no lo dice: el código `UNKNOWN`, o el de
+ * una llamada al sistema que no es transitoria, también sale de la rama por defecto.
+ *
+ * «Reconocido» es: una excepción tipada de flux, una regla de la aplicación, un status HTTP, un
+ * código de red transitorio o un timeout. Todo lo demás es la política de lo desconocido.
+ */
+export function createDetailedClassifier(
+  options: ClassifierOptions = {},
+): (e: unknown) => { classification: Classification; recognized: boolean } {
   const policy = options.unknownErrorPolicy ?? "retryable-bounded";
   const unknownBudget = options.unknownRetryBudget ?? 2;
   const timeoutClass =
@@ -136,54 +153,56 @@ export function createClassifier(
       : ErrorClass.RETRYABLE;
   const rules = options.rules ?? [];
 
-  return function classify(e: unknown): Classification {
+  return function classify(e: unknown): { classification: Classification; recognized: boolean } {
+    const ok = (classification: Classification) => ({ classification, recognized: true });
     // 1. Una excepción tipada de flux siempre gana: la aplicación sabe más que el SDK.
     if (isClassifiedError(e)) {
-      return {
+      return ok({
         class: e.fluxClass,
         code: e.opts.code ?? e.name,
         retryAfterMs:
           e.fluxClass === ErrorClass.RETRYABLE
             ? (e.opts as { retryAfterMs?: number }).retryAfterMs
             : undefined,
-      };
+      });
     }
 
     // 2. Reglas de la aplicación.
     for (const rule of rules) {
       const r = rule(e);
-      if (r) return r;
+      if (r) return ok(r);
     }
 
     // 3. Status HTTP: la señal más fiable que da una dependencia.
     const status = extractHttpStatus(e);
     if (status !== undefined) {
       const retryable = RETRYABLE_HTTP_STATUS.has(status);
-      return {
+      return ok({
         class: retryable ? ErrorClass.RETRYABLE : ErrorClass.PERMANENT,
         code: `HTTP_${status}`,
         ...(retryable && { retryAfterMs: extractRetryAfterMs(e) }),
-      };
+      });
     }
 
     // 4. Errores de sistema: red y DNS son transitorios por definición.
     const syscall = extractSyscallCode(e);
     if (syscall !== undefined && TRANSIENT_SYSCALL_CODES.has(syscall)) {
-      return { class: ErrorClass.RETRYABLE, code: syscall };
+      return ok({ class: ErrorClass.RETRYABLE, code: syscall });
     }
 
     // 5. Timeouts — política configurable.
     if (isTimeout(e)) {
-      return { class: timeoutClass, code: "TIMEOUT" };
+      return ok({ class: timeoutClass, code: "TIMEOUT" });
     }
 
     // 6. Lo desconocido. Aquí se decide el comportamiento del ecosistema ante lo que
     //    nadie previó. El default acotado da al transitorio una segunda oportunidad
     //    sin regalarle 51 minutos de cola al sistemático — 04-errors.md §2.1.
     const code = syscall ?? "UNKNOWN";
-    if (policy === "permanent") return { class: ErrorClass.PERMANENT, code };
-    if (policy === "retryable") return { class: ErrorClass.RETRYABLE, code };
-    return { class: ErrorClass.RETRYABLE, code, maxAttempts: unknownBudget };
+    const unknown = (classification: Classification) => ({ classification, recognized: false });
+    if (policy === "permanent") return unknown({ class: ErrorClass.PERMANENT, code });
+    if (policy === "retryable") return unknown({ class: ErrorClass.RETRYABLE, code });
+    return unknown({ class: ErrorClass.RETRYABLE, code, maxAttempts: unknownBudget });
   };
 }
 

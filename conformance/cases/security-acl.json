@@ -1,8 +1,8 @@
 {
   "suite": "security-acl",
   "title": "Los permisos que genera gen-acl.mjs, ejecutados contra un nats-server real",
-  "spec": "specification/06-security.md §2 y §3 (el estado, en §3.8)",
-  "plan": "docs/plan-v1.1/PLAN.md §1.5 (S1–S14), Fase 2 (S15–S20) y Apéndice A",
+  "spec": "specification/06-security.md §2 y §3 (el estado, en §3.8; la petición/respuesta, en §3.9)",
+  "plan": "docs/plan-v1.1/PLAN.md §1.5 (S1–S14), Fase 2 (S15–S20), Fase 3 (S21–S29), la suite con los SDKs reales de petición/respuesta (S30 en adelante) y Apéndice A",
   "runner": "conformance/security.mjs",
   "$comment": "Estos casos son DATOS: conformance/security.mjs no sabe qué es S1, solo ejecuta las operaciones de `vocabulary` y compara lo observado con `expect`. Añadir un caso es escribir JSON; solo una operación nueva toca el intérprete (conformance/security/interprete.mjs). El orden de las claves de un paso no importa; un campo desconocido, o una expectativa sobre algo que la operación no observa, es un ERROR al cargar: una errata no puede degradarse a «no se comprueba nada». Un caso DEBE llevar `spec`, `rationale` (qué se rompe si deja de ser cierto), `observed` (versión del servidor, fecha y resultado) y, si nace de un bug, `counterExample`. Los nombres de stream y de durable van LITERALES: es una derivación independiente de la de scripts/lib/manifest.mjs, y si el generador nombrara mal un durable un caso que reutilizase su código concedería exactamente el permiso equivocado y pasaría.",
   "verifiedAgainst": "nats-server 2.14.5",
@@ -10,21 +10,25 @@
 
   "scenario": {
     "manifest": "examples/services.json",
+    "extraServices": [
+      { "name": "panel-api", "watches": [{ "contract": "clientes.cliente.v1", "tenants": ["acme"] }], "calls": ["clientes.cliente.v1.calcular-descuento"] }
+    ],
     "ops": "El usuario `ops` no tiene restricciones y aprovisiona con `flux provision` por TLS. Es el único que crea streams y consumidores: ningún servicio tiene permiso para ello.",
     "services": {
-      "pedidos-api": "dueño de pedidos; consume inventario.stock.v1.ajustado",
-      "facturacion-api": "dueño de facturacion; consume pedidos.pedido.v1.creado y .cancelado",
+      "pedidos-api": "dueño de pedidos; consume inventario.stock.v1.ajustado; llama a clientes.cliente.v1.calcular-descuento (`calls`)",
+      "facturacion-api": "dueño de facturacion; consume pedidos.pedido.v1.creado y .cancelado; llama a clientes.cliente.v1.calcular-descuento y .obtener (`calls`)",
       "inventario-api": "dueño de inventario; consume pedidos.pedido.v1.creado y .cancelado",
       "logistica-api": "dueño de logistica; consume pedidos.pedido.v1.*, facturacion.factura.v2.emitida",
-      "crm-api": "dueño de clientes, que tiene estado (schemas/state/clientes/cliente): escribe `state.clientes.>`, lee lo suyo con DIRECT.GET y lee su DLQ de estado",
+      "crm-api": "dueño de clientes, que tiene estado (schemas/state/clientes/cliente): escribe `state.clientes.>`, lee lo suyo con DIRECT.GET y lee su DLQ de estado; atiende clientes.cliente.v1.calcular-descuento y .obtener (`serves`): se suscribe a `rpc.clientes.>` y responde con `allow_responses: { max: 1, expires: 30s }`",
       "tienda-web": "observa el estado clientes.cliente.v1 CONFINADA al tenant acme (`watches` con `tenants`)",
-      "informes-api": "observa el estado clientes.cliente.v1 de TODOS los tenants (`watches` sin `tenants`)"
+      "informes-api": "observa el estado clientes.cliente.v1 de TODOS los tenants (`watches` sin `tenants`)",
+      "panel-api": "(extraServices: SOLO para los casos con SDKs reales) observa el estado clientes.cliente.v1 (del tenant acme, el de `connect()` de los agentes) y además llama a clientes.cliente.v1.calcular-descuento: un servicio que consume estado Y hace peticiones por la misma conexión"
     },
     "tls": "El servidor exige TLS (sin allow_non_tls) con un certificado de una CA efímera creada con openssl para esta ejecución. Todo cliente de la suite confía solo en esa CA."
   },
 
   "vocabulary": {
-    "$comment": "`as` es un actor: el nombre de un servicio del manifiesto (conecta con SU nkey y SU inbox privado `_INBOX.<servicio>`), `ops`, o un objeto { service, inbox?, + variante }. `inbox`: `private` (por defecto en un servicio), `default` (el aleatorio de la librería: lo que haría un SDK que no fije el prefijo; por defecto en ops) o un prefijo explícito. Una VARIANTE parte de los permisos que genera gen-acl.mjs para el servicio y los estropea a propósito: `without` (quita permisos de publicación: DEBEN existir), `extraPublish`, `extraSubscribe`, `replaceSubscribe` (reemplaza la suscripción; `[]` escribe `allow: []`, que NATS lee como «sin restricción») o `dev` (parte de gen-acl.mjs --dev). Las variantes no existen con --acl (no hay permisos generados de los que partir). `{me}` en una cadena es el servicio que actúa y `{marker}` una marca única por caso y ejecución. `expect` compara con lo que la operación observa: valor exacto, o { match: regex }, { includes }, { lte }, { gte }, { not }, { present: bool }; una clave con puntos entra en objetos (`reply.error.err_code`). `control: true` marca un paso cuyo resultado esperado es lo MALO: demuestra que la sonda puede fallar. `onlyWith: generated-acl` lo omite con --acl. `save: nombre` guarda el `seq` que observó el paso, y `{ \"ref\": nombre, \"plus\": n }` lo usa en los argumentos o en `expect` de un paso POSTERIOR (la secuencia de una escritura condicional del estado): una referencia a algo no guardado es un error al cargar.",
+    "$comment": "`as` es un actor: el nombre de un servicio del manifiesto (conecta con SU nkey y SU inbox privado `_INBOX.<servicio>`), `ops`, o un objeto { service, inbox?, + variante }. `inbox`: `private` (por defecto en un servicio), `default` (el aleatorio de la librería: lo que haría un SDK que no fije el prefijo; por defecto en ops) o un prefijo explícito. Una VARIANTE parte de los permisos que genera gen-acl.mjs para el servicio y los estropea a propósito: `without` (quita permisos de publicación: DEBEN existir), `extraPublish`, `extraSubscribe`, `withoutSubscribe` (quita suscripciones: DEBEN existir; si la lista quedara vacía se escribe un subject que nadie usa, porque `allow: []` no deniega nada), `replaceSubscribe` (reemplaza la suscripción; `[]` escribe `allow: []`, que NATS lee como «sin restricción»), `allowResponses` (cambia el `allow_responses` del dueño: `null` lo quita —DEBE tenerlo—, `true` es la forma desnuda y `{ max, expires }` otra), `instance` (otra CONEXIÓN con la misma identidad: dos instancias de un servicio) o `dev` (parte de gen-acl.mjs --dev). Las variantes no existen con --acl (no hay permisos generados de los que partir). `{me}` en una cadena es el servicio que actúa y `{marker}` una marca única por caso y ejecución. `expect` compara con lo que la operación observa: valor exacto, o { match: regex }, { includes }, { lte }, { gte }, { not }, { present: bool }; una clave con puntos entra en objetos (`reply.error.err_code`). `control: true` marca un paso cuyo resultado esperado es lo MALO: demuestra que la sonda puede fallar. `onlyWith: generated-acl` lo omite con --acl. `save: nombre` guarda el `seq` que observó el paso, y `{ \"ref\": nombre, \"plus\": n }` lo usa en los argumentos o en `expect` de un paso POSTERIOR (la secuencia de una escritura condicional del estado): una referencia a algo no guardado es un error al cargar.",
     "ops": {
       "connect": {
         "doc": "Una conexión que puede NO establecerse. `tls`: ca (la buena) | wrong_ca (confía en una CA que no firmó el certificado del servidor) | system (solo las CA del sistema) | none (texto plano, por un socket: la librería de NATS sube sola a TLS). `auth`: ok | unknown_key (una nkey bien formada que el servidor no conoce) | none.",
@@ -41,9 +45,10 @@
         "outcomes": ["permitted", "denied"]
       },
       "subscribe": {
-        "doc": "Suscripción de core. Una suscripción denegada tampoco lanza: se observa por el aviso del broker.",
+        "doc": "Suscripción de core. Una suscripción denegada tampoco lanza: se observa por el aviso del broker. `queue` la hace con ese grupo de cola (así se atiende una operación: el nombre del servicio; y así se suplantaría el de otro).",
         "needsActor": true,
         "args": ["subject"],
+        "optional": ["queue"],
         "observes": ["outcome", "text"],
         "outcomes": ["permitted", "denied"]
       },
@@ -123,6 +128,28 @@
         "args": ["spy", "subscribe", "victim", "reads"],
         "observes": ["victimRead", "leaked", "subject", "via", "subscriptions"]
       },
+      "rpc_call": {
+        "doc": "Una petición/respuesta DESDE el punto de vista de quien llama, sin dueño: pide por core a `subject` (el de NATS, con `rpc.`) con su inbox privado y clasifica lo que ve (11-request-reply.md §4.3): `denied` (el broker deniega la publicación: ~1 ms con `@nats-io/*`, A-66), `no_responders` (estado 503: nadie escucha, A-56), `timeout` (ni respuesta ni aviso) o `answered`. `callerViolations` son los `-ERR` que el broker mandó por la conexión durante la llamada. `watchInbox`: ver `rpc_exchange`.",
+        "needsActor": true,
+        "args": ["subject"],
+        "optional": ["body", "timeoutMs", "watchInbox"],
+        "observes": ["outcome", "text", "reply", "ms", "delivered", "callerViolations"],
+        "outcomes": ["answered", "denied", "no_responders", "timeout"]
+      },
+      "rpc_exchange": {
+        "doc": "Una petición/respuesta de extremo a extremo con clientes en bruto: el dueño (`as`, si lo hay) se suscribe al subject EXACTO de la operación con su nombre de servicio como grupo de cola y responde según `replies` (un plan de `{ afterMs, to? }`: UNA publicación por entrada, por defecto al `reply` de la petición, y con dos entradas contesta DOS veces); `caller` pide con su inbox privado; `spy`, si lo hay, se suscribe a `spySubscribe` mientras tanto. Observa lo que ve quien llama (`outcome`: answered | denied | no_responders | timeout), cuántas respuestas llegaron de verdad a su inbox (`delivered`: una suscripción propia suya las cuenta todas), cuántas peticiones recibió el dueño (`received`), si pudo suscribirse (`subscription`: permitted | denied), cuántas publicaciones suyas sobre inboxes denegó el broker (`ownerDenied`, por el `-ERR` de su conexión: A-19, A-28) y qué leyó el espía (`leaked`, `spySubscriptions`). `queue` cambia el grupo de cola (por defecto, el nombre del servicio). `watchInbox`: `other-connection` (por defecto) cuenta las respuestas desde OTRA conexión con la misma identidad; `same-connection`, desde la misma que pide, que es la trampa de A-101 (el `no responders` no llega).",
+        "args": ["subject", "caller"],
+        "optional": ["replies", "queue", "timeoutMs", "body", "spy", "spySubscribe", "watchInbox"],
+        "observes": ["outcome", "text", "reply", "ms", "delivered", "received", "subscription", "ownerDenied", "ownerViolations", "callerViolations", "leaked", "via", "spySubscriptions"],
+        "outcomes": ["answered", "denied", "no_responders", "timeout"]
+      },
+      "rpc_cycle": {
+        "doc": "El ciclo de la aceptación (11-request-reply.md §12.9) sin SDK: varias instancias del dueño (`owners`: un actor por instancia, `instance` las distingue; la misma identidad y el mismo grupo de cola) atienden `subject`; `requests` peticiones CONCURRENTES de `caller` las reparten (`byInstance`, `minShare`) y cada una recibe UNA respuesta (`answered`, `failed`); `ownerDenied` cuenta las respuestas que el broker deniega; después las instancias dejan de escuchar (UNSUB y flush) y una petición más da `stopOutcome` en `stopMs`.",
+        "args": ["subject", "caller", "owners", "requests"],
+        "optional": ["timeoutMs"],
+        "observes": ["outcome", "answered", "failed", "byInstance", "minShare", "ownerDenied", "stopOutcome", "stopMs"],
+        "outcomes": ["ok"]
+      },
       "sdk_cycle": {
         "doc": "Un SDK REAL (`node` | `rust`) hace el ciclo completo —publicar, consumir, ack, reintento, DLQ— contra la ACL generada, como un proceso aparte gobernado por el entorno. El runner mira después, desde el broker, lo que quedó. `events`: [{ caso: ok | permanente | reintento, calls, data }].",
         "args": ["sdk", "producer", "consumer", "subject", "events"],
@@ -133,12 +160,17 @@
         "doc": "S9: levanta un SEGUNDO servidor con la ACL congelada de `acl`, vuelve a ejecutar en él los casos de `reruns` y expone `<caso>.passes`, `<caso>.failed` y `<caso>.steps.<id del paso>.<campo observado>`. La regresión se cumple cuando esos casos FALLAN como se documenta.",
         "args": ["acl", "reruns"],
         "observes": ["*"]
+      },
+      "sdk_script": {
+        "doc": "Un escenario con SDKs REALES (`node` | `rust`) como PROCESOS (conformance/security/sdk-escenario.mjs): `agents` son las instancias ({ id, sdk, as, tenant?, label?, signing?, tramposo? }; `signing`: require | warn | sign | { sign?, verify?, knows?, swap? } con claves Ed25519 que crea el orquestador; `tramposo`: su conexión publica DOS veces cada respuesta; `as` es un actor —servicio o variante—, así que entran con SU nkey y SU inbox privado, y dos agentes con el mismo servicio son dos instancias), y `script` los pasos, cada uno con su `expect` sobre lo que el agente contestó MÁS `wallMs`, `serverViolations[]` y `serverViolationCount` (lo que el nats-server anotó durante el paso). Órdenes de un agente (el mismo protocolo en los dos SDKs): `respond` (operation, behavior: echo | error {class, code, message, retryAfterMs} | http {status, text} | econnreset | unknown {text} | big {bytes} | no-object; con `afterMs` el handler tarda) · `behavior` · `stop` (Responder.stop: parada ordenada) · `call` (operation, data, options {timeoutMs, tenantId, aggregateId, retries}) · `call_repeat` (repeat: la mediana y el máximo de los tiempos y los códigos) · `call_many` (n, concurrency: quién atendió cada una) · `consume` (subject: un pull consumer en la misma conexión) · `watch` (contract: `state.watch`) · `publish` · `state_put` · `stats` (lo que atendió, el log del SDK) · `close`. Del orquestador: `sleep`, `stats` con `agents` (suma), `broker_subs` (las suscripciones de la conexión del agente, MIRADAS EN EL BROKER por `/connz`, y cuántas casan con el `reply` de una petición suya), `acl` (los permisos que genera gen-acl.mjs para un servicio) y `kill`. `until` repite la orden hasta que se cumpla (`waitMs`). Una variante o un servicio inexistente es un error del agente, no un salto.",
+        "args": ["agents", "script"],
+        "observes": ["*"]
       }
     }
   },
 
   "brokerObservations": {
-    "$comment": "Qué caso cubre cada observación del Apéndice A del plan que es del BROKER. Las que no aparecen aquí no tienen caso en esta suite: o son del SDK (A-8b, A-26…A-28, A-30), o son del estado sin ACL (A-9…A-13 y A-31…A-50, que ejecuta conformance/state-broker.mjs; aquí solo se repiten las que dependen de la ACL: A-14, A-32, A-33, A-38, A-39, A-40, A-44 y A-45), o de la fase 3 (A-15…A-18), o necesitan otra forma de arrancar el servidor (A-8d, A-23).",
+    "$comment": "Qué caso cubre cada observación del Apéndice A del plan que es del BROKER. Las que no aparecen aquí no tienen caso en esta suite: o son del SDK (A-8b, A-26…A-28, A-30), o son del estado sin ACL (A-9…A-13 y A-31…A-50, que ejecuta conformance/state-broker.mjs; aquí solo se repiten las que dependen de la ACL: A-14, A-32, A-33, A-38, A-39, A-40, A-44 y A-45), o de la fase 3 sin ACL (A-15…A-18, A-56…A-76, que ejecuta conformance/rpc-broker.mjs; aquí se repiten bajo los permisos GENERADOS las que dependen de la ACL: A-16, A-17, A-58, A-59, A-60, A-61, A-66, A-68, A-71 y A-73, más las nuevas A-100…A-109), o necesitan otra forma de arrancar el servidor (A-8d, A-23). A-109 y A-108 (su parte del Modelo B) las ejecuta scripts/verify-acl.mjs.",
     "A-1": ["S9"],
     "A-2": ["S6", "S9"],
     "A-3": ["S1"],
@@ -165,7 +197,31 @@
     "A-44": ["S19"],
     "A-45": ["S16"],
     "A-27": ["S10", "S11"],
-    "A-29": ["S11"]
+    "A-29": ["S11"],
+    "A-16": ["S21", "S24"],
+    "A-17": ["S21"],
+    "A-56": ["S21", "S29"],
+    "A-58": ["S28"],
+    "A-59": ["S28"],
+    "A-60": ["S22"],
+    "A-61": ["S25"],
+    "A-66": ["S21", "S27"],
+    "A-68": ["S24", "S25", "S27", "S28"],
+    "A-71": ["S23"],
+    "A-73": ["S22", "S26", "S27"],
+    "A-100": ["S21"],
+    "A-101": ["S29"],
+    "A-102": ["S22"],
+    "A-103": ["S23"],
+    "A-104": ["S24"],
+    "A-105": ["S25"],
+    "A-106": ["S26"],
+    "A-107": ["S27"],
+    "A-108": ["S28"],
+    "A-140": ["S30", "S31"],
+    "A-141": ["S30", "S31"],
+    "A-142": ["S32", "S33"],
+    "A-143": ["S34"]
   },
 
   "cases": [
@@ -766,7 +822,7 @@
       "spec": "06-security.md §3.8: cada permiso de estado es necesario; 06-security.md §3.7: las denegaciones se ven",
       "plan": "PLAN Fase 2: «mutantes: quitar un permiso es detectado»",
       "covers": ["A-19", "A-20", "A-21"],
-      "rationale": "Es el S12 del estado y la mitad de la minimalidad que `verify-acl.mjs` mide con ciclos completos. Cada permiso de estado tiene una función y, sin él, un fallo concreto: sin DIRECT.GET un observador no puede `get` ni el dueño dar el paso 1 de `put`; sin CONSUMER.INFO no hay `watch`; sin MSG.NEXT el `watch` queda inerte y parece sano (A-20); sin el ack la foto se reentrega para siempre (A-19); sin `dlq.state.<contrato>` lo que no se puede aplicar se pierde. Si el generador dejara de conceder uno, o lo cambiara por otra forma, el servicio arrancaría y fallaría en producción. Con él, los fallos silenciosos no pueden serlo: se ven por el aviso del broker y por el estado del consumidor.",
+      "rationale": "Es el S12 del estado y la mitad de la minimalidad que `verify-acl.mjs` mide con ciclos completos. Cada permiso de estado tiene una función y, sin él, un fallo concreto: sin DIRECT.GET un observador no puede `get` ni el dueño dar el paso 1 de `put`; sin CONSUMER.INFO no hay `watch`; sin MSG.NEXT el `watch` queda inerte y parece sano (A-20); sin el ack la foto se reentrega para siempre (A-19); sin `dlq.state.<contrato>` lo que no se puede aplicar se pierde. Si el generador dejara de conceder uno, o lo cambiara por otra forma, el servicio arrancaría y fallaría en producción. Con él, los fallos silenciosos no pueden serlo: se ven por el aviso del broker y por el estado del consumidor. Las variantes de crm-api sin ack llevan `allowResponses: null`: el dueño de una operación recibe `allow_responses` y con él el `reply` de cada entrega —que es el subject de ack— admite UNA publicación, así que su ack pasa aunque falte el permiso `$JS.ACK` (A-109); sin quitarlo, el caso no mediría el permiso.",
       "observed": { "server": "nats-server 2.14.5", "date": "2026-11-26", "result": "Sin DIRECT.GET: Permissions Violation en `get` (tienda-web) y en el paso 1 de `put` (crm-api). Sin CONSUMER.INFO: `consumers.get` denegado nombrando el subject. Sin MSG.NEXT: el pull no lanza; solo el aviso «Permissions Violation for Publish to $JS.API.CONSUMER.MSG.NEXT.…» y el consumidor queda con numPending 1 y delivered 0 (A-20). Sin el permiso de ack: la entrada llega y el ack se deniega en silencio (aviso «Publish to $JS.ACK.…»), con ackPending 1 (A-19). Sin `dlq.state.<contrato>`, sin STREAM.INFO.DLQ_CLIENTES o sin `state.clientes.>`: Permissions Violation en 0–18 ms." },
       "steps": [
         { "as": "ops", "op": "reset_consumer", "stream": "STATE_CLIENTES", "durable": "tienda-web__state_clientes_cliente_v1__acme", "filter": "state.clientes.cliente.v1.acme.*", "deliver": "new", "expect": { "outcome": "ok" } },
@@ -786,9 +842,354 @@
         { "as": { "service": "crm-api", "without": ["$JS.API.DIRECT.GET.STATE_CLIENTES.state.clientes.>"] }, "op": "direct_get", "stream": "STATE_CLIENTES", "subject": "state.clientes.cliente.v1.acme.{marker}", "title": "crm-api sin DIRECT.GET de su dominio: el paso 1 de `put` (leer la secuencia) se deniega", "expect": { "outcome": "denied" } },
         { "as": { "service": "crm-api", "without": ["$JS.API.CONSUMER.INFO.DLQ_CLIENTES.crm-api__dlq_state_clientes"] }, "op": "pull", "stream": "DLQ_CLIENTES", "durable": "crm-api__dlq_state_clientes", "timeoutMs": 800, "title": "crm-api sin CONSUMER.INFO de su durable de DLQ de estado: no la puede leer", "expect": { "outcome": "denied" } },
         { "as": { "service": "crm-api", "without": ["$JS.API.CONSUMER.MSG.NEXT.DLQ_CLIENTES.crm-api__dlq_state_clientes"] }, "op": "pull", "stream": "DLQ_CLIENTES", "durable": "crm-api__dlq_state_clientes", "timeoutMs": 1200, "title": "crm-api sin MSG.NEXT: el pull se deniega sin excepción: lo delata el aviso del broker", "expect": { "outcome": "denied", "text": { "match": "CONSUMER\\.MSG\\.NEXT\\.DLQ_CLIENTES\\.crm-api__dlq_state_clientes" } } },
-        { "as": { "service": "crm-api", "without": ["$JS.ACK.DLQ_CLIENTES.crm-api__dlq_state_clientes.>"] }, "op": "pull", "stream": "DLQ_CLIENTES", "durable": "crm-api__dlq_state_clientes", "title": "crm-api sin el permiso de ack: lee el muerto…", "expect": { "outcome": "message", "subject": "dlq.state.clientes.cliente.v1" } },
-        { "as": { "service": "crm-api", "without": ["$JS.ACK.DLQ_CLIENTES.crm-api__dlq_state_clientes.>"] }, "op": "ack", "kind": "ack", "title": "…y el ack se deniega en silencio", "expect": { "outcome": "sent", "violation": { "match": "Publish to \"\\$JS\\.ACK\\.DLQ_CLIENTES\\.crm-api__dlq_state_clientes\\." } } },
+        { "as": { "service": "crm-api", "without": ["$JS.ACK.DLQ_CLIENTES.crm-api__dlq_state_clientes.>"], "allowResponses": null }, "op": "pull", "stream": "DLQ_CLIENTES", "durable": "crm-api__dlq_state_clientes", "title": "crm-api sin el permiso de ack: lee el muerto…", "expect": { "outcome": "message", "subject": "dlq.state.clientes.cliente.v1" } },
+        { "as": { "service": "crm-api", "without": ["$JS.ACK.DLQ_CLIENTES.crm-api__dlq_state_clientes.>"], "allowResponses": null }, "op": "ack", "kind": "ack", "title": "…y el ack se deniega en silencio", "expect": { "outcome": "sent", "violation": { "match": "Publish to \"\\$JS\\.ACK\\.DLQ_CLIENTES\\.crm-api__dlq_state_clientes\\." } } },
         { "as": "crm-api", "op": "pull", "stream": "STATE_CLIENTES", "durable": "tienda-web__state_clientes_cliente_v1__acme", "timeoutMs": 800, "title": "con TODOS sus permisos, crm-api sigue sin poder leer el durable de estado de tienda-web", "expect": { "outcome": "denied" } }
+      ]
+    },
+    {
+      "id": "S21",
+      "title": "Una llamada concedida llega al dueño y se responde; una NO concedida se deniega, y RÁPIDO",
+      "spec": "11-request-reply.md §7.1: quien llama publica solo en el subject EXACTO de cada operación concedida; §4.3: una petición denegada falla rápido con PERMISSION_DENIED",
+      "plan": "PLAN Fase 3, §3.4: «Quien llama: publicación sobre el subject exacto de cada operación concedida. Clave `calls` en el manifiesto (A-17)»",
+      "covers": ["A-17", "A-56", "A-66", "A-100"],
+      "rationale": "Es lo que hace que `calls` valga algo: el broker, no el SDK, decide quién llama a qué. Con una concesión por operación, un servicio comprometido que llama a lo que no debe lo hace con un `Permissions Violation` en ~1 ms; con `rpc.<dominio>.>` (la forma «para que funcione») llamaría a TODAS las operaciones de un dominio, y con `rpc.>`, a las de todos. La denegación debe ser distinguible de las dos cosas que se le parecen: una operación concedida sin nadie escuchando (`no responders`, A-56) y un timeout. Si llegara como un timeout, el handler que llama reintentaría 51 minutos algo que nunca va a funcionar (11-request-reply.md §7.1). Los dos controles al final demuestran que la sonda PUEDE fallar: con `rpc.<dominio>.>` o `rpc.>` de más, la operación no concedida ya no se deniega.",
+      "observed": { "server": "nats-server 2.14.5", "date": "2026-11-26", "result": "Con los permisos generados, pedidos-api a `obtener` (solo tiene `calcular-descuento`), logistica-api, el propio dueño crm-api, facturacion-api a `crear` (mismo dominio) y a una operación de pedidos: `Permissions Violation for Publish to \"rpc.…\"` en 1–6 ms (con un timeout de 3 s: no esperan); la publicación a pelo, también. Una operación CONCEDIDA sin nadie escuchando: `no responders` en 3 ms. Las concedidas con su dueño: una respuesta, en 2–4 ms. Controles: con `rpc.clientes.>` o `rpc.>` de más, la operación no concedida da `no responders` en 1 ms en vez de denegarse." },
+      "steps": [
+        { "as": "crm-api", "caller": "facturacion-api", "op": "rpc_exchange", "subject": "rpc.clientes.cliente.v1.obtener", "control": true, "title": "facturacion-api llama a `obtener` (concedida) y crm-api, que la atiende, responde: UNA respuesta, a su inbox privado", "expect": { "subscription": "permitted", "outcome": "answered", "received": 1, "delivered": 1, "ownerDenied": 0 } },
+        { "as": "crm-api", "caller": "pedidos-api", "op": "rpc_exchange", "subject": "rpc.clientes.cliente.v1.calcular-descuento", "control": true, "title": "pedidos-api llama a `calcular-descuento` (la única que se le concede) y crm-api responde", "expect": { "subscription": "permitted", "outcome": "answered", "received": 1, "delivered": 1, "ownerDenied": 0 } },
+        { "as": "pedidos-api", "op": "rpc_call", "subject": "rpc.clientes.cliente.v1.obtener", "timeoutMs": 3000, "title": "pedidos-api llama a `obtener`, que su manifiesto NO le concede (solo `calcular-descuento`): denegada…", "expect": { "outcome": "denied", "ms": { "lte": 500 }, "text": { "match": "Publish to \"rpc\\.clientes\\.cliente\\.v1\\.obtener\"" } } },
+        { "as": "logistica-api", "op": "rpc_call", "subject": "rpc.clientes.cliente.v1.calcular-descuento", "timeoutMs": 3000, "title": "logistica-api, que no llama a nada, tampoco puede llamar a `calcular-descuento`", "expect": { "outcome": "denied", "ms": { "lte": 500 } } },
+        { "as": "crm-api", "op": "rpc_call", "subject": "rpc.clientes.cliente.v1.obtener", "timeoutMs": 3000, "title": "ni el DUEÑO de la operación puede llamarla por el bus: no se le concede ningún permiso de publicación sobre `rpc.`", "expect": { "outcome": "denied", "ms": { "lte": 500 } } },
+        { "as": "facturacion-api", "op": "rpc_call", "subject": "rpc.clientes.cliente.v1.crear", "timeoutMs": 3000, "title": "facturacion-api no puede llamar a otra operación del MISMO dominio que no se le concede (`crear`)", "expect": { "outcome": "denied", "ms": { "lte": 500 } } },
+        { "as": "facturacion-api", "op": "rpc_call", "subject": "rpc.pedidos.pedido.v1.obtener", "timeoutMs": 3000, "title": "…ni a una de otro dominio", "expect": { "outcome": "denied", "ms": { "lte": 500 } } },
+        { "as": "facturacion-api", "op": "publish", "subject": "rpc.clientes.cliente.v1.crear", "title": "…ni publicar a pelo en ella, sin subject de respuesta: el broker avisa por la conexión (A-28)", "expect": { "outcome": "denied" } },
+        { "as": "facturacion-api", "op": "rpc_call", "subject": "rpc.clientes.cliente.v1.obtener", "timeoutMs": 3000, "control": true, "title": "una operación CONCEDIDA que nadie atiende da `no responders` en milisegundos, no una denegación (A-56)", "expect": { "outcome": "no_responders", "ms": { "lte": 500 } } },
+        { "as": { "service": "facturacion-api", "extraPublish": ["rpc.clientes.>"] }, "op": "rpc_call", "subject": "rpc.clientes.cliente.v1.crear", "timeoutMs": 3000, "control": true, "title": "control (mutante): si a quien llama se le concede `rpc.clientes.>`, la operación que no tiene concedida YA NO se deniega: la sonda detecta el comodín de dominio", "expect": { "outcome": "no_responders" } },
+        { "as": { "service": "facturacion-api", "extraPublish": ["rpc.>"] }, "op": "rpc_call", "subject": "rpc.pedidos.pedido.v1.obtener", "timeoutMs": 3000, "control": true, "title": "control (mutante): con `rpc.>` llama a las operaciones de TODOS los dominios", "expect": { "outcome": "no_responders" } }
+      ]
+    },
+    {
+      "id": "S22",
+      "title": "Solo el dueño de la operación se suscribe a `rpc.<dominio>.>`: nadie más, y nadie a `rpc.>`",
+      "spec": "11-request-reply.md §2.3 y §7.1: el dueño es el único con permiso de suscripción sobre `rpc.<dominio>.>`; nunca `rpc.>`",
+      "plan": "PLAN Fase 3, §3.1: «Solo el dueño responde»",
+      "covers": ["A-60", "A-73", "A-102"],
+      "rationale": "«Solo el dueño responde» es una regla del broker, o es una sugerencia: con dos servicios sobre la misma operación los dos la EJECUTAN y quien llama ve una sola respuesta (A-60). Aquí se prueba por todos los lados: quien llama no se suscribe ni a la operación ni a su dominio ni a `rpc.>` (leería las peticiones de todos, con sus datos personales); un servicio que suplanta el GRUPO DE COLA del dueño (`queue crm-api`) para robarle la mitad de las peticiones tampoco; el dueño de OTRO dominio —o del mismo, sin la suscripción de su dominio— tampoco; y ni siquiera el dueño recibe `rpc.>` ni comodines por token. Los dos controles demuestran que la sonda puede fallar.",
+      "observed": { "server": "nats-server 2.14.5", "date": "2026-11-26", "result": "`Permissions Violation for Subscription to \"rpc.>\"`, `\"rpc.clientes.>\"` y `\"rpc.clientes.cliente.v1.obtener\"` (facturacion-api), también con `queue \"crm-api\"`; `\"rpc.pedidos.>\"` y la operación de clientes (pedidos-api); `\"rpc.>\"`, `\"rpc.*.>\"` y `\"rpc.pedidos.>\"` (crm-api). Control: crm-api sí se suscribe a `rpc.clientes.>` y al subject exacto con su grupo de cola. Mutantes: con `rpc.>` de más, tanto quien llama como el dueño se suscriben." },
+      "steps": [
+        { "as": "facturacion-api", "op": "subscribe", "subject": "rpc.>", "title": "facturacion-api (quien llama) no se suscribe a `rpc.>`", "expect": { "outcome": "denied" } },
+        { "as": "facturacion-api", "op": "subscribe", "subject": "rpc.clientes.>", "title": "…ni al comodín del dominio", "expect": { "outcome": "denied" } },
+        { "as": "facturacion-api", "op": "subscribe", "subject": "rpc.clientes.cliente.v1.obtener", "title": "…ni siquiera a la operación que SÍ llama (llamar no es atender)", "expect": { "outcome": "denied" } },
+        { "as": "facturacion-api", "op": "subscribe", "subject": "rpc.clientes.cliente.v1.obtener", "queue": "crm-api", "title": "…ni suplantando el grupo de cola del dueño (`queue crm-api`) para llevarse la mitad de las peticiones", "expect": { "outcome": "denied", "text": { "match": "using queue \"crm-api\"" } } },
+        { "as": "pedidos-api", "op": "subscribe", "subject": "rpc.pedidos.>", "title": "pedidos-api, dueño de `pedidos` que no atiende ninguna operación, no recibe `rpc.pedidos.>`", "expect": { "outcome": "denied" } },
+        { "as": "pedidos-api", "op": "subscribe", "subject": "rpc.clientes.cliente.v1.obtener", "title": "…ni atiende la operación de otro dominio", "expect": { "outcome": "denied" } },
+        { "as": "crm-api", "op": "subscribe", "subject": "rpc.>", "title": "crm-api, que SÍ atiende, no recibe `rpc.>`", "expect": { "outcome": "denied" } },
+        { "as": "crm-api", "op": "subscribe", "subject": "rpc.*.>", "title": "…ni un comodín por token", "expect": { "outcome": "denied" } },
+        { "as": "crm-api", "op": "subscribe", "subject": "rpc.pedidos.>", "title": "…ni el `rpc.<dominio>.>` de otro dominio", "expect": { "outcome": "denied" } },
+        { "as": "crm-api", "op": "subscribe", "subject": "rpc.clientes.>", "control": true, "title": "control: el dueño SÍ se suscribe a `rpc.clientes.>`", "expect": { "outcome": "permitted" } },
+        { "as": "crm-api", "op": "subscribe", "subject": "rpc.clientes.cliente.v1.obtener", "queue": "crm-api", "control": true, "title": "control: …y al subject exacto de su operación, con su servicio como grupo de cola", "expect": { "outcome": "permitted" } },
+        { "as": { "service": "facturacion-api", "extraSubscribe": ["rpc.>"] }, "op": "subscribe", "subject": "rpc.>", "control": true, "title": "control (mutante): con `rpc.>` de más, quien llama SÍ se suscribe a todo: la sonda detecta el comodín", "expect": { "outcome": "permitted" } },
+        { "as": { "service": "crm-api", "extraSubscribe": ["rpc.>"] }, "op": "subscribe", "subject": "rpc.pedidos.pedido.v1.crear", "control": true, "title": "control (mutante): con `rpc.>` de más, el dueño de clientes atendería las operaciones de otro dominio", "expect": { "outcome": "permitted" } }
+      ]
+    },
+    {
+      "id": "S23",
+      "title": "La respuesta de una petición no la lee otro servicio: el inbox privado (A-71)",
+      "spec": "11-request-reply.md §7.3: sin el inbox privado, cualquiera leería las respuestas ajenas; 06-security.md §3.3",
+      "plan": "PLAN Fase 3, §3.4: «Sin el inbox privado de la Fase 1, cualquiera leería las respuestas ajenas»",
+      "covers": ["A-71", "A-2", "A-103"],
+      "rationale": "En petición/respuesta el inbox importa más que en los eventos: una respuesta PUEDE llevar datos personales (11-request-reply.md §3.6). Con el `_INBOX.>` común de la ACL v1, un servicio ajeno recibe la respuesta completa dirigida a otro (A-71). Aquí se ejecuta con los permisos GENERADOS: una petición real de facturacion-api al dueño, y un espía —logistica-api, que no tiene concedida la operación— suscrito a `_INBOX.>` y al inbox de quien llama mientras la respuesta viaja. Ninguna de sus dos suscripciones se admite y no lee nada. Además, un servicio que NO fija su inbox privado (el prefijo aleatorio de la librería) no puede ni pedir: es lo que obliga a la capacidad `security` del SDK. El control demuestra que la sonda puede fallar: con `_INBOX.>` concedido, el espía lee la respuesta.",
+      "observed": { "server": "nats-server 2.14.5", "date": "2026-11-26", "result": "Con facturacion-api pidiendo y crm-api respondiendo, logistica-api ve denegadas `_INBOX.>` y `_INBOX.facturacion-api.>` y no lee nada (leaked=false; la respuesta llega a quien llama, delivered=1). Control: con `_INBOX.>` de más, leaked=true. Un servicio con el inbox por defecto: `Permissions Violation for Subscription to \"_INBOX.<nuid>.*\"` y la petición falla en 1 ms; había salido y llegó al dueño (received=1)." },
+      "steps": [
+        { "as": "crm-api", "caller": "facturacion-api", "op": "rpc_exchange", "subject": "rpc.clientes.cliente.v1.obtener", "spy": "logistica-api", "spySubscribe": ["_INBOX.>", "_INBOX.facturacion-api.>"], "title": "facturacion-api pide y crm-api responde, mientras logistica-api espía `_INBOX.>` y el inbox de quien llama: no ve la respuesta", "expect": { "outcome": "answered", "delivered": 1, "leaked": false, "spySubscriptions": { "_INBOX.>": "denied", "_INBOX.facturacion-api.>": "denied" } } },
+        { "as": "crm-api", "caller": "facturacion-api", "op": "rpc_exchange", "subject": "rpc.clientes.cliente.v1.obtener", "spy": { "service": "logistica-api", "extraSubscribe": ["_INBOX.>"] }, "spySubscribe": ["_INBOX.>"], "control": true, "title": "control (mutante): con `_INBOX.>` concedido, el espía SÍ lee la respuesta completa dirigida a otro", "expect": { "outcome": "answered", "leaked": true, "spySubscriptions": { "_INBOX.>": "permitted" } } },
+        { "as": "crm-api", "caller": { "service": "facturacion-api", "inbox": "default" }, "op": "rpc_exchange", "subject": "rpc.clientes.cliente.v1.obtener", "timeoutMs": 1000, "title": "un servicio que NO fija su inbox privado (el prefijo aleatorio de la librería) no puede ni pedir: la librería ve denegada la suscripción de su inbox y la petición falla al instante", "expect": { "outcome": "denied", "ms": { "lte": 500 }, "delivered": 0, "callerViolations": { "match": "Subscription to \"_INBOX\\." } } }
+      ]
+    },
+    {
+      "id": "S24",
+      "title": "`allow_responses`: el dueño responde UNA vez, solo al `reply` de la petición, y no puede publicar en ningún inbox",
+      "spec": "11-request-reply.md §7.2: `allow_responses: { max: 1, expires: 30s }`; el dueño no tiene ningún permiso de publicación sobre inboxes",
+      "plan": "PLAN Fase 3, §3.4 y A-68: `true` admite UNA respuesta y NO caduca; se recomienda `{ max: 1, expires: 30s }`",
+      "covers": ["A-16", "A-68", "A-104"],
+      "rationale": "«Una petición, una respuesta» (11-request-reply.md §3.2) la cumple el broker o no la cumple nadie. Con los permisos generados, un dueño que contesta DOS veces a la misma petición entrega una y el broker deniega la otra (`max: 1`); uno que contesta a un inbox que no es el `reply` de la petición recibida, también se deniega; y no puede publicar en ningún inbox por su cuenta —ni en el de quien llama ni en el suyo—, de modo que un dueño comprometido no puede escribir en los inboxes que ha visto pasar. Los dos controles demuestran que la sonda puede fallar: con un permiso de publicación sobre `_INBOX.>` desaparece el `max: 1`, y con un `max` mayor entra la segunda respuesta.",
+      "observed": { "server": "nats-server 2.14.5", "date": "2026-11-26", "result": "De dos respuestas del dueño a la misma petición llega una (delivered=1) y el broker deniega la otra (aviso en la conexión del dueño), en 3 ms. Una respuesta a un inbox que no es el `reply`, denegada: quien llama ve un timeout (1001 ms). crm-api no publica ni en `_INBOX.facturacion-api.…` ni en `_INBOX.crm-api.…`. Controles: con `_INBOX.>` de publicación llegan las dos; con `max: 3`, también." },
+      "steps": [
+        { "as": "crm-api", "caller": "facturacion-api", "op": "rpc_exchange", "subject": "rpc.clientes.cliente.v1.obtener", "replies": [{ "afterMs": 0 }, { "afterMs": 0 }], "title": "crm-api contesta DOS veces a la misma petición: llega UNA, y el broker deniega la segunda (`max: 1`)", "expect": { "outcome": "answered", "received": 1, "delivered": 1, "ownerDenied": 1 } },
+        { "as": "crm-api", "caller": "facturacion-api", "op": "rpc_exchange", "subject": "rpc.clientes.cliente.v1.obtener", "replies": [{ "afterMs": 0, "to": "_INBOX.logistica-api.{marker}" }], "timeoutMs": 1000, "title": "crm-api contesta a un inbox que NO es el `reply` de la petición: denegado, y quien llama solo ve un timeout", "expect": { "outcome": "timeout", "received": 1, "delivered": 0, "ownerDenied": 1 } },
+        { "as": "crm-api", "op": "publish", "subject": "_INBOX.facturacion-api.{marker}", "title": "crm-api no puede publicar en el inbox de quien llama por su cuenta, fuera de una petición", "expect": { "outcome": "denied" } },
+        { "as": "crm-api", "op": "publish", "subject": "_INBOX.crm-api.{marker}", "title": "…ni siquiera en el suyo: ningún permiso de publicación sobre inboxes", "expect": { "outcome": "denied" } },
+        { "as": { "service": "crm-api", "extraPublish": ["_INBOX.>"] }, "caller": "facturacion-api", "op": "rpc_exchange", "subject": "rpc.clientes.cliente.v1.obtener", "replies": [{ "afterMs": 0 }, { "afterMs": 0 }], "control": true, "title": "control (mutante): con `_INBOX.>` de publicación, el dueño contesta dos veces y LLEGAN las dos: el `max: 1` desaparece", "expect": { "outcome": "answered", "delivered": 2, "ownerDenied": 0 } },
+        { "as": { "service": "crm-api", "allowResponses": { "max": 3, "expires": "30s" } }, "caller": "facturacion-api", "op": "rpc_exchange", "subject": "rpc.clientes.cliente.v1.obtener", "replies": [{ "afterMs": 0 }, { "afterMs": 0 }], "control": true, "title": "control (mutante): con `allow_responses: { max: 3 }` entra la segunda respuesta", "expect": { "outcome": "answered", "delivered": 2, "ownerDenied": 0 } }
+      ]
+    },
+    {
+      "id": "S25",
+      "title": "`allow_responses` caduca: una respuesta TARDÍA se deniega, y una lenta pero dentro del plazo máximo llega",
+      "spec": "11-request-reply.md §7.2: `expires: 30s`, por encima del timeout máximo de 25 s (§4.2)",
+      "plan": "PLAN Fase 3, A-68: `true` NO caduca",
+      "covers": ["A-61", "A-68", "A-105"],
+      "rationale": "Sin `expires`, un dueño comprometido puede escribir en los inboxes que ha visto durante todo el tiempo que dure su conexión (A-68). Con `expires: 30s`, justo por encima del timeout máximo de una llamada (25 s), una respuesta legítima NUNCA llega después —así que no rompe a nadie— y una tardía se deniega. El caso mide los dos bordes con el valor GENERADO, sin atajos: un handler que contesta a los 24 s a una llamada con el timeout máximo (25 s) llega; uno que contesta a los 31 s, a una llamada que ya expiró, se deniega. Tarda ~57 s: es el único modo de que un generador que quite o relaje `expires` se note con permisos reales (la comprobación estática de verify-acl.mjs lo ve en el documento, esta lo ve en el broker).",
+      "observed": { "server": "nats-server 2.14.5", "date": "2026-11-26", "result": "Una respuesta a los 24 s a una llamada con timeout de 25 s llega (answered a los 24005 ms, sin denegaciones); una a los 31 s, con la llamada ya expirada, se deniega (delivered=0 y un aviso en el dueño). El caso tarda ~58 s. Los mutantes `no-expires` y `short-expires` de conformance/security/mutantes.mjs lo hacen fallar." },
+      "steps": [
+        { "as": "crm-api", "caller": "facturacion-api", "op": "rpc_exchange", "subject": "rpc.clientes.cliente.v1.obtener", "replies": [{ "afterMs": 24000 }], "timeoutMs": 25000, "control": true, "title": "un handler lento pero dentro del plazo máximo: contesta a los 24 s a una llamada con timeout de 25 s, y la respuesta LLEGA", "expect": { "outcome": "answered", "delivered": 1, "ownerDenied": 0, "ms": { "gte": 23000 } } },
+        { "as": "crm-api", "caller": "facturacion-api", "op": "rpc_exchange", "subject": "rpc.clientes.cliente.v1.obtener", "replies": [{ "afterMs": 31000 }], "timeoutMs": 1000, "title": "contesta a los 31 s, cuando la llamada ya expiró (timeout de 1 s): el broker DENIEGA la respuesta tardía", "expect": { "outcome": "timeout", "received": 1, "delivered": 0, "ownerDenied": 1 } }
+      ]
+    },
+    {
+      "id": "S26",
+      "title": "Un dueño sin permiso de suscripción parece un servicio CAÍDO (A-73), y el aviso se ve en el dueño",
+      "spec": "11-request-reply.md §7.1: `respond()` DEBE fallar con PERMISSION_DENIED nombrando el subject; quien llama ve `no responders`",
+      "plan": "PLAN Fase 3, §3.4 y A-73",
+      "covers": ["A-73", "A-106"],
+      "rationale": "Es la denegación más traicionera de la fase: la suscripción denegada NO lanza al crearla (A-8f) y quien llama no ve un error de permisos sino `no responders`, como si el servicio estuviera caído. Mientras tanto, el dueño arranca «sano». Aquí se ve con los permisos generados: el dueño de OTRO dominio (pedidos-api) que intenta atender una operación de clientes, y crm-api sin el `rpc.clientes.>` que genera `serves`. En los dos casos quien llama recibe `no responders` y el único rastro es el `-ERR` en la conexión del dueño, con el subject y el grupo de cola: es lo que el SDK DEBE escuchar para fallar al arrancar. Control: con el permiso, responde.",
+      "observed": { "server": "nats-server 2.14.5", "date": "2026-11-26", "result": "crm-api sin `rpc.clientes.>` (variante) y pedidos-api (dueño de otro dominio): la suscripción se deniega —`Permissions Violation for Subscription to \"rpc.clientes.cliente.v1.obtener\" using queue \"crm-api\"` en la conexión del dueño, sin lanzar— y quien llama recibe `no responders` en 1–2 ms. Control: con su permiso, responde." },
+      "steps": [
+        { "as": { "service": "crm-api", "withoutSubscribe": ["rpc.clientes.>"] }, "caller": "facturacion-api", "op": "rpc_exchange", "subject": "rpc.clientes.cliente.v1.obtener", "title": "crm-api sin el `rpc.clientes.>` que le da `serves`: su suscripción se deniega y quien llama recibe `no responders`, en milisegundos", "expect": { "subscription": "denied", "outcome": "no_responders", "ms": { "lte": 500 }, "received": 0, "ownerViolations": { "match": "Subscription to \"rpc\\.clientes\\.cliente\\.v1\\.obtener\" using queue \"crm-api\"" } } },
+        { "as": "pedidos-api", "caller": "facturacion-api", "op": "rpc_exchange", "subject": "rpc.clientes.cliente.v1.obtener", "title": "pedidos-api (dueño de OTRO dominio) intenta atender `obtener`: denegado, y quien llama también ve `no responders`", "expect": { "subscription": "denied", "outcome": "no_responders", "ms": { "lte": 500 }, "received": 0 } },
+        { "as": "crm-api", "caller": "facturacion-api", "op": "rpc_exchange", "subject": "rpc.clientes.cliente.v1.obtener", "control": true, "title": "control: con sus permisos generados, crm-api atiende y quien llama recibe la respuesta", "expect": { "subscription": "permitted", "outcome": "answered", "received": 1 } }
+      ]
+    },
+    {
+      "id": "S27",
+      "title": "Minimalidad de petición/respuesta: sin CUALQUIERA de los permisos de quien llama o del dueño, el fallo es el que toca",
+      "spec": "11-request-reply.md §7.1 y §4.3; 06-security.md §3.7: las denegaciones se ven",
+      "plan": "PLAN Fase 3: «quitar un permiso es detectado»",
+      "covers": ["A-66", "A-68", "A-73", "A-107"],
+      "rationale": "Cada permiso de petición/respuesta tiene una función y, sin él, un fallo concreto: sin el permiso de publicación, quien llama recibe una denegación en ~1 ms; sin su inbox privado, la petición llega pero la respuesta no tiene por dónde volver —un timeout, con el aviso `Subscription to \"_INBOX…\"` en la conexión—; sin la suscripción, el dueño parece un servicio caído (A-73); sin `allow_responses`, atiende y ejecuta pero su respuesta se deniega y quien llama ve un timeout (A-68). Si el generador dejara de conceder uno, el servicio arrancaría y fallaría en producción; con él, ninguno de los cuatro fallos puede pasar por un servicio sano. El control es el servicio completo, que responde.",
+      "observed": { "server": "nats-server 2.14.5", "date": "2026-11-26", "result": "Sin su permiso de publicación: denegada en 1 ms. Sin su inbox privado: la librería ve denegada la suscripción de `_INBOX.facturacion-api.<nuid>.*` y la petición falla en 3 ms, pero ya había salido y llegó al dueño (received=1). Sin la suscripción: `no responders` en 3 ms. Sin `allow_responses`: el dueño recibe, su respuesta se deniega (ownerDenied=1) y quien llama ve un timeout (1001 ms). Control: con todo, answered en 2 ms." },
+      "steps": [
+        { "as": { "service": "facturacion-api", "without": ["rpc.clientes.cliente.v1.obtener"] }, "op": "rpc_call", "subject": "rpc.clientes.cliente.v1.obtener", "timeoutMs": 3000, "title": "facturacion-api sin su permiso de publicación sobre `obtener`: denegada en ms", "expect": { "outcome": "denied", "ms": { "lte": 500 } } },
+        { "as": "crm-api", "caller": { "service": "facturacion-api", "withoutSubscribe": ["_INBOX.facturacion-api.>"] }, "op": "rpc_exchange", "subject": "rpc.clientes.cliente.v1.obtener", "timeoutMs": 1000, "title": "facturacion-api sin su inbox privado: la librería ve denegada la suscripción del inbox y la petición falla al instante, con el subject del inbox", "expect": { "outcome": "denied", "ms": { "lte": 500 }, "delivered": 0, "callerViolations": { "match": "Subscription to \"_INBOX\\.facturacion-api\\." } } },
+        { "as": { "service": "crm-api", "withoutSubscribe": ["rpc.clientes.>"] }, "caller": "facturacion-api", "op": "rpc_exchange", "subject": "rpc.clientes.cliente.v1.obtener", "title": "crm-api sin la suscripción `rpc.clientes.>`: `no responders` (parece caído)", "expect": { "subscription": "denied", "outcome": "no_responders", "received": 0 } },
+        { "as": { "service": "crm-api", "allowResponses": null }, "caller": "facturacion-api", "op": "rpc_exchange", "subject": "rpc.clientes.cliente.v1.obtener", "timeoutMs": 1000, "title": "crm-api sin `allow_responses`: recibe, EJECUTA, y su respuesta se deniega: quien llama ve un timeout y el aviso queda en el dueño", "expect": { "subscription": "permitted", "outcome": "timeout", "received": 1, "delivered": 0, "ownerDenied": 1 } },
+        { "as": "crm-api", "caller": "facturacion-api", "op": "rpc_exchange", "subject": "rpc.clientes.cliente.v1.obtener", "control": true, "title": "control: con TODOS sus permisos, el mismo intercambio funciona", "expect": { "subscription": "permitted", "outcome": "answered", "received": 1, "delivered": 1, "ownerDenied": 0 } }
+      ]
+    },
+    {
+      "id": "S28",
+      "title": "El ciclo de aceptación con los permisos generados: dos instancias reparten, 100 peticiones concurrentes, y al parar, `no responders` en <100 ms",
+      "spec": "11-request-reply.md §12.9: una operación atendida por dos instancias reparte las peticiones; al parar ambas, `RPC_UNAVAILABLE` en menos de 100 ms",
+      "plan": "PLAN Fase 3, aceptación",
+      "covers": ["A-58", "A-59", "A-68", "A-108"],
+      "rationale": "Los SDKs que declaren la capacidad `rpc` ejecutarán este ciclo con su propia librería; aquí se ejecuta ya, con clientes `@nats-io/*` en bruto, para demostrar que la ACL GENERADA lo permite: dos conexiones de crm-api (la misma identidad: dos instancias) en el grupo de cola `crm-api` reparten 100 peticiones CONCURRENTES de facturacion-api —cada una con su propia respuesta a su propio `reply`, así que `allow_responses` lleva cien entradas a la vez— y ninguna se deniega. Después las dos dejan de escuchar (UNSUB y flush: lo que hace el drenaje) y la siguiente petición da `no responders` en milisegundos. Es también la prueba de que `max: 1` y `expires` son por petición y no por conexión.",
+      "observed": { "server": "nats-server 2.14.5", "date": "2026-11-26", "result": "100 peticiones concurrentes de facturacion-api a dos instancias de crm-api (la misma identidad, dos conexiones, grupo de cola `crm-api`): 100 respondidas, 0 fallidas, reparto al azar (50/50 y 60/40 en dos ejecuciones), 0 respuestas denegadas; tras UNSUB y flush de las dos, `no responders` en 1 ms." },
+      "steps": [
+        { "op": "rpc_cycle", "caller": "facturacion-api", "owners": [{ "service": "crm-api", "instance": 1 }, { "service": "crm-api", "instance": 2 }], "subject": "rpc.clientes.cliente.v1.obtener", "requests": 100, "title": "100 peticiones concurrentes a dos instancias de crm-api: todas respondidas, repartidas, ninguna respuesta denegada; al parar las dos, `no responders` al instante", "expect": { "outcome": "ok", "answered": 100, "failed": 0, "minShare": { "gte": 15 }, "ownerDenied": 0, "stopOutcome": "no_responders", "stopMs": { "lte": 100 } } }
+      ]
+    },
+    {
+      "id": "S29",
+      "title": "Una segunda suscripción de la MISMA conexión al inbox de quien llama convierte `no responders` en un timeout (A-101)",
+      "spec": "11-request-reply.md §4.3: «nadie escucha» → RPC_UNAVAILABLE, inmediato; §12.4: la conexión anuncia `headers` y `no_responders`",
+      "plan": "PLAN Fase 3, A-56 y A-57: el `no responders` es lo que hace que RPC_UNAVAILABLE llegue en milisegundos",
+      "covers": ["A-56", "A-101"],
+      "rationale": "No es un permiso, pero se mide con los permisos generados y le importa a quien escriba un SDK `rpc`: el estado 503 de `no responders` llega a UNA de las suscripciones de la conexión que casan con el `reply` de la petición, y si es la que el SDK no espera, la petición no ve el 503 y agota su timeout —RPC_UNAVAILABLE (inmediato, RETRYABLE) pasaría a RPC_TIMEOUT (ambiguo)—. Con la suscripción propia a `_INBOX.<servicio>.>` por la MISMA conexión que la librería usa para pedir (la forma natural de «ver todas las respuestas», o de un SDK que se suscribe a su inbox para otra cosa), el 503 se pierde; por otra conexión con la misma identidad, o con un subject que no casa con el `reply`, llega. Por eso la suite cuenta las respuestas desde otra conexión. El primer paso es el control: demuestra que la sonda ve `no responders` cuando debe.",
+      "observed": { "server": "nats-server 2.14.5", "date": "2026-11-26", "result": "Con la suscripción `_INBOX.facturacion-api.>` por OTRA conexión: `no responders` en 2 ms. Por la MISMA conexión que pide: timeout a los 1502 ms (el 503 no llega a la librería)." },
+      "steps": [
+        { "as": "facturacion-api", "op": "rpc_call", "subject": "rpc.clientes.cliente.v1.obtener", "timeoutMs": 1500, "watchInbox": "other-connection", "control": true, "title": "control: la operación concedida sin nadie, con la suscripción al inbox por OTRA conexión: `no responders` en ms", "expect": { "outcome": "no_responders", "ms": { "lte": 500 } } },
+        { "as": "facturacion-api", "op": "rpc_call", "subject": "rpc.clientes.cliente.v1.obtener", "timeoutMs": 1500, "watchInbox": "same-connection", "title": "con la suscripción `_INBOX.facturacion-api.>` por la MISMA conexión que pide: el 503 no llega y la petición agota su timeout", "expect": { "outcome": "timeout", "ms": { "gte": 1400 } } }
+      ]
+    },
+    {
+      "id": "S30",
+      "title": "El ciclo de §12.9 con el SDK de Node REAL bajo los permisos generados: reparte, `RPC_UNAVAILABLE` en <100 ms, y quitar cada permiso se nota",
+      "spec": "11-request-reply.md §12.9 (el criterio de aceptación del SDK `rpc`), §4.3, §7.1, §7.2",
+      "plan": "PLAN Fase 3, aceptación (ola 2: la suite con los SDKs reales)",
+      "covers": ["A-58", "A-59", "A-66", "A-68", "A-73", "A-140", "A-141"],
+      "needs": ["sdk-node/dist"],
+      "rationale": "S28 ejecuta el ciclo de aceptación con clientes `@nats-io/*` en bruto; esto lo ejecuta el SDK de Node de verdad, con su librería, su inbox privado, su grupo de cola y su parada ordenada, bajo los permisos que genera `gen-acl.mjs` de un manifiesto con `calls` y `serves` y tras `flux provision`. Cada instancia es un PROCESO (`security/participante-*`): lo que se mide es lo que el SDK hace con su conexión. Si el SDK necesitara un permiso que el generador no concede, o el generador concediera uno que el SDK no usa y quitarlo no se notara, aquí se vería. Cada permiso que se quita lo quita una VARIANTE de las que ya usa S27 y el SDK tiene que dar el código que toca: PERMISSION_DENIED rápido a quien llama (y no un RPC_TIMEOUT reintentable 51 minutos), un dueño sin suscripción que falla al arrancar en vez de parecer un servicio caído (A-73), y un dueño sin `allow_responses` cuyo SDK registra la respuesta denegada, porque desde fuera solo se ve un timeout.",
+      "observed": {"server": "nats-server 2.14.5", "date": "2026-11-26", "result": "Dos instancias de crm-api (Node, la misma identidad) reparten 100 peticiones concurrentes de facturacion-api: 100 respondidas, reparto al azar (52/48, 55/45), exactamente 100 ejecuciones del handler entre las dos, 0 violaciones en el log del servidor; con la instancia 2 sola, todo va a ella; al parar ambas (Responder.stop, ~26 ms: incluye su margen de 25 ms), RPC_UNAVAILABLE en 7 de 7 llamadas, mediana 0,9 ms, máximo 2,2 ms. Sin publicar en la operación: PERMISSION_DENIED con el subject a los 4 ms, un `Publish Violation` y el dueño no recibe nada; sin su inbox privado, `connect()` ya falla con PERMISSION_DENIED (la suscripción `_INBOX.facturacion-api.<nuid>.*` denegada); dueño sin `rpc.clientes.>`: `respond()` lanza PERMISSION_DENIED con el subject; dueño sin `allow_responses`: el handler se ejecuta, quien llama ve RPC_TIMEOUT a los 1502 ms y el SDK registra la respuesta denegada. pedidos-api (solo llama): su ACL es solo `_INBOX.pedidos-api.>`, recibe la respuesta y no puede atender."},
+      "steps": [
+        {
+          "op": "sdk_script",
+          "agents": [
+            {"id": "crm1", "sdk": "node", "as": "crm-api"},
+            {"id": "crm2", "sdk": "node", "as": "crm-api"},
+            {"id": "fact", "sdk": "node", "as": "facturacion-api"},
+            {"id": "crmB", "sdk": "node", "as": "crm-api"},
+            {"id": "crmC", "sdk": "node", "as": "crm-api"},
+            {"id": "factSinLlamada", "sdk": "node", "as": {"service": "facturacion-api", "without": ["rpc.clientes.cliente.v1.obtener"]}},
+            {"id": "factSinInbox", "sdk": "node", "as": {"service": "facturacion-api", "withoutSubscribe": ["_INBOX.facturacion-api.>"]}},
+            {"id": "crmSinSub", "sdk": "node", "as": {"service": "crm-api", "withoutSubscribe": ["rpc.clientes.>"]}},
+            {"id": "crmSinAllow", "sdk": "node", "as": {"service": "crm-api", "allowResponses": null}},
+            {"id": "ped", "sdk": "node", "as": "pedidos-api"}
+          ],
+          "script": [
+            {"agent": "crm1", "cmd": "respond", "operation": "clientes.cliente.v1.obtener", "title": "crm-api (instancia 1) atiende `obtener`: la suscripción es al subject exacto", "expect": {"ok": true, "subject": "rpc.clientes.cliente.v1.obtener"}},
+            {"agent": "crm2", "cmd": "respond", "operation": "clientes.cliente.v1.obtener", "title": "crm-api (instancia 2) atiende `obtener`: el mismo grupo de cola", "expect": {"ok": true}},
+            {"agent": "fact", "cmd": "call_many", "operation": "clientes.cliente.v1.obtener", "n": 100, "concurrency": 20, "data": {"clienteId": "cli-1"}, "title": "facturacion-api hace 100 peticiones concurrentes: las 100 se contestan, repartidas entre las dos instancias, y no falta ningún permiso (0 violaciones en el log del servidor)", "expect": {"ok": true, "answered": 100, "failed": 0, "minShare": {"gte": 15}, "serverViolationCount": 0}},
+            {"cmd": "stats", "agents": ["crm1", "crm2"], "title": "cada petición la atendió UNA instancia: entre las dos, exactamente 100 ejecuciones del handler", "expect": {"total": 100, "perAgent.crm1.logCount": 0, "perAgent.crm2.logCount": 0}},
+            {"agent": "crm1", "cmd": "stop", "operation": "clientes.cliente.v1.obtener", "title": "se para la instancia 1 (parada ordenada)", "expect": {"ok": true}},
+            {"agent": "fact", "cmd": "call", "operation": "clientes.cliente.v1.obtener", "data": {"clienteId": "cli-1"}, "title": "con la instancia 2 sola, todo va a ella", "expect": {"ok": true, "data.instancia": "crm2"}},
+            {"agent": "crm2", "cmd": "stop", "operation": "clientes.cliente.v1.obtener", "title": "se para la instancia 2: ya no escucha nadie", "expect": {"ok": true}},
+            {"agent": "fact", "cmd": "call_repeat", "operation": "clientes.cliente.v1.obtener", "repeat": 7, "data": {"clienteId": "cli-1"}, "options": {"timeoutMs": 5000}, "title": "al parar ambas, quien llama recibe RPC_UNAVAILABLE en < 100 ms (la mediana de 7 llamadas; ninguna agota el timeout)", "expect": {"codes": {"RPC_UNAVAILABLE": 7}, "p50Ms": {"lte": 100}, "maxMs": {"lte": 1500}, "last.error.class": "retryable", "serverViolationCount": 0}},
+            {"agent": "crmB", "cmd": "respond", "operation": "clientes.cliente.v1.obtener", "title": "un dueño con todos sus permisos atiende `obtener` (control para lo siguiente)", "expect": {"ok": true}},
+            {"agent": "factSinLlamada", "cmd": "call", "operation": "clientes.cliente.v1.obtener", "data": {"clienteId": "cli-1"}, "options": {"timeoutMs": 3000}, "title": "SIN el permiso de publicar en la operación: PERMISSION_DENIED, rápido (no un timeout), con el subject; y la petición no llegó al dueño", "expect": {"ok": false, "error.code": "PERMISSION_DENIED", "error.class": "permanent", "error.message": {"includes": "rpc.clientes.cliente.v1.obtener"}, "ms": {"lte": 1500}, "serverViolations": {"anyMatch": "Publish Violation.*rpc\\.clientes\\.cliente\\.v1\\.obtener"}}},
+            {"agent": "crmB", "cmd": "stats", "title": "…y al dueño no le llegó nada", "expect": {"total": 0}},
+            {"agent": "factSinInbox", "cmd": "call", "operation": "clientes.cliente.v1.obtener", "data": {"clienteId": "cli-1"}, "options": {"timeoutMs": 3000}, "title": "SIN su inbox privado: la llamada falla al instante y con el motivo (la suscripción denegada), no con un timeout", "expect": {"ok": false, "error.code": "PERMISSION_DENIED", "error.message": {"includes": "_INBOX.facturacion-api."}}},
+            {"agent": "crmSinSub", "cmd": "respond", "operation": "clientes.cliente.v1.calcular-descuento", "title": "SIN su suscripción `rpc.clientes.>`: `respond()` falla AL ARRANCAR con PERMISSION_DENIED y el subject, no arranca mudo", "expect": {"ok": false, "error.code": "PERMISSION_DENIED", "error.message": {"includes": "rpc.clientes.cliente.v1.calcular-descuento"}, "serverViolations": {"anyMatch": "Subscription Violation"}}},
+            {"agent": "crmSinAllow", "cmd": "respond", "operation": "clientes.cliente.v1.calcular-descuento", "title": "SIN `allow_responses`: `respond()` arranca (el servidor no lo avisa hasta que contesta)", "expect": {"ok": true}},
+            {"agent": "fact", "cmd": "call", "operation": "clientes.cliente.v1.calcular-descuento", "data": {"clienteId": "cli-1", "totalCents": 9990, "moneda": "EUR"}, "options": {"timeoutMs": 1500}, "title": "…y quien llama ve RPC_TIMEOUT: el dueño ejecutó, pero su respuesta se denegó", "expect": {"ok": false, "error.code": "RPC_TIMEOUT", "ms": {"gte": 1400}}},
+            {"agent": "crmSinAllow", "cmd": "stats", "title": "el dueño lo ejecutó y el SDK REGISTRÓ la denegación de su respuesta (el aviso del broker llega a su log)", "until": {"logCount": {"gte": 1}}, "expect": {"total": 1, "logs": {"anyMatch": "denegó .*_INBOX"}}},
+            {"agent": "crmSinAllow", "cmd": "stop", "operation": "clientes.cliente.v1.calcular-descuento", "title": "(se retira)", "expect": {"ok": true}},
+            {"cmd": "acl", "service": "pedidos-api", "title": "pedidos-api solo llama (`calls`): su suscripción es SOLO su inbox privado; ninguna de dominio, ni `allow_responses`", "expect": {"subscribe": ["_INBOX.pedidos-api.>"], "allowResponses": null}},
+            {"agent": "crmC", "cmd": "respond", "operation": "clientes.cliente.v1.calcular-descuento", "title": "crm-api atiende `calcular-descuento`", "expect": {"ok": true}},
+            {"agent": "ped", "cmd": "call", "operation": "clientes.cliente.v1.calcular-descuento", "data": {"clienteId": "cli-1", "totalCents": 9990, "moneda": "EUR"}, "options": {"timeoutMs": 3000}, "title": "pedidos-api, sin ninguna suscripción de dominio, recibe la respuesta por su inbox: la consume sin otro permiso", "expect": {"ok": true, "data.instancia": "crmC", "serverViolationCount": 0}},
+            {"agent": "ped", "cmd": "respond", "operation": "clientes.cliente.v1.obtener", "title": "…y no puede atender: no es dueño de `clientes`", "expect": {"ok": false, "error.code": "PERMISSION_DENIED", "error.message": {"includes": "rpc.clientes.cliente.v1.obtener"}}}
+          ]
+        }
+      ]
+    },
+    {
+      "id": "S31",
+      "title": "El ciclo de §12.9 con el SDK de Rust REAL bajo los permisos generados: reparte, `RPC_UNAVAILABLE` en <100 ms, y quitar cada permiso se nota",
+      "spec": "11-request-reply.md §12.9 (el criterio de aceptación del SDK `rpc`), §4.3, §7.1, §7.2",
+      "plan": "PLAN Fase 3, aceptación (ola 2: la suite con los SDKs reales)",
+      "covers": ["A-58", "A-59", "A-66", "A-68", "A-73", "A-140", "A-141"],
+      "needs": ["cargo"],
+      "rationale": "S28 ejecuta el ciclo de aceptación con clientes `@nats-io/*` en bruto; esto lo ejecuta el SDK de Rust de verdad, con su librería, su inbox privado, su grupo de cola y su parada ordenada, bajo los permisos que genera `gen-acl.mjs` de un manifiesto con `calls` y `serves` y tras `flux provision`. Cada instancia es un PROCESO (`security/participante-*`): lo que se mide es lo que el SDK hace con su conexión. Si el SDK necesitara un permiso que el generador no concede, o el generador concediera uno que el SDK no usa y quitarlo no se notara, aquí se vería. Cada permiso que se quita lo quita una VARIANTE de las que ya usa S27 y el SDK tiene que dar el código que toca: PERMISSION_DENIED rápido a quien llama (y no un RPC_TIMEOUT reintentable 51 minutos), un dueño sin suscripción que falla al arrancar en vez de parecer un servicio caído (A-73), y un dueño sin `allow_responses` cuyo SDK registra la respuesta denegada, porque desde fuera solo se ve un timeout.",
+      "observed": {"server": "nats-server 2.14.5", "date": "2026-11-26", "result": "Dos instancias de crm-api (Rust, la misma identidad) reparten 100 peticiones concurrentes de facturacion-api: 100 respondidas, reparto al azar (49/51), exactamente 100 ejecuciones del handler, 0 violaciones; al parar ambas (Responder::stop, <1 ms), RPC_UNAVAILABLE en 7 de 7 llamadas, mediana 0,5 ms, máximo 0,8 ms. Sin publicar en la operación: PERMISSION_DENIED con el subject a los 1,2 ms (el SDK escucha el `-ERR` de la conexión: async-nats solo daría un timeout, A-72); sin su inbox privado, `connect()` pasa y falla la primera llamada (PERMISSION_DENIED, 1,1 ms); dueño sin `rpc.clientes.>`: `respond()` lanza PERMISSION_DENIED con el subject; dueño sin `allow_responses`: el handler se ejecuta, RPC_TIMEOUT a los 1503 ms y el SDK registra la respuesta denegada (con otro texto que el de Node). pedidos-api (solo llama): recibe la respuesta por su inbox sin otra suscripción y no puede atender."},
+      "steps": [
+        {
+          "op": "sdk_script",
+          "agents": [
+            {"id": "crm1", "sdk": "rust", "as": "crm-api"},
+            {"id": "crm2", "sdk": "rust", "as": "crm-api"},
+            {"id": "fact", "sdk": "rust", "as": "facturacion-api"},
+            {"id": "crmB", "sdk": "rust", "as": "crm-api"},
+            {"id": "crmC", "sdk": "rust", "as": "crm-api"},
+            {"id": "factSinLlamada", "sdk": "rust", "as": {"service": "facturacion-api", "without": ["rpc.clientes.cliente.v1.obtener"]}},
+            {"id": "factSinInbox", "sdk": "rust", "as": {"service": "facturacion-api", "withoutSubscribe": ["_INBOX.facturacion-api.>"]}},
+            {"id": "crmSinSub", "sdk": "rust", "as": {"service": "crm-api", "withoutSubscribe": ["rpc.clientes.>"]}},
+            {"id": "crmSinAllow", "sdk": "rust", "as": {"service": "crm-api", "allowResponses": null}},
+            {"id": "ped", "sdk": "rust", "as": "pedidos-api"}
+          ],
+          "script": [
+            {"agent": "crm1", "cmd": "respond", "operation": "clientes.cliente.v1.obtener", "title": "crm-api (instancia 1) atiende `obtener`: la suscripción es al subject exacto", "expect": {"ok": true, "subject": "rpc.clientes.cliente.v1.obtener"}},
+            {"agent": "crm2", "cmd": "respond", "operation": "clientes.cliente.v1.obtener", "title": "crm-api (instancia 2) atiende `obtener`: el mismo grupo de cola", "expect": {"ok": true}},
+            {"agent": "fact", "cmd": "call_many", "operation": "clientes.cliente.v1.obtener", "n": 100, "concurrency": 20, "data": {"clienteId": "cli-1"}, "title": "facturacion-api hace 100 peticiones concurrentes: las 100 se contestan, repartidas entre las dos instancias, y no falta ningún permiso (0 violaciones en el log del servidor)", "expect": {"ok": true, "answered": 100, "failed": 0, "minShare": {"gte": 15}, "serverViolationCount": 0}},
+            {"cmd": "stats", "agents": ["crm1", "crm2"], "title": "cada petición la atendió UNA instancia: entre las dos, exactamente 100 ejecuciones del handler", "expect": {"total": 100, "perAgent.crm1.logCount": 0, "perAgent.crm2.logCount": 0}},
+            {"agent": "crm1", "cmd": "stop", "operation": "clientes.cliente.v1.obtener", "title": "se para la instancia 1 (parada ordenada)", "expect": {"ok": true}},
+            {"agent": "fact", "cmd": "call", "operation": "clientes.cliente.v1.obtener", "data": {"clienteId": "cli-1"}, "title": "con la instancia 2 sola, todo va a ella", "expect": {"ok": true, "data.instancia": "crm2"}},
+            {"agent": "crm2", "cmd": "stop", "operation": "clientes.cliente.v1.obtener", "title": "se para la instancia 2: ya no escucha nadie", "expect": {"ok": true}},
+            {"agent": "fact", "cmd": "call_repeat", "operation": "clientes.cliente.v1.obtener", "repeat": 7, "data": {"clienteId": "cli-1"}, "options": {"timeoutMs": 5000}, "title": "al parar ambas, quien llama recibe RPC_UNAVAILABLE en < 100 ms (la mediana de 7 llamadas; ninguna agota el timeout)", "expect": {"codes": {"RPC_UNAVAILABLE": 7}, "p50Ms": {"lte": 100}, "maxMs": {"lte": 1500}, "last.error.class": "retryable", "serverViolationCount": 0}},
+            {"agent": "crmB", "cmd": "respond", "operation": "clientes.cliente.v1.obtener", "title": "un dueño con todos sus permisos atiende `obtener` (control para lo siguiente)", "expect": {"ok": true}},
+            {"agent": "factSinLlamada", "cmd": "call", "operation": "clientes.cliente.v1.obtener", "data": {"clienteId": "cli-1"}, "options": {"timeoutMs": 3000}, "title": "SIN el permiso de publicar en la operación: PERMISSION_DENIED, rápido (no un timeout), con el subject; y la petición no llegó al dueño", "expect": {"ok": false, "error.code": "PERMISSION_DENIED", "error.class": "permanent", "error.message": {"includes": "rpc.clientes.cliente.v1.obtener"}, "ms": {"lte": 1500}, "serverViolations": {"anyMatch": "Publish Violation.*rpc\\.clientes\\.cliente\\.v1\\.obtener"}}},
+            {"agent": "crmB", "cmd": "stats", "title": "…y al dueño no le llegó nada", "expect": {"total": 0}},
+            {"agent": "factSinInbox", "cmd": "call", "operation": "clientes.cliente.v1.obtener", "data": {"clienteId": "cli-1"}, "options": {"timeoutMs": 3000}, "title": "SIN su inbox privado: la llamada falla al instante y con el motivo (la suscripción denegada), no con un timeout", "expect": {"ok": false, "error.code": "PERMISSION_DENIED", "error.message": {"includes": "_INBOX.facturacion-api."}}},
+            {"agent": "crmSinSub", "cmd": "respond", "operation": "clientes.cliente.v1.calcular-descuento", "title": "SIN su suscripción `rpc.clientes.>`: `respond()` falla AL ARRANCAR con PERMISSION_DENIED y el subject, no arranca mudo", "expect": {"ok": false, "error.code": "PERMISSION_DENIED", "error.message": {"includes": "rpc.clientes.cliente.v1.calcular-descuento"}, "serverViolations": {"anyMatch": "Subscription Violation"}}},
+            {"agent": "crmSinAllow", "cmd": "respond", "operation": "clientes.cliente.v1.calcular-descuento", "title": "SIN `allow_responses`: `respond()` arranca (el servidor no lo avisa hasta que contesta)", "expect": {"ok": true}},
+            {"agent": "fact", "cmd": "call", "operation": "clientes.cliente.v1.calcular-descuento", "data": {"clienteId": "cli-1", "totalCents": 9990, "moneda": "EUR"}, "options": {"timeoutMs": 1500}, "title": "…y quien llama ve RPC_TIMEOUT: el dueño ejecutó, pero su respuesta se denegó", "expect": {"ok": false, "error.code": "RPC_TIMEOUT", "ms": {"gte": 1400}}},
+            {"agent": "crmSinAllow", "cmd": "stats", "title": "el dueño lo ejecutó y el SDK REGISTRÓ la denegación de su respuesta (el aviso del broker llega a su log)", "until": {"logCount": {"gte": 1}}, "expect": {"total": 1, "logs": {"anyMatch": "denegó .*_INBOX"}}},
+            {"agent": "crmSinAllow", "cmd": "stop", "operation": "clientes.cliente.v1.calcular-descuento", "title": "(se retira)", "expect": {"ok": true}},
+            {"cmd": "acl", "service": "pedidos-api", "title": "pedidos-api solo llama (`calls`): su suscripción es SOLO su inbox privado; ninguna de dominio, ni `allow_responses`", "expect": {"subscribe": ["_INBOX.pedidos-api.>"], "allowResponses": null}},
+            {"agent": "crmC", "cmd": "respond", "operation": "clientes.cliente.v1.calcular-descuento", "title": "crm-api atiende `calcular-descuento`", "expect": {"ok": true}},
+            {"agent": "ped", "cmd": "call", "operation": "clientes.cliente.v1.calcular-descuento", "data": {"clienteId": "cli-1", "totalCents": 9990, "moneda": "EUR"}, "options": {"timeoutMs": 3000}, "title": "pedidos-api, sin ninguna suscripción de dominio, recibe la respuesta por su inbox: la consume sin otro permiso", "expect": {"ok": true, "data.instancia": "crmC", "serverViolationCount": 0}},
+            {"agent": "ped", "cmd": "respond", "operation": "clientes.cliente.v1.obtener", "title": "…y no puede atender: no es dueño de `clientes`", "expect": {"ok": false, "error.code": "PERMISSION_DENIED", "error.message": {"includes": "rpc.clientes.cliente.v1.obtener"}}}
+          ]
+        }
+      ]
+    },
+    {
+      "id": "S32",
+      "title": "A-101 con el SDK de Node REAL: un servicio que consume por pull, o que observa estado, y llama por la misma conexión recibe `RPC_UNAVAILABLE` en milisegundos",
+      "spec": "11-request-reply.md §4.3: el SDK NO DEBE suscribirse, por la misma conexión que pide, a un subject que case con el `reply` de sus peticiones",
+      "plan": "PLAN Apéndice A, A-101 (ola 2: con los SDKs reales)",
+      "covers": ["A-56", "A-101", "A-142"],
+      "needs": ["sdk-node/dist"],
+      "rationale": "S29 mide que una segunda suscripción de la MISMA conexión al inbox (`_INBOX.<servicio>.>`) convierte `no responders` en un timeout de 5 s en 6 de 6 peticiones (A-101): RPC_UNAVAILABLE (inmediato, RETRYABLE) pasa a RPC_TIMEOUT (ambiguo), y un servicio que reintenta lo hace esperando. Es un riesgo real y silencioso para un SDK, porque un servicio que consume eventos por pull o observa estado y además llama a una operación hace las dos cosas por UNA conexión: si el pull consumer, el `watch` o cualquier otra parte del SDK abriera una suscripción que case con el `reply`, no daría error: daría timeouts. Aquí se mide con el SDK de Node REAL, no se lee su código: con un pull consumer con tráfico (40 eventos) y con un `state.watch`, una operación sin dueño da RPC_UNAVAILABLE con mediana < 100 ms en 7 de 7 llamadas; y además se mira en el BROKER (`/connz`) cuántas suscripciones de la conexión casan con un `reply` suyo: exactamente la del buzón único de la librería. El caso se rompe con un SDK que se suscriba a su inbox (`security/mutantes-sdk.mjs`).",
+      "observed": {"server": "nats-server 2.14.5", "date": "2026-11-26", "result": "Con el SDK de Node: con un pull consumer activo (y con 40 eventos consumidos mientras tanto) una operación sin dueño da RPC_UNAVAILABLE en 7 de 7 llamadas, mediana 1,0-1,1 ms, máximo 3,7 ms; con `state.watch` activo, 7 de 7, mediana 1,2 ms, máximo 4,7 ms. En el broker (`/connz?subs=detail`) UNA sola suscripción de cada conexión casa con el `reply`: el buzón único `_INBOX.<servicio>.<nuid>.*`. Con un SDK estropeado que abre `_INBOX.<servicio>.>` (en connect, en el pull o en el watch) las 7 llamadas dan RPC_TIMEOUT a los 2 s y casan dos suscripciones: el caso falla justo en los pasos que toca."},
+      "steps": [
+        {"as": "ops", "op": "reset_consumer", "stream": "EVT_PEDIDOS", "durable": "facturacion-api__pedidos_pedido_v1_creado", "filter": "pedidos.pedido.v1.creado", "deliver": "new", "expect": {"outcome": "ok"}},
+        {
+          "op": "sdk_script",
+          "agents": [
+            {"id": "fact", "sdk": "node", "as": "facturacion-api"},
+            {"id": "ped", "sdk": "node", "as": "pedidos-api"},
+            {"id": "crmS", "sdk": "node", "as": "crm-api"},
+            {"id": "panel", "sdk": "node", "as": "panel-api"}
+          ],
+          "script": [
+            {"agent": "fact", "cmd": "consume", "subject": "pedidos.pedido.v1.creado", "title": "facturacion-api consume `pedidos.pedido.v1.creado` por PULL, en la misma conexión con la que llamará (la suscripción del pull al inbox es de la librería)", "expect": {"ok": true, "durable": "facturacion-api__pedidos_pedido_v1_creado"}},
+            {"agent": "fact", "cmd": "call_repeat", "operation": "clientes.cliente.v1.obtener", "repeat": 7, "data": {"clienteId": "cli-1"}, "options": {"timeoutMs": 2000}, "title": "con el pull activo, una operación que NADIE atiende da RPC_UNAVAILABLE en ms: ni el pull ni nada del SDK se suscribió a un subject que case con el `reply`", "expect": {"codes": {"RPC_UNAVAILABLE": 7}, "p50Ms": {"lte": 100}, "maxMs": {"lte": 1500}, "last.error.class": "retryable"}},
+            {"agent": "ped", "cmd": "publish", "subject": "pedidos.pedido.v1.creado", "n": 40, "data": {"aggregateVersion": 1}, "title": "pedidos-api publica 40 eventos: el pull tiene tráfico de verdad", "expect": {"ok": true, "published": 40}},
+            {"agent": "fact", "cmd": "call_repeat", "operation": "clientes.cliente.v1.obtener", "repeat": 7, "data": {"clienteId": "cli-1"}, "options": {"timeoutMs": 2000}, "title": "…con el tráfico del pull en curso, lo mismo: RPC_UNAVAILABLE en ms", "expect": {"codes": {"RPC_UNAVAILABLE": 7}, "p50Ms": {"lte": 100}, "maxMs": {"lte": 1500}, "last.error.class": "retryable"}},
+            {"agent": "fact", "cmd": "stats", "title": "el pull consumió los 40 eventos por la misma conexión (el escenario no es hueco)", "until": {"consumed": {"gte": 40}}, "waitMs": 30000, "expect": {"consumed": {"gte": 40}}},
+            {"agent": "fact", "cmd": "broker_subs", "title": "lo que el BROKER ve de la conexión: UNA sola suscripción casa con el `reply` de sus peticiones, la del buzón único de la librería (`_INBOX.facturacion-api.<nuid>.*`)", "expect": {"ok": true, "connections": 1, "replyMatches": 1, "otherReplyMatches": []}},
+            {"agent": "crmS", "cmd": "state_put", "contract": "clientes.cliente.v1", "key": "cli-{marker}", "data": {"clienteId": "cli-{marker}", "nombre": "Ana", "aggregateVersion": 1}, "title": "crm-api escribe un estado: el `watch` tiene algo que observar", "expect": {"ok": true, "outcome": "ok"}},
+            {"agent": "panel", "cmd": "watch", "contract": "clientes.cliente.v1", "title": "panel-api observa el estado `clientes.cliente.v1` con `state.watch`, en la misma conexión con la que llamará", "expect": {"ok": true}},
+            {"agent": "panel", "cmd": "stats", "title": "el `watch` recibió la entrada", "until": {"watched": {"gte": 1}}, "expect": {"watched": {"gte": 1}}},
+            {"agent": "panel", "cmd": "call_repeat", "operation": "clientes.cliente.v1.calcular-descuento", "repeat": 7, "data": {"clienteId": "cli-1"}, "options": {"timeoutMs": 2000}, "title": "con el `watch` activo, una operación que nadie atiende da RPC_UNAVAILABLE en ms", "expect": {"codes": {"RPC_UNAVAILABLE": 7}, "p50Ms": {"lte": 100}, "maxMs": {"lte": 1500}, "last.error.class": "retryable"}},
+            {"agent": "panel", "cmd": "broker_subs", "title": "lo que el broker ve de la conexión del `watch`: solo la del buzón único casa con el `reply`", "expect": {"ok": true, "connections": 1, "replyMatches": 1, "otherReplyMatches": []}}
+          ]
+        }
+      ]
+    },
+    {
+      "id": "S33",
+      "title": "A-101 con el SDK de Rust REAL: un servicio que consume por pull, o que observa estado, y llama por la misma conexión recibe `RPC_UNAVAILABLE` en milisegundos",
+      "spec": "11-request-reply.md §4.3: el SDK NO DEBE suscribirse, por la misma conexión que pide, a un subject que case con el `reply` de sus peticiones",
+      "plan": "PLAN Apéndice A, A-101 (ola 2: con los SDKs reales)",
+      "covers": ["A-56", "A-101", "A-142"],
+      "needs": ["cargo"],
+      "rationale": "S29 mide que una segunda suscripción de la MISMA conexión al inbox (`_INBOX.<servicio>.>`) convierte `no responders` en un timeout de 5 s en 6 de 6 peticiones (A-101): RPC_UNAVAILABLE (inmediato, RETRYABLE) pasa a RPC_TIMEOUT (ambiguo), y un servicio que reintenta lo hace esperando. Es un riesgo real y silencioso para un SDK, porque un servicio que consume eventos por pull o observa estado y además llama a una operación hace las dos cosas por UNA conexión: si el pull consumer, el `watch` o cualquier otra parte del SDK abriera una suscripción que case con el `reply`, no daría error: daría timeouts. Aquí se mide con el SDK de Rust REAL, no se lee su código: con un pull consumer con tráfico (40 eventos) y con un `state.watch`, una operación sin dueño da RPC_UNAVAILABLE con mediana < 100 ms en 7 de 7 llamadas; y además se mira en el BROKER (`/connz`) cuántas suscripciones de la conexión casan con un `reply` suyo: exactamente la del buzón único de la librería. El caso se rompe con un SDK que se suscriba a su inbox (`security/mutantes-sdk.mjs`).",
+      "observed": {"server": "nats-server 2.14.5", "date": "2026-11-26", "result": "Con el SDK de Rust: con un pull consumer activo (y 40 eventos consumidos) una operación sin dueño da RPC_UNAVAILABLE en 7 de 7 llamadas, mediana 0,5-0,7 ms, máximo 0,8 ms; con `State::watch` activo, 7 de 7, mediana 0,6 ms, máximo 1,7 ms. En el broker UNA sola suscripción de cada conexión casa con el `reply`: el buzón único `_INBOX.<servicio>.<nuid>.*` de async-nats. Con un SDK estropeado que abre `_INBOX.<servicio>.>` el caso falla (mutantes rust-inbox-en-connect y rust-inbox-en-subscribe)."},
+      "steps": [
+        {"as": "ops", "op": "reset_consumer", "stream": "EVT_PEDIDOS", "durable": "facturacion-api__pedidos_pedido_v1_creado", "filter": "pedidos.pedido.v1.creado", "deliver": "new", "expect": {"outcome": "ok"}},
+        {
+          "op": "sdk_script",
+          "agents": [
+            {"id": "fact", "sdk": "rust", "as": "facturacion-api"},
+            {"id": "ped", "sdk": "rust", "as": "pedidos-api"},
+            {"id": "crmS", "sdk": "rust", "as": "crm-api"},
+            {"id": "panel", "sdk": "rust", "as": "panel-api"}
+          ],
+          "script": [
+            {"agent": "fact", "cmd": "consume", "subject": "pedidos.pedido.v1.creado", "title": "facturacion-api consume `pedidos.pedido.v1.creado` por PULL, en la misma conexión con la que llamará (la suscripción del pull al inbox es de la librería)", "expect": {"ok": true, "durable": "facturacion-api__pedidos_pedido_v1_creado"}},
+            {"agent": "fact", "cmd": "call_repeat", "operation": "clientes.cliente.v1.obtener", "repeat": 7, "data": {"clienteId": "cli-1"}, "options": {"timeoutMs": 2000}, "title": "con el pull activo, una operación que NADIE atiende da RPC_UNAVAILABLE en ms: ni el pull ni nada del SDK se suscribió a un subject que case con el `reply`", "expect": {"codes": {"RPC_UNAVAILABLE": 7}, "p50Ms": {"lte": 100}, "maxMs": {"lte": 1500}, "last.error.class": "retryable"}},
+            {"agent": "ped", "cmd": "publish", "subject": "pedidos.pedido.v1.creado", "n": 40, "data": {"aggregateVersion": 1}, "title": "pedidos-api publica 40 eventos: el pull tiene tráfico de verdad", "expect": {"ok": true, "published": 40}},
+            {"agent": "fact", "cmd": "call_repeat", "operation": "clientes.cliente.v1.obtener", "repeat": 7, "data": {"clienteId": "cli-1"}, "options": {"timeoutMs": 2000}, "title": "…con el tráfico del pull en curso, lo mismo: RPC_UNAVAILABLE en ms", "expect": {"codes": {"RPC_UNAVAILABLE": 7}, "p50Ms": {"lte": 100}, "maxMs": {"lte": 1500}, "last.error.class": "retryable"}},
+            {"agent": "fact", "cmd": "stats", "title": "el pull consumió los 40 eventos por la misma conexión (el escenario no es hueco)", "until": {"consumed": {"gte": 40}}, "waitMs": 30000, "expect": {"consumed": {"gte": 40}}},
+            {"agent": "fact", "cmd": "broker_subs", "title": "lo que el BROKER ve de la conexión: UNA sola suscripción casa con el `reply` de sus peticiones, la del buzón único de la librería (`_INBOX.facturacion-api.<nuid>.*`)", "expect": {"ok": true, "connections": 1, "replyMatches": 1, "otherReplyMatches": []}},
+            {"agent": "crmS", "cmd": "state_put", "contract": "clientes.cliente.v1", "key": "cli-{marker}", "data": {"clienteId": "cli-{marker}", "nombre": "Ana", "aggregateVersion": 1}, "title": "crm-api escribe un estado: el `watch` tiene algo que observar", "expect": {"ok": true, "outcome": "ok"}},
+            {"agent": "panel", "cmd": "watch", "contract": "clientes.cliente.v1", "title": "panel-api observa el estado `clientes.cliente.v1` con `state.watch`, en la misma conexión con la que llamará", "expect": {"ok": true}},
+            {"agent": "panel", "cmd": "stats", "title": "el `watch` recibió la entrada", "until": {"watched": {"gte": 1}}, "expect": {"watched": {"gte": 1}}},
+            {"agent": "panel", "cmd": "call_repeat", "operation": "clientes.cliente.v1.calcular-descuento", "repeat": 7, "data": {"clienteId": "cli-1"}, "options": {"timeoutMs": 2000}, "title": "con el `watch` activo, una operación que nadie atiende da RPC_UNAVAILABLE en ms", "expect": {"codes": {"RPC_UNAVAILABLE": 7}, "p50Ms": {"lte": 100}, "maxMs": {"lte": 1500}, "last.error.class": "retryable"}},
+            {"agent": "panel", "cmd": "broker_subs", "title": "lo que el broker ve de la conexión del `watch`: solo la del buzón único casa con el `reply`", "expect": {"ok": true, "connections": 1, "replyMatches": 1, "otherReplyMatches": []}}
+          ]
+        }
+      ]
+    },
+    {
+      "id": "S34",
+      "title": "`allow_responses { max: 1, expires: 30s }` con el SDK de Node REAL: un responder cuya conexión publica una SEGUNDA respuesta la ve denegada, y el SDK lo registra",
+      "spec": "11-request-reply.md §7.2: `max: 1` cierra «una petición, una respuesta»; §7.2 y 06-security.md §3.7: el SDK DEBE registrar cada respuesta denegada",
+      "plan": "PLAN Fase 3, A-68 (ola 2: con el SDK real)",
+      "covers": ["A-68", "A-104", "A-143"],
+      "needs": ["sdk-node/dist"],
+      "rationale": "S24 mide `allow_responses` con clientes en bruto. Con la API pública de un SDK no hay forma de contestar dos veces —y esa es justo la garantía—, así que el «handler tramposo» se coloca DEBAJO: el participante de Node repite cada publicación a un inbox sobre la librería de NATS que el SDK usa (`FLUX_P_TRAMPOSO`), que es lo que haría un handler comprometido con acceso a la conexión. Lo que se comprueba es lo que importa de cada lado: el broker (con los permisos generados) deniega la segunda —un `Publish Violation` por petición en su log—, quien llama no nota nada, y el SDK del dueño lo REGISTRA y sigue sirviendo. Con `max: 3` (mutante `allow-responses-max-3`) o con un permiso de publicación sobre inboxes (`owner-publishes-on-inboxes`) la segunda entra y el caso falla. Solo en Node: el SDK de Rust no expone la conexión y `async-nats` no admite este parche; el registro de una respuesta denegada del SDK de Rust lo cubre S31 (dueño sin `allow_responses`).",
+      "observed": {"server": "nats-server 2.14.5", "date": "2026-11-26", "result": "5 peticiones a un dueño cuya conexión publica DOS veces cada respuesta, con los permisos generados: quien llama recibe 5 respuestas (una por petición); el broker deniega la segunda de cada una (5 `Publish Violation` sobre `_INBOX.facturacion-api.<nuid>.<token>` en el log del servidor, ni una más); el SDK del dueño registra una vez «el broker denegó publicar en `_INBOX.facturacion-api.>`» con la pista de `allow_responses`; el servicio sigue sirviendo. Control con un dueño normal: 5 de 5 y 0 violaciones."},
+      "steps": [
+        {
+          "op": "sdk_script",
+          "agents": [
+            {"id": "crmN", "sdk": "node", "as": "crm-api"},
+            {"id": "crmT", "sdk": "node", "as": "crm-api", "tramposo": true},
+            {"id": "fact", "sdk": "node", "as": "facturacion-api"}
+          ],
+          "script": [
+            {"agent": "crmN", "cmd": "respond", "operation": "clientes.cliente.v1.obtener", "title": "control: un dueño normal atiende `obtener`", "expect": {"ok": true}},
+            {"agent": "fact", "cmd": "call_many", "operation": "clientes.cliente.v1.obtener", "n": 5, "concurrency": 5, "data": {"clienteId": "cli-1"}, "title": "control: 5 peticiones, 5 respuestas, ni una denegación en el broker (el `max: 1` alcanza para UNA respuesta por petición)", "expect": {"answered": 5, "failed": 0, "serverViolationCount": 0}},
+            {"agent": "crmN", "cmd": "stop", "operation": "clientes.cliente.v1.obtener", "title": "(se retira el dueño normal)", "expect": {"ok": true}},
+            {"agent": "crmT", "cmd": "respond", "operation": "clientes.cliente.v1.obtener", "title": "un dueño «tramposo» —su conexión publica DOS veces cada respuesta— atiende `obtener`", "expect": {"ok": true}},
+            {"agent": "fact", "cmd": "call_many", "operation": "clientes.cliente.v1.obtener", "n": 5, "concurrency": 5, "data": {"clienteId": "cli-1"}, "title": "5 peticiones: quien llama recibe UNA respuesta de cada una (la segunda no existe para él) y el broker deniega la segunda de cada una: 5 `Publish Violation` sobre el inbox de quien llama", "expect": {"answered": 5, "failed": 0, "minShare": 5, "serverViolationCount": 5, "serverViolations": {"anyMatch": "Publish Violation.*Subject \"_INBOX\\.facturacion-api\\."}}},
+            {"cmd": "sleep", "ms": 300, "title": "(ni una más de las cinco: nada se entregó tarde ni se denegó otra cosa)", "expect": {"scenarioViolationCount": 5}},
+            {"agent": "crmT", "cmd": "stats", "title": "el dueño ejecutó las 5 y la segunda respuesta de cada una se DENEGÓ: el SDK lo REGISTRÓ en su log (una vez por subject), con la pista de `allow_responses`", "until": {"logs": {"anyMatch": "denegó publicar en .*_INBOX"}}, "expect": {"total": 5, "logs": {"anyMatch": "denegó publicar en .*_INBOX"}}},
+            {"agent": "fact", "cmd": "call", "operation": "clientes.cliente.v1.obtener", "data": {"clienteId": "cli-1"}, "title": "y el servicio sigue sirviendo: la denegación no tumbó nada", "expect": {"ok": true, "data.instancia": "crmT"}}
+          ]
+        }
       ]
     }
   ]

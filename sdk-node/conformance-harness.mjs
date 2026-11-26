@@ -9,8 +9,9 @@
  *
  * Es el arnés de REFERENCIA: su salida fija lo esperado. Además de `build`, `dlq`, `sign`,
  * `verify` y `parse`, implementa las cuatro operaciones de la capacidad `state` (`state-build`,
- * `state-tombstone`, `state-subject` y `state-dlq`), que el runner solo ejecuta en los SDKs que la
- * declaran en protocol.json.
+ * `state-tombstone`, `state-subject` y `state-dlq`) y las cinco de la capacidad `rpc` (`rpc-request`,
+ * `rpc-reply`, `rpc-error`, `rpc-operation` y `rpc-timeout`: conformance/cases/cross-sdk-rpc-envelope.json),
+ * que el runner solo ejecuta en los SDKs que las declaran en protocol.json.
  */
 
 import { buildEvent, serialize, parseEvent, toDlqEvent } from "./dist/envelope.js";
@@ -21,6 +22,14 @@ import {
   buildStateTombstone,
   stateSubject,
 } from "./dist/state.js";
+import {
+  buildRpcError,
+  buildRpcReply,
+  buildRpcRequest,
+  encodeRpcMessage,
+  resolveRpcTimeout,
+  rpcSubject,
+} from "./dist/rpc.js";
 
 const leerStdin = () =>
   new Promise((res) => {
@@ -74,6 +83,21 @@ function construirEstado(e) {
   };
 }
 
+/**
+ * Petición/respuesta (specification/11-request-reply.md §3.5): lo mismo, el arnés NO rellena nada. `id`, `time` y
+ * `traceparent` vienen del vector. `dataschema` NO viene: lo deriva el SDK de la operación (es parte de lo que se compara).
+ * La respuesta y el error HEREDAN de `request` (`correlationid`, `tenantid`, `subject`) y su `causationid` es `request.id`:
+ * el `correlationid` de primer nivel que traen los vectores es redundante, y aquí no se usa.
+ */
+const construirReferencia = (r) => ({
+  operation: r.operation,
+  id: r.id,
+  correlationid: r.correlationid,
+  tenantid: r.tenantid,
+  ...(r.subject !== undefined && { subject: r.subject }),
+  ...(r.partitionkey !== undefined && { partitionkey: r.partitionkey }),
+});
+
 const b64 = (bytes) => Buffer.from(bytes).toString("base64");
 
 async function ejecutar(entrada) {
@@ -87,16 +111,15 @@ async function ejecutar(entrada) {
         ev = createSigner(entrada.signing).sign(ev);
       }
       const d = entrada.dlq;
+      // `dlqtime` lo fija el vector: si lo pusiera el SDK, los bytes no serían comparables entre ejecuciones, y mucho
+      // menos entre lenguajes. El SDK lo normaliza a la forma canónica (o lo rechaza).
       const conDlq = toDlqEvent(ev, {
         reason: d.reason,
         attempts: d.attempts,
         consumer: d.consumer,
         error: d.error,
-      });
-      // `dlqtime` lo fija el vector: si lo pusiera el SDK, los bytes no serían
-      // comparables entre ejecuciones, y mucho menos entre lenguajes.
-      const { data, ...resto } = { ...conDlq, dlqtime: d.dlqtime };
-      return { ok: true, bytes: b64(serialize({ ...resto, data })) };
+      }, d.dlqtime);
+      return { ok: true, bytes: b64(serialize(conDlq)) };
     }
 
     case "sign": {
@@ -162,6 +185,77 @@ async function ejecutar(entrada) {
       });
       return { ok: true, bytes: b64(serialize(ev)) };
     }
+
+    // ─── Petición/respuesta (capacidad `rpc`) ───────────────────────────────────────────
+    case "rpc-request":
+      return {
+        ok: true,
+        bytes: b64(
+          encodeRpcMessage(
+            buildRpcRequest({
+              operation: entrada.operation,
+              tenantId: entrada.tenantId,
+              id: entrada.id,
+              source: entrada.source,
+              time: entrada.time,
+              correlationid: entrada.correlationid,
+              producerversion: entrada.producerversion,
+              classification: entrada.classification,
+              data: entrada.data,
+              ...(entrada.aggregateId !== undefined && { aggregateId: entrada.aggregateId }),
+              ...(entrada.causationid !== undefined && { causationid: entrada.causationid }),
+              ...(entrada.traceparent !== undefined && { traceparent: entrada.traceparent }),
+              ...(entrada.tracestate !== undefined && { tracestate: entrada.tracestate }),
+            }),
+          ),
+        ),
+      };
+
+    case "rpc-reply":
+      return {
+        ok: true,
+        bytes: b64(
+          encodeRpcMessage(
+            buildRpcReply({
+              request: construirReferencia(entrada.request),
+              id: entrada.id,
+              source: entrada.source,
+              time: entrada.time,
+              producerversion: entrada.producerversion,
+              classification: entrada.classification,
+              data: entrada.data,
+              ...(entrada.traceparent !== undefined && { traceparent: entrada.traceparent }),
+            }),
+          ),
+        ),
+      };
+
+    case "rpc-error":
+      return {
+        ok: true,
+        bytes: b64(
+          encodeRpcMessage(
+            buildRpcError({
+              request: construirReferencia(entrada.request),
+              id: entrada.id,
+              source: entrada.source,
+              time: entrada.time,
+              producerversion: entrada.producerversion,
+              error: entrada.error,
+              ...(entrada.traceparent !== undefined && { traceparent: entrada.traceparent }),
+            }),
+          ),
+        ),
+      };
+
+    // El subject de NATS (`{ ok, subject }`) o el código estable del rechazo (`{ ok: false, code }`: INVALID_RPC_CALL o
+    // RESERVED_DOMAIN). `rpcSubject` lanza con `code`, y el `catch` de abajo lo reporta.
+    case "rpc-operation":
+      return { ok: true, subject: rpcSubject(entrada.operation) };
+
+    // Los milisegundos efectivos, o INVALID_RPC_CALL. `timeoutMs` ausente es 5000; `null` NO es «ausente»: es inválido.
+    case "rpc-timeout":
+      return { ok: true, effectiveMs: resolveRpcTimeout(entrada.timeoutMs) };
 
     default:
       return { ok: false, code: "UNSUPPORTED_OP", detail: entrada.op };
