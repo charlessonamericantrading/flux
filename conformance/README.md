@@ -11,7 +11,7 @@ conformance/
 ├── cases/
 │   ├── broker-invariants.json   ← invariantes de NATS de las que depende el protocolo
 │   ├── consumer-config.json     ← la config canónica sobrevive al servidor sin alterarse
-│   ├── security-acl.json        ← los permisos generados, ejecutados contra un broker con TLS (S1–S20)
+│   ├── security-acl.json        ← los permisos generados, ejecutados contra un broker con TLS (S1–S29)
 │   ├── state-broker.json        ← estado replicado: lo que hace el BROKER (A-31 … A-49), con ACL y cluster
 │   ├── state-semantics.json     ← estado replicado: el algoritmo de put/delete/get y la foto de watch (A-50)
 │   ├── cross-sdk-state-envelope.json ← la entrada de estado, la lápida y la DLQ de estado, byte a byte
@@ -20,7 +20,7 @@ conformance/
 ├── fixtures/
 │   └── acl-v1.conf              ← la ACL v1 de gen-acl.mjs, congelada y rota a propósito (caso S9)
 ├── security.mjs                 ← runner de security-acl.json: los casos son DATOS
-├── security/                    ← su intérprete, y el ciclo del SDK de Node (S10)
+├── security/                    ← su intérprete, el ciclo del SDK de Node (S10) y los mutantes del generador (mutantes.mjs)
 ├── state-broker.mjs             ← runner de los tres ficheros de estado: los casos son DATOS
 ├── cross-sdk.mjs                ← runner de la conformidad cruzada: los siete SDKs, byte a byte
 ├── harness/                     ← su contrato (README.md), los vectores y la clave de prueba
@@ -106,11 +106,17 @@ observarse. [`security.mjs`](security.mjs) no sabe qué es S1: monta el entorno 
 desconocido en un caso, o una expectativa sobre algo que la operación no observa, es un error al
 cargar: una errata no puede degradarse a «no se comprueba nada».
 
-Los casos S1–S8 y S12–S20 hablan NATS directamente, sin ningún SDK de flux. S15 a S20 son los del
+Los casos S1–S8 y S12–S29 hablan NATS directamente, sin ningún SDK de flux. S15 a S20 son los del
 **estado replicado** ([06-security.md §3.8](../specification/06-security.md)): el ciclo del dueño y de
 los observadores bajo la ACL generada, que solo el dueño escribe, que un tenant no lee el de otro, que
 nadie consulta el stream de estado más allá de lo concedido, la DLQ de estado y la minimalidad de cada
-permiso. Los pasos `save` / `{ "ref": … }` llevan la secuencia de una escritura condicional a la siguiente. S10 y S11 son la
+permiso. S21 a S29 son los de la **petición/respuesta** ([06-security.md §3.9](../specification/06-security.md)): quien llama
+publica solo en el subject exacto de cada operación y la denegación es rápida, solo el dueño atiende (ni `rpc.>`, ni el grupo
+de cola de otro), la respuesta no la lee otro servicio, `allow_responses` admite UNA respuesta y caduca, un dueño sin
+suscripción parece caído, la minimalidad de cada permiso, el ciclo de aceptación (dos instancias, 100 peticiones
+concurrentes, `no responders` al parar) y la trampa de la segunda suscripción al inbox, con clientes `@nats-io/*` en bruto
+(los SDKs `rpc` repetirán el ciclo con su propia librería). S25 tarda ~1 min: espera la caducidad de `allow_responses` de verdad.
+Los pasos `save` / `{ "ref": … }` llevan la secuencia de una escritura condicional a la siguiente. S10 y S11 son la
 excepción deliberada: el SDK de Node y el de Rust, sin modificar, hacen un ciclo completo
 (publicar, consumir, ack, reintento, DLQ) **contra la ACL generada**, y el runner mira después,
 desde el broker, lo que dejaron. S9 vuelve a ejecutar S1 y S6 contra la ACL v1 congelada y exige
@@ -126,6 +132,19 @@ nada. Los pasos marcados `control` demuestran que las sondas pueden fallar.
   servicio, `user: "<servicio>"` y `password: "pw"`, como el fixture): sirve para ver qué casos
   detectan una ACL rota. S9, S10 y S11 no aplican, y los pasos que necesitan partir de los
   permisos generados se omiten y se dicen.
+
+```bash
+node conformance/security/mutantes.mjs            # los 13 mutantes del generador: la suite DEBE fallar con cada uno
+node conformance/security/mutantes.mjs --fast     # sin los dos de `expires` (~1 min cada uno)
+node conformance/security/mutantes.mjs --list
+```
+
+Los pasos `control` demuestran que **una sonda** puede fallar; los mutantes demuestran que **la suite** detecta un
+**generador** que concede de más o de menos. [`security/mutantes.mjs`](security/mutantes.mjs) copia `scripts/` a un temporal, le
+aplica a la copia UN cambio de texto —`rpc.<dominio>.>` a quien llama, `rpc.>` al dueño, un permiso de publicación sobre inboxes,
+quitar `allow_responses` o su `expires`, el inbox común…— y ejecuta la suite con `FLUX_GEN_ACL` apuntando a esa copia: cada
+mutante declara los casos que DEBEN fallar, y antes se comprueba que sin mutar esos casos pasan. Un ancla que ya no aparece en el
+generador es un error, no un mutante que «no cambia nada y pasa».
 
 `scripts/verify-acl.mjs` **se queda**: no es redundante con esta suite. Verifica el generador (sus
 errores, `--nkeys`, `--tenants`), `flux provision` (idempotencia, diferencias, nunca borra), la

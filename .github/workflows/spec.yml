@@ -164,6 +164,13 @@ jobs:
         env:
           FLUX_REQUIRE_BROKER: '1'
         run: node conformance/security.mjs
+      # Una prueba que solo se ha visto en verde no demuestra nada: se estropea el GENERADOR de ACL a propósito (`rpc.<dominio>.>` a
+      # quien llama, `rpc.>` o un permiso de publicación sobre inboxes al dueño, sin `allow_responses` o sin su `expires`, el inbox
+      # común…) y los casos S21 a S29 DEBEN fallar con cada uno de los 13 mutantes. Sin mutar, el subconjunto pasa.
+      - name: Los casos detectan un generador de ACL estropeado (deben FALLAR)
+        env:
+          FLUX_REQUIRE_BROKER: '1'
+        run: node conformance/security/mutantes.mjs
       # El estado replicado (10-state.md): los casos del broker, una ACL por tenant escrita a mano y un
       # cluster de tres nodos. Levanta sus propios servidores con el nats-server compilado arriba.
       - name: Ejecutar la suite de estado replicado

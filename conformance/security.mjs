@@ -12,7 +12,8 @@
  * Los casos son DATOS (`cases/security-acl.json`): este fichero no sabe qué es S1. Orquesta el
  * entorno —PKI efímera con openssl, nkeys de prueba, la config que genera `gen-acl.mjs`, un
  * nats-server con TLS, `flux provision`— y delega la ejecución de cada paso en
- * `security/interprete.mjs`. Lo único que hace por su cuenta son las dos operaciones que
+ * `security/interprete.mjs` (S21 a S29, la petición/respuesta, con clientes `@nats-io/*` en bruto: no hay SDK `rpc` todavía).
+ * Lo único que hace por su cuenta son las dos operaciones que
  * necesitan procesos aparte: `sdk_cycle` (S10 y S11, los SDKs reales) y `regression` (S9, la ACL
  * v1 congelada en un segundo servidor).
  *
@@ -26,6 +27,8 @@
  *                          FALLO, no un salto con aviso. En CI siempre: un job verde que no
  *                          ejecutó nada aparenta cobertura.
  *   FLUX_TEST_PORTS        rango de puertos, `desde-hasta` (por defecto 4600-4649)
+ *   FLUX_GEN_ACL           otro `gen-acl.mjs` (una copia estropeada a propósito) en lugar del real: solo lo usa
+ *                          `security/mutantes.mjs`, para comprobar que la suite DETECTA un generador que concede de más
  *
  * Sale con 0 si todo lo ejecutado cumple, 1 si algo falla, 2 si el entorno está mal montado.
  */
@@ -195,7 +198,10 @@ function lineaObservado(o) {
   if (!o) return "";
   const partes = [];
   if (o.outcome !== undefined) partes.push(String(o.outcome));
-  for (const k of ["stream", "subject", "leaked", "victimRead", "count", "ackPending", "numPending", "ackTokens", "deliveryCount", "violation", "childExit", "serverViolationLines"]) {
+  for (const k of [
+    "stream", "subject", "leaked", "victimRead", "count", "ackPending", "numPending", "ackTokens", "deliveryCount", "violation", "childExit", "serverViolationLines",
+    "subscription", "received", "delivered", "ownerDenied", "callerViolations", "answered", "failed", "byInstance", "stopOutcome", "stopMs",
+  ]) {
     if (o[k] !== undefined && o[k] !== null && o[k] !== "") partes.push(`${k}=${typeof o[k] === "object" ? JSON.stringify(o[k]) : o[k]}`);
   }
   if (o.reply?.error) partes.push(`error ${o.reply.error.err_code ?? ""} «${o.reply.error.description}»`);
@@ -493,7 +499,7 @@ async function main() {
             const k = nuevaClave();
             const perms = permisosDeVariante(a, { prod, dev });
             variantes.set(clave, k);
-            extra += usuarioConf(k.pub, perms.publish, perms.subscribe);
+            extra += usuarioConf(k.pub, perms.publish, perms.subscribe, perms.allowResponses);
           } catch (e) {
             variantes.set(clave, { error: e.message });
           }

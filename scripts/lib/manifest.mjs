@@ -35,7 +35,24 @@ export const STATE_TENANT_MAX = 64;
  */
 export const RESERVED_DOMAINS = ["dlq", "state", "rpc", "system"];
 /** Las claves que admite un servicio del manifiesto. Una errata (`watch`) no puede ser «sin permisos». */
-export const SERVICE_KEYS = ["name", "owns", "consumes", "watches"];
+export const SERVICE_KEYS = ["name", "owns", "consumes", "watches", "calls", "serves"];
+/**
+ * El NOMBRE de una operación (`clientes.cliente.v1.obtener`, lo que reciben `request` y `respond`): cuatro tokens, la
+ * misma sintaxis que el subject de un evento — 11-request-reply.md §2.2. Lo que separa una operación de un evento es
+ * el prefijo `rpc.` del subject de NATS y la gramática del último token (infinitivo, no pasado), y eso no lo fija
+ * ninguna regex.
+ */
+export const OPERATION_RE = SUBJECT_RE;
+/**
+ * Lo que el dueño de una operación puede responder: UNA respuesta por petición y que caduque. Medido (A-68):
+ * `allow_responses: true` admite una y NO caduca; `{ max: 1, expires }` cierra «una petición, una respuesta» y
+ * acota lo que haría un dueño comprometido con los inboxes que ha visto. 30 s está por encima del timeout máximo
+ * de una llamada (25 s, 11-request-reply.md §4.2): una respuesta legítima nunca llega después.
+ * Lo fija `protocol.json` → `rpc.acl.ownerAllowResponses` y lo comprueba `check-protocol-json.mjs`.
+ */
+export const RPC_ALLOW_RESPONSES = Object.freeze({ max: 1, expires: "30s" });
+/** Las erratas de clave más probables, para que el aviso diga cuál era la buena. */
+const ERRATAS_DE_CLAVE = { watch: "watches", call: "calls", serve: "serves" };
 /** Clave PÚBLICA de usuario de NATS: `U` + 55 caracteres base32. Una semilla empieza por `S`. */
 export const NKEY_USER_RE = /^U[A-Z2-7]{55}$/;
 
@@ -87,9 +104,11 @@ export const dlqStateDurableName = (service, domain) =>
 // ─── Bundle ──────────────────────────────────────────────────────────────────
 
 /**
- * Lo que el bundle dice que existe: `{ subjects, state }`, los subjects de evento con esquema y los
- * contratos de estado (`clientes.cliente.v1`). Un bundle sin índice `state` es de antes de 1.1 y
- * se lee como «ningún dominio tiene estado».
+ * Lo que el bundle dice que existe: `{ subjects, state, rpc }`, los subjects de evento con esquema, los
+ * contratos de estado (`clientes.cliente.v1`) y las operaciones de petición/respuesta
+ * (`clientes.cliente.v1.obtener`: su par request/reply, 11-request-reply.md §11.1). Un bundle sin índice
+ * `state` es de antes de 1.1 y se lee como «ningún dominio tiene estado»; uno sin índice `rpc`, como «ninguna
+ * operación existe».
  */
 export async function loadBundle(path) {
   let texto;
@@ -114,7 +133,8 @@ export async function loadBundle(path) {
     );
   }
   const state = bundle.state && typeof bundle.state === "object" ? Object.keys(bundle.state).sort() : [];
-  return { subjects: Object.keys(bundle.subjects).sort(), state };
+  const rpc = bundle.rpc && typeof bundle.rpc === "object" ? Object.keys(bundle.rpc).sort() : [];
+  return { subjects: Object.keys(bundle.subjects).sort(), state, rpc };
 }
 
 /** Los subjects que tienen esquema publicado: la fuente de verdad de «qué existe». */
@@ -188,11 +208,11 @@ export function expandConsumes(entrada, bundleSubjects) {
 
 /**
  * Lo que `analizarManifiesto` sabe del bundle. Acepta el array de subjects de antes de 1.1 (sin
- * contratos de estado: ningún dominio tiene estado) o `{ subjects, state }` de `loadBundle`.
+ * contratos de estado ni operaciones) o `{ subjects, state, rpc }` de `loadBundle`.
  */
 function normalizarBundle(b) {
-  if (Array.isArray(b)) return { subjects: b, state: [] };
-  return { subjects: b?.subjects ?? [], state: b?.state ?? [] };
+  if (Array.isArray(b)) return { subjects: b, state: [], rpc: [] };
+  return { subjects: b?.subjects ?? [], state: b?.state ?? [], rpc: b?.rpc ?? [] };
 }
 
 /**
@@ -260,17 +280,64 @@ function normalizarWatch(entrada) {
 }
 
 /**
- * Valida el manifiesto contra el modelo y expande cada `consumes` y cada `watches`.
+ * Valida UNA entrada de `calls` o `serves`: el nombre de una operación (`clientes.cliente.v1.obtener`, sin `rpc.`).
+ * Devuelve `{ op, domain }` o `{ error, hint }`.
+ *
+ * El orden es el de 11-request-reply.md §4.1: primero el dominio reservado (`RESERVED_DOMAIN`, con el aviso de que
+ * el prefijo lo pone el SDK) y después la sintaxis. Un COMODÍN se rechaza aparte y con su motivo: `calls`
+ * concede publicar en el subject EXACTO de cada operación, y `rpc.<dominio>.>` en una llamada es «poder llamar a
+ * todo» (A-66, 06-security.md §3.9); en `serves`, el comodín ya es el permiso (`rpc.<dominio>.>`), no la entrada.
+ */
+export function normalizarOperacion(entrada, clave) {
+  if (typeof entrada !== "string" || entrada === "") {
+    return {
+      error: `entrada inválida ${JSON.stringify(entrada)} en \`${clave}\``,
+      hint: "El nombre de una operación: <dominio>.<agregado>.v<major>.<operacion>, p. ej. clientes.cliente.v1.calcular-descuento",
+    };
+  }
+  if (/[*>]/.test(entrada)) {
+    return {
+      error: `"${entrada}" lleva un comodín`,
+      hint:
+        clave === "calls"
+          ? "Se concede publicar en el subject EXACTO de cada operación: con un comodín (rpc.<dominio>.>) quien llama podría llamar a TODAS. Lista las operaciones una a una"
+          : "Lista las operaciones una a una. El permiso de suscripción ya es `rpc.<dominio>.>`; el SDK se suscribe al subject EXACTO de cada una (A-64)",
+    };
+  }
+  const domain = domainOf(entrada);
+  if (RESERVED_DOMAINS.includes(domain)) {
+    return {
+      error: `"${entrada}" es de un dominio RESERVADO (RESERVED_DOMAIN)`,
+      hint:
+        domain === "rpc"
+          ? `El prefijo \`rpc.\` lo pone el SDK, no el nombre de la operación: escribe "${entrada.split(".").slice(1).join(".")}" — 11-request-reply.md §2.2`
+          : `${RESERVED_DOMAINS.join(", ")} son espacios de nombres del protocolo, no dominios — 02-naming.md §1.3`,
+    };
+  }
+  if (!OPERATION_RE.test(entrada)) {
+    return {
+      error: `"${entrada}" no es una operación válida`,
+      hint:
+        "<dominio>.<agregado>.v<major>.<operacion>: cuatro tokens en kebab-case y la operación en INFINITIVO (obtener, calcular-descuento), " +
+        "sin el prefijo `rpc.` — 11-request-reply.md §2.2",
+    };
+  }
+  return { op: entrada, domain };
+}
+
+/**
+ * Valida el manifiesto contra el modelo y expande cada `consumes`, cada `watches`, cada `calls` y cada `serves`.
  * Devuelve `{ problemas: [{ m, hint }], servicios: [...] }`; `servicios` solo es fiable si
  * no hay problemas.
  *
- * `bundle` es `loadBundle(...)` (`{ subjects, state }`) o, por compatibilidad, la lista de subjects.
+ * `bundle` es `loadBundle(...)` (`{ subjects, state, rpc }`) o, por compatibilidad, la lista de subjects.
  * Cada servicio sale con `watches` (`[{ contract, domain, tenants|null }]`) y `stateOwns`, los
  * dominios que posee y que TIENEN estado —los que tienen un contrato en `schemas/state/`,
- * 10-state.md §2.1—.
+ * 10-state.md §2.1—; y con `calls` y `serves` (las operaciones, ordenadas y sin repetir) y `rpcDomains`, los
+ * dominios de las operaciones que atiende: los de su permiso de suscripción `rpc.<dominio>.>`.
  */
 export function analizarManifiesto(manifiesto, bundle) {
-  const { subjects: bundleSubjects, state: bundleState } = normalizarBundle(bundle);
+  const { subjects: bundleSubjects, state: bundleState, rpc: bundleRpc } = normalizarBundle(bundle);
   const dominiosConEstado = new Set(bundleState.map(domainOf));
   const problemas = [];
   const err = (m, hint) => problemas.push({ m, hint });
@@ -305,12 +372,12 @@ export function analizarManifiesto(manifiesto, bundle) {
       if (!SERVICE_KEYS.includes(k) && !k.startsWith("$")) {
         err(
           `${svc?.name}: clave desconocida «${k}»`,
-          `Las de un servicio son ${SERVICE_KEYS.join(", ")}` + (k === "watch" ? ". ¿Querías `watches`?" : ""),
+          `Las de un servicio son ${SERVICE_KEYS.join(", ")}` + (ERRATAS_DE_CLAVE[k] ? `. ¿Querías \`${ERRATAS_DE_CLAVE[k]}\`?` : ""),
         );
       }
     }
 
-    for (const campo of ["owns", "consumes", "watches"]) {
+    for (const campo of ["owns", "consumes", "watches", "calls", "serves"]) {
       if (svc?.[campo] !== undefined && !Array.isArray(svc[campo])) {
         err(`${svc?.name}: \`${campo}\` debe ser una lista`, `Es ${JSON.stringify(svc[campo])}`);
       }
@@ -337,6 +404,60 @@ export function analizarManifiesto(manifiesto, bundle) {
         );
       }
       dueñoDe.set(d, svc.name);
+    }
+  }
+
+  // ── Petición/respuesta: `serves` primero (de ahí sale quién atiende cada operación) y `calls` después ──────────────
+  // Solo el DUEÑO responde (11-request-reply.md §2.3): dos servicios sobre la misma operación la ejecutan los dos y
+  // quien llama ve UNA respuesta (A-60). La ACL lo hace cumplir; el manifiesto, antes de generarla.
+  const dondeFalta = (op) => {
+    const cercanos = bundleRpc.filter((o) => o.split(".").slice(0, 3).join(".") === op.split(".").slice(0, 3).join("."));
+    return cercanos.length
+      ? `Las operaciones de ${op.split(".").slice(0, 3).join(".")} son: ${cercanos.join(", ")}`
+      : `No hay ningún esquema para ella. Crea el PAR request/reply en ` +
+        `schemas/rpc/${op.split(".")[0]}/${op.split(".")[1]}/${op.split(".")[3]}/{request,reply}/${op.split(".")[2].slice(1)}.0.0.json ` +
+        `y ejecuta node scripts/bundle-schemas.mjs — 11-request-reply.md §11`;
+  };
+  const atiende = new Map(); // operación → servicio que la atiende
+  const operaciones = new Map(); // servicio → { calls, serves } normalizados
+  for (const svc of lista) {
+    const dichas = { calls: [], serves: [] };
+    for (const clave of ["calls", "serves"]) {
+      const vistas = new Set();
+      for (const entrada of Array.isArray(svc?.[clave]) ? svc[clave] : []) {
+        const n = normalizarOperacion(entrada, clave);
+        if (n.error) {
+          err(`${svc.name}: ${clave}: ${n.error}`, n.hint);
+          continue;
+        }
+        if (vistas.has(n.op)) {
+          err(`${svc.name}: ${clave}: la operación "${n.op}" está dos veces`, "Una vez basta: el permiso es el mismo");
+          continue;
+        }
+        vistas.add(n.op);
+        if (!bundleRpc.includes(n.op)) {
+          err(`${svc.name}: ${clave}: la operación "${n.op}" no existe en el bundle`, dondeFalta(n.op));
+          continue;
+        }
+        dichas[clave].push(n);
+      }
+    }
+    operaciones.set(svc?.name, dichas);
+
+    for (const { op, domain } of dichas.serves) {
+      const dueño = dueñoDe.get(domain);
+      if (dueño !== svc.name) {
+        err(
+          dueño
+            ? `${svc.name} atiende "${op}", pero el dominio "${domain}" es de ${dueño}`
+            : `${svc.name} atiende "${op}" sin ser dueño de "${domain}"`,
+          dueño
+            ? "Solo el dueño responde: con dos servicios sobre la misma operación los dos la ejecutan y quien llama ve UNA respuesta (A-60) — 11-request-reply.md §2.5"
+            : `Añade "${domain}" a \`owns\` de ${svc.name}, o quita la operación: solo el dueño de un dominio responde sus operaciones`,
+        );
+        continue;
+      }
+      atiende.set(op, svc.name);
     }
   }
 
@@ -468,6 +589,28 @@ export function analizarManifiesto(manifiesto, bundle) {
       }
     }
 
+    // ── Peticiones: lo que llama y lo que atiende ─────────────────────────────────────────────────────────────────
+    const { calls: llamadas, serves: atendidas } = operaciones.get(svc?.name) ?? { calls: [], serves: [] };
+    for (const { op, domain } of llamadas) {
+      if (!dueñoDe.has(domain)) {
+        err(
+          `${svc.name} llama a "${op}" pero nadie declara ser dueño de "${domain}"`,
+          "Solo el dueño responde: falta el dueño en el manifiesto, o la operación está mal escrita",
+        );
+      } else if (Array.isArray(svc.owns) && svc.owns.includes(domain)) {
+        err(
+          `${svc.name} llama a su propia operación "${op}"`,
+          "Una llamada a lo propio es una llamada de función, no una petición por el bus: no hace falta ningún permiso",
+        );
+      } else if (!atiende.has(op)) {
+        err(
+          `${svc.name} llama a "${op}", que nadie atiende`,
+          `Añádela al \`serves\` de ${dueñoDe.get(domain)} (el dueño de "${domain}"), o quita la llamada: sin quien la atienda, ` +
+            "quien llama solo vería `no responders` (RPC_UNAVAILABLE) — 11-request-reply.md §4.3",
+        );
+      }
+    }
+
     const owns = Array.isArray(svc?.owns) ? [...svc.owns] : [];
     servicios.push({
       name: svc.name,
@@ -477,6 +620,10 @@ export function analizarManifiesto(manifiesto, bundle) {
       // Dominios que posee y que tienen estado: los que reciben `state.<dom>.>` y su DLQ de estado.
       stateOwns: owns.filter((d) => dominiosConEstado.has(d) && !RESERVED_DOMAINS.includes(d)).sort(),
       watches: observados.sort((a, b) => (a.contract < b.contract ? -1 : 1)),
+      // Operaciones: lo que llama y lo que atiende, ordenado; y los dominios de lo que atiende (`rpc.<dominio>.>`).
+      calls: llamadas.map((x) => x.op).sort(),
+      serves: atendidas.map((x) => x.op).sort(),
+      rpcDomains: [...new Set(atendidas.map((x) => x.domain))].sort(),
     });
   }
 
@@ -510,7 +657,9 @@ export function analizarManifiesto(manifiesto, bundle) {
  * Devuelve:
  *   grupos     [{ titulo, publish: [...] }] — para que la config generada se pueda auditar a ojo
  *   publish    la unión de los grupos, sin repetidos
- *   subscribe  SOLO el inbox privado
+ *   subscribe  el inbox privado y, si el servicio atiende alguna operación, `rpc.<dominio>.>` de cada dominio
+ *   allowResponses  `{ max, expires }` si el servicio atiende alguna operación (el dueño responde con él, sin ningún
+ *              permiso de publicación sobre inboxes); `null` si no
  *   durables   [{ stream, durable, filter, kind }] — lo que `flux provision` tiene que crear.
  *              `kind` ∈ `events | dlq | state | dlq-state`; los de `state` llevan además
  *              `contract` y `tenant` (`null` si observan todos)
@@ -639,10 +788,34 @@ export function permisosDe(servicio, { dev = false } = {}) {
     ]);
   }
 
+  // ── Petición/respuesta — 11-request-reply.md §7.1 y 06-security.md §3.9 ───────────────────────────────────
+  // QUIEN LLAMA publica en el subject EXACTO de cada operación concedida (A-66) y nada más: ni `rpc.>`, ni
+  // `rpc.<dominio>.>`, ni un comodín por token; su inbox privado ya está en `subscribe`. El DUEÑO se suscribe a
+  // `rpc.<dominio>.>` (el SDK, al subject exacto de cada operación: A-64) y responde con `allow_responses`
+  // acotado, SIN ningún permiso de publicación sobre inboxes (A-16, A-68): lo que se concede no es lo que se usa.
+  const llamadas = servicio.calls ?? [];
+  const atendidas = servicio.serves ?? [];
+  for (const op of [...llamadas, ...atendidas]) {
+    const n = normalizarOperacion(op, "calls");
+    if (n.error) throw new Error(`${servicio.name}: ${n.error}: ${n.hint}`);
+  }
+  for (const op of atendidas) {
+    if (!servicio.owns.includes(domainOf(op))) {
+      throw new Error(`${servicio.name} atiende "${op}" sin ser dueño de "${domainOf(op)}": solo el dueño responde (11-request-reply.md §2.3)`);
+    }
+  }
+  for (const op of llamadas) {
+    grupo(`Llama a ${op}: publica en el subject EXACTO de la operación`, [`rpc.${op}`]);
+  }
+  const dominiosRpc = [...new Set(atendidas.map(domainOf))].sort();
+
   const publish = grupos.flatMap((g) => g.publish);
   // El inbox es PRIVADO: `_INBOX.>` común haría que cualquiera leyese las entregas de
-  // otro (A-2). El SDK fija el prefijo a partir del nombre de servicio — 06-security.md §3.
-  const subscribe = [`_INBOX.${servicio.name}.>`];
+  // otro (A-2) y las respuestas de las peticiones ajenas (A-71). El SDK fija el prefijo a partir del nombre de
+  // servicio — 06-security.md §3. El dueño de una operación añade `rpc.<dominio>.>`, y solo eso.
+  const subscribe = [`_INBOX.${servicio.name}.>`, ...dominiosRpc.map((d) => `rpc.${d}.>`)];
+  // `allow_responses`: solo quien atiende alguna operación. `null` = ninguno (un servicio que solo llama no responde a nadie).
+  const allowResponses = atendidas.length ? { ...RPC_ALLOW_RESPONSES } : null;
 
   // En NATS `allow: []` NO significa «nada»: significa «sin restricción» (medido: un usuario
   // con listas vacías publica y se suscribe donde quiere). Una lista vacía sería la ACL más
@@ -651,5 +824,5 @@ export function permisosDe(servicio, { dev = false } = {}) {
     throw new Error(`${servicio.name}: se generaría una lista de permisos vacía, que NATS interpreta como «sin restricción»`);
   }
 
-  return { grupos, publish, subscribe, durables };
+  return { grupos, publish, subscribe, durables, allowResponses };
 }
