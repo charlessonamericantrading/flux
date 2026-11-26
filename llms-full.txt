@@ -214,6 +214,7 @@ Estas no dan error: dan comportamiento incorrecto. Un agente las comete casi sie
 | Publicar por core NATS | Un `publish` de **core** a un subject que ningún stream captura **no da error** y el evento se evapora. Por JetStream sí falla. Publica **siempre** por JetStream. |
 | Los permisos de subject gobiernan JetStream | **No.** Los SDKs consumen por *pull*: piden mensajes por `$JS.API.CONSUMER.MSG.NEXT.…` y los reciben en su inbox, no por el subject del evento. Un `subscribe: ["pedidos.>"]` no deja consumir nada (sin `$JS.API.*` ni siquiera se puede consultar el stream), y un `$JS.API.>` «para arreglarlo» deja leer y crear consumidores sobre cualquier dominio. Lo que confina son los permisos **exactos** de cada durable: genéralos con `scripts/gen-acl.mjs`, no los escribas a mano. |
 | `_INBOX.>` común a todos los servicios | **Cualquiera lo lee todo.** Las entregas de un pull consumer viajan por el inbox: con `_INBOX.>` compartido, un servicio sin concesión sobre `inventario` leyó un evento completo de `inventario` (medido en NATS 2.14.5). Cada servicio usa **`_INBOX.<servicio>.>`**, fijado por el SDK a partir del nombre de servicio. |
+| Una credencial o un TLS mal puestos fallan con un error | **No siempre.** `waitOnFirstConnect` (Node) y `retry_on_initial_connect` (Rust) reintentan **cualquier** error: un certificado que no verifica deja `connect()` colgado, o el servicio arrancado y mudo. `connect()` espera a un broker caído pero **falla al instante** ante lo que esperar no arregla ([03-delivery.md §6.1](specification/03-delivery.md)). Un `ack` o un pull denegados tampoco lanzan: el evento se reentrega para siempre ([06-security.md §3.7](specification/06-security.md)). |
 | Los formateadores ISO por defecto sirven para `time` | No. Go recorta ceros (`.41Z`), Python da microsegundos y `+00:00`. Formatea explícitamente: **exactamente 3 decimales y sufijo `Z`**. |
 
 > Las tres primeras trampas de JetStream comparten forma: **el servidor acepta la
@@ -224,6 +225,8 @@ Estas no dan error: dan comportamiento incorrecto. Un agente las comete casi sie
 
 Opt-in. Un servicio que no las use sigue siendo conforme, pero si el proyecto ya las
 tiene activas, tu código debe respetarlas.
+
+**Capacidades por SDK:** cada SDK declara las que tiene (`signing`, `security`: columna *Capacidades* del [`README.md`](README.md)), y uno sin `security` no es compatible con las ACLs de `gen-acl.mjs` ([00-protocol.md §5](specification/00-protocol.md)).
 
 ### Validación L3 — [00-protocol.md §5](specification/00-protocol.md)
 
@@ -322,7 +325,7 @@ Los nombres y etiquetas son **contrato**, no decisión de cada servicio. Siete m
 
 > **Estado:** Draft normativo
 > **Versión:** 1.0.0
-> **Última revisión:** 2026-08-20
+> **Última revisión:** 2026-11-26
 
 ---
 
@@ -393,7 +396,9 @@ L1, más:
 - **DEBE** aplicar el backoff canónico y enrutar a DLQ al agotarlo.
 - **DEBE** propagar `correlationid` y `traceparent` desde el evento entrante al
   saliente sin intervención del desarrollador.
-- **DEBE** reconectar con backoff exponencial y jitter.
+- **DEBE** reconectar con backoff exponencial y jitter, y en la **primera** conexión esperar
+  a un broker que aún no ha arrancado pero **no** esperar lo que reintentar no arregla
+  ([03-delivery.md §6.1](03-delivery.md)).
 
 ### L3 — Gobernado
 L2, más:
@@ -447,6 +452,52 @@ arrastra el validador en ninguno de los siete.
 > opcional, así que el validador va en `go.mod` y lo paga también quien se quede en L2
 > (~1 MB de binario). En ejecución sigue sin costar nada: con el modo `off` no se compila
 > ni un esquema. Es una limitación del ecosistema, no una decisión del protocolo.
+
+### Capacidades opcionales
+
+Los niveles miden cuánto del **núcleo** implementa un SDK. Una **capacidad** es otra cosa:
+una extensión opcional, con su propio documento normativo, que un SDK **PUEDE** implementar
+**sin cambiar de nivel**. Un SDK que no implementa una capacidad sigue siendo L1, L2 o L3
+conforme; lo que no es, es compatible con aquello que la capacidad habilita.
+
+| Capacidad | Normativa en | Un SDK sin ella… |
+|---|---|---|
+| `signing` | [07-signing.md](07-signing.md) | No firma ni verifica. Un evento sin firma sigue siendo válido: el modo por defecto es `off` |
+| `security` | Esta sección, y lo que cita | **No es compatible con la configuración segura** de [06-security.md](06-security.md): con el inbox por defecto el broker le deniega la suscripción a su propio inbox y su primera petición falla |
+
+El registro de qué SDK declara qué capacidad es [`protocol.json`](../protocol.json) →
+`capabilities`, y la tabla «Estado de los SDKs» del [`README.md`](../README.md) lo muestra.
+**Un SDK no anuncia una capacidad que no tiene**: si hay duda, no la declara.
+
+#### `security`
+
+Un SDK **declara** `security` solo si cumple **todo** lo siguiente:
+
+1. **Inbox privado.** Fija el prefijo del inbox a `_INBOX.<servicio>` a partir del nombre de
+   servicio; no es una opción ([06-security.md §3.3](06-security.md)).
+2. **TLS con CA propia**, y opcionalmente mTLS. Si se exige TLS y el servidor no lo ofrece,
+   falla: nunca baja a texto plano ([06-security.md §2](06-security.md)).
+3. **Credenciales** `.creds` (JWT + NKey) y semilla NKey ([06-security.md §2](06-security.md)).
+   Un valor mal formado falla en `connect()`, antes de tocar la red.
+4. **`NOT_PROVISIONED` y `PERMISSION_DENIED`**, ambos PERMANENT y con el mensaje que exige
+   [04-errors.md §5](04-errors.md). Y *info antes de crear*: un `CREATE` denegado sobre un
+   recurso que existe no es un error ([06-security.md §3.4](06-security.md)).
+5. **Primera conexión** que espera a un broker caído pero falla de inmediato ante lo que
+   reintentar no arregla ([03-delivery.md §6.1](03-delivery.md)).
+6. **Denegaciones visibles**: una petición denegada falla en tiempo útil nombrando el subject,
+   y un `ack` o un pull denegados quedan registrados por el `logger`
+   ([06-security.md §3.7](06-security.md)).
+
+Se declara por **evidencia ejecutada**, no por intención: contra un broker real, con los
+permisos exactos que genera [`scripts/gen-acl.mjs`](../scripts/gen-acl.mjs), y en los dos
+sentidos —lo permitido funciona, y quitar un permiso **se nota**—.
+[`scripts/check-sdk-codes.mjs`](../scripts/check-sdk-codes.mjs) comprueba que el código de cada
+SDK contiene los códigos de error de las capacidades que declara y que existen los ficheros de
+evidencia que cita. Es necesario y **no suficiente**: que un código esté escrito no prueba que
+se emita.
+
+Una capacidad nueva se añade aquí con su nombre, su documento normativo y la evidencia que la
+acredita, y ningún SDK la declara hasta que pasa esa evidencia.
 
 ## 6. Fuera del alcance de v1
 
@@ -1265,6 +1316,50 @@ Un SDK L2 **DEBE**:
   cubre.
 - Exponer el estado de conexión como un healthcheck consultable.
 
+### 6.1 La primera conexión: esperar al broker, no a lo que no cambia
+
+Reconectar «indefinidamente» es lo correcto **una vez conectado**. La primera conexión es otro
+caso, porque ahí hay dos clases de fallo que el cliente NATS no distingue y que piden
+respuestas opuestas:
+
+| El `connect()` inicial falla porque… | ¿Lo arregla reintentar? | El SDK |
+|---|---|---|
+| El broker aún no ha arrancado (conexión rechazada o sin respuesta) | **Sí** | **DEBE** esperar, con la misma espera con jitter que la reconexión |
+| El broker rechaza las credenciales | No | **DEBE** fallar de inmediato |
+| El certificado del servidor no verifica: CA ausente o equivocada, host fuera de los SAN, caducado | No | **DEBE** fallar de inmediato |
+| Se exige TLS y el servidor no lo ofrece | No | **DEBE** fallar de inmediato, y **NO DEBE** bajar a texto plano |
+| Una opción local está mal formada: un `.creds` ilegible, una semilla que no es de usuario, una CA que no es PEM | No | **DEBE** fallar **antes** de abrir ningún socket |
+| Se exige mTLS y el cliente no presenta certificado | No | **DEBERÍA** fallar de inmediato: no todos los clientes NATS lo distinguen de un timeout |
+
+Un servicio que arranca antes que NATS es lo normal en un compose, y por eso la primera fila
+existe: morir en el primer intento convertiría cada despliegue en una carrera. Pero esperar es
+la respuesta equivocada a todas las demás.
+
+**El motivo está medido, no es teórico** (evidencias A-24 y A-30 del
+[Apéndice A del plan v1.1](../docs/plan-v1.1/PLAN.md#apéndice-a--evidencia), contra
+nats-server 2.14.5). `waitOnFirstConnect` (Node, A-24) y `retry_on_initial_connect`
+(`async-nats`, Rust, A-30) reintentan **cualquier** error y sin límite. Con un certificado de
+servidor que no verifica, el primero no falla: **`connect()` se cuelga**; el segundo devuelve
+el control al instante y el servicio queda arrancado, con el healthcheck de proceso en verde,
+y **mudo**: la primera publicación espera su *timeout* y nada dice que el problema es el
+certificado. Es lo peor que le puede pasar a quien acaba de
+configurar TLS: no ve un error, ve un servicio que no hace nada. Con `waitOnFirstConnect:
+false` el mismo fallo es un error en ~5 ms (A-24).
+
+Por eso el bucle de espera lo escribe el SDK, no la librería: la librería reintenta todo y
+solo el SDK sabe qué errores son de «aún no está» y cuáles de «esto no cambia por esperar».
+
+- Cómo reconocerlos depende de la librería, y no siempre es por el tipo: en `async-nats` los
+  tres fallos de TLS llegan como `ConnectErrorKind::Io` con un `io::Error` `InvalidData`
+  dentro, no como `Tls` (A-30); en `@nats-io/*`, un servidor sin TLS ante un `tls` pedido llega
+  como un `ConnectionError` más (A-24). Cada SDK **DEBERÍA** tener, contra un broker real, un
+  caso por cada fila de la tabla: es la única forma de saber que sigue reconociéndose cuando
+  la librería cambia.
+- El error **DEBE** decir la causa y qué revisar ([04-errors.md §5.3](04-errors.md)).
+- Esta regla es de la **primera** conexión. Qué debe hacer un SDK si el broker rechaza las
+  credenciales durante una *re*conexión (una credencial que caduca o se rota) **no está
+  medido**, y este documento no lo fija.
+
 
 ==============================================================================
 == specification/04-errors.md
@@ -1331,6 +1426,8 @@ El evento es sintácticamente correcto, pero este consumidor no puede actuar sob
 - Referencia a una entidad que no existe y no va a existir
 - HTTP 400, 403, 404, 422 de una dependencia
 - Versión de contrato no soportada por este consumidor
+- El broker deniega la operación por permisos, o falta un stream o un consumidor que
+  nadie ha aprovisionado ([§5](#5-errores-de-la-capacidad-security))
 
 → `term()` **inmediato** y publicación en la DLQ. Reintentar es puro desperdicio: 51
 minutos de cola bloqueada para llegar al mismo sitio.
@@ -1480,6 +1577,81 @@ nats stream get DLQ_PEDIDOS --last-for 'dlq.pedidos.pedido.v1.creado' --json \
 > El replay **DEBE** conservar el `id` original. Regenerarlo rompe la idempotencia de
 > todos los consumidores aguas abajo y convierte una recuperación en un incidente
 > nuevo.
+
+## 5. Errores de la capacidad `security`
+
+Un SDK que declara la capacidad `security` ([00-protocol.md §5](00-protocol.md)) **DEBE**
+emitir estos dos errores. Existen por algo medido: **cuando una ACL deniega una operación,
+el broker no contesta.** Descarta el mensaje y avisa aparte, por la conexión, con un
+`-ERR 'Permissions Violation …'` ([A-28](../docs/plan-v1.1/PLAN.md#apéndice-a--evidencia),
+medido contra nats-server 2.14.5). Lo que ve la aplicación depende de la librería de NATS:
+un *timeout* de 5 a 30 s si no entrega la denegación (`async-nats`, A-28), o un error de
+petición genérico si sí lo hace (`@nats-io/*`, A-21). Ninguno de los dos dice si lo que falta
+es un permiso o un recurso, ni cómo se arregla. Con estos códigos es un error en
+milisegundos que lo dice.
+
+| Código | Clase | Se emite cuando |
+|---|---|---|
+| `NOT_PROVISIONED` | **PERMANENT** | El SDK necesita un stream o un consumidor durable que **no existe**, y el broker le **deniega crearlo**. |
+| `PERMISSION_DENIED` | **PERMANENT** | El broker deniega una operación por permisos y no se da lo anterior: ni siquiera se puede *consultar* el recurso, se publica en un subject que la ACL no concede, o se deniega una suscripción. |
+
+**La frontera entre los dos es si se sabe que el recurso falta.** `NOT_PROVISIONED` significa
+«falta y no puedo crearlo», y su señal medida es una **pareja**: crear → denegado **y**
+consultar → no existe ([06-security.md §3.6](06-security.md)). Un SDK **NO DEBE** emitirlo por
+una denegación sola: si el recurso existe, un `CREATE` denegado no es un error y el SDK sigue
+con la consulta ([06-security.md §3.4](06-security.md)); decir «no está aprovisionado» de algo
+que sí lo está mandaría a quien opera a buscar donde no es. Y cuando ni siquiera la consulta
+está permitida —una ACL de la v1, que no concede nada de `$JS.API.*`— no se sabe si falta:
+eso es `PERMISSION_DENIED`.
+
+### 5.1 Son PERMANENT
+
+Como un HTTP 403 ([§1.2](#12-permanent)): reintentar una denegación da la misma denegación, y
+esperar no hace aparecer un recurso ni concede un permiso. Un handler que los provoque —por
+ejemplo, publicando en un dominio sin aprovisionar— va a la DLQ en la **primera** entrega.
+Sin una clase propia caerían en la política de lo desconocido ([§2.1](#21-el-default-para-lo-desconocido-retryable-acotado)):
+dos entregas y ~30 s de cola ocupada para acabar en el mismo sitio.
+
+### 5.2 Qué DEBE decir el mensaje
+
+Un error accionable es el que no obliga a abrir el log del broker para saber qué hacer.
+
+| | `NOT_PROVISIONED` | `PERMISSION_DENIED` |
+|---|---|---|
+| **DEBE nombrar** | El **recurso** que falta: el stream, o el consumidor **y** su stream. Y el **subject denegado** (el de la creación), tal como lo comunicó el broker | Lo que el SDK intentaba (publicar o suscribirse y, en términos de flux, a qué: «abrir el stream `EVT_PEDIDOS`») y el **subject denegado**, completo y sin normalizar |
+| **DEBE apuntar a** | **`flux provision`**, que se ejecuta con credenciales de **operación**, no con las del servicio ([06-security.md §3.6](06-security.md)) | La ACL del servicio, que es donde se arregla: [06-security.md §3](06-security.md) |
+
+Además, los dos:
+
+- Llevan un **código fijo que la aplicación no puede sustituir**: es lo que agrupa el panel
+  (`code` de [08-observability.md §2.2](08-observability.md)), y dejar que cada servicio lo
+  cambiara rompería esa agrupación.
+- **NO DEBEN** incluir credenciales ni el contenido de `data`: el mensaje acaba en logs y en
+  `dlqerror`.
+- Encabezan `dlqerror` con el formato de siempre, `<código>: <mensaje>` ([§3](#3-formato-del-mensaje-en-dlq)).
+
+**No se define ninguna métrica nueva.** Un handler cuyo error es uno de estos dos acaba en la
+DLQ y queda contado por la que ya existe: `flux_events_dlq_total{reason="permanent",
+code="NOT_PROVISIONED"}`, porque `code` es «el código estable de la clasificación»
+([08-observability.md §2.1](08-observability.md)). Las denegaciones que no son un error
+—`ack` y pull, [06-security.md §3.7](06-security.md)— no tienen contador: solo el log.
+
+### 5.3 Fallo de la conexión inicial: sin código estable todavía
+
+Un `connect()` que falla porque reintentar no lo arregla ([03-delivery.md §6.1](03-delivery.md))
+**DEBE** lanzar un error que se distinga de «el broker aún no está» —es decir, que **no** se
+espere—, que diga la **causa** (credencial rechazada, certificado que no verifica, TLS exigido
+y no ofrecido) y que diga **qué revisar**.
+
+> **Sin decidir: esta spec no fija un código estable para este fallo.** Los dos SDKs que
+> declaran `security` divergen, y no se elige por ellos. Node lanza `ConnectionRejectedError`
+> con `code = "CONNECTION_REJECTED"` y `reason` ∈ `tls | auth`, y para las opciones mal
+> formadas `INVALID_CREDENTIALS` e `INVALID_TLS_OPTIONS`. Rust devuelve `FluxError::Transport`
+> para el rechazo y `FluxError::Config` para las opciones mal formadas, y **ninguno de los dos
+> lleva código** (`code()` es `None`). Unificarlos es una decisión de diseño —¿tres códigos?,
+> ¿uno con motivo?, ¿ninguno?— que no corresponde tomar aquí. Hasta entonces, una aplicación
+> **NO DEBERÍA** ramificar por un código de este fallo: es un error de arranque, y lo que
+> hay que hacer con él es leer el mensaje.
 
 
 ==============================================================================
@@ -1675,10 +1847,18 @@ Account DEV          eventos de desarrollo
     acabar con TLS «obligatorio» y sin protección.
   - **Inbox privado**: fijar el prefijo del inbox a `_INBOX.<servicio>` a partir del nombre
     de servicio de `connect()` — [§3.3](#33-el-inbox-es-privado). No es una opción.
+  - **Conexión inicial**: esperar a un broker que aún no ha arrancado, pero **fallar de
+    inmediato** ante credenciales rechazadas o un TLS que no encaja — [03-delivery.md
+    §6.1](03-delivery.md). Con TLS propio, el fallo que no se ve es el peor: un certificado
+    que no verifica dejaba al servicio arrancado y mudo.
+  - **Denegaciones visibles**: un permiso que falta no puede parecer un servicio sano —
+    [§3.7](#37-las-denegaciones-se-ven).
 
-  Mientras un SDK no lo cumpla, **no es compatible con la configuración segura** y su
-  README **DEBE** decirlo: con el inbox por defecto (`_INBOX.<aleatorio>`) el broker le
-  deniega la suscripción a su propio inbox y **su primera petición falla**
+  Un SDK que cumple todo esto —y el aprovisionamiento de [§3.6](#36-aprovisionamiento-los-streams-no-los-crea-el-servicio)—
+  declara la capacidad **`security`** ([00-protocol.md §5](00-protocol.md)). Mientras un SDK
+  no la declare, **no es compatible con la configuración segura** y su README **DEBE**
+  decirlo: con el inbox por defecto (`_INBOX.<aleatorio>`) el broker le deniega la
+  suscripción a su propio inbox y **su primera petición falla**
   (`Permissions Violation for Subscription to "_INBOX.….*"`, en milisegundos).
 
 ## 3. ACLs a nivel de subject
@@ -1926,17 +2106,54 @@ nunca.
 
 Un SDK que intente crear un stream o un consumidor y reciba una denegación **DEBE** fallar
 con un error accionable, **`NOT_PROVISIONED`**, que nombre el recurso que falta y diga que
-lo crea `flux provision`. **NO DEBE** acabar en un *timeout* de un minuto sin explicación. Si
-el recurso existe, un `CREATE` denegado **NO** es un error: el SDK sigue con `INFO`. La señal
-medida (`verify-acl`) es `consumers.add` → `Permissions Violation` **y** `consumers.info` →
-`404`: esa pareja, y no solo la primera, es lo que significa «falta y no puedo crearlo».
+lo crea `flux provision` (contenido exacto del mensaje y frontera con `PERMISSION_DENIED`:
+[04-errors.md §5](04-errors.md)). **NO DEBE** acabar en un *timeout* de un minuto sin
+explicación. Si el recurso existe, un `CREATE` denegado **NO** es un error: el SDK sigue con
+`INFO`. La señal medida (`verify-acl`) es `consumers.add` → `Permissions Violation` **y**
+`consumers.info` → `404`: esa pareja, y no solo la primera, es lo que significa «falta y no
+puedo crearlo».
 
 Para quien implemente un SDK, dos cosas medidas (A-8f) sobre cómo se manifiestan las
 denegaciones en las librerías `@nats-io/*` 3.4.0: una **petición** a un subject sin permiso
 falla *en milisegundos* con `Permissions Violation for Publish to "…"` —no es un timeout—;
 pero una **suscripción** denegada no lanza nada al suscribirse: el error llega por el canal
 de estado y, además, hace que el **iterador de esa suscripción lance** al consumirlo. Si no
-se captura, el proceso muere.
+se captura, el proceso muere. Qué **DEBE** hacer un SDK ante cada denegación, en
+[§3.7](#37-las-denegaciones-se-ven).
+
+### 3.7 Las denegaciones se ven
+
+Un servicio al que le falta un permiso **no puede parecer sano.** El broker no ayuda: cuando
+una ACL deniega una publicación, el servidor la descarta y manda un `-ERR 'Permissions
+Violation …'` aparte, por la conexión; no hay respuesta que pueda fallar (A-28). Lo que ve
+cada operación, medido contra nats-server 2.14.5, y lo que el SDK **DEBE** hacer con ello:
+
+| Operación denegada | Qué ve el cliente | El SDK |
+|---|---|---|
+| Petición a la API de JetStream (consultar o crear un stream o un consumidor) o `publish()` | Depende de la librería: un error en ~1 ms (`RequestError` con `cause: PermissionViolationError`, A-21) o **nada**, y la petición espera su *timeout* de 5 a 30 s (A-28) | **DEBE** fallar en tiempo útil, no por *timeout*, con `PERMISSION_DENIED` o `NOT_PROVISIONED` ([04-errors.md §5](04-errors.md)), **nombrando el subject denegado**. Si la librería no entrega la denegación, **DEBE** escuchar los `-ERR` de la conexión y competirlos con la respuesta |
+| Suscripción core (la de su inbox) | No lanza al suscribirse: el error llega por el canal de estado y el **iterador** de esa suscripción lanza al consumirla (A-8f). Sin permiso sobre el inbox, ninguna respuesta puede llegar | **DEBE** fallar la operación que la necesita con `PERMISSION_DENIED`, y **NO DEBE** dejar que el error del iterador tumbe el proceso |
+| `ack` (y `nak`, `term` y WIP, que publican en el mismo `$JS.ACK.…`: el denegado que se midió fue el ack) | **Silencio.** Son publicaciones sin respuesta: el evento se procesa y se **reentrega cada `ack_wait`, para siempre** (A-19) | **DEBE** registrarlo en el `logger` del SDK, a nivel de error, con el subject denegado y esa consecuencia |
+| Petición de mensajes de un pull (`CONSUMER.MSG.NEXT`) | **Silencio.** El consumidor queda inerte y parece sano (A-20) | **DEBE** registrarlo igual. **DEBERÍA** además hacer fallar `subscribe()` con `PERMISSION_DENIED` si lo detecta al arrancar: descubrirlo por la ausencia de eventos semanas después es el peor momento |
+
+- Las dos filas silenciosas **solo** tienen el log como salida, así que un SDK `security`
+  **DEBE** ofrecer un `logger` configurable y su README **DEBE** pedir que se configure. Sin
+  él, un ack o un pull denegados no dejan rastro en ninguna parte.
+- Un ack denegado se repite con cada mensaje. Un SDK **DEBERÍA** avisar una vez por subject:
+  un log por mensaje entierra la causa bajo su propio volumen.
+- Cómo llega la denegación lo decide la librería. Cuando da un tipo (`PermissionViolationError`)
+  se reconoce por él, **recorriendo la cadena de causas** —llega envuelta en el error de la
+  petición— y por **nombre** y no por `instanceof`, que con dos copias de la librería en el
+  árbol de dependencias falla sin ruido. Cuando solo da texto (`async-nats`: el `-ERR` llega
+  como `ServerError::Other`), se interpreta ese texto, y es el único sitio donde hacerlo está
+  justificado.
+- **No se define ninguna métrica nueva.** El contrato de [08-observability.md](08-observability.md)
+  no tiene una para esto y ampliarlo es otra decisión. Un handler cuyo error es
+  `PERMISSION_DENIED` o `NOT_PROVISIONED` sí queda contado por la que ya existe
+  (`flux_events_dlq_total{code=…}`, [04-errors.md §5.2](04-errors.md)); un ack o un pull
+  denegados, no: solo el log.
+
+Se comprueba **de extremo a extremo** y **en los dos sentidos** ([§3.4](#34-permisos-exactos-por-consumidor-durable)):
+con el permiso quitado, la denegación se *nota* por el canal que corresponde a su fila.
 
 ## 4. Multi-tenant
 

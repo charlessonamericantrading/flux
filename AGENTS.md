@@ -194,6 +194,7 @@ Estas no dan error: dan comportamiento incorrecto. Un agente las comete casi sie
 | Publicar por core NATS | Un `publish` de **core** a un subject que ningún stream captura **no da error** y el evento se evapora. Por JetStream sí falla. Publica **siempre** por JetStream. |
 | Los permisos de subject gobiernan JetStream | **No.** Los SDKs consumen por *pull*: piden mensajes por `$JS.API.CONSUMER.MSG.NEXT.…` y los reciben en su inbox, no por el subject del evento. Un `subscribe: ["pedidos.>"]` no deja consumir nada (sin `$JS.API.*` ni siquiera se puede consultar el stream), y un `$JS.API.>` «para arreglarlo» deja leer y crear consumidores sobre cualquier dominio. Lo que confina son los permisos **exactos** de cada durable: genéralos con `scripts/gen-acl.mjs`, no los escribas a mano. |
 | `_INBOX.>` común a todos los servicios | **Cualquiera lo lee todo.** Las entregas de un pull consumer viajan por el inbox: con `_INBOX.>` compartido, un servicio sin concesión sobre `inventario` leyó un evento completo de `inventario` (medido en NATS 2.14.5). Cada servicio usa **`_INBOX.<servicio>.>`**, fijado por el SDK a partir del nombre de servicio. |
+| Una credencial o un TLS mal puestos fallan con un error | **No siempre.** `waitOnFirstConnect` (Node) y `retry_on_initial_connect` (Rust) reintentan **cualquier** error: un certificado que no verifica deja `connect()` colgado, o el servicio arrancado y mudo. `connect()` espera a un broker caído pero **falla al instante** ante lo que esperar no arregla ([03-delivery.md §6.1](specification/03-delivery.md)). Un `ack` o un pull denegados tampoco lanzan: el evento se reentrega para siempre ([06-security.md §3.7](specification/06-security.md)). |
 | Los formateadores ISO por defecto sirven para `time` | No. Go recorta ceros (`.41Z`), Python da microsegundos y `+00:00`. Formatea explícitamente: **exactamente 3 decimales y sufijo `Z`**. |
 
 > Las tres primeras trampas de JetStream comparten forma: **el servidor acepta la
@@ -204,6 +205,8 @@ Estas no dan error: dan comportamiento incorrecto. Un agente las comete casi sie
 
 Opt-in. Un servicio que no las use sigue siendo conforme, pero si el proyecto ya las
 tiene activas, tu código debe respetarlas.
+
+**Capacidades por SDK:** cada SDK declara las que tiene (`signing`, `security`: columna *Capacidades* del [`README.md`](README.md)), y uno sin `security` no es compatible con las ACLs de `gen-acl.mjs` ([00-protocol.md §5](specification/00-protocol.md)).
 
 ### Validación L3 — [00-protocol.md §5](specification/00-protocol.md)
 

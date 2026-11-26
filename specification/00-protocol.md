@@ -2,7 +2,7 @@
 
 > **Estado:** Draft normativo
 > **Versión:** 1.0.0
-> **Última revisión:** 2026-08-20
+> **Última revisión:** 2026-11-26
 
 ---
 
@@ -73,7 +73,9 @@ L1, más:
 - **DEBE** aplicar el backoff canónico y enrutar a DLQ al agotarlo.
 - **DEBE** propagar `correlationid` y `traceparent` desde el evento entrante al
   saliente sin intervención del desarrollador.
-- **DEBE** reconectar con backoff exponencial y jitter.
+- **DEBE** reconectar con backoff exponencial y jitter, y en la **primera** conexión esperar
+  a un broker que aún no ha arrancado pero **no** esperar lo que reintentar no arregla
+  ([03-delivery.md §6.1](03-delivery.md)).
 
 ### L3 — Gobernado
 L2, más:
@@ -127,6 +129,52 @@ arrastra el validador en ninguno de los siete.
 > opcional, así que el validador va en `go.mod` y lo paga también quien se quede en L2
 > (~1 MB de binario). En ejecución sigue sin costar nada: con el modo `off` no se compila
 > ni un esquema. Es una limitación del ecosistema, no una decisión del protocolo.
+
+### Capacidades opcionales
+
+Los niveles miden cuánto del **núcleo** implementa un SDK. Una **capacidad** es otra cosa:
+una extensión opcional, con su propio documento normativo, que un SDK **PUEDE** implementar
+**sin cambiar de nivel**. Un SDK que no implementa una capacidad sigue siendo L1, L2 o L3
+conforme; lo que no es, es compatible con aquello que la capacidad habilita.
+
+| Capacidad | Normativa en | Un SDK sin ella… |
+|---|---|---|
+| `signing` | [07-signing.md](07-signing.md) | No firma ni verifica. Un evento sin firma sigue siendo válido: el modo por defecto es `off` |
+| `security` | Esta sección, y lo que cita | **No es compatible con la configuración segura** de [06-security.md](06-security.md): con el inbox por defecto el broker le deniega la suscripción a su propio inbox y su primera petición falla |
+
+El registro de qué SDK declara qué capacidad es [`protocol.json`](../protocol.json) →
+`capabilities`, y la tabla «Estado de los SDKs» del [`README.md`](../README.md) lo muestra.
+**Un SDK no anuncia una capacidad que no tiene**: si hay duda, no la declara.
+
+#### `security`
+
+Un SDK **declara** `security` solo si cumple **todo** lo siguiente:
+
+1. **Inbox privado.** Fija el prefijo del inbox a `_INBOX.<servicio>` a partir del nombre de
+   servicio; no es una opción ([06-security.md §3.3](06-security.md)).
+2. **TLS con CA propia**, y opcionalmente mTLS. Si se exige TLS y el servidor no lo ofrece,
+   falla: nunca baja a texto plano ([06-security.md §2](06-security.md)).
+3. **Credenciales** `.creds` (JWT + NKey) y semilla NKey ([06-security.md §2](06-security.md)).
+   Un valor mal formado falla en `connect()`, antes de tocar la red.
+4. **`NOT_PROVISIONED` y `PERMISSION_DENIED`**, ambos PERMANENT y con el mensaje que exige
+   [04-errors.md §5](04-errors.md). Y *info antes de crear*: un `CREATE` denegado sobre un
+   recurso que existe no es un error ([06-security.md §3.4](06-security.md)).
+5. **Primera conexión** que espera a un broker caído pero falla de inmediato ante lo que
+   reintentar no arregla ([03-delivery.md §6.1](03-delivery.md)).
+6. **Denegaciones visibles**: una petición denegada falla en tiempo útil nombrando el subject,
+   y un `ack` o un pull denegados quedan registrados por el `logger`
+   ([06-security.md §3.7](06-security.md)).
+
+Se declara por **evidencia ejecutada**, no por intención: contra un broker real, con los
+permisos exactos que genera [`scripts/gen-acl.mjs`](../scripts/gen-acl.mjs), y en los dos
+sentidos —lo permitido funciona, y quitar un permiso **se nota**—.
+[`scripts/check-sdk-codes.mjs`](../scripts/check-sdk-codes.mjs) comprueba que el código de cada
+SDK contiene los códigos de error de las capacidades que declara y que existen los ficheros de
+evidencia que cita. Es necesario y **no suficiente**: que un código esté escrito no prueba que
+se emita.
+
+Una capacidad nueva se añade aquí con su nombre, su documento normativo y la evidencia que la
+acredita, y ningún SDK la declara hasta que pasa esa evidencia.
 
 ## 6. Fuera del alcance de v1
 

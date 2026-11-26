@@ -59,6 +59,8 @@ El evento es sintácticamente correcto, pero este consumidor no puede actuar sob
 - Referencia a una entidad que no existe y no va a existir
 - HTTP 400, 403, 404, 422 de una dependencia
 - Versión de contrato no soportada por este consumidor
+- El broker deniega la operación por permisos, o falta un stream o un consumidor que
+  nadie ha aprovisionado ([§5](#5-errores-de-la-capacidad-security))
 
 → `term()` **inmediato** y publicación en la DLQ. Reintentar es puro desperdicio: 51
 minutos de cola bloqueada para llegar al mismo sitio.
@@ -208,3 +210,78 @@ nats stream get DLQ_PEDIDOS --last-for 'dlq.pedidos.pedido.v1.creado' --json \
 > El replay **DEBE** conservar el `id` original. Regenerarlo rompe la idempotencia de
 > todos los consumidores aguas abajo y convierte una recuperación en un incidente
 > nuevo.
+
+## 5. Errores de la capacidad `security`
+
+Un SDK que declara la capacidad `security` ([00-protocol.md §5](00-protocol.md)) **DEBE**
+emitir estos dos errores. Existen por algo medido: **cuando una ACL deniega una operación,
+el broker no contesta.** Descarta el mensaje y avisa aparte, por la conexión, con un
+`-ERR 'Permissions Violation …'` ([A-28](../docs/plan-v1.1/PLAN.md#apéndice-a--evidencia),
+medido contra nats-server 2.14.5). Lo que ve la aplicación depende de la librería de NATS:
+un *timeout* de 5 a 30 s si no entrega la denegación (`async-nats`, A-28), o un error de
+petición genérico si sí lo hace (`@nats-io/*`, A-21). Ninguno de los dos dice si lo que falta
+es un permiso o un recurso, ni cómo se arregla. Con estos códigos es un error en
+milisegundos que lo dice.
+
+| Código | Clase | Se emite cuando |
+|---|---|---|
+| `NOT_PROVISIONED` | **PERMANENT** | El SDK necesita un stream o un consumidor durable que **no existe**, y el broker le **deniega crearlo**. |
+| `PERMISSION_DENIED` | **PERMANENT** | El broker deniega una operación por permisos y no se da lo anterior: ni siquiera se puede *consultar* el recurso, se publica en un subject que la ACL no concede, o se deniega una suscripción. |
+
+**La frontera entre los dos es si se sabe que el recurso falta.** `NOT_PROVISIONED` significa
+«falta y no puedo crearlo», y su señal medida es una **pareja**: crear → denegado **y**
+consultar → no existe ([06-security.md §3.6](06-security.md)). Un SDK **NO DEBE** emitirlo por
+una denegación sola: si el recurso existe, un `CREATE` denegado no es un error y el SDK sigue
+con la consulta ([06-security.md §3.4](06-security.md)); decir «no está aprovisionado» de algo
+que sí lo está mandaría a quien opera a buscar donde no es. Y cuando ni siquiera la consulta
+está permitida —una ACL de la v1, que no concede nada de `$JS.API.*`— no se sabe si falta:
+eso es `PERMISSION_DENIED`.
+
+### 5.1 Son PERMANENT
+
+Como un HTTP 403 ([§1.2](#12-permanent)): reintentar una denegación da la misma denegación, y
+esperar no hace aparecer un recurso ni concede un permiso. Un handler que los provoque —por
+ejemplo, publicando en un dominio sin aprovisionar— va a la DLQ en la **primera** entrega.
+Sin una clase propia caerían en la política de lo desconocido ([§2.1](#21-el-default-para-lo-desconocido-retryable-acotado)):
+dos entregas y ~30 s de cola ocupada para acabar en el mismo sitio.
+
+### 5.2 Qué DEBE decir el mensaje
+
+Un error accionable es el que no obliga a abrir el log del broker para saber qué hacer.
+
+| | `NOT_PROVISIONED` | `PERMISSION_DENIED` |
+|---|---|---|
+| **DEBE nombrar** | El **recurso** que falta: el stream, o el consumidor **y** su stream. Y el **subject denegado** (el de la creación), tal como lo comunicó el broker | Lo que el SDK intentaba (publicar o suscribirse y, en términos de flux, a qué: «abrir el stream `EVT_PEDIDOS`») y el **subject denegado**, completo y sin normalizar |
+| **DEBE apuntar a** | **`flux provision`**, que se ejecuta con credenciales de **operación**, no con las del servicio ([06-security.md §3.6](06-security.md)) | La ACL del servicio, que es donde se arregla: [06-security.md §3](06-security.md) |
+
+Además, los dos:
+
+- Llevan un **código fijo que la aplicación no puede sustituir**: es lo que agrupa el panel
+  (`code` de [08-observability.md §2.2](08-observability.md)), y dejar que cada servicio lo
+  cambiara rompería esa agrupación.
+- **NO DEBEN** incluir credenciales ni el contenido de `data`: el mensaje acaba en logs y en
+  `dlqerror`.
+- Encabezan `dlqerror` con el formato de siempre, `<código>: <mensaje>` ([§3](#3-formato-del-mensaje-en-dlq)).
+
+**No se define ninguna métrica nueva.** Un handler cuyo error es uno de estos dos acaba en la
+DLQ y queda contado por la que ya existe: `flux_events_dlq_total{reason="permanent",
+code="NOT_PROVISIONED"}`, porque `code` es «el código estable de la clasificación»
+([08-observability.md §2.1](08-observability.md)). Las denegaciones que no son un error
+—`ack` y pull, [06-security.md §3.7](06-security.md)— no tienen contador: solo el log.
+
+### 5.3 Fallo de la conexión inicial: sin código estable todavía
+
+Un `connect()` que falla porque reintentar no lo arregla ([03-delivery.md §6.1](03-delivery.md))
+**DEBE** lanzar un error que se distinga de «el broker aún no está» —es decir, que **no** se
+espere—, que diga la **causa** (credencial rechazada, certificado que no verifica, TLS exigido
+y no ofrecido) y que diga **qué revisar**.
+
+> **Sin decidir: esta spec no fija un código estable para este fallo.** Los dos SDKs que
+> declaran `security` divergen, y no se elige por ellos. Node lanza `ConnectionRejectedError`
+> con `code = "CONNECTION_REJECTED"` y `reason` ∈ `tls | auth`, y para las opciones mal
+> formadas `INVALID_CREDENTIALS` e `INVALID_TLS_OPTIONS`. Rust devuelve `FluxError::Transport`
+> para el rechazo y `FluxError::Config` para las opciones mal formadas, y **ninguno de los dos
+> lleva código** (`code()` es `None`). Unificarlos es una decisión de diseño —¿tres códigos?,
+> ¿uno con motivo?, ¿ninguno?— que no corresponde tomar aquí. Hasta entonces, una aplicación
+> **NO DEBERÍA** ramificar por un código de este fallo: es un error de arranque, y lo que
+> hay que hacer con él es leer el mensaje.
