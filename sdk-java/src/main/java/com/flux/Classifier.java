@@ -299,7 +299,9 @@ public final class Classifier {
             FluxErrors.FluxException fe = typed.get();
             Duration retryAfter = fe instanceof FluxErrors.RetryableException re
                     ? re.retryAfter().orElse(null)
-                    : null;
+                    : fe instanceof RetryAfterAware ra && fe.errorClass() == ErrorClass.RETRYABLE
+                            ? ra.retryAfter()
+                            : null;
             return new Classification(fe.errorClass(), fe.code(), retryAfter, null);
         }
 

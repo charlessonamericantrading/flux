@@ -131,8 +131,14 @@ class EnvelopeTest {
         assertThrows(Envelope.EnvelopeException.class, () -> entradaValida().correlationId(null).build());
         assertThrows(Envelope.EnvelopeException.class, () -> entradaValida().dataSchema(null).build());
         assertThrows(Envelope.EnvelopeException.class, () -> entradaValida().id(null).build());
-        assertThrows(Envelope.EnvelopeException.class,
-                () -> entradaValida().dataClassification(null).build());
+        // La clasificacion ausente es INVALID_DATACLASSIFICATION (el mismo codigo que da el parser ante un valor fuera del enum).
+        assertEquals("INVALID_DATACLASSIFICATION", assertThrows(FluxErrors.FluxException.class,
+                () -> entradaValida().dataClassification(null).build()).code());
+        // Y los vacios llevan el MISMO codigo que daria el parser: atributo obligatorio / extension obligatoria.
+        assertEquals("MISSING_REQUIRED_ATTRIBUTE", assertThrows(Envelope.EnvelopeException.class,
+                () -> entradaValida().id("").build()).code());
+        assertEquals("MISSING_REQUIRED_EXTENSION", assertThrows(Envelope.EnvelopeException.class,
+                () -> entradaValida().tenantId("").build()).code());
     }
 
     @Test
@@ -591,22 +597,31 @@ class EnvelopeTest {
     }
 
     @Test
-    @DisplayName("dlqerror se recorta a 1024 sin partir un par suplente")
+    @DisplayName("dlqerror se recorta a 1024 BYTES UTF-8 sin partir un caracter (04-errors.md §3)")
     void dlqErrorSeRecorta() {
         FluxEvent original = Envelope.parseEvent(ENVELOPE_VALIDO.getBytes(StandardCharsets.UTF_8));
 
         FluxEvent dlq = Envelope.toDlqEvent(original,
                 new Envelope.DlqInfo(FluxEvent.DlqReason.PERMANENT, 1, "c", "x".repeat(5000)));
-        assertEquals(1024, dlq.dlqerror().length());
+        assertEquals(1024, dlq.dlqerror().getBytes(StandardCharsets.UTF_8).length);
 
-        // 1023 'x' + un emoji (2 unidades UTF-16): el corte caeria entre los dos suplentes.
-        String conEmoji = "x".repeat(1023) + "🚀";
+        // 1500 `é` (2 bytes cada una): caben 512, no 1024 unidades UTF-16 ni 2693 bytes en total.
+        FluxEvent acentos = Envelope.toDlqEvent(original,
+                new Envelope.DlqInfo(FluxEvent.DlqReason.PERMANENT, 1, "c", "é".repeat(1500)));
+        assertEquals("é".repeat(512), acentos.dlqerror());
+
+        // 1021 `x` + un emoji (4 bytes): el emoji no cabe (1025) y se DESCARTA ENTERO, no se parte.
+        String conEmoji = "x".repeat(1021) + "🚀";
         FluxEvent conSuplente = Envelope.toDlqEvent(original,
                 new Envelope.DlqInfo(FluxEvent.DlqReason.PERMANENT, 1, "c", conEmoji));
-        assertEquals(1023, conSuplente.dlqerror().length(),
-                "debe retroceder una posicion antes que dejar un suplente huerfano");
+        assertEquals("x".repeat(1021), conSuplente.dlqerror(), "un caracter que no cabe se descarta entero");
         assertFalse(Character.isHighSurrogate(
                 conSuplente.dlqerror().charAt(conSuplente.dlqerror().length() - 1)));
+
+        // Justo 1024 bytes: se conserva entero.
+        FluxEvent justo = Envelope.toDlqEvent(original,
+                new Envelope.DlqInfo(FluxEvent.DlqReason.PERMANENT, 1, "c", "x".repeat(1020) + "🚀"));
+        assertTrue(justo.dlqerror().endsWith("🚀"));
 
         // Y el resultado sigue siendo serializable sin U+FFFD.
         assertFalse(Envelope.serializeToString(conSuplente).contains("�"));

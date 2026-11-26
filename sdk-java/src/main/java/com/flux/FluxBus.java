@@ -1414,6 +1414,7 @@ public final class FluxBus implements AutoCloseable {
 
         FluxEvent envelope = new Envelope.BuildEventInput()
                 .subject("system.poison.v1.capturado")
+                .allowReservedDomain()
                 .data(data)
                 .id(id)
                 .source(source)

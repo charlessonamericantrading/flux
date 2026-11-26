@@ -220,6 +220,23 @@ public final class Protocol {
         if (subject == null) {
             throw new InvalidSubjectException("null", "el subject es obligatorio");
         }
+        // Todo lo que recibe un subject —publish, subscribe, durableName…— pasa por aqui: un dominio
+        // reservado se rechaza antes de tocar la red (10-state.md §2.7). Se comprueba ANTES que la
+        // forma: `dlq.pedidos.pedido.v1.creado` tiene cinco tokens y «debe tener cuatro» no diria que
+        // pasa de verdad.
+        ReservedDomainException.assertNotReserved(subject, "subject");
+        return parseSubjectUnchecked(subject);
+    }
+
+    /**
+     * Como {@link #parseSubject}, pero SIN rechazar un dominio reservado. Solo para el sobre
+     * sintetico {@code system.poison.v1.capturado} de la DLQ: lo escribe el propio SDK, no la
+     * aplicacion.
+     */
+    static ParsedSubject parseSubjectUnchecked(String subject) {
+        if (subject == null) {
+            throw new InvalidSubjectException("null", "el subject es obligatorio");
+        }
         // La comprobacion de minusculas va ANTES que el patron para poder dar un mensaje
         // util: los subjects de NATS son case-sensitive, asi que "Pedidos.pedido.v1.creado"
         // crea un subject fantasma al que nadie esta suscrito y no produce ningun error.
@@ -269,7 +286,15 @@ public final class Protocol {
      * al final. La transformacion es mecanica, asi que jamas se le pide al desarrollador.
      */
     public static String subjectToType(String subject) {
-        ParsedSubject p = parseSubject(subject);
+        return typeOf(parseSubject(subject));
+    }
+
+    /** Como {@link #subjectToType}, sin rechazar dominios reservados (ver {@link #parseSubjectUnchecked}). */
+    static String subjectToTypeUnchecked(String subject) {
+        return typeOf(parseSubjectUnchecked(subject));
+    }
+
+    private static String typeOf(ParsedSubject p) {
         return "com.flux." + p.domain() + "." + p.aggregate() + "." + p.event() + ".v" + p.major();
     }
 
