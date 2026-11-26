@@ -1,20 +1,25 @@
-# flux — Event Protocol v1
+# flux — protocolo de integración v1.1
 
-> Contrato de eventos polyglot para arquitecturas dirigidas por eventos. Envelope
-> CloudEvents 1.0 sobre NATS JetStream, entrega at-least-once con idempotencia
-> obligatoria en el consumidor, versionado mayor en el subject. La API pública es el
-> protocolo, no una librería: cualquier lenguaje que lo hable es ciudadano de primera
-> clase, tenga o no SDK oficial.
+> Protocolo de integración polyglot que sustituye las APIs, los webhooks y el polling entre sistemas propios: **eventos** (un hecho que pasó), **estado**
+> replicado (el valor actual de un dato que guarda otro sistema) y **petición/respuesta** (una orden o un cálculo con respuesta inmediata), más un **gateway**
+> HTTP para lo que no puede mantener una conexión NATS. Envelope CloudEvents 1.0 sobre NATS, entrega at-least-once con idempotencia obligatoria en el consumidor,
+> versionado mayor en el subject y permisos generados de un manifiesto. La API pública es el protocolo, no una librería: cualquier lenguaje que lo hable es
+> ciudadano de primera clase, tenga o no SDK oficial.
 
 Si solo vas a cargar un fichero, carga
 [llms-full.txt](https://raw.githubusercontent.com/charlessonamericantrading/flux/main/llms-full.txt)
-— es la especificación entera (~45 KB) en un solo documento.
+— es la especificación entera en un solo documento.
+
+**¿Qué primitiva uso?** Un hecho que pasó → evento. Un dato que guarda otro sistema → estado. Una orden o un cálculo con respuesta ya → petición/respuesta. Quien no puede
+mantener una conexión NATS (hosting compartido, `cron`, un tercero) → el gateway. El árbol de decisión está en AGENTS.md §1.
 
 ## Empieza aquí
 
 - [AGENTS.md](https://raw.githubusercontent.com/charlessonamericantrading/flux/main/AGENTS.md): Reglas accionables para agentes de IA. Cómo publicar, cómo consumir, qué nunca hacer, y las trampas de NATS que fallan en silencio. **Léelo antes de escribir código.**
 - [protocol.json](https://raw.githubusercontent.com/charlessonamericantrading/flux/main/protocol.json): Constantes verificables en JSON — regex de naming, atributos obligatorios, defaults de consumidor, taxonomía de errores. Para validar en vez de recordar.
 - [llms-full.txt](https://raw.githubusercontent.com/charlessonamericantrading/flux/main/llms-full.txt): Especificación completa concatenada, una sola descarga.
+- [docs/migracion.md](https://raw.githubusercontent.com/charlessonamericantrading/flux/main/docs/migracion.md): Guía de migración: el mapa de sustitución fila a fila (webhook, polling, `GET`, carga inicial, `POST` con respuesta, cálculo, trabajo asíncrono, webhook de un tercero, webhook saliente, hosting compartido, ficheros, tiempo real) con el antes (HTTP) y el después (flux) en código real que se ejecuta; el patrón gradual (doble publicación, apagar el polling), cuándo NO migrar y la lista de comprobación de seguridad.
+- [examples/ecosistema/README.md](https://raw.githubusercontent.com/charlessonamericantrading/flux/main/examples/ecosistema/README.md): Un ecosistema completo que funciona con un comando y bajo la configuración segura: un CRM (estado, evento y operaciones), una tienda, facturación (idempotente) y una web en PHP que solo habla con el gateway; con su prueba de extremo a extremo y qué primitiva usa cada punto y por qué.
 
 ## Especificación normativa
 
@@ -39,6 +44,11 @@ Si solo vas a cargar un fichero, carga
 - [schemas/state/clientes/cliente/1.0.0.json](https://raw.githubusercontent.com/charlessonamericantrading/flux/main/schemas/state/clientes/cliente/1.0.0.json): Esquema de **estado**: `aggregateVersion` obligatoria y campos con `x-pii`. Su lápida fija es [schemas/system/state/eliminado/1.0.0.json](https://raw.githubusercontent.com/charlessonamericantrading/flux/main/schemas/system/state/eliminado/1.0.0.json).
 - [schemas/rpc/clientes/cliente/calcular-descuento/request/1.0.0.json](https://raw.githubusercontent.com/charlessonamericantrading/flux/main/schemas/rpc/clientes/cliente/calcular-descuento/request/1.0.0.json): Esquema de una **petición** (su respuesta es `…/reply/1.0.0.json`: una operación es un par). Un cálculo, no un dato guardado; el error fijo es [schemas/system/rpc/error/1.0.0.json](https://raw.githubusercontent.com/charlessonamericantrading/flux/main/schemas/system/rpc/error/1.0.0.json).
 - [sdk-node/src/errors.ts](https://raw.githubusercontent.com/charlessonamericantrading/flux/main/sdk-node/src/errors.ts): Taxonomía de errores tipada en TypeScript.
+
+## Herramientas
+
+- `flux new event|state|rpc <nombre>` (CLI, `cli/`): crea el esquema de un contrato nuevo con su `$id` y lo obligatorio, rechaza lo que `protocol.json` rechaza, no pisa uno existente y regenera el bundle. `flux provision`, `flux doctor`, `flux state resync`, `flux call`, `flux dlq`.
+- `scripts/gen-acl.mjs` (las ACLs de NATS salen del manifiesto `services.json`, nunca a mano), `scripts/dev-secure.mjs` (TLS + una nkey por servicio + esas ACLs), `scripts/bundle-schemas.mjs`, `scripts/check-compat.mjs`.
 
 ## Opcional
 

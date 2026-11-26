@@ -1,18 +1,24 @@
-# AGENTS.md — flux Event Protocol v1
+# AGENTS.md — flux: protocolo de integración v1.1
 
 > Instrucciones canónicas para agentes de IA (Claude Code, Codex, Cursor, Grok,
-> Replit, Copilot, Aider, Zed, Windsurf, Jules…) que escriban código que **publique o
-> consuma eventos** de este ecosistema.
+> Replit, Copilot, Aider, Zed, Windsurf, Jules…) que escriban código que **integre
+> sistemas con flux**: publicar y consumir **eventos**, mantener y leer **estado**, hacer y
+> atender **peticiones**, o hablar con el **gateway** HTTP de borde.
+>
+> flux es un **protocolo de integración**: sustituye las APIs, los webhooks y el polling
+> entre sistemas propios. Tres primitivas —evento, estado, petición/respuesta— y un borde
+> HTTP para lo que no puede mantener una conexión NATS. Ver [¿Qué primitiva uso?](#qué-primitiva-uso--evento-estado-peticiónrespuesta-o-gateway).
 >
 > Este fichero es la fuente de verdad para agentes. `CLAUDE.md`,
-> `.cursor/rules/flux.mdc` y `.github/copilot-instructions.md` son punteros a esto.
+> `.cursor/rules/flux.mdc` y `.github/copilot-instructions.md` son resúmenes de esto
+> (`node scripts/check-agent-docs.mjs` comprueba que no divergen).
 
 ---
 
 ## 0. Carga el contrato antes de escribir código
 
 Si vas a tocar código que publica o consume eventos, **primero descarga la spec
-completa** (un solo fichero, ~100 KB, sin auth):
+completa** (un solo fichero, ~400 KB: unos 100 000 tokens; sin auth). **Si solo necesitas decidir qué primitiva usar o qué regla aplica, esta página basta**; la spec es para el detalle:
 
 ```
 https://raw.githubusercontent.com/charlessonamericantrading/flux/main/llms-full.txt
@@ -27,6 +33,10 @@ https://raw.githubusercontent.com/charlessonamericantrading/flux/main/protocol.j
 
 Índice curado por si prefieres cargar solo una parte:
 [`llms.txt`](llms.txt) · Documentos individuales: [`specification/`](specification/)
+
+**Un ecosistema completo que funciona**, para copiar de él en vez de inventar:
+[`examples/ecosistema/`](examples/ecosistema/) (un CRM, una tienda, facturación y una web en PHP, bajo la configuración segura, con su prueba
+de extremo a extremo). **Migrar de APIs y webhooks**: [`docs/migracion.md`](docs/migracion.md), fila a fila, con el antes (HTTP) y el después (flux).
 
 ---
 
@@ -100,14 +110,42 @@ https://raw.githubusercontent.com/charlessonamericantrading/flux/main/protocol.j
 19. **Quien llama traduce lo que ve**: `no responders` → `RPC_UNAVAILABLE`, sin respuesta → `RPC_TIMEOUT`, un error →
     `RetryableError` / `PermanentError`. Timeout **5 s** por defecto, **25 s** como máximo.
 
-**¿Qué primitiva uso?**
+**Borde HTTP** (extensión opcional, [12-edge.md](specification/12-edge.md)):
 
-| Necesito… | Uso |
-|---|---|
-| Avisar de que algo pasó; que cada interesado reaccione | **Evento** (`bus.publish`) |
-| Un dato que guarda otro sistema; la carga inicial; una copia local al día | **Estado** (`state.get` / `state.watch`) |
-| Una **orden** que necesita respuesta ya; un **cálculo** con parámetros | **Petición/respuesta** (`bus.request` / `bus.respond`) |
-| Encolar trabajo sin esperar | **Evento** del que pide + un evento de resultado, unidos por `correlationid` |
+20. **HTTP queda en el borde: entre servicios propios, nada va por HTTP.** Un `GET`, un `POST` o un webhook entre dos sistemas del
+    ecosistema es una de las tres primitivas. Lo que **no puede mantener una conexión NATS** (un PHP de hosting compartido, un `cron`,
+    una función *serverless*, el sistema de un tercero) habla con el **gateway** como un servicio más (`"via": "gateway"` en el manifiesto:
+    los **mismos permisos** que cualquier servicio, ninguno especial). Nunca con `$JS.API.>` ni con credenciales compartidas.
+21. **Un webhook de un tercero entra por el gateway, y cada campo que pasa se nombra.** La firma se verifica sobre los **bytes en bruto**; el
+    `id` del evento es **determinista** (`externalKey` + el instante del hecho) para que el mismo aviso reenviado no se duplique; y `data.pick`
+    deja pasar **solo** lo necesario (el cuerpo del tercero trae PII). El que **recibe** una entrega del gateway verifica `Flux-Signature` y
+    deduplica por `Idempotency-Key`.
+
+### ¿Qué primitiva uso? — evento, estado, petición/respuesta o gateway
+
+```text
+¿Quien habla puede mantener una conexión NATS (un servicio propio con SDK)?
+├─ No (hosting compartido, cron, serverless, un tercero) ───────────────→  GATEWAY (HTTP solo en el borde)
+└─ Sí
+   ├─ ¿Un HECHO que pasó, y cada interesado reacciona a su ritmo? ─────→  EVENTO     bus.publish / bus.subscribe
+   ├─ ¿Un DATO que guarda otro sistema (leerlo, tener una copia)? ─────→  ESTADO     bus.state.watch / get / put
+   ├─ ¿Una ORDEN o un CÁLCULO y necesitas la respuesta YA? ────────────→  PETICIÓN   bus.request / bus.respond
+   └─ ¿Trabajo que no tiene que esperarse? ────────────────────────────→  EVENTO del que pide + EVENTO de resultado (mismo correlationid)
+```
+
+| Hoy hago… | Uso | Primitiva |
+|---|---|---|
+| Un webhook: «te aviso de que pasó algo» · polling `GET /cambios?desde=` | Publico un hecho en pasado; cada interesado se suscribe | **Evento** |
+| `GET /clientes/123` · la carga inicial `GET /clientes?page=` | El dueño hace `put`; el que lo necesita hace `watch` (foto + cambios) o `get` | **Estado** |
+| `POST /accion` que necesita respuesta ya · `GET /precio?…` (un cálculo) | `respond` en el dueño del dominio, `request` en quien llama | **Petición/respuesta** |
+| `POST /accion` asíncrona (encolar trabajo) | Un evento de quien pide y otro de resultado, unidos por `correlationid` | **Evento** + evento |
+| El webhook de un tercero · un webhook saliente a quien no puede conectarse · un PHP de hosting compartido | El gateway: HTTP → evento, evento → HTTP firmado, o HTTP ↔ flux | **Gateway** |
+| Un fichero de más de 1 MiB | `{ uri, sha256, bytes }` en el evento (claim-check); el fichero sigue por HTTP(S) al almacén | Evento |
+
+**La regla que evita recrear el problema.** Si lo que pides es *un dato que otro sistema guarda*, es **estado**, no una petición: una operación
+`obtener-cliente` que devuelve lo que guarda el CRM es volver a tener una API con otro transporte. La petición es para órdenes y cálculos.
+**Cuándo NO migrar a flux** (sigue siendo HTTP): una API pública de producto, las llamadas salientes a APIs de terceros, el tiempo real hacia el navegador y las
+consultas ad hoc (el estado es *un valor por clave*, no una base de datos consultable). Ver [`docs/migracion.md`](docs/migracion.md) §5.
 
 ---
 
@@ -267,7 +305,10 @@ equipo la semana que viene.
 
 - El bundle (`schemas/bundle.json`) se despliega **con el servicio**; nunca se resuelve
   el `dataschema` por HTTP en la ruta caliente.
-- Tras cambiar un esquema: `node scripts/bundle-schemas.mjs`.
+- **Un contrato nuevo se crea con `flux new`**, no a mano: `flux new event <subject>` · `flux new state <contrato>` · `flux new rpc <operacion>` (el **par**
+  `request`/`reply`). Crea el esquema con su `$id` y lo obligatorio (`aggregateVersion` en un evento y en un estado), rechaza lo que `protocol.json`
+  rechaza —y dice cómo arreglarlo—, **no pisa** un esquema existente, comprueba `check-compat` y regenera el bundle.
+- Tras cambiar un esquema: `node scripts/bundle-schemas.mjs` (con `--schemas <dir>` para el `schemas/` de otro proyecto).
 - Los esquemas declaran **draft 2020-12**. Un validador de draft-07 no da un error de
   versión: da `no schema with key or ref …/2020-12/schema`, que no dice nada.
 - El bundle también resuelve el **`dataschema` exacto** de cada subject; sin él, el SDK
@@ -361,6 +402,7 @@ Los nombres y etiquetas son **contrato**, no decisión de cada servicio. Siete m
 
 ### Borde HTTP — [12-edge.md](specification/12-edge.md)
 
+- Un ecosistema completo con el gateway, un PHP de hosting compartido y las negativas de seguridad probadas: [`examples/ecosistema/`](examples/ecosistema/).
 - El **gateway** (`gateway/`) aloja clientes que no pueden mantener una conexión NATS como servicios flux normales (`"via": "gateway"`
   en el manifiesto: **mismos permisos que cualquier servicio**, ninguno especial). HTTP queda en el borde; dentro, nada lo usa.
 - **Recibir** un evento por webhook propio: verifica `Flux-Signature` (`t=<unix>,v1=<hmac-sha256(secreto, t + "." + cuerpo)>`)
@@ -368,6 +410,14 @@ Los nombres y etiquetas son **contrato**, no decisión de cada servicio. Siete m
   Un `4xx` es PERMANENT (a la DLQ sin reintentos); `429`/`502`/`503`/`504` se reintentan.
 - El **cuerpo de un webhook de un tercero no está libre de PII** por construcción: se clasifica `confidential` y se publican solo los
   campos necesarios. Y el gateway **no registra nunca `data`**.
+
+### Migrar a flux — [`docs/migracion.md`](docs/migracion.md)
+
+- **No cambies todo a la vez.** El productor publica **los dos** (el endpoint o webhook de siempre y el evento o el estado); los consumidores se migran de uno en uno,
+  los que solo leen primero; una operación, al revés (primero quien responde, después quien llama). Lo viejo se apaga **cuando una cuenta de uso dice cero**, no cuando se supone.
+- **Los efectos que no se pueden repetir** (un número de factura, un cobro) se protegen con la **marca de evento procesado en la misma transacción** que el efecto, y lo que se
+  publica tras guardar va por una **bandeja de salida** en esa misma transacción («guardar y publicar» son dos escrituras sin transacción entre ellas).
+- Un servicio que no está en **Node o Rust** no tiene hoy estado, petición/respuesta ni la configuración segura: va por el gateway como cliente de borde.
 
 ### Multi-tenant — [09-multitenancy.md](specification/09-multitenancy.md)
 
@@ -398,6 +448,9 @@ Los nombres y etiquetas son **contrato**, no decisión de cada servicio. Siete m
 | Una operación `obtener-cliente-por-email` que devuelve lo que otro guarda | Es una consulta a un almacén: **estado**. La petición/respuesta es para órdenes y cálculos. |
 | `rpc.clientes.cliente.v1.creado` (un evento donde va una orden) | La operación va en **infinitivo** (`crear`); el pasado es de un evento. |
 | Suscribirse a `rpc.<dominio>.>` «para atenderlo todo» | Convierte `no responders` en un timeout. Un subject exacto por operación. |
+| Un `fetch`/`curl` a la API interna de otro servicio del ecosistema, o un webhook entre dos de ellos | HTTP es del borde. Es un evento, el estado o una petición; si quien llama no puede conectarse, va por el gateway. |
+| Un endpoint propio para recibir el webhook de un tercero | Es una entrada del gateway (`hooks`): firma, `id` determinista y `data.pick` ya resueltos. |
+| Escribir un esquema a mano copiando otro | `flux new event\|state\|rpc <nombre>`: con el `$id` correcto y lo obligatorio, y el bundle regenerado. |
 
 ## 11. Antes de dar por terminado
 
@@ -412,13 +465,17 @@ Los nombres y etiquetas son **contrato**, no decisión de cada servicio. Siete m
 - [ ] Ningún atributo del envelope escrito a mano
 - [ ] `data` es el último atributo, también en el evento de DLQ
 - [ ] Las cuatro extensiones obligatorias están presentes y con el tipo correcto
-- [ ] Si tocaste un esquema: `node scripts/bundle-schemas.mjs` y
+- [ ] Un contrato nuevo, creado con `flux new` (no a mano); si tocaste un esquema: `node scripts/bundle-schemas.mjs` y
       `node scripts/check-compat.mjs`
 - [ ] Si tocaste `AGENTS.md` o `specification/`: `node scripts/build-llms.mjs`
 - [ ] Ninguna métrica etiquetada por `tenantid`, `id` ni `correlationid`
 - [ ] Si escribes **estado**: `aggregateVersion` ≥ 1 en `data` y en el esquema (`schemas/state/…`);
       el dato personal con `x-pii` y `confidential`; el consumidor borra su copia al recibir una lápida
 - [ ] Ningún dominio llamado `dlq`, `state`, `rpc` ni `system`; ninguna clave o tenant como etiqueta de métrica
+- [ ] Entre servicios propios, **nada por HTTP**: eventos, estado o peticiones; lo que no puede conectarse va por el **gateway**, con los permisos de su
+      entrada del manifiesto. Un webhook de un tercero: firma verificada, `id` determinista y `data.pick` (sin PII)
+- [ ] Una **orden** (petición que cambia datos) lleva una **clave de negocio** y quien responde deduplica por ella; un efecto que no se puede repetir
+      lleva la marca de procesado en la misma transacción
 - [ ] Si haces o atiendes **peticiones**: la operación en infinitivo con su **par** `request`/`reply` en `schemas/rpc/…`; el
       handler **deduplica por el `id`** de la petición; el timeout ≤ 25 s; los errores traducidos a `RETRYABLE` / `PERMANENT`;
       ninguna métrica etiquetada por tenant, `id` ni quién llama; ningún stream captura `rpc.>` (`flux doctor`)

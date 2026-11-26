@@ -1,30 +1,52 @@
 ---
-description: flux Event Protocol v1 — reglas para publicar y consumir eventos
-globs: ["**/*.ts", "**/*.js", "**/*.py", "**/*.go", "**/*.java", "**/*.cs", "**/*.rs", "**/*.php", "schemas/**/*.json"]
+description: flux — protocolo de integración (eventos, estado y petición/respuesta, más el gateway HTTP de borde): reglas para integrar sistemas
+globs: ["**/*.ts", "**/*.js", "**/*.mjs", "**/*.py", "**/*.go", "**/*.java", "**/*.cs", "**/*.rs", "**/*.php", "schemas/**/*.json", "services.json", "gateway.json"]
 alwaysApply: true
 ---
 
-# flux Event Protocol v1
+# flux — protocolo de integración v1.1
 
-Fuente canónica: [AGENTS.md](mdc:AGENTS.md) · Spec completa: [llms-full.txt](mdc:llms-full.txt)
-· Constantes verificables: [protocol.json](mdc:protocol.json)
+Fuente canónica: [AGENTS.md](mdc:AGENTS.md) · Spec completa: [llms-full.txt](mdc:llms-full.txt) · Constantes verificables: [protocol.json](mdc:protocol.json)
+· Ejemplo que funciona: [examples/ecosistema/](mdc:examples/ecosistema/) · Migrar de APIs y webhooks: [docs/migracion.md](mdc:docs/migracion.md)
 
-## Reglas duras
+flux **sustituye las APIs, los webhooks y el polling** entre sistemas propios con tres primitivas y un borde HTTP. Este fichero resume AGENTS.md; si algo
+no está claro, manda AGENTS.md (`node scripts/check-agent-docs.mjs` comprueba que no divergen).
 
-1. **Subject:** `<dominio>.<agregado>.v<major>.<evento>` — exactamente 4 tokens,
-   minúsculas, `kebab-case`, dominio plural, agregado singular, evento en **pasado**.
-   ✅ `pedidos.pedido.v1.creado` ❌ `pedidos.crear-pedido`
-2. **Nunca escribas el envelope a mano.** El SDK rellena `id`, `source`, `time`,
-   `specversion`, `type`, `dataschema`, `correlationid`, `causationid`,
-   `producerversion`, `traceparent`. El desarrollador solo escribe subject, `data` y
-   opcionalmente `aggregateId`.
-3. **Todo consumidor debe ser idempotente** — la garantía es at-least-once.
-   Tabla de procesados en la misma transacción, u operación naturalmente idempotente,
-   o `Idempotency-Key` derivada del `id` del evento.
-4. **No asumas orden.** `aggregateVersion` + `WHERE aggregate_version < $n`.
-5. **Sin PII en `data`.** Referencias (`clienteId`), no valores (`email`, `dni`).
-6. **Schemas publicados son inmutables.** Se añade versión, no se edita.
-7. **Dinero en enteros de unidad mínima** (`totalCents: 9990`) + ISO 4217.
+## ¿Qué primitiva uso?
+
+| Necesito… | Primitiva | API |
+|---|---|---|
+| Avisar de un **hecho** que pasó; cada interesado reacciona | **Evento** | `bus.publish` / `bus.subscribe` |
+| Un **dato** que guarda otro sistema (leerlo, una copia, la carga inicial) | **Estado** | `bus.state.watch` / `get` / `put` |
+| Una **orden** o un **cálculo** con respuesta ya | **Petición/respuesta** | `bus.request` / `bus.respond` |
+| Trabajo que no tiene que esperarse | **Evento** + evento de resultado (mismo `correlationid`) | |
+| Quien habla **no puede mantener una conexión NATS** (hosting compartido, `cron`, serverless, un tercero) | **Gateway** | HTTP al gateway |
+
+Si lo que pides es *un dato que otro sistema guarda*, es **estado**, no una petición. Un contrato nuevo se crea con **`flux new event|state|rpc <nombre>`**, no a mano.
+
+## Reglas duras: 21 (AGENTS.md §1)
+
+1. **Nunca inventes un subject.** `<dominio>.<agregado>.v<major>.<evento>`: 4 tokens, minúsculas, `kebab-case`, dominio plural, agregado singular, evento en **pasado**.
+2. **Nunca escribas el envelope a mano.** El SDK rellena `id`, `source`, `time`, `type`, `correlationid`, `traceparent`…; tú solo subject, `data` y `aggregateId`.
+3. **Todo consumidor DEBE ser idempotente.** at-least-once: los duplicados llegan. Tabla de procesados **en la misma transacción**, operación naturalmente idempotente, o `Idempotency-Key` derivada del `id`.
+4. **Nunca asumas orden.** `aggregateVersion` + `WHERE aggregate_version < $n`.
+5. **Nunca metas PII en `data`.** Referencias (`clienteId`), no valores (`email`).
+6. **Nunca modifiques un JSON Schema ya publicado.** Se añade versión.
+7. **Importes monetarios: enteros en la unidad mínima** (`totalCents`) más ISO 4217. Nunca `float`.
+8. **`data` va SIEMPRE el último atributo**. El orden de claves es normativo (replay, firma, dedupe por hash).
+9. **Las cuatro extensiones obligatorias se exigen de verdad.** Sin `correlationid`, `tenantid`, `producerversion` o `dataclassification`, el evento es POISON; no hay defaults.
+10. **Los tipos son exactos.** `{"tenantid": 42}` es POISON.
+11. **UTF-8 literal, sin escapes `\u`.** `café`, no `café`.
+12. **Un dato que guarda otro sistema es estado, no una llamada.** `state.watch` / `state.get`; solo el **dueño** escribe.
+13. **`put` exige `aggregateVersion` (entero ≥ 1) y es condicional.** Una versión que no avanza da `stale`, que **no** es un error.
+14. **El dato personal solo vive en estado**: `confidential`, con `x-pii`, borrable con `delete`; el consumidor borra su copia al recibir la lápida. En un **evento**, la regla 5 sigue intacta.
+15. **`dlq`, `state`, `rpc` y `system` no son dominios.** `publish()` los rechaza (`RESERVED_DOMAIN`).
+16. **Una orden o un cálculo con respuesta inmediata es una petición; un dato guardado es estado.** Nunca un `POST`/`GET` por HTTP entre servicios propios.
+17. **El que responde deduplica por el `id` de la petición**, y un reintento reutiliza el `id`. Una orden lleva además una clave de negocio. `RPC_TIMEOUT` **no** dice que no se ejecutó.
+18. **Una suscripción por operación, al subject exacto** (`rpc.<dom>.<agr>.v<M>.<operacion>`, operación en **infinitivo**), nunca `rpc.<dominio>.>`. Ningún stream captura `rpc.>`.
+19. **Quien llama traduce lo que ve**: `no responders` → `RPC_UNAVAILABLE`, sin respuesta → `RPC_TIMEOUT`, un error → `RetryableError` / `PermanentError`. Timeout 5 s, máximo 25 s.
+20. **HTTP queda en el borde: entre servicios propios, nada va por HTTP.** Lo que no puede conectarse habla con el gateway (`"via": "gateway"`: los mismos permisos que un servicio, ninguno especial).
+21. **Un webhook de un tercero entra por el gateway, y cada campo que pasa se nombra.** Firma sobre los bytes en bruto, `id` determinista (`externalKey` + instante) y `data.pick` (sin PII); el receptor de una entrega verifica `Flux-Signature` y deduplica por `Idempotency-Key`.
 
 ## Errores
 
@@ -32,20 +54,21 @@ Fuente canónica: [AGENTS.md](mdc:AGENTS.md) · Spec completa: [llms-full.txt](m
 |---|---|---|
 | `RETRYABLE` | Timeout, ECONNRESET, HTTP 429/502/503/504 | `nak` + backoff |
 | `PERMANENT` | Schema inválido, regla de negocio, HTTP 400/403/404/422 | `term()` + DLQ ya |
-| `POISON` | JSON malformado, atributo CloudEvents ausente | `term()` + DLQ + alerta |
+| `POISON` | JSON malformado, atributo CloudEvents obligatorio ausente | `term()` + DLQ + alerta |
 
-Default: **PERMANENT**. DLQ en `dlq.<subject>` (prefijo, no sufijo).
+Lo **desconocido** es RETRYABLE con presupuesto acotado de **2 entregas**; los RETRYABLE reconocidos conservan sus 6. DLQ en `dlq.<subject>` (prefijo, no sufijo).
 
 ## Trampas que no dan error, dan comportamiento incorrecto
 
-- `subject` de CloudEvents = id del agregado, **no** el subject de NATS.
-- Nombres de stream/durable de NATS **no admiten puntos** (`EVT_PEDIDOS`).
-- `duplicate_window` deduplica **publicaciones**, nunca reentregas de consumo.
-- Subjects **case-sensitive**: `Pedidos.` ≠ `pedidos.`, sin error.
-- Replay desde DLQ **conserva el `id` original**.
+- `subject` de CloudEvents = id del agregado, **no** el subject de NATS. Los nombres de stream y de durable **no admiten puntos**. Los subjects son **case-sensitive**.
+- `duplicate_window` deduplica **publicaciones**, nunca reentregas de consumo. El replay desde la DLQ **conserva el `id`**.
+- Publica **siempre por JetStream**: un `publish` de core a un subject que ningún stream captura no da error y el evento se evapora.
+- Los permisos **no se escriben a mano**: salen de `services.json` (`scripts/gen-acl.mjs`). Nunca `$JS.API.>` ni un `_INBOX.>` común (cada servicio, su inbox). Los streams y durables los crea `flux provision`.
+- El estado va en un subject de 6 tokens (`state.<dom>.<agr>.v<M>.<tenant>.<clave>`); la clave la validas tú (`^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$`). Un `publish` de core a un subject de estado lo sobrescribe sin chequeo.
+- `RPC_TIMEOUT` es **ambiguo**; el stream que captura `rpc.>` contesta con su acuse antes que el responder; parar un responder cerrando la conexión pierde lo que atiende.
 - `…actualizado` es un antipatrón: nombra qué cambió (`…direccion-envio-cambiada`).
 
-## Al editar la spec
+## Al terminar
 
-`llms-full.txt` es generado. Tras tocar `AGENTS.md` o `specification/*.md`:
-`node scripts/build-llms.mjs`
+Checklist de AGENTS.md §11. Tras tocar un esquema: `node scripts/bundle-schemas.mjs` y `node scripts/check-compat.mjs`. Tras tocar `AGENTS.md` o `specification/*.md`: `node scripts/build-llms.mjs`
+(`llms-full.txt` es generado: no lo edites).
