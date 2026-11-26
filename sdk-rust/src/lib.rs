@@ -104,6 +104,7 @@
 // donde corresponde —en CI, con `cargo clippy -- -D warnings`—, que es el único sitio
 // donde el toolchain está fijado.
 
+mod canonical;
 pub mod classify;
 pub mod client;
 pub mod context;
@@ -159,9 +160,9 @@ pub use client::{
 };
 pub use context::EventContext;
 pub use envelope::{
-    build_event, data_to_raw, format_time, parse_event, serialize, strip_dlq_extensions,
-    to_dlq_event, BuildEventInput, DataClassification, DlqInfo, DlqReason, Event,
-    ALLOWED_ROOT_ATTRIBUTES,
+    build_event, canonical_data, data_to_raw, format_time, parse_event, parse_instant, parse_time,
+    serialize, strip_dlq_extensions, to_dlq_event, BuildEventInput, DataClassification, DlqInfo,
+    DlqReason, Event, ALLOWED_ROOT_ATTRIBUTES,
 };
 pub use errors::{
     as_classified, describe, Classification, ConfigDifference, ErrorClass, Failure, FluxError,
@@ -188,11 +189,12 @@ pub use protocol::{
     RESERVED_DOMAINS, SPEC_VERSION, STREAM_MAX_AGE,
 };
 pub use rpc::{
-    build_rpc_error, build_rpc_reply, build_rpc_request, resolve_timeout_ms, rpc_dataschema,
-    rpc_subject, ReplyTo, RequestOptions, RespondOptions, Responder, RpcContext, RpcErrorBody,
-    RpcErrorInput, RpcHandler, RpcOperation, RpcReplyInput, RpcRequest, RpcRequestInput,
-    RpcRequestRef, RpcSide, DEFAULT_TIMEOUT_MS, MAX_CONCURRENT_HANDLERS, MAX_TIMEOUT_MS,
-    MIN_TIMEOUT_MS, RPC_ERROR_DATASCHEMA, RPC_ERROR_TYPE, STALE_REQUEST_WINDOW_SECS,
+    build_rpc_error, build_rpc_reply, build_rpc_request, parse_rpc_time, resolve_timeout_ms,
+    rpc_dataschema, rpc_subject, ReplyTo, RequestOptions, RespondOptions, Responder, RpcContext,
+    RpcErrorBody, RpcErrorInput, RpcHandler, RpcOperation, RpcReplyInput, RpcRequest,
+    RpcRequestInput, RpcRequestRef, RpcSide, DEFAULT_TIMEOUT_MS, MAX_CONCURRENT_HANDLERS,
+    MAX_TIMEOUT_MS, MIN_TIMEOUT_MS, RPC_ERROR_DATASCHEMA, RPC_ERROR_TYPE,
+    STALE_REQUEST_WINDOW_SECS,
 };
 pub use security::TlsOptions;
 #[cfg(feature = "signing")]

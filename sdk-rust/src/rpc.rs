@@ -84,7 +84,10 @@ use uuid::Uuid;
 
 use crate::client::{lock, permission_denied, transport, Bus, LogLevel};
 use crate::context::{self, EventContext};
-use crate::envelope::{format_time, parse_event, DataClassification, Event};
+use crate::envelope::{
+    canonical_data, format_time, invalid_time_reason, parse_event, parse_instant,
+    DataClassification, Event,
+};
 use crate::errors::{
     as_classified, describe, Classification, ErrorClass, Failure, FluxError, HandlerError,
 };
@@ -186,17 +189,18 @@ pub struct RpcOperation {
     pub domain: String,
     /// Agregado, kebab-case.
     pub aggregate: String,
-    /// La versión mayor **como texto**: `1`, `2`… Sin límite de tamaño, como el patrón
-    /// `v[1-9][0-9]*` de `protocol.json` (un `u32` rechazaría `v99999999999`).
+    /// La versión mayor **como texto**: `1`, `2`… de 1 a 4 dígitos (`v1`…`v9999`), como el patrón
+    /// `v[1-9][0-9]{0,3}` de `protocol.json`.
     pub major: String,
     /// El nombre de la operación: un infinitivo en kebab-case (`calcular-descuento`).
     pub name: String,
 }
 
-/// `v` + un entero ≥ 1 sin ceros a la izquierda, sin tope: `^v[1-9][0-9]*$`.
+/// `v` + un entero de 1 a 4 dígitos, ≥ 1 y sin ceros a la izquierda: `^v[1-9][0-9]{0,3}$`.
 fn parse_major_text(token: &str) -> Option<&str> {
     let digits = token.strip_prefix('v')?;
     let valid = !digits.is_empty()
+        && digits.len() <= crate::protocol::MAJOR_MAX_DIGITS
         && !digits.starts_with('0')
         && digits.bytes().all(|b| b.is_ascii_digit());
     valid.then_some(digits)
@@ -220,7 +224,7 @@ impl RpcOperation {
                 "la operación {operation:?} no es válida: {reason}. Una operación son cuatro tokens \
                  `<dominio>.<agregado>.v<major>.<operacion>` (`clientes.cliente.v1.calcular-descuento`) \
                  en minúsculas y kebab-case, sin el prefijo `rpc.` —lo pone el SDK— y sin comodines \
-                 (patrón `^[a-z0-9]+(-[a-z0-9]+)*\\.[a-z0-9]+(-[a-z0-9]+)*\\.v[1-9][0-9]*\\.[a-z0-9]+(-[a-z0-9]+)*$`)"
+                 (patrón `^[a-z0-9]+(-[a-z0-9]+)*\\.[a-z0-9]+(-[a-z0-9]+)*\\.v[1-9][0-9]{{0,3}}\\.[a-z0-9]+(-[a-z0-9]+)*$`)"
             ),
         }
         };
@@ -243,7 +247,8 @@ impl RpcOperation {
         }
         let Some(major) = parse_major_text(tokens[2]) else {
             return Err(invalid(
-                "el tercer token debe ser la versión mayor: literal `v` + entero >= 1 (`v1`)",
+                "el tercer token debe ser la versión mayor: literal `v` + un entero de 1 a 4 dígitos, sin ceros \
+                 a la izquierda (`v1`…`v9999`)",
             ));
         };
         if !is_kebab_lower(tokens[3]) {
@@ -448,7 +453,7 @@ impl RpcErrorBody {
             self.code = default_code(self.class).to_string();
         }
         if self.message.trim().is_empty() {
-            self.message = "error del servicio".to_string();
+            self.message = "el servicio rechazó la petición".to_string();
         }
         if self.message.chars().count() > ERROR_MESSAGE_MAX_CHARS {
             let mut cut: String = self
@@ -655,10 +660,9 @@ pub struct RpcReplyInput {
     pub classification: DataClassification,
     /// URI del esquema de la respuesta.
     pub dataschema: String,
-    /// El contexto de quien responde, de la misma traza.
+    /// El contexto de quien responde, de la misma traza. La respuesta lleva **solo** `traceparent`: `tracestate` no
+    /// figura en §3.2 y Node tampoco lo escribe.
     pub traceparent: Option<String>,
-    /// W3C Trace Context.
-    pub tracestate: Option<String>,
     /// Lo que devuelve el handler: un **objeto** JSON.
     pub data: Box<RawValue>,
 }
@@ -691,28 +695,31 @@ pub struct RpcErrorInput {
     pub time: DateTime<Utc>,
     /// SemVer del servicio de quien responde.
     pub producerversion: String,
-    /// W3C Trace Context.
+    /// W3C Trace Context: el de quien responde (§3.2). El error lleva **solo** `traceparent`, como la respuesta.
     pub traceparent: Option<String>,
-    /// W3C Trace Context.
-    pub tracestate: Option<String>,
     /// Qué falló.
     pub error: RpcErrorBody,
 }
 
+/// Los atributos que el SDK rellena no pueden llegar vacíos a un constructor de petición/respuesta:
+/// `INVALID_RPC_CALL` (el conjunto de códigos de rpc es cerrado, 04-errors.md §7).
 fn require_present(fields: &[(&str, &str)]) -> Result<(), FluxError> {
     for (name, value) in fields {
         if value.is_empty() {
-            return Err(FluxError::Envelope(format!(
-                "`{name}` es obligatorio y llegó vacío. Lo rellena el SDK a partir de \
-                 ConnectOptions; si estás construyendo la entrada a mano, rellénalo \
-                 (01-envelope.md §5)"
-            )));
+            return Err(FluxError::InvalidRpcCall {
+                reason: format!(
+                    "`{name}` es obligatorio y llegó vacío. Lo rellena el SDK a partir de connect() y \
+                     del evento en curso; si estás llamando a un constructor a mano, rellénalo con \
+                     una cadena no vacía (01-envelope.md §5)"
+                ),
+            });
         }
     }
     Ok(())
 }
 
-/// `data` debe ser un **objeto** JSON en la raíz — 01-envelope.md §4.
+/// `data` debe ser un **objeto** JSON en la raíz — 01-envelope.md §4. Es la comprobación barata de
+/// `request`, que va antes que la clasificación y L3 (§4.1, paso 0); la forma canónica la da el constructor.
 fn require_object(data: &RawValue, what: &str) -> Result<(), FluxError> {
     if data.get().trim_start().starts_with('{') {
         return Ok(());
@@ -722,6 +729,25 @@ fn require_object(data: &RawValue, what: &str) -> Result<(), FluxError> {
             "{what} debe ser un objeto JSON en la raíz (ni array ni escalar), para poder añadir \
              campos sin romper el contrato (01-envelope.md §4)"
         ),
+    })
+}
+
+/// `data` debe ser un **objeto** JSON en la raíz — 01-envelope.md §4 — y viaja en su forma canónica
+/// ([`canonical_data`]): sin espacios, UTF-8 literal, una clave repetida una sola vez.
+fn canonical_object(data: &RawValue, what: &str) -> Result<Box<RawValue>, FluxError> {
+    canonical_data(data).map_err(|reason| FluxError::InvalidRpcCall {
+        reason: format!("{what}: {reason}"),
+    })
+}
+
+/// [`parse_instant`] con el error de petición/respuesta: `INVALID_RPC_CALL`.
+///
+/// # Errores
+///
+/// [`FluxError::InvalidRpcCall`] si `text` no es un instante RFC 3339 válido.
+pub fn parse_rpc_time(text: &str) -> Result<DateTime<Utc>, FluxError> {
+    parse_instant(text).ok_or_else(|| FluxError::InvalidRpcCall {
+        reason: invalid_time_reason(),
     })
 }
 
@@ -736,7 +762,7 @@ fn require_object(data: &RawValue, what: &str) -> Result<(), FluxError> {
 /// [`FluxError::Envelope`] si falta algún atributo obligatorio.
 pub fn build_rpc_request(input: RpcRequestInput) -> Result<Event, FluxError> {
     let op = RpcOperation::parse(&input.operation)?;
-    require_object(&input.data, "`data` de la petición")?;
+    let data = canonical_object(&input.data, "`data` de la petición")?;
     require_present(&[
         ("id", &input.id),
         ("source", &input.source),
@@ -771,7 +797,7 @@ pub fn build_rpc_request(input: RpcRequestInput) -> Result<Event, FluxError> {
         dlqconsumer: None,
         dlqerror: None,
         dlqtime: None,
-        data: input.data,
+        data,
     })
 }
 
@@ -812,7 +838,6 @@ fn assemble_reply(
     classification: DataClassification,
     inherited: Inherited,
     traceparent: Option<String>,
-    tracestate: Option<String>,
     data: Box<RawValue>,
 ) -> Event {
     Event {
@@ -831,7 +856,8 @@ fn assemble_reply(
         causationid: inherited.causationid,
         partitionkey: inherited.partitionkey,
         traceparent,
-        tracestate,
+        // §3.2: la respuesta y el error no llevan `tracestate`.
+        tracestate: None,
         signkeyid: None,
         signature: None,
         dlqreason: None,
@@ -854,7 +880,7 @@ fn assemble_reply(
 /// [`FluxError::Envelope`] si falta algún atributo obligatorio.
 pub fn build_rpc_reply(input: RpcReplyInput) -> Result<Event, FluxError> {
     let op = RpcOperation::parse(&input.request.operation)?;
-    require_object(&input.data, "`data` de la respuesta")?;
+    let data = canonical_object(&input.data, "`data` de la respuesta")?;
     require_present(&[
         ("id", &input.id),
         ("source", &input.source),
@@ -874,8 +900,7 @@ pub fn build_rpc_reply(input: RpcReplyInput) -> Result<Event, FluxError> {
         input.classification,
         Inherited::from_request(&input.request),
         input.traceparent,
-        input.tracestate,
-        input.data,
+        data,
     ))
 }
 
@@ -892,6 +917,10 @@ pub fn build_rpc_reply(input: RpcReplyInput) -> Result<Event, FluxError> {
 /// estable, `message` de 1 a 1000 caracteres, `retryAfterMs` solo con `retryable`) y
 /// [`FluxError::Envelope`] si falta algún atributo obligatorio.
 pub fn build_rpc_error(input: RpcErrorInput) -> Result<Event, FluxError> {
+    // El orden de Node: la operación, el esquema del error, y los atributos vacíos.
+    if let ReplyTo::Request(request) = &input.reply_to {
+        RpcOperation::parse(&request.operation)?;
+    }
     input
         .error
         .check()
@@ -932,7 +961,6 @@ pub fn build_rpc_error(input: RpcErrorInput) -> Result<Event, FluxError> {
         DataClassification::Internal,
         inherited,
         input.traceparent,
-        input.tracestate,
         data,
     ))
 }
@@ -1847,10 +1875,11 @@ fn error_reply(
     outcome: RpcServerOutcome,
 ) -> Served {
     let own_trace = env.traceparent();
-    let (traceparent, tracestate) = if own_trace.is_some() {
-        (own_trace, None)
+    // El error lleva solo `traceparent` (§3.2): el de quien responde o, sin él, el de la petición.
+    let traceparent = if own_trace.is_some() {
+        own_trace
     } else {
-        request_trace
+        request_trace.0
     };
     let built = build_rpc_error(RpcErrorInput {
         reply_to,
@@ -1859,7 +1888,6 @@ fn error_reply(
         time: env.now(),
         producerversion: env.producer_version().to_string(),
         traceparent,
-        tracestate,
         error: body.normalized(),
     })
     .and_then(|e| env.sign(e))
@@ -2313,10 +2341,10 @@ fn finish(
 ) -> Served {
     let op_name = cfg.op.name_with_path();
     let own_trace = env.traceparent();
-    let (traceparent, tracestate) = if own_trace.is_some() {
-        (own_trace, None)
+    let traceparent = if own_trace.is_some() {
+        own_trace
     } else {
-        answering.trace.clone()
+        answering.trace.0.clone()
     };
     let built = build_rpc_reply(RpcReplyInput {
         request: answering.request.clone(),
@@ -2327,7 +2355,6 @@ fn finish(
         classification: cfg.classification,
         dataschema: cfg.reply_dataschema.clone(),
         traceparent,
-        tracestate,
         data: raw,
     })
     .and_then(|e| env.sign(e))
@@ -3077,7 +3104,6 @@ mod tests {
             dataschema: rpc_dataschema(BASE, &text(&i["request"], "operation"), RpcSide::Reply)
                 .unwrap(),
             traceparent: opt_text(i, "traceparent"),
-            tracestate: None,
             data: raw_of(&i["data"]),
         }
     }
@@ -3092,7 +3118,6 @@ mod tests {
             time: utc(&text(i, "time")),
             producerversion: text(i, "producerversion"),
             traceparent: opt_text(i, "traceparent"),
-            tracestate: None,
             error: RpcErrorBody {
                 class: if e["class"] == "retryable" {
                     ErrorClass::Retryable
@@ -3334,16 +3359,30 @@ mod tests {
         assert!(msg.contains("lo pone el SDK"), "{msg}");
     }
 
+    /// La versión mayor son de 1 a 4 dígitos (`v1`…`v9999`): `v[1-9][0-9]{0,3}`. Sin tope, Node escribía
+    /// `v100000000000000000000` y Rust rechazaba lo que no cupiese en un `u32`.
     #[test]
-    fn la_version_mayor_no_tiene_tope_como_dice_el_patron() {
-        // `v[1-9][0-9]*` sin límite: un `u32` rechazaría esta operación y Node la aceptaría.
-        let op = RpcOperation::parse("clientes.cliente.v99999999999999999999.obtener").unwrap();
-        assert_eq!(op.major, "99999999999999999999");
-        assert_eq!(
-            op.event_type(RpcSide::Request),
-            "com.flux.rpc.clientes.cliente.obtener.request.v99999999999999999999"
-        );
-        for malo in ["v0", "v01", "v", "V1", "1", "v1.5", "v-1"] {
+    fn la_version_mayor_es_de_1_a_4_digitos() {
+        for (ok, major) in [("v1", "1"), ("v9", "9"), ("v10", "10"), ("v9999", "9999")] {
+            let op = RpcOperation::parse(&format!("clientes.cliente.{ok}.obtener")).unwrap();
+            assert_eq!(op.major, major);
+            assert_eq!(
+                op.event_type(RpcSide::Request),
+                format!("com.flux.rpc.clientes.cliente.obtener.request.v{major}")
+            );
+        }
+        for malo in [
+            "v10000",
+            "v99999999999999999999",
+            "v4294967296",
+            "v0",
+            "v01",
+            "v",
+            "V1",
+            "1",
+            "v1.5",
+            "v-1",
+        ] {
             let op = format!("clientes.cliente.{malo}.obtener");
             assert_eq!(
                 code_of(&RpcOperation::parse(&op)).as_deref(),
@@ -3451,8 +3490,13 @@ mod tests {
                 "tenantid" => input.tenant_id.clear(),
                 _ => input.dataschema.clear(),
             }
+            // Un atributo que el SDK rellena y llega vacío es `INVALID_RPC_CALL` (el conjunto de rpc es cerrado).
             let r = build_rpc_request(input);
-            assert!(matches!(r, Err(FluxError::Envelope(_))), "{campo}: {r:?}");
+            assert_eq!(
+                code_of(&r).as_deref(),
+                Some(INVALID_RPC_CALL_CODE),
+                "{campo}: {r:?}"
+            );
         }
     }
 
@@ -4416,7 +4460,8 @@ mod tests {
             (body.class, body.code.as_str()),
             (ErrorClass::Retryable, "RETRYABLE")
         );
-        // `poison` no viaja: es `permanent`.
+        // `poison` no viaja: es `permanent`, y sin código propio lleva `PERMANENT` —el de la clase con la que viaja, no el de
+        // la que no viaja—, como en Node.
         let (body, _) = error_de(
             &atiende(
                 &env,
@@ -4425,7 +4470,77 @@ mod tests {
             )
             .await,
         );
-        assert_eq!(body.class, ErrorClass::Permanent);
+        assert_eq!(
+            (body.class, body.code.as_str()),
+            (ErrorClass::Permanent, "PERMANENT")
+        );
+    }
+
+    /// Un mensaje de más de 1000 CARACTERES UNICODE (puntos de código, como `maxLength` de JSON Schema) se trunca;
+    /// mil emojis caben. Node contaba unidades UTF-16 y rechazaba lo que Rust aceptaba.
+    #[test]
+    fn el_mensaje_del_error_se_cuenta_en_puntos_de_codigo() {
+        let cuerpo = |m: String| RpcErrorBody {
+            class: ErrorClass::Permanent,
+            code: "X".into(),
+            message: m,
+            retry_after_ms: None,
+        };
+        assert!(cuerpo("😀".repeat(1_000)).check().is_ok());
+        assert!(cuerpo("😀".repeat(1_001)).check().is_err());
+        assert!(cuerpo(format!("{}ñ", "😀".repeat(999))).check().is_ok());
+        assert!(cuerpo("ñ".repeat(1_000)).check().is_ok());
+        assert!(cuerpo("ñ".repeat(1_001)).check().is_err());
+        assert!(cuerpo(String::new()).check().is_err());
+        // Lo que normaliza quien responde: 1000 emojis pasan enteros; 1001 quedan en 999 + «…».
+        assert_eq!(
+            cuerpo("😀".repeat(1_000)).normalized().message,
+            "😀".repeat(1_000)
+        );
+        assert_eq!(
+            cuerpo("😀".repeat(1_001)).normalized().message,
+            format!("{}…", "😀".repeat(999))
+        );
+    }
+
+    /// El `id` de una petición ilegible solo se cita si es una cadena válida: no vacía, de 128 caracteres como
+    /// máximo y sin caracteres de control (§5.2). Node aceptaba hasta 256 y controles.
+    #[test]
+    fn el_id_de_una_peticion_ilegible_solo_se_cita_si_es_valido() {
+        let con = |id: &str| {
+            rescue_request_id(
+                format!("{{\"id\":{}}}", serde_json::to_string(id).unwrap()).as_bytes(),
+            )
+        };
+        assert_eq!(con("abc-123").as_deref(), Some("abc-123"));
+        assert_eq!(
+            con(&"x".repeat(128)).as_deref(),
+            Some("x".repeat(128).as_str())
+        );
+        assert_eq!(
+            con(&"😀".repeat(128)).as_deref(),
+            Some("😀".repeat(128).as_str())
+        );
+        for malo in [
+            "",
+            &"x".repeat(129),
+            &"😀".repeat(129),
+            "a\u{1}b",
+            "a\u{7f}b",
+            "a\nb",
+            "a\u{85}b",
+        ] {
+            assert_eq!(con(malo), None, "{malo:?}");
+        }
+        for no_cadena in [
+            r#"{"id":42}"#,
+            r#"{"id":null}"#,
+            r#"{"id":{"a":1}}"#,
+            r"{}",
+            "no es json",
+        ] {
+            assert_eq!(rescue_request_id(no_cadena.as_bytes()), None, "{no_cadena}");
+        }
     }
 
     /// Un código que no cumple el patrón, o un mensaje de más de 1000 caracteres, no pueden hacer que
@@ -4452,7 +4567,7 @@ mod tests {
             )
             .await,
         );
-        assert_eq!(body.message, "error del servicio");
+        assert_eq!(body.message, "el servicio rechazó la petición");
         // `retryAfterMs` en un permanent se descarta.
         let normal = RpcErrorBody {
             class: ErrorClass::Permanent,

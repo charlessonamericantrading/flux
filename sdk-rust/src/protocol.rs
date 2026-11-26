@@ -122,7 +122,7 @@ pub struct ParsedSubject {
     pub domain: String,
     /// Raíz de agregado. Sustantivo singular en kebab-case: `pedido`.
     pub aggregate: String,
-    /// Versión mayor del contrato, entero ≥ 1.
+    /// Versión mayor del contrato: un entero de 1 a 9999.
     pub major: u32,
     /// Hecho en pasado, kebab-case: `creado`, `entrega-fallida`.
     pub event: String,
@@ -170,10 +170,19 @@ pub(crate) fn is_kebab_lower(token: &str) -> bool {
         .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
 }
 
-/// Valida `v<major>`: literal `v` + entero ≥ 1 sin ceros a la izquierda.
+/// Cuántos dígitos como máximo tiene la versión mayor: `v1`…`v9999` (`^v[1-9][0-9]{0,3}$`, 02-naming.md §1).
+/// Con tope, el valor cabe en un `u32` y en un `Number` de JavaScript: sin él, Node escribía
+/// `v100000000000000000000` y Rust rechazaba lo que no cupiese en un `u32`.
+pub(crate) const MAJOR_MAX_DIGITS: usize = 4;
+
+/// Valida `v<major>`: literal `v` + un entero de 1 a 4 dígitos, ≥ 1 y sin ceros a la izquierda.
 pub(crate) fn parse_major(token: &str) -> Option<u32> {
     let digits = token.strip_prefix('v')?;
-    if digits.is_empty() || digits.starts_with('0') || !digits.bytes().all(|b| b.is_ascii_digit()) {
+    if digits.is_empty()
+        || digits.len() > MAJOR_MAX_DIGITS
+        || digits.starts_with('0')
+        || !digits.bytes().all(|b| b.is_ascii_digit())
+    {
         return None;
     }
     digits.parse().ok()
@@ -232,7 +241,8 @@ pub fn parse_subject(subject: &str) -> Result<ParsedSubject, FluxError> {
     }
     let Some(major) = parse_major(tokens[2]) else {
         return Err(invalid(
-            "el tercer token debe ser la versión mayor: literal `v` + entero >= 1 (`v1`, `v2`)",
+            "el tercer token debe ser la versión mayor: literal `v` + un entero de 1 a 4 dígitos, \
+             sin ceros a la izquierda (`v1`…`v9999`)",
         ));
     };
     if !is_kebab_lower(tokens[3]) {
