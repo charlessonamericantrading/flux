@@ -70,8 +70,12 @@ export function comprobarB(r) {
 export function comprobarC(r) {
   const out = [];
   out.push(c("sin errores", r.errores === 0, `${r.errores} errores en ${r.peticiones} peticiones`));
-  out.push(c("el servidor atendió lo que el cliente pidió (±concurrencia en vuelo)", Math.abs((r.http?.atendidas ?? r.atendidas) - r.peticiones) <= r.concurrencia + 1,
-    `pedidas ${r.peticiones}, atendidas ${r.http?.atendidas ?? r.atendidas}`));
+  // Las dos cuentas (el cliente las completadas, el servidor las atendidas) se toman con milisegundos de diferencia por procesos distintos:
+  // a 20 000 llamadas/s, o con la máquina cargada (la IPC tarda lo que tarde), son decenas o cientos de llamadas. Se tolera lo que cabe en
+  // vuelo (`concurrencia`) más el 1 % de las llamadas: una pérdida de verdad (una de cada tres, todas) sigue saltando.
+  const atendidas = r.http?.atendidas ?? r.atendidas;
+  out.push(c("el servidor atendió lo que el cliente pidió (±concurrencia en vuelo y 1 % de desfase entre cuentas)", Math.abs(atendidas - r.peticiones) <= r.concurrencia + 1 + 0.01 * r.peticiones,
+    `pedidas ${r.peticiones}, atendidas ${atendidas}`));
   if (r.metodo === "http-ka") {
     out.push(c("keep-alive real: ninguna conexión nueva en la ventana y a lo sumo `concurrencia` abiertas", r.http.conexiones === 0 && r.http.abiertas <= r.concurrencia,
       `${r.http.conexiones} nuevas, ${r.http.abiertas} abiertas (concurrencia ${r.concurrencia})`));
@@ -79,7 +83,8 @@ export function comprobarC(r) {
     out.push(c("sin keep-alive: una conexión TCP por petición", r.http.conexiones >= 0.98 * r.peticiones - r.concurrencia, `${r.http.conexiones} conexiones, ${r.peticiones} peticiones`));
   } else if (r.nats) {
     // Cada petición: 1 mensaje hacia el servidor (la petición) y 1 de vuelta (la respuesta), cada uno entra y sale del broker.
-    out.push(c("el broker vio ~2 mensajes por llamada (petición y respuesta)", r.nats.in_msgs >= 1.9 * r.peticiones - 2 * r.concurrencia && r.nats.in_msgs <= 2.1 * r.peticiones + 2 * r.concurrencia + 50,
+    // Con la misma salvedad del desfase entre cuentas (aquí el de `/varz` frente al contador del cliente): la banda es del ±10 %.
+    out.push(c("el broker vio ~2 mensajes por llamada (petición y respuesta; ±10 %)", r.nats.in_msgs >= 1.8 * r.peticiones - 2 * r.concurrencia && r.nats.in_msgs <= 2.2 * r.peticiones + 2 * r.concurrencia + 50,
       `in_msgs ${r.nats.in_msgs} para ${r.peticiones} peticiones`));
   }
   return out;

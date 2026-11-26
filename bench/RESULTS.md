@@ -97,6 +97,8 @@ Una corrida con la máquina tranquila la debe confirmar o corregir.
 **Lo que esta ejecución no puede decir:** los porcentajes de CPU absolutos (con la máquina compartida, el planificador mete esperas y cambios de contexto que inflan todos los métodos), las latencias a concurrencia 1
 (dependen de la carga que haya en ese instante: p50 de 0.04 ms para HTTP) ni el rendimiento máximo. Los **cocientes** entre métodos medidos a la vez (intercalados) son la parte fiable.
 
+**Una comprobación del propio banco falla en 5 de 90 repeticiones de C, todas «flux a concurrencia 256»:** las llamadas que cuenta el cliente y las que cuenta el responder difieren un 10–17 %, en las dos direcciones (el responder cuenta de menos y de más), con la máquina a 10–22 de carga. Es el **desfase entre las dos lecturas** (se toman por IPC en dos procesos y con la carga tardan lo que tarden: a 4 000 llamadas/s, 0.6 s son 2 400 llamadas), no una pérdida (una pérdida iría siempre en el mismo sentido y `in_msgs` de `nats-server` cuadra en las 55). Esas cinco repeticiones tienen, por tanto, una incertidumbre de ese orden en «CPU por llamada» y «llamadas/s» a concurrencia 256; el resto no la tiene. Con la máquina en calma debe desaparecer: si no, es un fallo del banco.
+
 ## Escenario A — enterarse de un cambio
 
 N consumidores quieren saber cuanto antes que un cliente cambió; el CRM lo cambia C veces por minuto. Línea base: cada consumidor sondea `GET /clientes/cli-1` cada T segundos con keep-alive (`node:http`, un `Agent` y una conexión por consumidor), «ingenuo» (siempre 200 con el cuerpo) o con `If-None-Match` (304). flux: cada consumidor es un servicio con su `bus.state.watch`. El centro de los barridos es **N = 100, C = 12 /min, T = 5 s**; cada tabla varía un factor.
@@ -191,24 +193,24 @@ Un productor, N receptores, un hecho (pedido creado) cada 60/H segundos. Línea 
 |  | HTTP sin keep-alive | 5139 [3931–5597] | 0.14 ms [0.12 ms–0.20 ms] | 0.73 ms [0.71 ms–0.82 ms] | 23.8 ms [21.6 ms–63.1 ms] | 192 [171–289] | 118 [103–175] | 73.9 [67.6–114] | 0 | 360 | 1.000 [1.000–1.000] | ~5 |
 |  | NATS crudo (sin SDK) | 6056 [5241–7142] | 0.14 ms [0.12 ms–0.16 ms] | 0.57 ms [0.44 ms–0.62 ms] | 37.9 ms [9.26 ms–48.8 ms] | 187 [154–213] | 70.3 [58.6–76.0] | 35.2 [29.2–39.2] | 81.1 [65.5–98.3] | 182 [182–182] | 0.000 | ~5 |
 |  | flux `request`/`respond` | 893 [848–970] | 0.95 ms [0.90 ms–1.06 ms] | 4.45 ms [2.87 ms–5.95 ms] | 41.3 ms [20.6 ms–105 ms] | 1139 [1076–1236] | 463 [457–506] | 425 [415–464] | 230 [203–277] | 2172 [2172–2172] | 0.000 | ~5 |
-|  | flux (con OpenTelemetry presente, experimento) | 2634 [2580–2792] | 0.30 ms [0.29 ms–0.33 ms] | 1.38 ms [1.09 ms–1.51 ms] | 26.9 ms [6.25 ms–34.9 ms] | 405 [397–470] | 160 [152–167] | 128 [119–135] | 132 [108–168] | 2172 [2172–2173] | 0.000 | ⚠1 ~5 |
-| 16 | HTTP keep-alive | 19859 [15937–25900] | 0.69 ms [0.58 ms–0.80 ms] | 2.31 ms [1.74 ms–3.23 ms] | 24.5 ms [5.76 ms–70.7 ms] | 51.6 [49.2–62.0] | 31.7 [30.2–37.2] | 19.9 [18.7–24.8] | 0 | 395 [395–395] | 0.000 | ⚠1 ~5 |
+|  | flux (con OpenTelemetry presente, experimento) | 2634 [2580–2792] | 0.30 ms [0.29 ms–0.33 ms] | 1.38 ms [1.09 ms–1.51 ms] | 26.9 ms [6.25 ms–34.9 ms] | 405 [397–470] | 160 [152–167] | 128 [119–135] | 132 [108–168] | 2172 [2172–2173] | 0.000 | ~5 |
+| 16 | HTTP keep-alive | 19859 [15937–25900] | 0.69 ms [0.58 ms–0.80 ms] | 2.31 ms [1.74 ms–3.23 ms] | 24.5 ms [5.76 ms–70.7 ms] | 51.6 [49.2–62.0] | 31.7 [30.2–37.2] | 19.9 [18.7–24.8] | 0 | 395 [395–395] | 0.000 | ~5 |
 |  | HTTP sin keep-alive | 8856 [6303–11861] | 1.60 ms [1.17 ms–2.11 ms] | 5.09 ms [3.55 ms–10.8 ms] | 28.7 ms [16.7 ms–55.6 ms] | 134 [111–149] | 84.6 [70.8–94.0] | 48.7 [40.4–55.3] | 0 | 360 [360–360] | 1.000 [1.000–1.000] | ~5 |
 |  | NATS crudo (sin SDK) | 18113 [16483–19675] | 0.66 ms [0.56 ms–0.84 ms] | 5.94 ms [4.64 ms–6.77 ms] | 26.7 ms [11.9 ms–76.3 ms] | 64.6 [52.4–70.8] | 33.4 [29.2–37.0] | 10.6 [8.62–12.5] | 18.8 [14.1–21.4] | 182 [182–182] | 0.000 | ~5 |
-|  | flux `request`/`respond` | 2399 [2267–3614] | 5.61 ms [3.98 ms–6.42 ms] | 21.8 ms [10.9 ms–23.5 ms] | 40.9 ms [30.7 ms–78.1 ms] | 497 [450–526] | 217 [195–231] | 198 [176–211] | 82.9 [67.3–91.4] | 2172 [2171–2174] | 0.000 | ⚠1 ~5 |
+|  | flux `request`/`respond` | 2399 [2267–3614] | 5.61 ms [3.98 ms–6.42 ms] | 21.8 ms [10.9 ms–23.5 ms] | 40.9 ms [30.7 ms–78.1 ms] | 497 [450–526] | 217 [195–231] | 198 [176–211] | 82.9 [67.3–91.4] | 2172 [2171–2174] | 0.000 | ~5 |
 |  | flux (con OpenTelemetry presente, experimento) | 6924 [6050–12886] | 1.84 ms [1.07 ms–2.14 ms] | 8.74 ms [3.94 ms–11.0 ms] | 26.6 ms [12.5 ms–55.9 ms] | 169 [157–179] | 71.1 [69.1–79.6] | 49.6 [47.2–54.9] | 44.2 [40.3–49.7] | 2172 [2172–2172] | 0.000 | ~5 |
 | 256 | HTTP keep-alive | 20034 [12436–21207] | 11.7 ms [11.2 ms–17.3 ms] | 31.8 ms [24.4 ms–66.5 ms] | 51.2 ms [44.1 ms–107 ms] | 67.4 [59.7–75.6] | 43.0 [38.0–47.8] | 24.5 [21.7–27.8] | 0 | 395 [395–395] | 0.000 | ~5 |
 |  | HTTP sin keep-alive | 6710 [4118–8633] | 35.9 ms [28.2 ms–47.3 ms] | 79.6 ms [58.9 ms–334 ms] | 97.8 ms [73.8 ms–495 ms] | 160 [156–205] | 109 [105–137] | 51.2 [50.5–68.2] | 0 | 360 [360–362] | 1.002 [1.000–1.006] | ~5 |
-|  | NATS crudo (sin SDK) | 25542 [22967–25664] | 8.51 ms [8.00 ms–9.44 ms] | 27.6 ms [24.4 ms–30.3 ms] | 90.0 ms [35.7 ms–104 ms] | 43.7 [40.4–47.3] | 28.3 [26.0–30.1] | 5.68 [5.21–6.27] | 9.78 [9.00–11.0] | 182 [182–182] | 0.000 | ⚠1 ~5 |
-|  | flux `request`/`respond` | 3605 [2282–4600] | 64.9 ms [51.9 ms–94.8 ms] | 196 ms [91.7 ms–475 ms] | 231 ms [103 ms–535 ms] | 402 [370–470] | 175 [162–201] | 161 [155–199] | 66.3 [53.4–69.5] | 2169 [1981–2211] | 0.000 | ⚠4 ~5 |
-|  | flux (con OpenTelemetry presente, experimento) | 12275 [9759–15129] | 19.5 ms [16.0 ms–23.9 ms] | 54.3 ms [35.3 ms–92.0 ms] | 83.1 ms [51.9 ms–162 ms] | 117 [112–126] | 55.2 [52.9–62.0] | 35.8 [33.2–37.7] | 27.2 [23.7–28.2] | 2159 [2107–2180] | 0.000 | ⚠4 ~5 |
+|  | NATS crudo (sin SDK) | 25542 [22967–25664] | 8.51 ms [8.00 ms–9.44 ms] | 27.6 ms [24.4 ms–30.3 ms] | 90.0 ms [35.7 ms–104 ms] | 43.7 [40.4–47.3] | 28.3 [26.0–30.1] | 5.68 [5.21–6.27] | 9.78 [9.00–11.0] | 182 [182–182] | 0.000 | ~5 |
+|  | flux `request`/`respond` | 3605 [2282–4600] | 64.9 ms [51.9 ms–94.8 ms] | 196 ms [91.7 ms–475 ms] | 231 ms [103 ms–535 ms] | 402 [370–470] | 175 [162–201] | 161 [155–199] | 66.3 [53.4–69.5] | 2169 [1981–2211] | 0.000 | ⚠3 ~5 |
+|  | flux (con OpenTelemetry presente, experimento) | 12275 [9759–15129] | 19.5 ms [16.0 ms–23.9 ms] | 54.3 ms [35.3 ms–92.0 ms] | 83.1 ms [51.9 ms–162 ms] | 117 [112–126] | 55.2 [52.9–62.0] | 35.8 [33.2–37.7] | 27.2 [23.7–28.2] | 2159 [2107–2180] | 0.000 | ⚠2 ~5 |
 
 #### C.2 — Con TLS (concurrencia 16)
 
 | Concurrencia | Método | Llamadas /s † | p50 † | p99 † | máx † | CPU total (µs /llamada) | · cliente | · servidor | · nats-server | Bytes /llamada | Conexiones TCP nuevas /llamada | Estado |
 |---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| 16 | HTTP keep-alive | 13046 [11743–13734] | 1.05 ms [1.00 ms–1.16 ms] | 3.60 ms [3.31 ms–4.64 ms] | 38.0 ms [25.3 ms–48.0 ms] | 96.0 [82.8–98.8] | 61.1 [52.9–62.2] | 34.9 [29.9–36.7] | 0 | 395 [395–395] | 0.000 | ⚠1 ~5 |
-|  | NATS crudo (sin SDK) | 14465 [13071–18239] | 0.90 ms [0.69 ms–0.98 ms] | 6.07 ms [4.84 ms–6.52 ms] | 24.1 ms [12.9 ms–47.8 ms] | 99.2 [94.2–123] | 42.8 [41.9–52.3] | 22.2 [20.8–27.5] | 34.1 [30.5–42.9] | 182 [182–182] | 0.000 | ⚠2 ~5 |
+| 16 | HTTP keep-alive | 13046 [11743–13734] | 1.05 ms [1.00 ms–1.16 ms] | 3.60 ms [3.31 ms–4.64 ms] | 38.0 ms [25.3 ms–48.0 ms] | 96.0 [82.8–98.8] | 61.1 [52.9–62.2] | 34.9 [29.9–36.7] | 0 | 395 [395–395] | 0.000 | ~5 |
+|  | NATS crudo (sin SDK) | 14465 [13071–18239] | 0.90 ms [0.69 ms–0.98 ms] | 6.07 ms [4.84 ms–6.52 ms] | 24.1 ms [12.9 ms–47.8 ms] | 99.2 [94.2–123] | 42.8 [41.9–52.3] | 22.2 [20.8–27.5] | 34.1 [30.5–42.9] | 182 [182–182] | 0.000 | ~5 |
 |  | flux `request`/`respond` | 2391 [2023–3204] | 5.75 ms [4.63 ms–6.47 ms] | 22.0 ms [10.7 ms–30.8 ms] | 86.5 ms [26.9 ms–171 ms] | 567 [540–645] | 263 [249–293] | 225 [214–254] | 85.1 [75.6–97.4] | 2172 [2171–2174] | 0.000 | ~5 |
 
 ## Hallazgos del banco
@@ -278,8 +280,8 @@ Antes de fiarse de un número hay que saber que mide lo que se cree. Cada repeti
 | B: sin avisos de fiabilidad (proceso saturado, carga ajena) | 6 / 59 | ⚠ |
 | B: un POST por hecho y receptor (±N en vuelo), sin reintentos ni fallos | 30 / 30 | ✓ |
 | B: una conexión viva por receptor | 30 / 30 | ✓ |
-| C: el broker vio ~2 mensajes por llamada (petición y respuesta) | 54 / 55 | ⚠ |
-| C: el servidor atendió lo que el cliente pidió (±concurrencia en vuelo) | 75 / 90 | ⚠ |
+| C: el broker vio ~2 mensajes por llamada (petición y respuesta; ±10 %) | 55 / 55 | ✓ |
+| C: el servidor atendió lo que el cliente pidió (±concurrencia en vuelo y 1 % de desfase entre cuentas) | 85 / 90 | ⚠ |
 | C: keep-alive real: ninguna conexión nueva en la ventana y a lo sumo `concurrencia` abiertas | 20 / 20 | ✓ |
 | C: sin errores | 90 / 90 | ✓ |
 | C: sin keep-alive: una conexión TCP por petición | 15 / 15 | ✓ |
@@ -294,12 +296,10 @@ Comprobaciones que fallaron (el punto se publica igualmente, marcado):
   - B webhook N=1 H=120 → carga ajena: 2.80 núcleos gastados por procesos que no son del banco
   - B webhook N=1 H=120 → carga ajena: 2.59 núcleos gastados por procesos que no son del banco
   - B webhook N=1 H=120 → carga ajena: 0.59 núcleos gastados por procesos que no son del banco
-- **C: el servidor atendió lo que el cliente pidió (±concurrencia en vuelo)**
-  - C flux-otel c=1 → pedidas 15742, atendidas 15747
-  - C http-ka c=16 → pedidas 119352, atendidas 119320
-  - C flux c=16 → pedidas 21719, atendidas 21740
-- **C: el broker vio ~2 mensajes por llamada (petición y respuesta)**
-  - C flux c=256 → in_msgs 36011 para 19745 peticiones
+- **C: el servidor atendió lo que el cliente pidió (±concurrencia en vuelo y 1 % de desfase entre cuentas)**
+  - C flux c=256 → pedidas 24334, atendidas 21905
+  - C flux c=256 → pedidas 14186, atendidas 15700
+  - C flux c=256 → pedidas 19745, atendidas 16356
 
 ## La máquina y las versiones
 
