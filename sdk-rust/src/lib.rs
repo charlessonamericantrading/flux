@@ -69,6 +69,12 @@
 //! # Ok(()) }
 //! ```
 //!
+//! # Estado replicado
+//!
+//! El **valor actual** de un agregado, que su dueño publica y los demás observan —sustituye a
+//! `GET /clientes/123` y a la carga inicial—: [`Bus::state`], `put`, `delete`, `get` y `watch`.
+//! Extensión opcional de v1.1; ver [`state`] y `specification/10-state.md`.
+//!
 //! # Las cuatro reglas que no se negocian
 //!
 //! 1. **Nunca inventes un subject.** `<dominio>.<agregado>.v<major>.<evento>`, 4 tokens,
