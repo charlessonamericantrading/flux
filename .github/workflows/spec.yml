@@ -500,6 +500,33 @@ jobs:
       - name: Vectores idénticos en todos los SDKs
         run: node conformance/cross-sdk.mjs --verbose
 
+      # Las operaciones de estado (state-build, state-tombstone, state-subject, state-dlq) las ejecutan
+      # SOLO los SDKs que declaran `state` en protocol.json (Node y Rust): los otros cinco salen
+      # «N/A: no declara state» en el paso de arriba. Un runner que solo se ha visto en verde no demuestra
+      # que detecte nada: cada mutante estropea a propósito lo que un SDK entrega o declara (un byte, un
+      # tenant, una operación ausente, un arnés sin registrar) y el runner DEBE fallar. Con `--only` para no
+      # recompilar ni invocar lo que el mutante no toca.
+      - name: El runner detecta un byte, un tenant o una operación ausente (debe FALLAR)
+        run: |
+          for par in rust-un-byte:node,rust rust-tenant-cambiado:node,rust rust-ignora-tenant:node,rust \
+                     rust-sin-state-subject:node,rust rust-sin-arnes-registrado:node,rust \
+                     python-declara-state:node,python; do
+            mutante="${par%%:*}"
+            solo="${par#*:}"
+            if node conformance/cross-sdk.mjs --only "$solo" --mutant "$mutante" > /dev/null 2>&1; then
+              echo "✗ el mutante $mutante NO hizo fallar el runner: no vigila lo que dice vigilar"
+              exit 1
+            fi
+            echo "✓ $mutante detectado"
+          done
+
+      # El reverso: un SDK que NO declara `state` no es un fallo, pero tampoco un salto silencioso.
+      - name: Un SDK que no declara state sale N/A y NO falla
+        run: |
+          salida=$(node conformance/cross-sdk.mjs --only node,rust --mutant rust-no-declara-state)
+          echo "$salida" | grep -q "N/A: no declara state — rust" || { echo "✗ no imprimió el N/A"; exit 1; }
+          echo "✓ N/A visible y sin fallo"
+
   conformance:
     name: Conformidad contra NATS real
     runs-on: ubuntu-latest

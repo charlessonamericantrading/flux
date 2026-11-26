@@ -20,6 +20,9 @@ conformance/
 ├── security.mjs                 ← runner de security-acl.json: los casos son DATOS
 ├── security/                    ← su intérprete, y el ciclo del SDK de Node (S10)
 ├── state-broker.mjs             ← runner de los tres ficheros de estado: los casos son DATOS
+├── cross-sdk.mjs                ← runner de la conformidad cruzada: los siete SDKs, byte a byte
+├── harness/                     ← su contrato (README.md), los vectores y la clave de prueba
+├── harnesses.json               ← cómo se invoca el arnés de cada SDK
 └── README.md
 ```
 
@@ -152,9 +155,11 @@ operación no observa, es un error al cargar.
   en el runner como implementación de **referencia** sobre NATS crudo. **Los SDKs de Node y Rust ejecutan estos
   mismos escenarios con su API**: lo esperado es lo de aquí.
 - [`cross-sdk-state-envelope.json`](cases/cross-sdk-state-envelope.json): los ejemplos byte a byte de
-  [10-state.md §2.6](../specification/10-state.md) con su SHA-256, las operaciones que el arnés cruzado debe
-  aprender (`state-build`, `state-tombstone`, `state-subject`, `state-dlq`) y 23 vectores del subject con el
-  **código estable** de cada rechazo. El runner reconstruye los bytes desde los datos y comprueba el hash.
+  [10-state.md §2.6](../specification/10-state.md) con su SHA-256, las operaciones del arnés cruzado
+  (`state-build`, `state-tombstone`, `state-subject`, `state-dlq`) y 23 vectores del subject con el
+  **código estable** de cada rechazo. `state-broker.mjs` reconstruye los bytes desde los datos y comprueba el
+  hash; **`cross-sdk.mjs` ejecuta las mismas entradas en los SDKs** y comprueba que `harness/vectors.json`
+  sigue repitiéndolas sin cambios (véase [La conformidad cruzada](#la-conformidad-cruzada-entre-sdks)).
 - `--mutant <nombre>` estropea a propósito la configuración del stream o la referencia (`no-max-msgs-per-subject`,
   `no-allow-direct`, `discard-new`, `only-10071`, `no-own-write-check`, `equal-version-applies`,
   `publish-via-core`, `fresh-id-per-attempt`, `no-cas-header`) y **cada uno DEBE hacer fallar el runner**.
@@ -162,6 +167,40 @@ operación no observa, es un error al cargar.
 
 Puertos: `FLUX_TEST_PORTS=desde-hasta` (por defecto `4600-4649`; se usan hasta 8), `NATS_SERVER` y
 `FLUX_REQUIRE_BROKER=1`, como en la suite de seguridad.
+
+## La conformidad cruzada entre SDKs
+
+```bash
+(cd sdk-node && npm install && npm run build)          # y lo que necesite cada SDK que quieras incluir
+node conformance/cross-sdk.mjs --verbose               # sin broker
+node conformance/cross-sdk.mjs --only node,rust        # un subconjunto
+node conformance/cross-sdk.mjs --only node,rust --mutant rust-un-byte    # DEBE fallar
+```
+
+Cada SDK trae un arnés diminuto (una operación por stdin, un JSON por stdout) y el runner los invoca
+con los **mismos vectores** y compara las salidas **byte a byte**: el contrato está en
+[`harness/README.md`](harness/README.md). Es lo único que ejecuta la interoperabilidad entre lenguajes;
+los `cases/cross-sdk-*.json` la describen y nada más. **Un fixture que nadie ejecuta aparenta
+cobertura.**
+
+**El estado replicado** ([10-state.md](../specification/10-state.md)) entra por las operaciones
+`state-build`, `state-tombstone`, `state-subject` y `state-dlq`, con los ejemplos de §2.6, los
+`subjectVectors` de [`cross-sdk-state-envelope.json`](cases/cross-sdk-state-envelope.json) y vectores
+de límites, UTF-8 literal, versión, orden de validación (§3.6) y un **control** (otro `tenantid` da otros
+bytes). Reglas del runner:
+
+- Las operaciones de estado se ejecutan **solo en los SDKs que declaran `state`** en `protocol.json` →
+  `capabilities` (hoy, Node y Rust). Para los demás imprime **`N/A: no declara state`** en el resumen y
+  una `–` en cada fila: nunca un salto silencioso.
+- Un SDK que **declara** `state` y no tiene la operación en su arnés **falla** (`UNSUPPORTED_OP`), y también
+  si no tiene arnés registrado.
+- Node, la referencia, fija lo esperado; el resto debe coincidir byte a byte. Los tres ejemplos de la
+  spec llevan además su SHA-256: ahí el patrón es la spec y no Node.
+
+**Las mutaciones** (`--mutant`, y CI las ejecuta) demuestran que el runner detecta lo que dice detectar: un
+byte cambiado en Rust, un tenant intercambiado o ignorado, una operación ausente en un SDK que declara
+`state`, un SDK sin arnés registrado —todos **fallan**— y un SDK que no declara `state`, que sale `N/A`
+**sin** fallo. La tabla está en [`harness/README.md`](harness/README.md#mutaciones).
 
 ## Añadir un caso
 
