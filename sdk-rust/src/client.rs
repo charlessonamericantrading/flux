@@ -2709,7 +2709,7 @@ mod tests {
         for _ in 0..1_000 {
             assert_eq!(slow.note(), None, "los siguientes, dentro del segundo, no");
         }
-        *lock(&slow.last) = Some(std::time::Instant::now() - Duration::from_secs(2));
+        *lock(&slow.last) = std::time::Instant::now().checked_sub(Duration::from_secs(2));
         assert_eq!(
             slow.note(),
             Some(1_001),

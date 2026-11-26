@@ -3283,10 +3283,10 @@ mod tests {
         assert!(resolve_timeout(Some(Duration::from_micros(1_500))).is_err());
         assert!(resolve_timeout(Some(Duration::from_micros(500))).is_err());
         assert_eq!(
-            resolve_timeout(Some(Duration::from_millis(2_000))).unwrap(),
-            Duration::from_millis(2_000)
+            resolve_timeout(Some(Duration::from_secs(2))).unwrap(),
+            Duration::from_secs(2)
         );
-        assert_eq!(resolve_timeout(None).unwrap(), Duration::from_millis(5_000));
+        assert_eq!(resolve_timeout(None).unwrap(), Duration::from_secs(5));
         assert!(resolve_timeout(Some(Duration::from_secs(26))).is_err());
         assert!(resolve_timeout(Some(Duration::ZERO)).is_err());
     }
@@ -3733,7 +3733,7 @@ mod tests {
         .into_flux_error();
         assert_eq!(r.class(), Some(ErrorClass::Retryable));
         assert_eq!(r.code(), Some("HTTP_503"));
-        assert_eq!(r.retry_after(), Some(Duration::from_millis(5_000)));
+        assert_eq!(r.retry_after(), Some(Duration::from_secs(5)));
         assert_eq!(r.to_string(), "el servicio de tarifas no responde");
         let p = RpcErrorBody {
             class: ErrorClass::Permanent,
@@ -5064,7 +5064,7 @@ mod tests {
             .with_classification(DataClassification::Confidential)
             .with_retries(2)
             .with_retry_delay(Duration::from_millis(7));
-        assert_eq!(o.timeout, Some(Duration::from_millis(2_000)));
+        assert_eq!(o.timeout, Some(Duration::from_secs(2)));
         assert_eq!(
             (o.aggregate_id.as_deref(), o.tenant_id.as_deref()),
             (Some("cli-1"), Some("acme"))

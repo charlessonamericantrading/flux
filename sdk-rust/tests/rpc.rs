@@ -540,7 +540,7 @@ async fn acl_una_llamada_no_concedida_falla_rapido_con_permission_denied() {
     assert_eq!(code(&e), "PERMISSION_DENIED", "{e}");
     assert_eq!(e.class(), Some(ErrorClass::Permanent));
     assert!(
-        tardo < Duration::from_millis(1_000),
+        tardo < Duration::from_secs(1),
         "con `async-nats` la petición denegada solo da un timeout (5 s): el SDK debe competir el -ERR; \
          tardó {tardo:?}"
     );
@@ -584,7 +584,7 @@ async fn acl_sin_permiso_de_publicacion_o_de_inbox_quien_llama_ve_permission_den
             .expect_err(permiso);
         assert_eq!(code(&e), "PERMISSION_DENIED", "{permiso}: {e}");
         assert!(
-            t.elapsed() < Duration::from_millis(1_000),
+            t.elapsed() < Duration::from_secs(1),
             "{permiso}: tardó {:?}",
             t.elapsed()
         );
@@ -916,7 +916,7 @@ async fn broker_una_respuesta_que_no_cabe_se_contesta_con_rpc_message_too_large_
     assert_eq!(code(&e), "RPC_MESSAGE_TOO_LARGE", "{e}");
     assert_eq!(e.class(), Some(ErrorClass::Permanent));
     assert!(
-        t.elapsed() < Duration::from_millis(1_000),
+        t.elapsed() < Duration::from_secs(1),
         "un timeout sería el síntoma de A-65: {:?}",
         t.elapsed()
     );
@@ -995,7 +995,7 @@ async fn broker_una_peticion_que_no_cabe_falla_antes_de_la_red_y_el_limite_exact
         .unwrap_err();
     assert_eq!(code(&e), "RPC_MESSAGE_TOO_LARGE", "{e}");
     assert!(
-        t.elapsed() < Duration::from_millis(1_000),
+        t.elapsed() < Duration::from_secs(1),
         "no espera a ningún timeout: {:?}",
         t.elapsed()
     );
