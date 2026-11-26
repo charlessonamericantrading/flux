@@ -1,0 +1,52 @@
+{
+  "$comment": "La configuración del gateway para el ecosistema de ejemplo. NO contiene ningún secreto: lo secreto es el NOMBRE de una variable de entorno (`nkeySeedEnv`, `secretEnv`) y el SHA-256 de los tokens. `run.mjs` genera un token por ejecución (`node gateway/src/index.mjs token`), pone su SHA-256 aquí, y sustituye el broker, el puerto, las rutas y la URL del receptor; en producción, lo tuyo. Un solo cliente de borde, `web-php` (el del manifiesto con `\"via\": \"gateway\"`): sus permisos los da services.json, no este fichero.",
+  "listen": { "host": "127.0.0.1", "port": 8080 },
+  "nats": { "servers": ["tls://127.0.0.1:4223"], "tls": { "caFile": ".dev-secure/ca.pem" } },
+  "environment": "produccion",
+  "version": "1.0.0",
+  "schemaBaseUrl": "https://schemas.internal",
+  "validation": "strict",
+  "bundleFile": "examples/ecosistema/schemas/bundle.json",
+  "clients": [
+    {
+      "service": "web-php",
+      "tenantId": "acme",
+      "credentials": { "nkeySeedEnv": "WEB_PHP_NKEY_SEED" },
+      "tokens": [
+        { "id": "web-php-1", "sha256": "0000000000000000000000000000000000000000000000000000000000000000" }
+      ],
+      "deliveries": [
+        {
+          "subject": "facturacion.factura.v1.emitida",
+          "url": "https://web.example.com/recibir.php",
+          "secretEnv": "WEB_PHP_ENTREGA_SECRETO",
+          "timeoutMs": 10000
+        }
+      ],
+      "hooks": {
+        "pasarela": {
+          "$comment": "El webhook de la pasarela de pagos (un TERCERO). Se autentica por su FIRMA (HMAC-SHA256, `t=<unix>,v1=<hex>` como Stripe), no por token. `externalKey` + `time` hacen DETERMINISTA el `id`: el mismo aviso reenviado da el mismo evento y el consumidor aplica UN efecto. `data.pick` es la regla 5: el cuerpo trae el correo del pagador y NO pasa; solo los campos nombrados.",
+          "subject": "pagos.cobro.v1.recibido",
+          "verify": {
+            "scheme": "hmac-sha256",
+            "secretEnv": "PASARELA_HOOK_SECRETO",
+            "signature": { "header": "X-Pasarela-Firma", "format": "t-v1" },
+            "toleranceSeconds": 300
+          },
+          "externalKey": { "from": "body", "pointer": "/id" },
+          "time": { "from": "body", "pointer": "/created", "unit": "seconds" },
+          "aggregateId": { "from": "body", "pointer": "/id" },
+          "classification": "internal",
+          "data": {
+            "pick": {
+              "pagoId": "/id",
+              "pedidoId": "/metadata/pedidoId",
+              "importeCents": "/amount",
+              "moneda": "/currency"
+            }
+          }
+        }
+      }
+    }
+  ]
+}

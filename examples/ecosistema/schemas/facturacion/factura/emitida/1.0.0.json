@@ -1,0 +1,66 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.internal/facturacion/factura/emitida/1.0.0.json",
+  "title": "facturacion.factura.v1.emitida",
+  "description": "Se ha emitido una factura. Emitido por `facturacion`, dueño del agregado. Lleva el número (correlativo, sin huecos) y los importes finales, en enteros de la unidad mínima. Referencias, no datos personales.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "facturaId",
+    "pedidoId",
+    "clienteId",
+    "aggregateVersion",
+    "numero",
+    "subtotalCents",
+    "descuentoCents",
+    "totalCents",
+    "moneda"
+  ],
+  "properties": {
+    "facturaId": {
+      "type": "string",
+      "pattern": "^fac-[0-9]{1,12}$",
+      "description": "Identificador del agregado; el atributo `subject` del CloudEvent."
+    },
+    "pedidoId": {
+      "type": "string",
+      "pattern": "^ped-[0-9a-z]{3,32}$",
+      "description": "El pedido que se factura."
+    },
+    "clienteId": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$",
+      "description": "Referencia al cliente. NO se incluye PII."
+    },
+    "aggregateVersion": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Contador monotónico de la factura (1 al emitirla)."
+    },
+    "numero": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Número de factura, correlativo y sin huecos."
+    },
+    "subtotalCents": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Importe antes de descuento."
+    },
+    "descuentoCents": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Descuento aplicado, el que calculó el CRM."
+    },
+    "totalCents": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Importe final: subtotal menos descuento."
+    },
+    "moneda": {
+      "type": "string",
+      "pattern": "^[A-Z]{3}$",
+      "description": "Moneda, ISO 4217."
+    }
+  }
+}

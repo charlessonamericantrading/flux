@@ -1,0 +1,45 @@
+{
+  "$comment": "El manifiesto del ecosistema de ejemplo: quién es dueño de qué y qué toca cada servicio. De aquí salen, sin escribir ni un permiso a mano, las ACLs de NATS (scripts/gen-acl.mjs) y los streams y durables (`flux provision`). Cuatro sistemas: `crm` (dueño de `clientes`: publica estado y eventos y atiende dos operaciones), `tienda-web` (observa el estado de clientes, publica pedidos y se entera de las facturas), `facturacion` (consume pedidos, cobros y altas de clientes, y llama al CRM) y `web-php` (un cliente de BORDE, `\"via\": \"gateway\"`: un PHP en un hosting compartido que no puede mantener una conexión NATS; sus permisos son los de cualquier servicio con lo mismo declarado, y es el dueño de `pagos` porque el webhook de la pasarela entra por el gateway en su nombre). Con un solo tenant (`acme`). Para añadir un contrato: `flux new event|state|rpc <nombre> --schemas examples/ecosistema/schemas`, y declararlo aquí.",
+  "environment": "produccion",
+  "services": [
+    {
+      "name": "crm",
+      "owns": ["clientes"],
+      "serves": [
+        "clientes.cliente.v1.calcular-descuento",
+        "clientes.cliente.v1.sumar-puntos"
+      ]
+    },
+    {
+      "name": "tienda-web",
+      "owns": ["pedidos"],
+      "consumes": ["facturacion.factura.v1.emitida"],
+      "watches": [
+        { "contract": "clientes.cliente.v1", "tenants": ["acme"] }
+      ]
+    },
+    {
+      "name": "facturacion",
+      "owns": ["facturacion"],
+      "consumes": [
+        "pedidos.pedido.v1.creado",
+        "pagos.cobro.v1.recibido",
+        "clientes.cliente.v1.registrado"
+      ],
+      "calls": [
+        "clientes.cliente.v1.calcular-descuento",
+        "clientes.cliente.v1.sumar-puntos"
+      ]
+    },
+    {
+      "name": "web-php",
+      "via": "gateway",
+      "owns": ["pagos"],
+      "consumes": ["facturacion.factura.v1.emitida"],
+      "watches": [
+        { "contract": "clientes.cliente.v1", "tenants": ["acme"] }
+      ],
+      "calls": ["clientes.cliente.v1.calcular-descuento"]
+    }
+  ]
+}

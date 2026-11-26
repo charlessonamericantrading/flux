@@ -1,0 +1,16 @@
+{
+  "name": "@flux/ejemplo-ecosistema",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Un ecosistema de ejemplo de flux de principio a fin: un CRM, una tienda, facturación y una web en PHP que solo habla con el gateway, bajo la configuración segura (ACLs generadas, nkeys, TLS, inbox privado). Ver README.md.",
+  "scripts": {
+    "start": "node run.mjs",
+    "test": "node --test --test-force-exit --test-concurrency=1 test/*.test.mjs",
+    "mutantes": "node test/mutantes.mjs"
+  },
+  "dependencies": {
+    "@flux/sdk": "file:../../sdk-node"
+  },
+  "engines": { "node": ">=20" }
+}

@@ -1,0 +1,30 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.internal/rpc/clientes/cliente/calcular-descuento/request/1.0.0.json",
+  "title": "rpc clientes.cliente.v1.calcular-descuento — petición",
+  "description": "La PETICIÓN de `clientes.cliente.v1.calcular-descuento`: un CÁLCULO (las reglas de descuento viven en el CRM), no un dato guardado. Lleva la referencia `clienteId`, nunca el dato del cliente; el importe, en enteros de la unidad mínima.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "clienteId",
+    "totalCents",
+    "moneda"
+  ],
+  "properties": {
+    "clienteId": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$",
+      "description": "Referencia al cliente: la clave de su estado."
+    },
+    "totalCents": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Total del pedido en la unidad mínima de la moneda. Entero, nunca un decimal."
+    },
+    "moneda": {
+      "type": "string",
+      "pattern": "^[A-Z]{3}$",
+      "description": "Moneda, ISO 4217."
+    }
+  }
+}

@@ -1,0 +1,35 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.internal/clientes/cliente/registrado/1.0.0.json",
+  "title": "clientes.cliente.v1.registrado",
+  "description": "Un cliente se ha dado de alta en el CRM. Emitido por `crm`, dueño del agregado. Lleva SOLO la referencia `clienteId`: el nombre y el correo viajan en el ESTADO `clientes.cliente.v1` (clasificado, con `x-pii` y borrable), nunca en un evento — AGENTS.md, regla 5.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "clienteId",
+    "aggregateVersion",
+    "plan"
+  ],
+  "properties": {
+    "clienteId": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$",
+      "description": "Referencia al cliente. NO se incluye PII: es la clave de su estado."
+    },
+    "aggregateVersion": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Contador monotónico del agregado (1 en el alta)."
+    },
+    "plan": {
+      "type": "string",
+      "enum": [
+        "bronce",
+        "plata",
+        "oro"
+      ],
+      "x-extensible-enum": true,
+      "description": "Plan comercial del cliente. Enum EXTENSIBLE: pueden añadirse planes en un MINOR, así que quien lo lee DEBE tener una rama por defecto no destructiva (05-compatibility.md §2.3)."
+    }
+  }
+}
