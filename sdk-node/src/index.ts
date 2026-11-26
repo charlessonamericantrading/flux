@@ -57,6 +57,10 @@ export {
 } from "./envelope.js";
 export type { FluxEvent, DataClassification } from "./envelope.js";
 
+// `id` determinista de un hecho importado (specification/01-envelope.md §2.6.1): función PURA, sin reloj ni azar.
+export { externalEventId, instantToMs, EXTERNAL_KEY_MAX_BYTES, UUIDV7_MAX_MS } from "./external-id.js";
+export type { ExternalIdInput } from "./external-id.js";
+
 export {
   CONSUMER_DEFAULTS,
   STREAM_DEFAULTS,

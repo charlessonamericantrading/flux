@@ -122,7 +122,9 @@
         "type": "string",
         "format": "uuid",
         "uuidVersion": 7,
-        "generatedBy": "sdk"
+        "generatedBy": "sdk",
+        "deterministicWhenImported": "edge.externalId",
+        "$commentDeterministic": "Un hecho importado de un sistema externo (un webhook de un tercero) lleva un id DETERMINISTA: UUIDv7 con los ms del hecho externo y 74 bits de SHA-256(source|clave externa). Es un UUIDv7 valido y siempre el mismo. specification/01-envelope.md §2.6.1."
       },
       "source": {
         "type": "string",
@@ -883,7 +885,8 @@
         "consumes",
         "watches",
         "calls",
-        "serves"
+        "serves",
+        "via"
       ],
       "unknownServiceKeysRejected": true,
       "watches": {
@@ -931,6 +934,13 @@
         "watchesRejected": true,
         "names": "naming.reservedDomains.names",
         "$comment": "ownDomain (security.acl.permissionPatterns) casa con `state.>` y `dlq.>`: un servicio dueno del dominio `state` recibiria permiso para escribir el estado de TODOS los dominios. Lo impide el generador (RESERVED_DOMAIN), no el patron."
+      },
+      "via": {
+        "values": "edge.manifest.values",
+        "annotationOnly": true,
+        "extraPermissions": "none",
+        "servesRejected": true,
+        "$comment": "`\"via\": \"gateway\"` marca un cliente de borde (12-edge.md §3): su conexion NATS vive dentro del gateway, con SU identidad y SUS permisos, que son los de cualquier servicio con lo mismo declarado. El gateway no necesita ninguno especial. Un cliente de borde no puede llevar `serves`: atender una operacion exige una suscripcion viva."
       }
     },
     "provisioning": {
@@ -1027,7 +1037,9 @@
       "event": "forbidden",
       "state": "allowed-if-confidential-with-x-pii",
       "$comment": "El evento lleva referencias (clienteId) y nunca PII: un log append-only no puede satisfacer el derecho de supresion. El estado lleva el DATO, clasificado confidential, con x-pii en los campos del esquema, y es BORRABLE: state.delete sustituye el valor por una lapida y el anterior sale del stream (A-34). `restricted` NO se admite en estado en 1.1. Normativo en specification/06-security.md §5.1 y 10-state.md §7. La primitiva de peticion/respuesta (fase 3) anadira la suya. La peticion/respuesta (fase 3) lleva la suya: `data` PUEDE llevar dato personal como PARAMETRO de una orden o resultado de un calculo, con `x-pii` en el esquema y la clasificacion que le toque, porque el broker NO lo persiste (core NATS, sin stream: rpc.transport) —salvo que un stream capture `rpc.>` (A-18, A-67), y por eso `flux doctor` lo comprueba (rpc.doctor)—. Leer un dato guardado por otro sistema NO es una operacion: es estado. Decidido provisionalmente; normativo en specification/11-request-reply.md §3.6.",
-      "rpc": "allowed-as-parameter-never-persisted"
+      "rpc": "allowed-as-parameter-never-persisted",
+      "edge": "hooks-default-confidential-and-pick-fields",
+      "$commentEdge": "El cuerpo de un webhook de un tercero NO es libre de PII por construccion (un cobro trae el email del pagador): su clasificacion por defecto es confidential y el propietario elige que campos pasan (edge.gateway.hooks). Hacia fuera, restricted no sale nunca por HTTP y confidential exige autorizacion explicita (edge.delivery.classification). Normativo en 12-edge.md §4.7 y §6.3."
     },
     "retentionByClassification": {
       "public": "30d",
@@ -2444,6 +2456,770 @@
         "client",
         "service"
       ]
+    }
+  },
+  "edge": {
+    "status": "optional-extension-of-v1.1",
+    "spec": "specification/12-edge.md",
+    "capability": null,
+    "$comment": "El gateway HTTP de borde (gateway/): HTTP solo en el borde, nada dentro del ecosistema. NO es una capacidad de SDK (capabilities no lo lista y ningun SDK lo declara). Es normativo SOLO el formato de la entrega saliente (edge.delivery) y el id determinista de un hecho importado (edge.externalId, specification/01-envelope.md §2.6.1); el resto (edge.gateway) describe el gateway de referencia: es una implementacion, no el protocolo. Si algo diverge, manda la prosa de 12-edge.md.",
+    "normative": [
+      "delivery",
+      "externalId"
+    ],
+    "implementationOnly": [
+      "gateway",
+      "manifest"
+    ],
+    "delivery": {
+      "$comment": "Lo que recibe un sistema HTTP cuando flux le avisa de un evento (12-edge.md §4). Lo implementan los RECEPTORES, que flux no controla: por eso lleva vectores.",
+      "method": "POST",
+      "contentType": "application/cloudevents+json; charset=utf-8",
+      "contentTypeIsStructuredMode": true,
+      "body": {
+        "isEventVerbatim": true,
+        "serialization": "cloudevents.attributeOrder",
+        "dlqExtensionsStripped": true,
+        "sameBytesEveryAttempt": true,
+        "$comment": "El CloudEvent tal cual (01-envelope.md §6: data el ultimo, UTF-8 literal). Si el evento llevaba signature y signkeyid (07-signing.md) viajan tal cual."
+      },
+      "headers": {
+        "idempotencyKey": {
+          "name": "Idempotency-Key",
+          "value": "event.id",
+          "sameEveryAttempt": true
+        },
+        "signature": {
+          "name": "Flux-Signature"
+        },
+        "receiverMustNotAssumeOthers": true
+      },
+      "signature": {
+        "format": "t=<unix>,v1=<hex>[,v1=<hex>...]",
+        "pattern": "^t=[0-9]{1,15}(,v1=[0-9a-f]{64})+(,[a-z0-9]+=[^,]*)*$",
+        "valid": [
+          "t=1700000000,v1=8dbbbbf4523b10bbb793e74d854144c45acccc2d233667b1c06b805b6ded8a84",
+          "t=1700000000,v1=8dbbbbf4523b10bbb793e74d854144c45acccc2d233667b1c06b805b6ded8a84,v1=f63f1341b06e485fe1fe78cbfd5f6d4cee0d492c21bbc3333af817254d0db38a",
+          "t=1700000000,v1=8dbbbbf4523b10bbb793e74d854144c45acccc2d233667b1c06b805b6ded8a84,v2=lo-que-venga"
+        ],
+        "invalid": [
+          "v1=8dbbbbf4523b10bbb793e74d854144c45acccc2d233667b1c06b805b6ded8a84",
+          "t=1700000000",
+          "t=1700000000,v1=8DBBBBF4523B10BBB793E74D854144C45ACCCC2D233667B1C06B805B6DED8A84",
+          "t=1700000000,v1=8dbbbbf4523b10bbb793e74d854144c45acccc2d233667b1c06b805b6ded8a8",
+          "t=1700000000,v1=zzbbbbf4523b10bbb793e74d854144c45acccc2d233667b1c06b805b6ded8a84",
+          "t=17.5,v1=8dbbbbf4523b10bbb793e74d854144c45acccc2d233667b1c06b805b6ded8a84",
+          "t=,v1=8dbbbbf4523b10bbb793e74d854144c45acccc2d233667b1c06b805b6ded8a84"
+        ],
+        "algorithm": "HMAC-SHA256",
+        "key": "secret-utf8-bytes",
+        "signedMessage": "<t>.<body-bytes>",
+        "encoding": "hex-lowercase",
+        "hexLength": 64,
+        "timestampUnit": "seconds",
+        "timestampRenewedEveryAttempt": true,
+        "multipleV1ForRotation": true,
+        "unknownFieldsIgnored": true,
+        "receiver": {
+          "verifyRawBytes": true,
+          "validateHexFormatBeforeDecoding": true,
+          "compare": "constant-time",
+          "toleranceSeconds": 300,
+          "toleranceSymmetric": true,
+          "rejectedAs": "4xx",
+          "deduplicateBy": "Idempotency-Key"
+        },
+        "secret": {
+          "neverInConfiguration": true,
+          "opaque": true,
+          "recommendedMinBytes": 32
+        },
+        "vectors": [
+          {
+            "name": "cuerpo minimo",
+            "secret": "s3cr3t",
+            "t": 1700000000,
+            "body": "{\"a\":1}",
+            "v1": "8dbbbbf4523b10bbb793e74d854144c45acccc2d233667b1c06b805b6ded8a84"
+          },
+          {
+            "name": "cuerpo vacio",
+            "secret": "s3cr3t",
+            "t": 1700000000,
+            "body": "",
+            "v1": "f63f1341b06e485fe1fe78cbfd5f6d4cee0d492c21bbc3333af817254d0db38a"
+          },
+          {
+            "name": "evento de inventario con no-ASCII (12-edge.md §4.1)",
+            "secret": "whsec_flux_prueba_0123456789abcdef",
+            "t": 1787221600,
+            "body": "{\"specversion\":\"1.0\",\"id\":\"01924f8e-7c3a-7b2d-9e14-3f8a1c9d0e55\",\"source\":\"/produccion/inventario-api\",\"type\":\"com.flux.inventario.stock.ajustado.v1\",\"time\":\"2026-08-20T10:25:39.412Z\",\"datacontenttype\":\"application/json\",\"dataschema\":\"https://schemas.internal/inventario/stock/ajustado/1.0.0.json\",\"subject\":\"sku-77\",\"correlationid\":\"01924f8e-7c3a-7b2d-9e14-3f8a1c9d0e55\",\"tenantid\":\"acme\",\"producerversion\":\"2.1.0\",\"dataclassification\":\"internal\",\"partitionkey\":\"sku-77\",\"data\":{\"sku\":\"sku-77\",\"almacen\":\"Málaga\",\"delta\":-3,\"aggregateVersion\":12}}",
+            "v1": "3f247f6e0826ff51981ff1403ffc24b9abf8ac981c53818dc897b06173e9eba8"
+          },
+          {
+            "name": "GitHub: el vector publicado en «Validating webhook deliveries» (sin t: sha256=<hex> sobre el cuerpo)",
+            "secret": "It's a Secret to Everybody",
+            "t": null,
+            "body": "Hello, World!",
+            "v1": "757107ea0eb2509fc211221cce984b8a37570b6d7586c22c46f4379c8b043e17"
+          }
+        ],
+        "rotationVector": {
+          "secrets": [
+            "whsec_flux_prueba_0123456789abcdef",
+            "whsec_flux_nueva_fedcba9876543210"
+          ],
+          "t": 1787221600,
+          "body": "{\"specversion\":\"1.0\",\"id\":\"01924f8e-7c3a-7b2d-9e14-3f8a1c9d0e55\",\"source\":\"/produccion/inventario-api\",\"type\":\"com.flux.inventario.stock.ajustado.v1\",\"time\":\"2026-08-20T10:25:39.412Z\",\"datacontenttype\":\"application/json\",\"dataschema\":\"https://schemas.internal/inventario/stock/ajustado/1.0.0.json\",\"subject\":\"sku-77\",\"correlationid\":\"01924f8e-7c3a-7b2d-9e14-3f8a1c9d0e55\",\"tenantid\":\"acme\",\"producerversion\":\"2.1.0\",\"dataclassification\":\"internal\",\"partitionkey\":\"sku-77\",\"data\":{\"sku\":\"sku-77\",\"almacen\":\"Málaga\",\"delta\":-3,\"aggregateVersion\":12}}",
+          "v1": [
+            "3f247f6e0826ff51981ff1403ffc24b9abf8ac981c53818dc897b06173e9eba8",
+            "5a9bd3b252f61ba78778351adef803dfb1c1c167101bbd687aa23c02ebd302e0"
+          ]
+        }
+      },
+      "response": {
+        "bodyIgnored": true,
+        "bodyNeverLogged": true,
+        "redirectsFollowed": false,
+        "codeFormat": "HTTP_<status>",
+        "codePattern": "^HTTP_[1-5][0-9][0-9]$",
+        "ack": {
+          "httpStatus": "2xx"
+        },
+        "retryable": {
+          "httpStatus": "errors.classes.retryable.httpStatus",
+          "budget": 6
+        },
+        "retryableBounded": {
+          "httpStatus": [
+            408,
+            425
+          ],
+          "alsoEveryOther5xx": true,
+          "budget": 2
+        },
+        "permanent": {
+          "httpStatus": "3xx-and-4xx-not-listed",
+          "budget": 1
+        },
+        "firmRejectedIsPermanent": true,
+        "network": {
+          "retryable": [
+            "TIMEOUT",
+            "ECONNRESET",
+            "ECONNREFUSED",
+            "ETIMEDOUT",
+            "EPIPE",
+            "EHOSTUNREACH",
+            "ENETUNREACH",
+            "EAI_AGAIN"
+          ],
+          "retryableBounded": "anything-else",
+          "tlsVerificationFailure": {
+            "class": "permanent",
+            "code": "TLS_VERIFICATION_FAILED",
+            "systemCodes": [
+              "DEPTH_ZERO_SELF_SIGNED_CERT",
+              "SELF_SIGNED_CERT_IN_CHAIN",
+              "UNABLE_TO_VERIFY_LEAF_SIGNATURE",
+              "UNABLE_TO_GET_ISSUER_CERT_LOCALLY",
+              "CERT_HAS_EXPIRED",
+              "CERT_NOT_YET_VALID",
+              "ERR_TLS_CERT_ALTNAME_INVALID",
+              "HOSTNAME_MISMATCH"
+            ]
+          }
+        },
+        "examples": [
+          {
+            "status": 200,
+            "outcome": "ack"
+          },
+          {
+            "status": 201,
+            "outcome": "ack"
+          },
+          {
+            "status": 204,
+            "outcome": "ack"
+          },
+          {
+            "status": 301,
+            "outcome": "permanent"
+          },
+          {
+            "status": 302,
+            "outcome": "permanent"
+          },
+          {
+            "status": 308,
+            "outcome": "permanent"
+          },
+          {
+            "status": 400,
+            "outcome": "permanent"
+          },
+          {
+            "status": 401,
+            "outcome": "permanent"
+          },
+          {
+            "status": 403,
+            "outcome": "permanent"
+          },
+          {
+            "status": 404,
+            "outcome": "permanent"
+          },
+          {
+            "status": 410,
+            "outcome": "permanent"
+          },
+          {
+            "status": 413,
+            "outcome": "permanent"
+          },
+          {
+            "status": 422,
+            "outcome": "permanent"
+          },
+          {
+            "status": 408,
+            "outcome": "retryable-bounded"
+          },
+          {
+            "status": 425,
+            "outcome": "retryable-bounded"
+          },
+          {
+            "status": 429,
+            "outcome": "retryable"
+          },
+          {
+            "status": 500,
+            "outcome": "retryable-bounded"
+          },
+          {
+            "status": 501,
+            "outcome": "retryable-bounded"
+          },
+          {
+            "status": 505,
+            "outcome": "retryable-bounded"
+          },
+          {
+            "status": 502,
+            "outcome": "retryable"
+          },
+          {
+            "status": 503,
+            "outcome": "retryable"
+          },
+          {
+            "status": 504,
+            "outcome": "retryable"
+          }
+        ]
+      },
+      "timeout": {
+        "defaultMs": 10000,
+        "maxMs": 25000,
+        "maxBelowAckWait": true,
+        "scope": "total-attempt"
+      },
+      "retryAfter": {
+        "appliesTo": "first-retry-only",
+        "maxMs": 300000,
+        "formats": [
+          "delta-seconds",
+          "http-date"
+        ],
+        "onlyOn": "retryable-outcomes",
+        "$comment": "Con backoff configurado, JetStream ignora el delay de un nak desde la segunda reentrega (03-delivery.md §2.2; A-158)."
+      },
+      "retries": "consumer-canonical-config",
+      "ordering": "none",
+      "concurrencyPerDelivery": "sequential",
+      "deliveriesPerSubjectPerClient": 1,
+      "$commentOnePerSubject": "Dos URLs para el mismo evento compartirian durable, y un durable compartido reparte los mensajes entre quienes lo usan (A-47).",
+      "classification": {
+        "allowedByDefault": [
+          "public",
+          "internal"
+        ],
+        "confidentialRequiresExplicitOptIn": true,
+        "confidentialRequiresHttps": true,
+        "restricted": "never",
+        "deniedCode": "DELIVERY_CLASSIFICATION_DENIED",
+        "deniedClass": "permanent",
+        "deniedMessageNeverQuotesData": true,
+        "spec": "specification/06-security.md §5"
+      },
+      "receiverMust": [
+        "verify-raw-bytes",
+        "validate-hex-format",
+        "constant-time-compare",
+        "check-tolerance-symmetric",
+        "deduplicate-by-idempotency-key",
+        "2xx-only-after-storing"
+      ],
+      "state": {
+        "normative": false,
+        "bodyIsEvent": false,
+        "body": "state-entry-json",
+        "fields": [
+          "contract",
+          "tenantId",
+          "key",
+          "deleted",
+          "aggregateVersion",
+          "revision",
+          "data"
+        ],
+        "idempotencyKey": "<contract>/<tenant>/<key>@<revision>",
+        "defaultClassification": "confidential",
+        "$comment": "watch entrega la ENTRADA, no el CloudEvent: el SDK no expone el sobre. Por eso no es normativo (12-edge.md §4.8)."
+      }
+    },
+    "externalId": {
+      "spec": "specification/01-envelope.md §2.6.1",
+      "layout": "uuidv7",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+      "valid": [
+        "01a01eb4-7a54-7325-ac9b-67da707ec1d4",
+        "00000000-0000-7fdc-8906-90c15f53aa90",
+        "01924f8e-7c3a-7b2d-9e14-3f8a1c9d0e55"
+      ],
+      "invalid": [
+        "01a01eb4-7a54-4325-ac9b-67da707ec1d4",
+        "01a01eb4-7a54-7325-1c9b-67da707ec1d4",
+        "01a01eb4-7a54-7325-cc9b-67da707ec1d4",
+        "01A01EB4-7A54-7325-ac9b-67DA707EC1D4",
+        "01a01eb47a54-7325-ac9b-67da707ec1d4"
+      ],
+      "timeBits": 48,
+      "randomBits": 74,
+      "randABits": 12,
+      "randBBits": 62,
+      "derivation": "first-74-bits-of-SHA-256(source|externalKey)",
+      "hash": "SHA-256",
+      "separator": "|",
+      "encoding": "UTF-8-literal",
+      "timeIs": "the-instant-of-the-external-fact",
+      "requiresTime": true,
+      "timeNeverNow": true,
+      "externalKeyMinBytes": 1,
+      "externalKeyMaxBytes": 512,
+      "sourceMustNotContain": "|",
+      "msRange": [
+        0,
+        281474976710655
+      ],
+      "pureFunction": true,
+      "keyIsUniquePerFactWithinSource": true,
+      "doesNotReplaceConsumerDedupe": true,
+      "sdkApi": "publish(subject, data, { externalKey, time })",
+      "casesFile": "conformance/cases/cross-sdk-external-id.json",
+      "vectors": [
+        {
+          "source": "/produccion/pasarela-web",
+          "externalKey": "pasarela:evt_1Nx",
+          "time": "2026-08-20T10:25:39.412Z",
+          "id": "01a01eb4-7a54-7325-ac9b-67da707ec1d4"
+        },
+        {
+          "source": "/produccion/pasarela-web",
+          "externalKey": "pasarela:evt_1Ny",
+          "time": "2026-08-20T10:25:39.412Z",
+          "id": "01a01eb4-7a54-7923-9653-1de6ff56d23a"
+        },
+        {
+          "source": "/produccion/otra-web",
+          "externalKey": "pasarela:evt_1Nx",
+          "time": "2026-08-20T10:25:39.412Z",
+          "id": "01a01eb4-7a54-7b72-9f1e-b64778eeb41f"
+        },
+        {
+          "source": "/produccion/pasarela-web",
+          "externalKey": "pasarela:evt_1Nx",
+          "time": "2026-08-20T10:25:39.413Z",
+          "id": "01a01eb4-7a55-7325-ac9b-67da707ec1d4"
+        },
+        {
+          "source": "/dev/tienda-web",
+          "externalKey": "pedido-ñandú-ß-日本",
+          "time": "2024-02-29T23:59:59.999Z",
+          "id": "018df74f-83ff-72cc-9c87-4843a505450d"
+        },
+        {
+          "source": "/dev/a",
+          "externalKey": "k",
+          "time": "1970-01-01T00:00:00.000Z",
+          "id": "00000000-0000-7fdc-8906-90c15f53aa90"
+        }
+      ],
+      "providerWithoutFactTime": {
+        "hasDeterministicId": false,
+        "gatewayHook": "idempotent-false",
+        "msZeroAdopted": false
+      }
+    },
+    "manifest": {
+      "$comment": "`via` es una ANOTACION del manifiesto (scripts/lib/manifest.mjs, specification/06-security.md §3 y 12-edge.md §3): sus permisos son los de cualquier servicio con lo mismo declarado.",
+      "key": "via",
+      "values": [
+        "gateway"
+      ],
+      "unknownValueRejected": true,
+      "annotationOnly": true,
+      "extraPermissions": "none",
+      "gatewayNeedsSpecialPermissions": false,
+      "servesRejected": true,
+      "serviceHasItsOwnIdentity": true
+    },
+    "gateway": {
+      "implementation": true,
+      "package": "gateway/",
+      "framework": "none",
+      "httpServer": "node:http",
+      "$comment": "Describe el gateway de REFERENCIA. No es el protocolo: otro gateway puede hacerlo distinto mientras respete edge.delivery y edge.externalId.",
+      "routes": [
+        {
+          "method": "POST",
+          "path": "/v1/events/{subject}",
+          "does": "publish",
+          "response": 202
+        },
+        {
+          "method": "PUT",
+          "path": "/v1/state/{contract}/{key}",
+          "does": "state.put",
+          "response": 200
+        },
+        {
+          "method": "DELETE",
+          "path": "/v1/state/{contract}/{key}",
+          "does": "state.delete",
+          "response": 200
+        },
+        {
+          "method": "GET",
+          "path": "/v1/state/{contract}/{key}",
+          "does": "state.get",
+          "response": 200
+        },
+        {
+          "method": "POST",
+          "path": "/v1/rpc/{operation}",
+          "does": "request",
+          "response": 200
+        },
+        {
+          "method": "POST",
+          "path": "/v1/hooks/{name}",
+          "does": "publish-from-third-party",
+          "response": 202,
+          "auth": "hmac"
+        },
+        {
+          "method": "GET",
+          "path": "/healthz",
+          "does": "health",
+          "response": 200,
+          "auth": "none"
+        }
+      ],
+      "headers": {
+        "aggregateId": "Flux-Aggregate-Id",
+        "tenant": "Flux-Tenant",
+        "classification": "Flux-Classification",
+        "eventTime": "Flux-Event-Time",
+        "timeoutMs": "Flux-Timeout-Ms",
+        "idempotencyKey": "Idempotency-Key"
+      },
+      "idempotencyKeyRequiresEventTime": true,
+      "bodyIsDataObject": true,
+      "envelopeNeverWrittenByHand": true,
+      "auth": {
+        "scheme": "Bearer",
+        "storedAs": "sha256",
+        "plaintextTokenStored": false,
+        "compare": "timingSafeEqual-of-sha256-digests",
+        "compareLoopsAllClients": true,
+        "sameResponseForUnknownAndMissing": true,
+        "tokenBytes": 32,
+        "tokensPerClient": "many",
+        "hooksAuthenticatedBy": "hmac-not-bearer",
+        "hookWithoutVerifyRefusesToStart": true,
+        "hookVerifySchemes": [
+          "hmac-sha256"
+        ],
+        "hookSignatureFormats": [
+          "hex",
+          "sha256=hex",
+          "stripe"
+        ],
+        "hookToleranceSecondsDefault": 300
+      },
+      "hooks": {
+        "keyNamespace": "<hook>:<providerKey>",
+        "timeFrom": [
+          "body",
+          "header"
+        ],
+        "timeUnits": [
+          "seconds",
+          "milliseconds",
+          "iso"
+        ],
+        "defaultClassification": "confidential",
+        "dataSelection": "pick-or-whole-body",
+        "idempotentFalseRequiresExplicit": true,
+        "duplicateReturnsSameId": true,
+        "duplicateStatus": 202,
+        "publishesOnlyInOwnDomain": true
+      },
+      "limits": {
+        "maxBodyBytes": 1048576,
+        "maxBodyBytesIsEventLimit": true,
+        "rejectsBeforeReading": true,
+        "closesConnectionOnOversize": true,
+        "chunkedStopsAtLimit": true,
+        "rateLimitPer": "token",
+        "hookRateLimitPer": "hook-name",
+        "rateLimitIsPerInstance": true,
+        "rateLimitAlgorithm": "token-bucket",
+        "serverTimeoutMs": 60000,
+        "serverTimeoutAboveRpcMaxMs": true,
+        "connectionsCheckingIntervalMs": 1000,
+        "headersTimeoutMs": 10000,
+        "requestTimeoutMs": 30000
+      },
+      "tls": {
+        "modes": [
+          "terminates-in-front",
+          "in-gateway"
+        ],
+        "atLeastOneRequiredInProduction": true,
+        "inGatewayConfig": [
+          "certFile",
+          "keyFile"
+        ],
+        "natsTlsSeparate": true
+      },
+      "logging": {
+        "neverLogs": [
+          "data",
+          "authorization",
+          "token",
+          "secrets",
+          "response-body"
+        ],
+        "logsDataOfConfidential": false,
+        "logsDataOfAnyClassification": false,
+        "logs": [
+          "client",
+          "route",
+          "status",
+          "durationMs",
+          "eventId",
+          "subjectOrOperation",
+          "code"
+        ]
+      },
+      "config": {
+        "file": "gateway.json",
+        "holdsSecrets": false,
+        "secretsByEnvVarName": true,
+        "refusesPlaintextSecretKeys": [
+          "nkeySeed",
+          "credsContent",
+          "token",
+          "secret",
+          "password",
+          "pass"
+        ],
+        "refusesNatsSeedShapedValues": true,
+        "missingEnvVarNamedInError": true,
+        "tokensAreSha256Hex": true,
+        "onePerSubjectPerClient": true,
+        "hookNamesUniqueAcrossClients": true
+      },
+      "shutdown": {
+        "order": [
+          "stop-accepting",
+          "answer-in-flight-with-connection-close",
+          "close-idle",
+          "drain-nats"
+        ],
+        "hardDeadline": true
+      },
+      "errors": {
+        "bodyShape": {
+          "error": [
+            "code",
+            "class",
+            "message",
+            "retryAfterMs"
+          ]
+        },
+        "classes": [
+          "retryable",
+          "permanent"
+        ],
+        "statusRule": "4xx-client-5xx-ecosystem-class-says-if-retry-helps",
+        "messageNeverQuotesData": true,
+        "retryAfterHeaderOnRetryable": true,
+        "protocolCodes": {
+          "INVALID_SCHEMA": {
+            "status": 422,
+            "class": "permanent",
+            "definedIn": "reused"
+          },
+          "INVALID_DATACLASSIFICATION": {
+            "status": 400,
+            "class": "permanent",
+            "definedIn": "reused"
+          },
+          "SCHEMA_NOT_FOUND": {
+            "status": 500,
+            "class": "permanent",
+            "definedIn": "reused"
+          },
+          "RESERVED_DOMAIN": {
+            "status": 400,
+            "class": "permanent"
+          },
+          "INVALID_STATE_CONTRACT": {
+            "status": 400,
+            "class": "permanent"
+          },
+          "INVALID_STATE_KEY": {
+            "status": 400,
+            "class": "permanent"
+          },
+          "INVALID_TENANT_FOR_STATE": {
+            "status": 400,
+            "class": "permanent"
+          },
+          "MISSING_AGGREGATE_VERSION": {
+            "status": 422,
+            "class": "permanent"
+          },
+          "STATE_CONFLICT": {
+            "status": 409,
+            "class": "retryable"
+          },
+          "INVALID_RPC_CALL": {
+            "status": 400,
+            "class": "permanent"
+          },
+          "RPC_UNAVAILABLE": {
+            "status": 503,
+            "class": "retryable",
+            "retryAfterSeconds": 1
+          },
+          "RPC_TIMEOUT": {
+            "status": 504,
+            "class": "retryable",
+            "ambiguous": true
+          },
+          "RPC_MESSAGE_TOO_LARGE": {
+            "status": 413,
+            "class": "permanent"
+          },
+          "RPC_INVALID_REPLY": {
+            "status": 500,
+            "class": "permanent"
+          },
+          "STALE_REQUEST": {
+            "status": 400,
+            "class": "permanent"
+          },
+          "PERMISSION_DENIED": {
+            "status": 403,
+            "class": "permanent",
+            "deniedByBroker": true
+          },
+          "NOT_PROVISIONED": {
+            "status": 500,
+            "class": "permanent"
+          }
+        },
+        "remoteErrors": {
+          "retryable": 503,
+          "permanent": 422,
+          "keepsTheirCode": true
+        },
+        "notSurfaced": {
+          "CONNECTION_REJECTED": "connect",
+          "INVALID_CREDENTIALS": "connect",
+          "INVALID_TLS_OPTIONS": "connect",
+          "STATE_SUBJECT_MISMATCH": "consume",
+          "MISSING_SIGNATURE": "signing-not-enabled-in-gateway",
+          "INVALID_SIGNATURE": "signing-not-enabled-in-gateway",
+          "UNKNOWN_SIGNING_KEY": "signing-not-enabled-in-gateway"
+        },
+        "codes": {
+          "EDGE_UNAUTHENTICATED": {
+            "status": 401,
+            "class": "permanent"
+          },
+          "EDGE_RATE_LIMITED": {
+            "status": 429,
+            "class": "retryable"
+          },
+          "EDGE_BODY_TOO_LARGE": {
+            "status": 413,
+            "class": "permanent"
+          },
+          "EDGE_INVALID_BODY": {
+            "status": 400,
+            "class": "permanent"
+          },
+          "EDGE_UNSUPPORTED_MEDIA_TYPE": {
+            "status": 415,
+            "class": "permanent"
+          },
+          "EDGE_INVALID_REQUEST": {
+            "status": 400,
+            "class": "permanent"
+          },
+          "EDGE_TENANT_NOT_ALLOWED": {
+            "status": 403,
+            "class": "permanent"
+          },
+          "EDGE_NOT_FOUND": {
+            "status": 404,
+            "class": "permanent"
+          },
+          "EDGE_METHOD_NOT_ALLOWED": {
+            "status": 405,
+            "class": "permanent"
+          },
+          "EDGE_INVALID_WEBHOOK_SIGNATURE": {
+            "status": 401,
+            "class": "permanent"
+          },
+          "EDGE_WEBHOOK_TIMESTAMP_OUT_OF_TOLERANCE": {
+            "status": 401,
+            "class": "permanent"
+          },
+          "EDGE_WEBHOOK_PAYLOAD_INVALID": {
+            "status": 422,
+            "class": "permanent"
+          },
+          "EDGE_SHUTTING_DOWN": {
+            "status": 503,
+            "class": "retryable"
+          },
+          "EDGE_INTERNAL": {
+            "status": 500,
+            "class": "permanent"
+          }
+        },
+        "codesAreNotProtocolCodes": true
+      }
     }
   }
 }

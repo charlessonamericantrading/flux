@@ -104,6 +104,12 @@
  *   · Solo el dueño de un dominio atiende sus operaciones; una operación llamada debe estar atendida; un servicio
  *     no se llama a sí mismo; una operación con dominio reservado (`rpc.…`, `state.…`) o con comodín se rechaza.
  *   · Un servicio que solo llama NO recibe ninguna suscripción de dominio ni `allow_responses`.
+ *
+ * Cliente de borde (specification/12-edge.md §2): `"via": "gateway"` marca un servicio cuya conexión NATS vive dentro del
+ * gateway HTTP, para sistemas que no pueden mantener una (hosting compartido, cron, serverless, un tercero). Es una
+ * ANOTACIÓN: sus permisos son exactamente los de cualquier servicio con lo mismo declarado —el gateway no necesita ninguno
+ * especial, y un cliente de borde NO tiene más que el que declara—. Un cliente de borde no puede llevar `serves`: atender una
+ * operación exige una suscripción viva y HTTP no la sostiene. Un valor de `via` desconocido es un error.
  */
 
 import { readFile } from "node:fs/promises";
@@ -281,6 +287,7 @@ if (args.json) {
       const perm = permisosDe(s, { dev: !!args.dev });
       filas.push({
         name: s.name,
+        via: s.via,
         ...(t && { tenant: t, account: `${env.toUpperCase()}_${up(t)}` }),
         publish: perm.publish,
         subscribe: perm.subscribe,
@@ -314,6 +321,7 @@ function renderUsuario(svc, { id, placeholder, titulo }) {
   const l = [];
   l.push(``);
   l.push(`      # ${titulo}`);
+  if (svc.via === "gateway") l.push(`      #   cliente de borde: su conexión vive en el gateway (12-edge.md §2); sus permisos son los de cualquier servicio`);
   if (svc.owns.length) l.push(`      #   dueño de: ${svc.owns.join(", ")}`);
   if (svc.consumes.length) {
     l.push(`      #   consume: ${svc.consumes.join(", ")}`);

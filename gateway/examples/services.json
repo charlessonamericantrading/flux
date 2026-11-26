@@ -1,0 +1,63 @@
+{
+  "$comment": "El ecosistema del ejemplo del gateway (y de sus pruebas): tres servicios NATIVOS (con conexión propia) y tres CLIENTES DE BORDE (`\"via\": \"gateway\"`: su conexión NATS vive dentro del gateway, con SUS credenciales y SUS permisos). Los permisos de todos salen de scripts/gen-acl.mjs, con el índice de contratos de `bundle.json` de esta carpeta (`--bundle gateway/examples/bundle.json`); el gateway no necesita ninguno especial (specification/12-edge.md §3). tienda-web: publica pedidos, llama a precios-api, lee el estado de catálogo (solo del tenant acme) y recibe por HTTP los ajustes de inventario. catalogo-web: dueño del estado de catálogo (PUT y DELETE) y NO puede llamar a precios-api. pasarela-web: recibe los webhooks de la pasarela de pagos de un tercero.",
+  "environment": "produccion",
+  "services": [
+    {
+      "name": "inventario-api",
+      "owns": [
+        "inventario"
+      ]
+    },
+    {
+      "name": "precios-api",
+      "owns": [
+        "precios"
+      ],
+      "serves": [
+        "precios.tarifa.v1.calcular"
+      ]
+    },
+    {
+      "name": "contabilidad-api",
+      "consumes": [
+        "pagos.cobro.v1.recibido",
+        "pedidos.pedido.v1.creado"
+      ]
+    },
+    {
+      "name": "tienda-web",
+      "via": "gateway",
+      "owns": [
+        "pedidos"
+      ],
+      "consumes": [
+        "inventario.stock.v1.ajustado"
+      ],
+      "calls": [
+        "precios.tarifa.v1.calcular"
+      ],
+      "watches": [
+        {
+          "contract": "catalogo.producto.v1",
+          "tenants": [
+            "acme"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "catalogo-web",
+      "via": "gateway",
+      "owns": [
+        "catalogo"
+      ]
+    },
+    {
+      "name": "pasarela-web",
+      "via": "gateway",
+      "owns": [
+        "pagos"
+      ]
+    }
+  ]
+}

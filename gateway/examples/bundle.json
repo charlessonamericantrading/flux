@@ -1,0 +1,17 @@
+{
+  "$comment": "Índice mínimo para gen-acl.mjs y flux provision (`--bundle`) en el ejemplo del gateway: solo importan las CLAVES de `subjects`, `state` y `rpc` (qué contratos existen). En tu ecosistema es schemas/bundle.json, generado con scripts/bundle-schemas.mjs. El gateway del ejemplo no valida L3.",
+  "subjects": {
+    "inventario.stock.v1.ajustado": "https://schemas.internal/inventario/stock/ajustado/1.0.0.json",
+    "pedidos.pedido.v1.creado": "https://schemas.internal/pedidos/pedido/creado/1.0.0.json",
+    "pagos.cobro.v1.recibido": "https://schemas.internal/pagos/cobro/recibido/1.0.0.json"
+  },
+  "state": {
+    "catalogo.producto.v1": "https://schemas.internal/state/catalogo/producto/1.0.0.json"
+  },
+  "rpc": {
+    "precios.tarifa.v1.calcular": {
+      "request": "https://schemas.internal/rpc/precios/tarifa/calcular/request/1.0.0.json",
+      "reply": "https://schemas.internal/rpc/precios/tarifa/calcular/reply/1.0.0.json"
+    }
+  }
+}

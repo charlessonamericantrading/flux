@@ -11,6 +11,7 @@
  * es inválido.
  */
 
+import { createHash, createHmac } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -23,6 +24,8 @@ import {
   STATE_CONTRACT_RE,
   STATE_TENANT_MAX,
   STATE_TENANT_RE,
+  VIA_VALUES,
+  analizarManifiesto,
   permisosDe,
 } from "./lib/manifest.mjs";
 
@@ -343,6 +346,23 @@ const CASES = [
   ["rpc.metrics.operationLabelPattern",
     ["clientes.cliente.v1.obtener", "logistica.linea-envio.v2.reservar-stock"],
     ["rpc.clientes.cliente.v1.obtener", "clientes.cliente.v1", "clientes.cliente.v1.obtener.x", "Clientes.cliente.v1.obtener"]],
+
+  // El borde (12-edge.md): lo que recibe un receptor HTTP y el id determinista. Cada patrón, en los dos sentidos.
+  ["edge.delivery.signature.pattern",
+    ["t=1700000000,v1=8dbbbbf4523b10bbb793e74d854144c45acccc2d233667b1c06b805b6ded8a84"],
+    ["v1=8dbbbbf4523b10bbb793e74d854144c45acccc2d233667b1c06b805b6ded8a84", "t=1700000000", "t=1700000000,v1=", "t=1700000000,v1=ABC",
+     "t=1700000000,v1=8dbbbbf4523b10bbb793e74d854144c45acccc2d233667b1c06b805b6ded8a8", "t=1700000000, v1=8dbbbbf4523b10bbb793e74d854144c45acccc2d233667b1c06b805b6ded8a84",
+     "t=-1,v1=8dbbbbf4523b10bbb793e74d854144c45acccc2d233667b1c06b805b6ded8a84", "sha256=8dbbbbf4523b10bbb793e74d854144c45acccc2d233667b1c06b805b6ded8a84"]],
+  ["edge.delivery.response.codePattern",
+    ["HTTP_503", "HTTP_429", "HTTP_400", "HTTP_302"],
+    ["HTTP_99", "HTTP_1000", "HTTP_600", "http_503", "HTTP-503", "503", "HTTP_5O3"]],
+  ["edge.externalId.pattern",
+    ["01a01eb4-7a54-7325-ac9b-67da707ec1d4", "00000000-0000-7fdc-8906-90c15f53aa90", "ffffffff-ffff-7000-bfff-ffffffffffff"],
+    ["01a01eb4-7a54-4325-ac9b-67da707ec1d4",   // versión 4
+     "01a01eb4-7a54-7325-1c9b-67da707ec1d4",   // variante 0
+     "01a01eb4-7a54-7325-cc9b-67da707ec1d4",   // variante 11
+     "01A01EB4-7A54-7325-AC9B-67DA707EC1D4",   // mayúsculas
+     "01a01eb47a54-7325-ac9b-67da707ec1d4", "01a01eb4-7a54-7325-ac9b-67da707ec1d", "01a01eb4-7a54-7325-ac9b-67da707ec1d4\n"]],
 ];
 
 // ─── La ACL de ESTADO y su generador — 06-security.md §3.8 ───────────────────────────────────────
@@ -1040,6 +1060,269 @@ function fallosDeRpc(doc) {
 }
 
 
+// ─── El borde: gateway HTTP — specification/12-edge.md ───────────────────────────────────────────────────────────
+// Como `fallosDeRpc`: una función PURA sobre el documento, que se ejecuta sobre el protocol.json real (cero fallos) y sobre
+// copias estropeadas a propósito (cada una DEBE dar al menos uno). Además RECALCULA lo que el documento afirma con vectores:
+// los HMAC de la entrega saliente (con `node:crypto`, no con el gateway) y los `id` deterministas (con BigInt, no con el SDK).
+// Una invariante que solo se ha visto en verde no demuestra nada, y un vector copiado de la salida de quien lo ejecuta tampoco.
+
+/** El id determinista de 01-envelope.md §2.6.1, escrito otra vez aquí: independiente del SDK que se verifica. */
+function idDeterminista(source, clave, ms) {
+  const h = createHash("sha256").update(`${source}|${clave}`, "utf8").digest();
+  const r = BigInt(`0x${h.subarray(0, 10).toString("hex")}`) >> 6n;
+  const u = (BigInt(ms) << 80n) | (0x7n << 76n) | ((r >> 62n) << 64n) | (0b10n << 62n) | (r & ((1n << 62n) - 1n));
+  const x = u.toString(16).padStart(32, "0");
+  return `${x.slice(0, 8)}-${x.slice(8, 12)}-${x.slice(12, 16)}-${x.slice(16, 20)}-${x.slice(20)}`;
+}
+
+/** El HMAC de la entrega saliente: `t + "." + cuerpo` (o solo el cuerpo si no hay `t`: el formato de GitHub). */
+function hmacHex(secreto, t, cuerpo) {
+  const h = createHmac("sha256", secreto);
+  if (t !== null && t !== undefined) h.update(`${t}.`, "utf8");
+  return h.update(cuerpo, "utf8").digest("hex");
+}
+
+/** Lo que el documento dice de una respuesta HTTP del receptor, como función: el contrato de 12-edge.md §4.4. */
+function claseDeRespuesta(doc, status) {
+  const r = doc.edge?.delivery?.response ?? {};
+  if (status >= 200 && status <= 299) return "ack";
+  if ((doc.errors?.classes?.retryable?.httpStatus ?? []).includes(status)) return "retryable";
+  if ((r.retryableBounded?.httpStatus ?? []).includes(status) || (r.retryableBounded?.alsoEveryOther5xx === true && status >= 500 && status <= 599)) return "retryable-bounded";
+  return "permanent";
+}
+
+/** Un manifiesto mínimo para comprobar `via`: lo que dice `edge.manifest` frente a lo que hace el analizador y el generador. */
+const BUNDLE_DE_EDGE = { subjects: ["pedidos.pedido.v1.creado", "inventario.stock.v1.ajustado"], state: [], rpc: ["clientes.cliente.v1.obtener"] };
+const clienteDeBorde = (extra = {}) => ({
+  name: "tienda-web", owns: ["pedidos"], consumes: ["inventario.stock.v1.ajustado"], calls: ["clientes.cliente.v1.obtener"], ...extra,
+});
+const manifiestoDeEdge = (cliente) => ({
+  services: [
+    cliente,
+    { name: "inventario-api", owns: ["inventario"] },
+    { name: "crm-api", owns: ["clientes"], serves: ["clientes.cliente.v1.obtener"] },
+  ],
+});
+
+/** @returns {string[]} */
+function fallosDeEdge(doc, { analizar = analizarManifiesto, emitir = permisosDe } = {}) {
+  const f = [];
+  const e = doc.edge;
+  if (!e) return ["falta el bloque `edge` (12-edge.md)"];
+  const eq = (a, b) => JSON.stringify(a) === JSON.stringify(b);
+  const re = (src) => { try { return new RegExp(src); } catch { return /(?!)/; } };
+  const cs = doc.errors?.codes ?? {};
+
+  // No es una capacidad de SDK: ni definida ni declarada.
+  if (e.capability !== null) f.push("edge.capability debe ser null: el gateway no es una capacidad de SDK (12-edge.md encabezado)");
+  if (doc.capabilities?.definitions?.edge) f.push("capabilities.definitions.edge no debe existir: el gateway no es una capacidad de SDK");
+  for (const [sdk, v] of Object.entries(doc.capabilities?.sdks ?? {})) if ((v?.capabilities ?? []).includes("edge")) f.push(`capabilities.sdks.${sdk} declara «edge»: ningún SDK implementa el gateway`);
+  if (!eq(e.normative, ["delivery", "externalId"])) f.push("edge.normative debe ser [delivery, externalId]: es normativo SOLO el formato de la entrega saliente y el id determinista");
+  if (!eq(e.implementationOnly, ["gateway", "manifest"])) f.push("edge.implementationOnly debe ser [gateway, manifest]: el resto es una implementación, no el protocolo");
+  if (e.gateway?.implementation !== true) f.push("edge.gateway.implementation debe ser true");
+
+  // ── La entrega saliente ──────────────────────────────────────────────────────────────────────────────────────
+  const d = e.delivery ?? {};
+  if (d.method !== "POST") f.push("edge.delivery.method debe ser POST");
+  if (d.contentType !== "application/cloudevents+json; charset=utf-8" || d.contentTypeIsStructuredMode !== true) f.push("edge.delivery.contentType debe ser application/cloudevents+json; charset=utf-8, el structured mode de 01-envelope.md §1");
+  if (d.body?.isEventVerbatim !== true || d.body?.sameBytesEveryAttempt !== true || d.body?.dlqExtensionsStripped !== true || d.body?.serialization !== "cloudevents.attributeOrder") f.push("edge.delivery.body: el CloudEvent tal cual (orden de atributos de cloudevents.attributeOrder, sin extensiones dlq*) y los mismos bytes en cada intento");
+  if (d.headers?.idempotencyKey?.name !== "Idempotency-Key" || d.headers?.idempotencyKey?.value !== "event.id" || d.headers?.idempotencyKey?.sameEveryAttempt !== true) f.push("edge.delivery.headers.idempotencyKey: `Idempotency-Key` = el id del evento, el mismo en cada intento");
+  if (d.headers?.signature?.name !== "Flux-Signature") f.push("edge.delivery.headers.signature.name debe ser Flux-Signature");
+  const sg = d.signature ?? {};
+  if (sg.algorithm !== "HMAC-SHA256" || sg.signedMessage !== "<t>.<body-bytes>" || sg.encoding !== "hex-lowercase" || sg.hexLength !== 64 || sg.timestampUnit !== "seconds" || sg.key !== "secret-utf8-bytes") f.push("edge.delivery.signature: HMAC-SHA256 de `<t>.<bytes del cuerpo>`, en hexadecimal minúsculas de 64 caracteres, t en segundos");
+  if (sg.timestampRenewedEveryAttempt !== true) f.push("edge.delivery.signature.timestampRenewedEveryAttempt debe ser true: con un t fijo, la tolerancia rechazaría los reintentos de 51 min");
+  if (sg.multipleV1ForRotation !== true || sg.unknownFieldsIgnored !== true) f.push("edge.delivery.signature: varios v1 para rotar secretos sin corte, y los campos desconocidos se ignoran");
+  const rc = sg.receiver ?? {};
+  if (rc.verifyRawBytes !== true || rc.validateHexFormatBeforeDecoding !== true) f.push("edge.delivery.signature.receiver: se verifica sobre los bytes en bruto y el formato hexadecimal se valida ANTES de decodificar (en Node, Buffer.from('abc','hex') da un byte sin error: A-154)");
+  if (rc.compare !== "constant-time") f.push("edge.delivery.signature.receiver.compare debe ser constant-time");
+  if (rc.toleranceSeconds !== 300 || rc.toleranceSymmetric !== true) f.push("edge.delivery.signature.receiver: tolerancia de 300 s y simétrica (un t del futuro también se rechaza)");
+  if (rc.rejectedAs !== "4xx") f.push("edge.delivery.signature.receiver.rejectedAs debe ser 4xx: una firma rechazada es PERMANENT, reintentarla no la arregla");
+  if (rc.deduplicateBy !== "Idempotency-Key") f.push("edge.delivery.signature.receiver.deduplicateBy debe ser Idempotency-Key");
+  if (sg.secret?.neverInConfiguration !== true || !(sg.secret?.recommendedMinBytes >= 32)) f.push("edge.delivery.signature.secret: nunca en la configuración y de al menos 32 bytes");
+  const sigRe = re(sg.pattern ?? "(?!)");
+  for (const v of sg.valid ?? []) if (!sigRe.test(v)) f.push(`edge.delivery.signature.valid: el patrón rechaza ${JSON.stringify(v)}`);
+  for (const v of sg.invalid ?? []) if (sigRe.test(v)) f.push(`edge.delivery.signature.invalid: el patrón acepta ${JSON.stringify(v)}`);
+  // Los vectores se RECALCULAN: un v1 copiado de la salida del gateway no demuestra nada.
+  if ((sg.vectors ?? []).length < 4) f.push("edge.delivery.signature.vectors: faltan vectores (cuerpo mínimo, vacío, el evento con no-ASCII y el de GitHub)");
+  for (const v of sg.vectors ?? []) {
+    const calculado = hmacHex(v.secret, v.t, v.body);
+    if (calculado !== v.v1) f.push(`edge.delivery.signature.vectors «${v.name}»: HMAC-SHA256 recalculado ${calculado} ≠ ${v.v1}`);
+    if (!/^[0-9a-f]{64}$/.test(v.v1 ?? "")) f.push(`edge.delivery.signature.vectors «${v.name}»: v1 no es hexadecimal de 64 minúsculas`);
+  }
+  if (!(sg.vectors ?? []).some((v) => /[^\x00-\x7f]/.test(v.body ?? ""))) f.push("edge.delivery.signature.vectors: debe haber un cuerpo con no-ASCII: el HMAC es sobre bytes UTF-8, no sobre caracteres");
+  if (!(sg.vectors ?? []).some((v) => v.t === null && v.secret === "It's a Secret to Everybody" && v.body === "Hello, World!")) f.push("edge.delivery.signature.vectors: falta el vector publicado de GitHub (un HMAC que no es el nuestro: comprueba la primitiva, no el formato)");
+  const rot = sg.rotationVector ?? {};
+  if ((rot.secrets ?? []).length < 2 || !eq((rot.secrets ?? []).map((s) => hmacHex(s, rot.t, rot.body)), rot.v1)) f.push("edge.delivery.signature.rotationVector: dos secretos, y sus v1 recalculados");
+  else if (!sigRe.test(`t=${rot.t},${rot.v1.map((x) => `v1=${x}`).join(",")}`)) f.push("edge.delivery.signature.rotationVector: la cabecera con dos v1 no cumple el patrón");
+
+  const rs = d.response ?? {};
+  if (rs.bodyIgnored !== true || rs.bodyNeverLogged !== true) f.push("edge.delivery.response: el cuerpo de la respuesta del receptor se descarta y no se registra");
+  if (rs.redirectsFollowed !== false) f.push("edge.delivery.response.redirectsFollowed debe ser false: seguirla enviaría el cuerpo firmado a una URL que el operador no configuró");
+  if (rs.firmRejectedIsPermanent !== true) f.push("edge.delivery.response.firmRejectedIsPermanent debe ser true: reintentar una firma rechazada no la arregla");
+  if (rs.retryable?.httpStatus !== "errors.classes.retryable.httpStatus" || rs.retryable?.budget !== doc.consumer?.maxDeliver || rs.retryable?.budget !== doc.errors?.budgets?.recognizedRetryable) f.push("edge.delivery.response.retryable: los de errors.classes.retryable.httpStatus, con el presupuesto completo (consumer.maxDeliver)");
+  if (rs.retryableBounded?.budget !== doc.errors?.unknownRetryBudget || rs.retryableBounded?.budget !== doc.errors?.budgets?.unknown) f.push("edge.delivery.response.retryableBounded.budget debe ser el de lo desconocido (errors.unknownRetryBudget): un 500 no es un 503");
+  if (rs.permanent?.budget !== doc.errors?.budgets?.permanent) f.push("edge.delivery.response.permanent.budget debe ser errors.budgets.permanent (1: a la DLQ sin reintentos)");
+  if (rs.ack?.httpStatus !== "2xx") f.push("edge.delivery.response.ack debe ser 2xx");
+  if (re(rs.codePattern ?? "(?!)").source === "(?:)" || !re(doc.errors?.codePattern ?? "(?!)").test("HTTP_503")) f.push("edge.delivery.response.codePattern / errors.codePattern: el código HTTP_<n> debe ser un code válido");
+  // La función de clasificación, probada sobre TODO el rango de estados HTTP.
+  for (const x of rs.examples ?? []) if (claseDeRespuesta(doc, x.status) !== x.outcome) f.push(`edge.delivery.response.examples: el ${x.status} es «${claseDeRespuesta(doc, x.status)}» según el documento y el ejemplo dice «${x.outcome}»`);
+  for (let st = 100; st <= 599; st++) {
+    const c = claseDeRespuesta(doc, st);
+    if ((st >= 200 && st <= 299) !== (c === "ack")) { f.push(`edge.delivery.response: el estado ${st} es «${c}»: ack debe ser exactamente 2xx`); break; }
+    if (st >= 300 && st <= 399 && c !== "permanent") { f.push(`edge.delivery.response: la redirección ${st} es «${c}», debe ser permanent`); break; }
+    if (st >= 400 && st <= 499 && ![408, 425, 429].includes(st) && c !== "permanent") { f.push(`edge.delivery.response: el ${st} es «${c}»: un 4xx que no es 408, 425 ni 429 es permanent y va a la DLQ sin reintentos`); break; }
+    if (st >= 500 && st <= 599 && c === "permanent") { f.push(`edge.delivery.response: el ${st} es permanent: todo 5xx se reintenta (completo si es de errors.classes.retryable.httpStatus, acotado si no)`); break; }
+  }
+  for (const st of [429, 502, 503, 504]) if (claseDeRespuesta(doc, st) !== "retryable") f.push(`edge.delivery.response: el ${st} debe ser retryable (presupuesto completo)`);
+  for (const st of [500, 501, 505, 599]) if (claseDeRespuesta(doc, st) !== "retryable-bounded") f.push(`edge.delivery.response: el ${st} debe ser retryable-bounded (presupuesto de 2): no es un 503`);
+  const nw = rs.network ?? {};
+  const ejemplosRed = [...(doc.errors?.classes?.retryable?.syscallCodesExample ?? []), "TIMEOUT"];
+  if (!eq([...(nw.retryable ?? [])].sort(), [...ejemplosRed].sort())) f.push("edge.delivery.response.network.retryable debe ser errors.classes.retryable.syscallCodesExample más TIMEOUT");
+  if (nw.retryableBounded !== "anything-else") f.push("edge.delivery.response.network.retryableBounded: lo desconocido es retryable acotado (04-errors.md §2.1)");
+  const tl = nw.tlsVerificationFailure ?? {};
+  if (tl.class !== "permanent" || !re(doc.errors?.codePattern ?? "(?!)").test(tl.code ?? "") || !(tl.systemCodes ?? []).includes("DEPTH_ZERO_SELF_SIGNED_CERT") || !(tl.systemCodes ?? []).includes("ERR_TLS_CERT_ALTNAME_INVALID")) f.push("edge.delivery.response.network.tlsVerificationFailure: un certificado que no verifica es permanent, con un code estable y los códigos de Node medidos (A-161)");
+  const to = d.timeout ?? {};
+  if (to.defaultMs !== 10000 || to.maxMs !== doc.rpc?.timeout?.maxMs || !(to.maxMs < (doc.consumer?.ackWaitSeconds ?? 0) * 1000) || to.maxBelowAckWait !== true || to.scope !== "total-attempt") f.push("edge.delivery.timeout: 10 s por defecto y como máximo el del rpc (25 s, por debajo del ack_wait), total por intento");
+  const ra = d.retryAfter ?? {};
+  if (ra.appliesTo !== "first-retry-only" || ra.maxMs !== 300000 || !eq(ra.formats, ["delta-seconds", "http-date"]) || ra.onlyOn !== "retryable-outcomes") f.push("edge.delivery.retryAfter: solo acorta o alarga el PRIMER reintento (03-delivery.md §2.2), recortado a 300 s, en segundos o fecha HTTP, y solo en respuestas reintentables");
+  if (d.retries !== "consumer-canonical-config" || d.ordering !== "none") f.push("edge.delivery: los reintentos son los del consumidor canónico y no hay orden");
+  if (d.concurrencyPerDelivery !== "sequential" || d.deliveriesPerSubjectPerClient !== 1) f.push("edge.delivery: una entrega por subject y cliente (un durable compartido reparte los mensajes: A-47) y secuencial");
+  const cl = d.classification ?? {};
+  if (!eq(cl.allowedByDefault, ["public", "internal"]) || cl.confidentialRequiresExplicitOptIn !== true || cl.confidentialRequiresHttps !== true || cl.restricted !== "never") f.push("edge.delivery.classification: por defecto public e internal; confidential solo con autorización explícita y https; restricted nunca");
+  if (cl.deniedClass !== "permanent" || !re(doc.errors?.codePattern ?? "(?!)").test(cl.deniedCode ?? "") || cl.deniedMessageNeverQuotesData !== true) f.push("edge.delivery.classification: una clasificación no permitida es permanent, con un code estable y sin citar data");
+  if (!eq(d.receiverMust, ["verify-raw-bytes", "validate-hex-format", "constant-time-compare", "check-tolerance-symmetric", "deduplicate-by-idempotency-key", "2xx-only-after-storing"])) f.push("edge.delivery.receiverMust: lo que DEBE el receptor, en orden");
+  if (d.state?.normative !== false || d.state?.bodyIsEvent !== false || d.state?.defaultClassification !== "confidential") f.push("edge.delivery.state: la entrega de estado NO es normativa (watch entrega la entrada, no el CloudEvent) y su clasificación por defecto es confidential");
+
+  // ── El id determinista ───────────────────────────────────────────────────────────────────────────────────────
+  const x = e.externalId ?? {};
+  if (x.layout !== "uuidv7" || x.timeBits !== 48 || x.randomBits !== 74 || x.randABits !== 12 || x.randBBits !== 62 || x.randABits + x.randBBits !== x.randomBits || x.timeBits + x.randomBits + 6 !== 128) f.push("edge.externalId: UUIDv7 de 128 bits = 48 de tiempo + 6 fijos (versión y variante) + 74 aleatorios (12 de rand_a y 62 de rand_b)");
+  if (x.hash !== "SHA-256" || x.separator !== "|" || x.encoding !== "UTF-8-literal" || x.derivation !== "first-74-bits-of-SHA-256(source|externalKey)") f.push("edge.externalId: SHA-256 de `<source>|<clave>` en UTF-8 literal, los 74 primeros bits");
+  if (x.timeIs !== "the-instant-of-the-external-fact" || x.requiresTime !== true || x.timeNeverNow !== true) f.push("edge.externalId: el tiempo es el del hecho externo, exigido y nunca «ahora» (con «ahora» cada reenvío tendría su id)");
+  if (x.externalKeyMinBytes !== 1 || x.externalKeyMaxBytes !== 512 || x.sourceMustNotContain !== "|" || !eq(x.msRange, [0, 2 ** 48 - 1])) f.push("edge.externalId: la clave tiene de 1 a 512 bytes, el source no lleva `|` y los ms caben en 48 bits");
+  if (x.pureFunction !== true || x.doesNotReplaceConsumerDedupe !== true || x.keyIsUniquePerFactWithinSource !== true) f.push("edge.externalId: función pura; la clave es única por hecho dentro del source; no sustituye a la deduplicación del consumidor");
+  if (x.providerWithoutFactTime?.hasDeterministicId !== false || x.providerWithoutFactTime?.msZeroAdopted !== false || x.providerWithoutFactTime?.gatewayHook !== "idempotent-false") f.push("edge.externalId.providerWithoutFactTime: sin instante del hecho no hay id determinista (el hook es idempotent:false) y no se adopta «ms = 0»");
+  if (x.pattern !== doc.cloudevents?.requiredAttributes?.id?.pattern && !re(x.pattern ?? "(?!)").test("01924f8e-7c3a-7b2d-9e14-3f8a1c9d0e55")) f.push("edge.externalId.pattern debe aceptar un UUIDv7 normal: el determinista ES un UUIDv7 válido");
+  if (doc.cloudevents?.requiredAttributes?.id?.deterministicWhenImported !== "edge.externalId" || doc.cloudevents?.requiredAttributes?.id?.uuidVersion !== 7) f.push("cloudevents.requiredAttributes.id: debe remitir a edge.externalId para un hecho importado y seguir siendo un UUIDv7");
+  const idRe = re(x.pattern ?? "(?!)");
+  for (const v of x.valid ?? []) if (!idRe.test(v)) f.push(`edge.externalId.valid: el patrón rechaza ${JSON.stringify(v)}`);
+  for (const v of x.invalid ?? []) if (idRe.test(v)) f.push(`edge.externalId.invalid: el patrón acepta ${JSON.stringify(v)}`);
+  if ((x.invalid ?? []).length < 4) f.push("edge.externalId.invalid: faltan ejemplos inválidos (versión 4, variante equivocada, mayúsculas)");
+  if ((x.vectors ?? []).length < 6) f.push("edge.externalId.vectors: faltan vectores");
+  for (const v of x.vectors ?? []) {
+    const calculado = idDeterminista(v.source, v.externalKey, Date.parse(v.time));
+    if (calculado !== v.id) f.push(`edge.externalId.vectors ${JSON.stringify(v.externalKey)}: id recalculado ${calculado} ≠ ${v.id}`);
+    if (!idRe.test(v.id)) f.push(`edge.externalId.vectors ${v.id}: no es un UUIDv7 válido según su propio patrón`);
+  }
+  const [v0, v1, v2, v3] = x.vectors ?? [];
+  if (v0 && v1 && v2 && v3) {
+    if (new Set([v0.id, v1.id, v2.id, v3.id]).size !== 4) f.push("edge.externalId.vectors: los cuatro primeros deben tener ids distintos (clave, source y milisegundo)");
+    if (v0.id.slice(14) !== v3.id.slice(14) || v0.id.slice(0, 14) === v3.id.slice(0, 14)) f.push("edge.externalId.vectors: un milisegundo más cambia SOLO los 48 bits de tiempo y no los 74 aleatorios");
+  }
+  if (!(x.vectors ?? []).some((v) => /[^\x00-\x7f]/.test(v.externalKey))) f.push("edge.externalId.vectors: debe haber una clave con no-ASCII (el hash es sobre UTF-8, no sobre UTF-16)");
+  if (!(x.vectors ?? []).some((v) => Date.parse(v.time) === 0)) f.push("edge.externalId.vectors: debe haber el instante 0 (los 48 bits de tiempo van en los primeros 6 bytes)");
+
+  // ── El manifiesto: `via` ─────────────────────────────────────────────────────────────────────────────────────
+  const m = e.manifest ?? {};
+  if (m.key !== "via" || !eq(m.values, [...VIA_VALUES]) || m.unknownValueRejected !== true) f.push(`edge.manifest: la clave es \`via\` y sus valores los de manifest.mjs (${JSON.stringify(VIA_VALUES)}); uno desconocido se rechaza`);
+  if (m.annotationOnly !== true || m.extraPermissions !== "none" || m.gatewayNeedsSpecialPermissions !== false || m.serviceHasItsOwnIdentity !== true) f.push("edge.manifest: `via` es una anotación: sin permisos extra, el gateway no necesita ninguno especial y cada cliente tiene su propia identidad");
+  if (m.servesRejected !== true) f.push("edge.manifest.servesRejected debe ser true: un cliente de borde no sostiene la suscripción viva que exige `serves`");
+  if (!(doc.security?.manifest?.serviceKeys ?? []).includes("via") || doc.security?.manifest?.via?.servesRejected !== true) f.push("security.manifest: serviceKeys incluye `via` y la clave documentada rechaza `serves`");
+  // …y el analizador y el generador lo cumplen. Aquí es donde un `via` que concede permisos de más se vería.
+  {
+    const ok = analizar(manifiestoDeEdge(clienteDeBorde({ via: "gateway" })), BUNDLE_DE_EDGE);
+    if (ok.problemas.length) f.push(`edge.manifest: un cliente de borde válido da problemas en el analizador: ${ok.problemas[0].m}`);
+    const borde = ok.servicios.find((s) => s.name === "tienda-web");
+    const nativo = analizar(manifiestoDeEdge(clienteDeBorde()), BUNDLE_DE_EDGE).servicios.find((s) => s.name === "tienda-web");
+    if (!borde || !nativo) f.push("edge.manifest: no se pudo analizar el cliente de borde de comprobación");
+    else {
+      const a = emitir(borde), b = emitir(nativo);
+      if (!eq(a.publish, b.publish) || !eq(a.subscribe, b.subscribe) || !eq(a.allowResponses, b.allowResponses) || !eq(a.durables, b.durables)) f.push("edge.manifest: un cliente de borde (`via: gateway`) debe tener EXACTAMENTE los permisos del mismo servicio sin `via`: ni uno más, ni uno menos");
+      if (a.publish.some((p) => /^(\$JS\.API\.>|>|\*\.>)$/.test(p)) || a.subscribe.some((p) => /^(>|\*\.>)$/.test(p))) f.push("edge.manifest: el cliente de borde recibe un permiso ancho");
+    }
+    const raro = analizar(manifiestoDeEdge(clienteDeBorde({ via: "proxy" })), BUNDLE_DE_EDGE);
+    if (!raro.problemas.some((p) => /via/.test(p.m))) f.push("edge.manifest: un `via` desconocido debe ser un error del manifiesto: no puede degradar a «nativo» en silencio");
+    const sirve = analizar(manifiestoDeEdge({ name: "crm-web", via: "gateway", owns: ["clientes"], serves: ["clientes.cliente.v1.obtener"] }), BUNDLE_DE_EDGE);
+    if (!sirve.problemas.some((p) => /serves/.test(p.m) && /borde/.test(p.m))) f.push("edge.manifest: un cliente de borde con `serves` debe ser un error del manifiesto");
+  }
+
+  // ── El gateway de referencia (implementación) ────────────────────────────────────────────────────────────────
+  const g = e.gateway ?? {};
+  if (g.framework !== "none" || g.httpServer !== "node:http" || g.package !== "gateway/") f.push("edge.gateway: sin framework web, node:http, en gateway/");
+  const rutas = (g.routes ?? []).map((r) => `${r.method} ${r.path}`).sort();
+  const esperadas = ["DELETE /v1/state/{contract}/{key}", "GET /healthz", "GET /v1/state/{contract}/{key}", "POST /v1/events/{subject}", "POST /v1/hooks/{name}", "POST /v1/rpc/{operation}", "PUT /v1/state/{contract}/{key}"];
+  if (!eq(rutas, esperadas)) f.push(`edge.gateway.routes debe ser exactamente ${JSON.stringify(esperadas)}; es ${JSON.stringify(rutas)}`);
+  if ((g.routes ?? []).find((r) => r.path === "/v1/events/{subject}")?.response !== 202 || (g.routes ?? []).find((r) => r.path === "/v1/hooks/{name}")?.response !== 202) f.push("edge.gateway.routes: publicar un evento y recibir un hook responden 202");
+  if ((g.routes ?? []).find((r) => r.path === "/v1/hooks/{name}")?.auth !== "hmac" || (g.routes ?? []).find((r) => r.path === "/healthz")?.auth !== "none") f.push("edge.gateway.routes: los hooks se autentican por HMAC, y /healthz no necesita autenticación");
+  if (g.envelopeNeverWrittenByHand !== true || g.bodyIsDataObject !== true) f.push("edge.gateway: el cuerpo es `data` (un objeto) y el gateway nunca escribe el sobre (AGENTS.md regla 2)");
+  if (g.idempotencyKeyRequiresEventTime !== true) f.push("edge.gateway.idempotencyKeyRequiresEventTime debe ser true: sin el instante del hecho el id determinista no es estable");
+  const au = g.auth ?? {};
+  if (au.scheme !== "Bearer" || au.storedAs !== "sha256" || au.plaintextTokenStored !== false) f.push("edge.gateway.auth: Bearer, y solo se guarda el SHA-256 del token");
+  if (au.compare !== "timingSafeEqual-of-sha256-digests" || au.compareLoopsAllClients !== true) f.push("edge.gateway.auth.compare: timingSafeEqual de los digests SHA-256 (mismas longitudes), recorriendo todos los clientes");
+  if (au.sameResponseForUnknownAndMissing !== true || au.tokenBytes !== 32) f.push("edge.gateway.auth: el mismo 401 para un token ausente y uno desconocido; tokens de 32 bytes aleatorios");
+  if (au.hooksAuthenticatedBy !== "hmac-not-bearer" || au.hookWithoutVerifyRefusesToStart !== true || !eq(au.hookVerifySchemes, ["hmac-sha256"])) f.push("edge.gateway.auth: un hook se autentica por HMAC y sin `verify` no arranca (un endpoint público que publica eventos es una puerta abierta)");
+  if (au.hookToleranceSecondsDefault !== sg.receiver?.toleranceSeconds) f.push("edge.gateway.auth.hookToleranceSecondsDefault debe ser el de la entrega saliente (300 s)");
+  const hk = g.hooks ?? {};
+  if (hk.keyNamespace !== "<hook>:<providerKey>") f.push("edge.gateway.hooks.keyNamespace debe ser <hook>:<providerKey>: dos proveedores pueden numerar sus eventos igual");
+  if (hk.defaultClassification !== "confidential" || hk.dataSelection !== "pick-or-whole-body") f.push("edge.gateway.hooks: la clasificación por defecto es confidential y el propietario elige qué campos pasan");
+  if (hk.duplicateReturnsSameId !== true || hk.duplicateStatus !== 202 || hk.publishesOnlyInOwnDomain !== true) f.push("edge.gateway.hooks: el mismo webhook devuelve 202 con el mismo id, y solo publica en el dominio del cliente");
+  if (hk.idempotentFalseRequiresExplicit !== true) f.push("edge.gateway.hooks.idempotentFalseRequiresExplicit debe ser true: un hook sin id determinista es una decisión explícita");
+  if (!eq(hk.timeFrom, ["body", "header"]) || !eq(hk.timeUnits, ["seconds", "milliseconds", "iso"])) f.push("edge.gateway.hooks: el instante del hecho se lee del cuerpo o de una cabecera, en segundos, milisegundos o ISO");
+  const lm = g.limits ?? {};
+  if (lm.maxBodyBytes !== doc.data?.maxMessageBytes || lm.maxBodyBytesIsEventLimit !== true) f.push("edge.gateway.limits.maxBodyBytes debe ser data.maxMessageBytes (1 MiB)");
+  if (lm.rejectsBeforeReading !== true || lm.closesConnectionOnOversize !== true || lm.chunkedStopsAtLimit !== true) f.push("edge.gateway.limits: un cuerpo demasiado grande se rechaza antes de leerlo y se cierra la conexión (A-152: sin cerrarla, Node lee y descarta todo lo declarado)");
+  if (lm.rateLimitPer !== "token" || lm.hookRateLimitPer !== "hook-name" || lm.rateLimitIsPerInstance !== true || lm.rateLimitAlgorithm !== "token-bucket") f.push("edge.gateway.limits: límite por token (y por nombre de hook), cubo de tokens, por instancia");
+  if (!(lm.serverTimeoutMs > (doc.rpc?.timeout?.maxMs ?? Infinity)) || lm.serverTimeoutAboveRpcMaxMs !== true) f.push("edge.gateway.limits.serverTimeoutMs debe superar el timeout máximo del rpc: mide inactividad del socket mientras el gateway espera al broker (A-153)");
+  if (!(lm.connectionsCheckingIntervalMs <= 5000) || !(lm.connectionsCheckingIntervalMs < lm.headersTimeoutMs) || !(lm.headersTimeoutMs < lm.requestTimeoutMs) || !(lm.requestTimeoutMs <= lm.serverTimeoutMs)) f.push("edge.gateway.limits: connectionsCheckingIntervalMs ≤ 5000 y menor que headersTimeoutMs < requestTimeoutMs ≤ serverTimeoutMs (con el intervalo por defecto de Node, 30 s, los otros límites no se aplican: A-153)");
+  if (!eq(g.tls?.modes, ["terminates-in-front", "in-gateway"]) || g.tls?.atLeastOneRequiredInProduction !== true || g.tls?.natsTlsSeparate !== true) f.push("edge.gateway.tls: dos modos (termina delante o en el propio gateway), uno obligatorio en producción, y el TLS hacia NATS es aparte");
+  const lg = g.logging ?? {};
+  for (const n of ["data", "authorization", "token", "secrets", "response-body"]) if (!(lg.neverLogs ?? []).includes(n)) f.push(`edge.gateway.logging.neverLogs debe incluir «${n}»`);
+  if (lg.logsDataOfConfidential !== false || lg.logsDataOfAnyClassification !== false) f.push("edge.gateway.logging: no se registra `data` de ninguna clasificación (en particular, nunca el de un confidential)");
+  const cf = g.config ?? {};
+  if (cf.holdsSecrets !== false || cf.secretsByEnvVarName !== true || cf.tokensAreSha256Hex !== true) f.push("edge.gateway.config: gateway.json no contiene secretos: nombres de variables de entorno y SHA-256 de tokens");
+  for (const k of ["nkeySeed", "token", "secret", "password", "pass"]) if (!(cf.refusesPlaintextSecretKeys ?? []).includes(k)) f.push(`edge.gateway.config.refusesPlaintextSecretKeys debe incluir «${k}»`);
+  if (cf.refusesNatsSeedShapedValues !== true || cf.missingEnvVarNamedInError !== true || cf.onePerSubjectPerClient !== true || cf.hookNamesUniqueAcrossClients !== true) f.push("edge.gateway.config: rechaza semillas de NATS en claro, nombra la variable que falta, una entrega por subject y cliente, y nombres de hook únicos");
+  if (!eq(g.shutdown?.order, ["stop-accepting", "answer-in-flight-with-connection-close", "close-idle", "drain-nats"]) || g.shutdown?.hardDeadline !== true) f.push("edge.gateway.shutdown: dejar de aceptar, contestar lo que vuela con Connection: close, cerrar las ociosas y drenar NATS, con un plazo máximo (A-162)");
+
+  // Los errores HTTP: la tabla de la spec, contra errors.codes y la regla de los estados.
+  const er = g.errors ?? {};
+  if (!eq(er.classes, ["retryable", "permanent"]) || er.messageNeverQuotesData !== true || er.retryAfterHeaderOnRetryable !== true) f.push("edge.gateway.errors: clase retryable o permanent, sin citar data, con Retry-After en lo reintentable");
+  const mapa = er.protocolCodes ?? {};
+  const noSale = er.notSurfaced ?? {};
+  for (const c of Object.keys(cs).filter((k) => !k.startsWith("$"))) {
+    const enMapa = c in mapa, enNo = c in noSale;
+    if (!enMapa && !enNo) f.push(`edge.gateway.errors: el código «${c}» de errors.codes no está ni en protocolCodes ni en notSurfaced: un código nuevo no puede quedar sin estado HTTP`);
+    if (enMapa && enNo) f.push(`edge.gateway.errors: «${c}» está a la vez en protocolCodes y en notSurfaced`);
+    if (enMapa && cs[c].class !== "poison" && mapa[c].class !== cs[c].class) f.push(`edge.gateway.errors.protocolCodes.${c}.class (${mapa[c].class}) ≠ errors.codes.${c}.class (${cs[c].class})`);
+  }
+  for (const c of Object.keys(mapa)) if (!(c in cs) && mapa[c].definedIn !== "reused") f.push(`edge.gateway.errors.protocolCodes.${c}: no está en errors.codes y no se marca como reutilizado (definedIn: "reused")`);
+  for (const [c, v] of [...Object.entries(mapa), ...Object.entries(er.codes ?? {})]) {
+    if (!Number.isInteger(v.status) || v.status < 400 || v.status > 599) f.push(`edge.gateway.errors: «${c}» tiene un estado HTTP que no es de error (${v.status})`);
+    if (!["retryable", "permanent"].includes(v.class)) f.push(`edge.gateway.errors: «${c}» tiene una clase que no es retryable ni permanent`);
+    // La regla de los estados: 4xx = reintentar igual da lo mismo (salvo 408, 409, 429); 5xx = lo dice `class`.
+    if (v.class === "retryable" && v.status >= 400 && v.status <= 499 && ![408, 409, 429].includes(v.status)) f.push(`edge.gateway.errors: «${c}» es retryable con un ${v.status}: un 4xx retryable solo puede ser 408, 409 o 429`);
+    if (v.class === "permanent" && v.status >= 502 && v.status <= 599) f.push(`edge.gateway.errors: «${c}» es permanent con un ${v.status}: un 502, 503 o 504 invita a reintentar`);
+    if (!re(doc.errors?.codePattern ?? "(?!)").test(c)) f.push(`edge.gateway.errors: «${c}» no cumple errors.codePattern`);
+  }
+  for (const c of Object.keys(er.codes ?? {})) {
+    if (!c.startsWith("EDGE_")) f.push(`edge.gateway.errors.codes.${c}: los códigos solo del borde llevan el prefijo EDGE_ para no confundirse con los del protocolo`);
+    if (c in cs || c in mapa) f.push(`edge.gateway.errors.codes.${c}: choca con un código del protocolo`);
+  }
+  if (er.codesAreNotProtocolCodes !== true) f.push("edge.gateway.errors.codesAreNotProtocolCodes debe ser true: no se añaden a errors.codes (listas cerradas)");
+  if (mapa.RPC_TIMEOUT?.status !== 504 || mapa.RPC_TIMEOUT?.ambiguous !== true) f.push("edge.gateway.errors.protocolCodes.RPC_TIMEOUT debe ser 504 y ambiguo: la operación pudo ejecutarse");
+  if (mapa.RPC_UNAVAILABLE?.status !== 503 || mapa.RPC_UNAVAILABLE?.retryAfterSeconds !== 1) f.push("edge.gateway.errors.protocolCodes.RPC_UNAVAILABLE debe ser 503 con Retry-After de 1 s");
+  if (mapa.PERMISSION_DENIED?.status !== 403 || mapa.PERMISSION_DENIED?.deniedByBroker !== true) f.push("edge.gateway.errors.protocolCodes.PERMISSION_DENIED debe ser 403, y lo deniega el BROKER (no solo el gateway)");
+  if (mapa.NOT_PROVISIONED?.status !== 500 || mapa.NOT_PROVISIONED?.class !== "permanent") f.push("edge.gateway.errors.protocolCodes.NOT_PROVISIONED: un fallo del ecosistema que arregla quien opera es 500 permanent");
+  if (mapa.STATE_CONFLICT?.status !== 409) f.push("edge.gateway.errors.protocolCodes.STATE_CONFLICT debe ser 409");
+  if (er.remoteErrors?.retryable !== 503 || er.remoteErrors?.permanent !== 422 || er.remoteErrors?.keepsTheirCode !== true) f.push("edge.gateway.errors.remoteErrors: un error del que responde es 503 (retryable) o 422 (permanent) y conserva su code");
+  if (er.codes?.EDGE_UNAUTHENTICATED?.status !== 401 || er.codes?.EDGE_RATE_LIMITED?.status !== 429 || er.codes?.EDGE_BODY_TOO_LARGE?.status !== 413) f.push("edge.gateway.errors.codes: sin token es 401, el límite por token es 429 y un cuerpo grande es 413");
+  if (er.codes?.EDGE_INVALID_WEBHOOK_SIGNATURE?.status !== 401 || er.codes?.EDGE_WEBHOOK_TIMESTAMP_OUT_OF_TOLERANCE?.status !== 401 || er.codes?.EDGE_INVALID_WEBHOOK_SIGNATURE?.class !== "permanent") f.push("edge.gateway.errors.codes: una firma de webhook inválida o fuera de tolerancia es 401 y permanent (códigos distintos para no confundir un reloj con un secreto)");
+
+  // PII
+  if (!doc.security?.piiInPayload?.edge || doc.security.piiInPayload.edge === "forbidden") f.push("security.piiInPayload.edge: el cuerpo de un webhook de un tercero no está libre de PII por construcción");
+  return f;
+}
+
+
 // ─── La ACL de PETICIÓN/RESPUESTA y su generador — 06-security.md §3.9 ───────────────────────────
 // Como la de estado: una función PURA sobre el documento y sobre un EMISOR de permisos (por defecto, el generador real).
 // Sobre el protocol.json y el generador reales da cero fallos; sobre copias estropeadas a propósito —un documento con un
@@ -1293,6 +1576,7 @@ fallos.push(...fallosDeEstado(p));
 fallos.push(...fallosDeAclDeEstado(p));
 fallos.push(...fallosDeRpc(p));
 fallos.push(...fallosDeAclDeRpc(p));
+fallos.push(...fallosDeEdge(p));
 if (!Object.hasOwn(p.errors.codes, p.security.provisioning.notProvisionedErrorCode)) fallos.push("security.provisioning.notProvisionedErrorCode no está en errors.codes");
 if (!Object.hasOwn(capDefs, p.security.sdk.capability)) fallos.push(`security.sdk.capability "${p.security.sdk.capability}" no está en capabilities.definitions`);
 
@@ -1744,6 +2028,218 @@ let mutacionesAclRpc = 0;
   mutacionesAclRpc = Object.keys(delDocumento).length + Object.keys(delGenerador).length;
 }
 
+// Autocomprobación de `fallosDeEdge`: cada copia estropeada DEBE dar un fallo, o la invariante no vigila nada. Son las
+// equivocaciones reales que 12-edge.md existe para impedir: firmar sin el instante, no renovarlo, comparar con `===`, seguir una
+// redirección, reintentar un 4xx permanente, un id que no es un UUIDv7 o que no depende de la clave, un `via` que concede de más,
+// un token en claro, un `data` en los registros, un código del protocolo sin estado HTTP…
+let mutacionesEdge = 0;
+{
+  const base = fallosDeEdge(p);
+  if (base.length) fallos.push(`autocomprobación: fallosDeEdge ya falla sobre el protocol.json real (${base.length}); no se puede autocomprobar`);
+  const cambia = (d, ruta, valor) => { const k = ruta.split("."); let o = d; for (const x of k.slice(0, -1)) o = o[x]; o[k.at(-1)] = valor; };
+  const mutaciones = {
+    // No es una capacidad de SDK
+    "el gateway como capacidad de SDK": (d) => { d.capabilities.definitions.edge = { spec: "specification/12-edge.md", evidence: "sdk-files" }; },
+    "un SDK que declara edge": (d) => { d.capabilities.sdks.node.capabilities.push("edge"); },
+    "edge.capability distinta de null": (d) => { d.edge.capability = "edge"; },
+    "el gateway entero como normativo": (d) => { d.edge.normative = ["delivery", "externalId", "gateway"]; },
+    "el gateway que no se dice implementación": (d) => { d.edge.gateway.implementation = false; },
+    // La entrega saliente
+    "la entrega con GET": (d) => { d.edge.delivery.method = "GET"; },
+    "el Content-Type application/json": (d) => { d.edge.delivery.contentType = "application/json"; },
+    "un cuerpo que no es el evento tal cual": (d) => { d.edge.delivery.body.isEventVerbatim = false; },
+    "bytes distintos en cada intento": (d) => { d.edge.delivery.body.sameBytesEveryAttempt = false; },
+    "las extensiones dlq* en el cuerpo": (d) => { d.edge.delivery.body.dlqExtensionsStripped = false; },
+    "la Idempotency-Key aleatoria": (d) => { d.edge.delivery.headers.idempotencyKey.value = "random-uuid"; },
+    "la Idempotency-Key distinta en cada intento": (d) => { d.edge.delivery.headers.idempotencyKey.sameEveryAttempt = false; },
+    "otra cabecera de firma": (d) => { d.edge.delivery.headers.signature.name = "X-Signature"; },
+    "HMAC-SHA1": (d) => { d.edge.delivery.signature.algorithm = "HMAC-SHA1"; },
+    "firmar solo el cuerpo (sin el instante)": (d) => { d.edge.delivery.signature.signedMessage = "<body-bytes>"; },
+    "la firma en base64": (d) => { d.edge.delivery.signature.encoding = "base64"; },
+    "el instante fijo en los reintentos": (d) => { d.edge.delivery.signature.timestampRenewedEveryAttempt = false; },
+    "un solo v1 (sin rotación)": (d) => { d.edge.delivery.signature.multipleV1ForRotation = false; },
+    "el receptor compara con ==": (d) => { d.edge.delivery.signature.receiver.compare = "equals"; },
+    "una tolerancia de una hora": (d) => { d.edge.delivery.signature.receiver.toleranceSeconds = 3600; },
+    "una tolerancia asimétrica": (d) => { d.edge.delivery.signature.receiver.toleranceSymmetric = false; },
+    "verificar sobre el JSON reserializado": (d) => { d.edge.delivery.signature.receiver.verifyRawBytes = false; },
+    "decodificar el hexadecimal sin validarlo": (d) => { d.edge.delivery.signature.receiver.validateHexFormatBeforeDecoding = false; },
+    "una firma rechazada con 5xx": (d) => { d.edge.delivery.signature.receiver.rejectedAs = "5xx"; },
+    "el secreto en la configuración": (d) => { d.edge.delivery.signature.secret.neverInConfiguration = false; },
+    "un vector con un v1 cambiado": (d) => { d.edge.delivery.signature.vectors[0].v1 = d.edge.delivery.signature.vectors[0].v1.replace(/^./, "0"); },
+    "un vector con el instante cambiado": (d) => { d.edge.delivery.signature.vectors[2].t += 1; },
+    "un vector con el cuerpo reserializado": (d) => { d.edge.delivery.signature.vectors[2].body = d.edge.delivery.signature.vectors[2].body.replace('"delta":-3', '"delta": -3'); },
+    "sin el vector de GitHub": (d) => { d.edge.delivery.signature.vectors.pop(); },
+    "sin ningún vector con no-ASCII": (d) => { d.edge.delivery.signature.vectors[2].body = d.edge.delivery.signature.vectors[2].body.replace("Málaga", "Malaga"); d.edge.delivery.signature.vectors[2].v1 = hmacHex(d.edge.delivery.signature.vectors[2].secret, d.edge.delivery.signature.vectors[2].t, d.edge.delivery.signature.vectors[2].body); },
+    "el vector de rotación con un secreto de menos": (d) => { d.edge.delivery.signature.rotationVector.secrets.pop(); },
+    "el patrón admite hexadecimal en mayúsculas": (d) => { d.edge.delivery.signature.pattern = d.edge.delivery.signature.pattern.replaceAll("0-9a-f", "0-9a-fA-F"); },
+    "el patrón admite una firma sin v1": (d) => { d.edge.delivery.signature.pattern = "^t=[0-9]{1,15}(,v1=[0-9a-f]{64})*$"; },
+    "el patrón admite una firma corta": (d) => { d.edge.delivery.signature.pattern = d.edge.delivery.signature.pattern.replace("{64}", "{32,64}"); },
+    // La respuesta del receptor
+    "seguir las redirecciones": (d) => { d.edge.delivery.response.redirectsFollowed = true; },
+    "una firma rechazada que se reintenta": (d) => { d.edge.delivery.response.firmRejectedIsPermanent = false; },
+    "registrar el cuerpo de la respuesta": (d) => { d.edge.delivery.response.bodyNeverLogged = false; },
+    "un 404 reintentable": (d) => { d.errors.classes.retryable.httpStatus.push(404); },
+    "un 400 reintentable acotado": (d) => { d.edge.delivery.response.retryableBounded.httpStatus.push(400); },
+    "el 503 fuera de los reintentables": (d) => { d.errors.classes.retryable.httpStatus = d.errors.classes.retryable.httpStatus.filter((x) => x !== 503); },
+    "un 500 permanente": (d) => { d.edge.delivery.response.retryableBounded.alsoEveryOther5xx = false; },
+    "un 500 con el presupuesto completo": (d) => { d.errors.classes.retryable.httpStatus.push(500); },
+    "un 408 permanente": (d) => { d.edge.delivery.response.retryableBounded.httpStatus = [425]; },
+    "un presupuesto acotado de 6": (d) => { d.edge.delivery.response.retryableBounded.budget = 6; },
+    "un permanente con presupuesto de 2": (d) => { d.edge.delivery.response.permanent.budget = 2; },
+    "un ejemplo que no es lo que dice el documento": (d) => { d.edge.delivery.response.examples.find((x) => x.status === 302).outcome = "retryable"; },
+    "el 3xx como ack": (d) => { d.edge.delivery.response.examples.push({ status: 301, outcome: "ack" }); },
+    "la red sin ECONNRESET": (d) => { d.edge.delivery.response.network.retryable = d.edge.delivery.response.network.retryable.filter((x) => x !== "ECONNRESET"); },
+    "un certificado que no verifica como reintentable": (d) => { d.edge.delivery.response.network.tlsVerificationFailure.class = "retryable"; },
+    "el code de TLS en minúsculas": (d) => { d.edge.delivery.response.network.tlsVerificationFailure.code = "tls_verification_failed"; },
+    "lo desconocido de la red como permanente": (d) => { d.edge.delivery.response.network.retryableBounded = "permanent"; },
+    // Plazos, reintentos y orden
+    "un plazo por intento de 30 s": (d) => { d.edge.delivery.timeout.defaultMs = 30000; },
+    "un plazo máximo por encima del ack_wait": (d) => { d.edge.delivery.timeout.maxMs = 60000; },
+    "un plazo de inactividad en vez de total": (d) => { d.edge.delivery.timeout.scope = "idle"; },
+    "Retry-After en todos los reintentos": (d) => { d.edge.delivery.retryAfter.appliesTo = "every-retry"; },
+    "Retry-After sin tope": (d) => { d.edge.delivery.retryAfter.maxMs = 86400000; },
+    "Retry-After también en un 4xx": (d) => { d.edge.delivery.retryAfter.onlyOn = "any-response"; },
+    "dos entregas por subject": (d) => { d.edge.delivery.deliveriesPerSubjectPerClient = 2; },
+    "una entrega con orden garantizado": (d) => { d.edge.delivery.ordering = "per-aggregate"; },
+    "reintentos propios de la entrega": (d) => { d.edge.delivery.retries = "own-schedule"; },
+    // Clasificación de los datos
+    "confidential por defecto": (d) => { d.edge.delivery.classification.allowedByDefault = ["public", "internal", "confidential"]; },
+    "confidential sin autorización explícita": (d) => { d.edge.delivery.classification.confidentialRequiresExplicitOptIn = false; },
+    "confidential por http": (d) => { d.edge.delivery.classification.confidentialRequiresHttps = false; },
+    "restricted con autorización": (d) => { d.edge.delivery.classification.restricted = "opt-in"; },
+    "una clasificación denegada reintentable": (d) => { d.edge.delivery.classification.deniedClass = "retryable"; },
+    "el estado hacia HTTP como normativo": (d) => { d.edge.delivery.state.normative = true; },
+    "el estado hacia HTTP como CloudEvent": (d) => { d.edge.delivery.state.bodyIsEvent = true; },
+    "el receptor sin deduplicar": (d) => { d.edge.delivery.receiverMust = d.edge.delivery.receiverMust.filter((x) => x !== "deduplicate-by-idempotency-key"); },
+    // El id determinista
+    "el id con 47 bits de tiempo": (d) => { d.edge.externalId.timeBits = 47; },
+    "el id con 64 bits aleatorios": (d) => { d.edge.externalId.randomBits = 64; },
+    "rand_a de 16 bits": (d) => { d.edge.externalId.randABits = 16; },
+    "otro separador": (d) => { d.edge.externalId.separator = ","; },
+    "el hash MD5": (d) => { d.edge.externalId.hash = "MD5"; },
+    "el hash sobre UTF-16": (d) => { d.edge.externalId.encoding = "UTF-16"; },
+    "el id con el «ahora» como tiempo": (d) => { d.edge.externalId.timeIs = "now"; d.edge.externalId.timeNeverNow = false; },
+    "el id sin exigir el instante": (d) => { d.edge.externalId.requiresTime = false; },
+    "una clave externa de 4 KiB": (d) => { d.edge.externalId.externalKeyMaxBytes = 4096; },
+    "un source con separador": (d) => { d.edge.externalId.sourceMustNotContain = ""; },
+    "el id que no es una función pura": (d) => { d.edge.externalId.pureFunction = false; },
+    "el id que sustituye al consumidor": (d) => { d.edge.externalId.doesNotReplaceConsumerDedupe = false; },
+    "ms = 0 para un proveedor sin instante": (d) => { d.edge.externalId.providerWithoutFactTime.msZeroAdopted = true; },
+    "un id determinista sin instante del hecho": (d) => { d.edge.externalId.providerWithoutFactTime.hasDeterministicId = true; },
+    "un vector del id con un dígito cambiado": (d) => { d.edge.externalId.vectors[0].id = d.edge.externalId.vectors[0].id.replace(/.$/, "5"); },
+    "un vector del id con otro source": (d) => { d.edge.externalId.vectors[0].source = "/produccion/otro-web"; },
+    "un vector del id que es un UUIDv4": (d) => { d.edge.externalId.vectors[0].id = d.edge.externalId.vectors[0].id.replace("-7325-", "-4325-"); },
+    "sin el vector con no-ASCII": (d) => { d.edge.externalId.vectors = d.edge.externalId.vectors.filter((v) => !/[^\x00-\x7f]/.test(v.externalKey)); },
+    "sin el vector del instante 0": (d) => { d.edge.externalId.vectors = d.edge.externalId.vectors.filter((v) => Date.parse(v.time) !== 0); },
+    "el patrón del id que admite un UUIDv4": (d) => { d.edge.externalId.pattern = d.edge.externalId.pattern.replace("-7[0-9a-f]{3}-", "-[0-9a-f]{4}-"); },
+    "el patrón del id que admite mayúsculas": (d) => { d.edge.externalId.pattern = d.edge.externalId.pattern.replaceAll("0-9a-f", "0-9a-fA-F"); },
+    "el atributo id sin remitir a edge.externalId": (d) => { delete d.cloudevents.requiredAttributes.id.deterministicWhenImported; },
+    // El manifiesto
+    "un valor de via más": (d) => { d.edge.manifest.values = ["gateway", "proxy"]; },
+    "via que concede permisos": (d) => { d.edge.manifest.extraPermissions = "admin"; },
+    "via que no es solo una anotación": (d) => { d.edge.manifest.annotationOnly = false; },
+    "un gateway con permisos especiales": (d) => { d.edge.manifest.gatewayNeedsSpecialPermissions = true; },
+    "un cliente de borde con serves": (d) => { d.edge.manifest.servesRejected = false; },
+    "via fuera de las claves del manifiesto": (d) => { d.security.manifest.serviceKeys = d.security.manifest.serviceKeys.filter((k) => k !== "via"); },
+    // El gateway de referencia
+    "un framework web": (d) => { d.edge.gateway.framework = "express"; },
+    "falta la ruta de los hooks": (d) => { d.edge.gateway.routes = d.edge.gateway.routes.filter((r) => !r.path.includes("hooks")); },
+    "una ruta de más": (d) => { d.edge.gateway.routes.push({ method: "POST", path: "/v1/admin", does: "admin", response: 200 }); },
+    "los hooks con Bearer": (d) => { d.edge.gateway.routes.find((r) => r.path.includes("hooks")).auth = "bearer"; },
+    "publicar con 200": (d) => { d.edge.gateway.routes.find((r) => r.path.includes("events")).response = 200; },
+    "el gateway que escribe el sobre": (d) => { d.edge.gateway.envelopeNeverWrittenByHand = false; },
+    "Idempotency-Key sin el instante": (d) => { d.edge.gateway.idempotencyKeyRequiresEventTime = false; },
+    "el token en claro": (d) => { d.edge.gateway.auth.plaintextTokenStored = true; d.edge.gateway.auth.storedAs = "plaintext"; },
+    "comparar el token con ===": (d) => { d.edge.gateway.auth.compare = "strict-equality"; },
+    "comparar solo hasta el primer acierto": (d) => { d.edge.gateway.auth.compareLoopsAllClients = false; },
+    "un 401 distinto si el token no existe": (d) => { d.edge.gateway.auth.sameResponseForUnknownAndMissing = false; },
+    "un token de 8 bytes": (d) => { d.edge.gateway.auth.tokenBytes = 8; },
+    "los hooks sin autenticar": (d) => { d.edge.gateway.auth.hooksAuthenticatedBy = "none"; },
+    "un hook sin verify que arranca": (d) => { d.edge.gateway.auth.hookWithoutVerifyRefusesToStart = false; },
+    "un esquema de verificación de hook más": (d) => { d.edge.gateway.auth.hookVerifySchemes = ["hmac-sha256", "none"]; },
+    "otra tolerancia por defecto en los hooks": (d) => { d.edge.gateway.auth.hookToleranceSecondsDefault = 3600; },
+    "la clave externa sin el nombre del hook": (d) => { d.edge.gateway.hooks.keyNamespace = "<providerKey>"; },
+    "un hook internal por defecto": (d) => { d.edge.gateway.hooks.defaultClassification = "internal"; },
+    "un hook que devuelve otro id en el duplicado": (d) => { d.edge.gateway.hooks.duplicateReturnsSameId = false; },
+    "un hook que publica en cualquier dominio": (d) => { d.edge.gateway.hooks.publishesOnlyInOwnDomain = false; },
+    "un hook no idempotente sin pedirlo": (d) => { d.edge.gateway.hooks.idempotentFalseRequiresExplicit = false; },
+    "un límite de cuerpo de 10 MiB": (d) => { d.edge.gateway.limits.maxBodyBytes = 10485760; },
+    "leer el cuerpo antes de rechazarlo": (d) => { d.edge.gateway.limits.rejectsBeforeReading = false; },
+    "no cerrar la conexión ante un cuerpo grande": (d) => { d.edge.gateway.limits.closesConnectionOnOversize = false; },
+    "un chunked sin límite": (d) => { d.edge.gateway.limits.chunkedStopsAtLimit = false; },
+    "el límite de peticiones por IP": (d) => { d.edge.gateway.limits.rateLimitPer = "ip"; },
+    "server.timeout por debajo del rpc": (d) => { d.edge.gateway.limits.serverTimeoutMs = 10000; },
+    "el intervalo de comprobación por defecto de Node": (d) => { d.edge.gateway.limits.connectionsCheckingIntervalMs = 30000; },
+    "headersTimeout mayor que requestTimeout": (d) => { d.edge.gateway.limits.headersTimeoutMs = 60000; },
+    "un solo modo de TLS": (d) => { d.edge.gateway.tls.modes = ["terminates-in-front"]; },
+    "TLS opcional en producción": (d) => { d.edge.gateway.tls.atLeastOneRequiredInProduction = false; },
+    "registrar el data": (d) => { d.edge.gateway.logging.neverLogs = d.edge.gateway.logging.neverLogs.filter((x) => x !== "data"); },
+    "registrar el data de los confidential": (d) => { d.edge.gateway.logging.logsDataOfConfidential = true; },
+    "registrar el data de lo que no es confidential": (d) => { d.edge.gateway.logging.logsDataOfAnyClassification = true; },
+    "registrar el token": (d) => { d.edge.gateway.logging.neverLogs = d.edge.gateway.logging.neverLogs.filter((x) => x !== "token"); },
+    "secretos en gateway.json": (d) => { d.edge.gateway.config.holdsSecrets = true; },
+    "gateway.json sin rechazar un token en claro": (d) => { d.edge.gateway.config.refusesPlaintextSecretKeys = d.edge.gateway.config.refusesPlaintextSecretKeys.filter((x) => x !== "token"); },
+    "gateway.json sin rechazar una semilla de NATS": (d) => { d.edge.gateway.config.refusesNatsSeedShapedValues = false; },
+    "dos hooks con el mismo nombre": (d) => { d.edge.gateway.config.hookNamesUniqueAcrossClients = false; },
+    "dos entregas por subject en la configuración": (d) => { d.edge.gateway.config.onePerSubjectPerClient = false; },
+    "drenar NATS antes de contestar lo que vuela": (d) => { d.edge.gateway.shutdown.order = ["stop-accepting", "drain-nats", "answer-in-flight-with-connection-close", "close-idle"]; },
+    "una parada sin plazo máximo": (d) => { d.edge.gateway.shutdown.hardDeadline = false; },
+    // Los errores HTTP
+    "un código del protocolo sin estado HTTP": (d) => { delete d.edge.gateway.errors.protocolCodes.STATE_CONFLICT; },
+    "un código nuevo del protocolo sin estado HTTP": (d) => { d.errors.codes.OTRO_CODIGO_NUEVO = { class: "permanent", capability: "rpc" }; },
+    "un código a la vez mapeado y no expuesto": (d) => { d.edge.gateway.errors.notSurfaced.PERMISSION_DENIED = "connect"; },
+    "PERMISSION_DENIED reintentable": (d) => { d.edge.gateway.errors.protocolCodes.PERMISSION_DENIED.class = "retryable"; },
+    "PERMISSION_DENIED con un 401": (d) => { d.edge.gateway.errors.protocolCodes.PERMISSION_DENIED.status = 401; },
+    "PERMISSION_DENIED que no lo deniega el broker": (d) => { d.edge.gateway.errors.protocolCodes.PERMISSION_DENIED.deniedByBroker = false; },
+    "RPC_TIMEOUT como 408": (d) => { d.edge.gateway.errors.protocolCodes.RPC_TIMEOUT.status = 408; },
+    "RPC_TIMEOUT no ambiguo": (d) => { d.edge.gateway.errors.protocolCodes.RPC_TIMEOUT.ambiguous = false; },
+    "RPC_UNAVAILABLE como 400": (d) => { d.edge.gateway.errors.protocolCodes.RPC_UNAVAILABLE.status = 400; },
+    "RPC_UNAVAILABLE sin Retry-After": (d) => { delete d.edge.gateway.errors.protocolCodes.RPC_UNAVAILABLE.retryAfterSeconds; },
+    "NOT_PROVISIONED como 503": (d) => { d.edge.gateway.errors.protocolCodes.NOT_PROVISIONED.status = 503; },
+    "un permanente con 502": (d) => { d.edge.gateway.errors.protocolCodes.RPC_INVALID_REPLY.status = 502; },
+    "STATE_CONFLICT como 400": (d) => { d.edge.gateway.errors.protocolCodes.STATE_CONFLICT.status = 400; },
+    "un 4xx reintentable que no es 408, 409 ni 429": (d) => { d.edge.gateway.errors.protocolCodes.STATE_CONFLICT.status = 403; },
+    "un estado de éxito en un error": (d) => { d.edge.gateway.errors.protocolCodes.INVALID_SCHEMA.status = 200; },
+    "una clase que no existe": (d) => { d.edge.gateway.errors.protocolCodes.INVALID_SCHEMA.class = "poison"; },
+    "un código del borde sin el prefijo EDGE_": (d) => { d.edge.gateway.errors.codes.RATE_LIMITED = d.edge.gateway.errors.codes.EDGE_RATE_LIMITED; delete d.edge.gateway.errors.codes.EDGE_RATE_LIMITED; },
+    "un código del borde que choca con el protocolo": (d) => { d.edge.gateway.errors.protocolCodes.EDGE_UNAUTHENTICATED = { status: 401, class: "permanent", definedIn: "reused" }; },
+    "un código del borde en errors.codes": (d) => { d.edge.gateway.errors.codesAreNotProtocolCodes = false; },
+    "sin token es 403": (d) => { d.edge.gateway.errors.codes.EDGE_UNAUTHENTICATED.status = 403; },
+    "el límite por token como 503": (d) => { d.edge.gateway.errors.codes.EDGE_RATE_LIMITED.status = 503; },
+    "un cuerpo grande como 400": (d) => { d.edge.gateway.errors.codes.EDGE_BODY_TOO_LARGE.status = 400; },
+    "una firma de webhook inválida como 200": (d) => { d.edge.gateway.errors.codes.EDGE_INVALID_WEBHOOK_SIGNATURE.status = 200; },
+    "una firma de webhook inválida reintentable": (d) => { d.edge.gateway.errors.codes.EDGE_INVALID_WEBHOOK_SIGNATURE.class = "retryable"; },
+    "un error del que responde sin conservar su code": (d) => { d.edge.gateway.errors.remoteErrors.keepsTheirCode = false; },
+    "un error permanente del que responde como 503": (d) => { d.edge.gateway.errors.remoteErrors.permanent = 503; },
+    "los mensajes de error que citan data": (d) => { d.edge.gateway.errors.messageNeverQuotesData = false; },
+    // PII
+    "el webhook de un tercero sin tratar su PII": (d) => { delete d.security.piiInPayload.edge; },
+  };
+  const delAnalizador = {
+    "un via desconocido que se acepta": (m, b) => { const c = structuredClone(m); for (const s of c.services) if (s.via && s.via !== "gateway") delete s.via; return analizarManifiesto(c, b); },
+    "un cliente de borde con serves que se acepta": (m, b) => { const c = structuredClone(m); for (const s of c.services) if (s.via === "gateway") delete s.serves, delete s.via; return analizarManifiesto(c, b); },
+  };
+  const delGenerador = {
+    "un cliente de borde con `$JS.API.>`": (svc, opts) => { const r = permisosDe(svc, opts); return svc.via === "gateway" ? { ...r, publish: [...r.publish, "$JS.API.>"] } : r; },
+    "un cliente de borde con `_INBOX.>`": (svc, opts) => { const r = permisosDe(svc, opts); return svc.via === "gateway" ? { ...r, subscribe: ["_INBOX.>"] } : r; },
+    "un cliente de borde con un permiso más": (svc, opts) => { const r = permisosDe(svc, opts); return svc.via === "gateway" ? { ...r, publish: [...r.publish, "pedidos.>"] } : r; },
+    "un cliente de borde con un permiso menos": (svc, opts) => { const r = permisosDe(svc, opts); return svc.via === "gateway" ? { ...r, publish: r.publish.filter((x) => !x.startsWith("rpc.")) } : r; },
+    "un cliente de borde con allow_responses": (svc, opts) => { const r = permisosDe(svc, opts); return svc.via === "gateway" ? { ...r, allowResponses: { max: 1, expires: "30s" } } : r; },
+  };
+  for (const [nombre, estropea] of Object.entries(mutaciones)) {
+    const copia = structuredClone(p);
+    try { estropea(copia); } catch (e) { fallos.push(`autocomprobación: la mutación «${nombre}» no se pudo aplicar (${e.message})`); continue; }
+    if (!fallosDeEdge(copia).length) fallos.push(`autocomprobación: la mutación «${nombre}» NO la detecta fallosDeEdge`);
+  }
+  for (const [nombre, analizador] of Object.entries(delAnalizador)) {
+    if (!fallosDeEdge(p, { analizar: analizador }).length) fallos.push(`autocomprobación: el analizador estropeado «${nombre}» NO lo detecta fallosDeEdge`);
+  }
+  for (const [nombre, emisor] of Object.entries(delGenerador)) {
+    if (!fallosDeEdge(p, { emitir: emisor }).length) fallos.push(`autocomprobación: el generador estropeado «${nombre}» NO lo detecta fallosDeEdge`);
+  }
+  mutacionesEdge = Object.keys(mutaciones).length + Object.keys(delAnalizador).length + Object.keys(delGenerador).length;
+}
+
 // ── Los ajustes: el documento real y sus mutaciones ────────────────────────────────────────────────────────────────────────
 let mutacionesAjustes = 0;
 {
@@ -1785,4 +2281,4 @@ if (fallos.length) {
   process.exit(1);
 }
 
-console.log(`✓ protocol.json coherente (${CASES.length} patrones + invariantes numéricas, de códigos, de capacidades y de estado · autocomprobación de estado: ${mutacionesEstado} mutaciones del documento y ${mutacionesAcl} de la ACL y su generador · de rpc: ${mutacionesRpc} mutaciones del documento y ${mutacionesAclRpc} de su ACL y su generador · de los ajustes: ${mutacionesAjustes} mutaciones, todas detectadas)`);
+console.log(`✓ protocol.json coherente (${CASES.length} patrones + invariantes numéricas, de códigos, de capacidades y de estado · autocomprobación de estado: ${mutacionesEstado} mutaciones del documento y ${mutacionesAcl} de la ACL y su generador · de rpc: ${mutacionesRpc} mutaciones del documento y ${mutacionesAclRpc} de su ACL y su generador · del borde: ${mutacionesEdge} mutaciones del documento, del analizador y del generador · de los ajustes: ${mutacionesAjustes} mutaciones, todas detectadas)`);

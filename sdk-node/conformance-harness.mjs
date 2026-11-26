@@ -11,10 +11,12 @@
  * `verify` y `parse`, implementa las cuatro operaciones de la capacidad `state` (`state-build`,
  * `state-tombstone`, `state-subject` y `state-dlq`) y las cinco de la capacidad `rpc` (`rpc-request`,
  * `rpc-reply`, `rpc-error`, `rpc-operation` y `rpc-timeout`: conformance/cases/cross-sdk-rpc-envelope.json),
- * que el runner solo ejecuta en los SDKs que las declaran en protocol.json.
+ * que el runner solo ejecuta en los SDKs que las declaran en protocol.json. También `external-id` (el `id` determinista de un
+ * hecho importado, 01-envelope.md §2.6.1): hoy solo la implementa este arnés y se integra en el cruzado más adelante.
  */
 
 import { buildEvent, serialize, parseEvent, toDlqEvent } from "./dist/envelope.js";
+import { externalEventId } from "./dist/external-id.js";
 import { createSigner, createVerifier } from "./dist/signing.js";
 import {
   buildStateDlqEvent,
@@ -104,6 +106,19 @@ async function ejecutar(entrada) {
   switch (entrada.op) {
     case "build":
       return { ok: true, bytes: b64(serialize(construir(entrada.event))) };
+
+    // El `id` determinista de un hecho importado (specification/01-envelope.md §2.6.1; conformance/cases/cross-sdk-external-id.json).
+    // Todavía NO está en conformance/harness/vectors.json: lo ejecuta, de momento, `sdk-node/test/external-id.test.ts` contra ese fichero.
+    // `externalKey: { repeat, times }` se expande para no pegar 513 caracteres en el caso.
+    case "external-id": {
+      const e = entrada.input ?? entrada;
+      const clave = e.externalKey !== null && typeof e.externalKey === "object" ? String(e.externalKey.repeat).repeat(e.externalKey.times) : e.externalKey;
+      try {
+        return { ok: true, id: externalEventId({ source: e.source, externalKey: clave, time: e.time }) };
+      } catch {
+        return { ok: false };
+      }
+    }
 
     case "dlq": {
       let ev = construir(entrada.event);

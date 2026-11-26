@@ -73,6 +73,41 @@ services:
       retries: 10
       start_period: 5s
 
+  # Perfil `gateway`: el gateway HTTP de borde (specification/12-edge.md, gateway/README.md) contra el `nats` de arriba.
+  # Un sistema que no puede mantener una conexión NATS (hosting compartido, cron, un tercero) publica, lee estado, llama y recibe
+  # webhooks por HTTP; sus permisos son los del manifiesto (`"via": "gateway"`), que `gen-acl.mjs` convierte en ACL.
+  #
+  #   # Una semilla de usuario de NATS por cliente de borde (con el `nats` abierto de arriba da igual cuál; con `nats-secure`, la de
+  #   # .dev-secure/nkeys/<servicio>.nk que genera scripts/dev-secure.mjs), y los secretos de las entregas y de los webhooks:
+  #   export TIENDA_WEB_NKEY_SEED=… CATALOGO_WEB_NKEY_SEED=… PASARELA_WEB_NKEY_SEED=…
+  #   export TIENDA_WEB_ENTREGA_SECRETO=$(openssl rand -hex 32) PASARELA_HOOK_SECRETO=$(openssl rand -hex 32) GITHUB_HOOK_SECRETO=$(openssl rand -hex 32)
+  #   docker compose --profile gateway up -d --build
+  #   curl -s localhost:8080/healthz
+  #
+  # `gateway/examples/gateway.json` apunta a `nats://nats:4222` y es solo un ejemplo (sus tokens son de mentira: genera los tuyos con
+  # `node gateway/src/index.mjs token`). Con otro fichero: GATEWAY_CONFIG=./mi-gateway.json.
+  gateway:
+    profiles: ["gateway"]
+    build:
+      context: .
+      dockerfile: gateway/Dockerfile
+    container_name: flux-gateway
+    depends_on:
+      nats:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:8080:8080"   # sin TLS: delante, un proxy que lo termine (12-edge.md §7.2)
+    volumes:
+      - ${GATEWAY_CONFIG:-./gateway/examples/gateway.json}:/etc/flux/gateway.json:ro
+    environment:
+      TIENDA_WEB_NKEY_SEED: ${TIENDA_WEB_NKEY_SEED:?define la semilla NATS de tienda-web}
+      CATALOGO_WEB_NKEY_SEED: ${CATALOGO_WEB_NKEY_SEED:?define la semilla NATS de catalogo-web}
+      PASARELA_WEB_NKEY_SEED: ${PASARELA_WEB_NKEY_SEED:?define la semilla NATS de pasarela-web}
+      TIENDA_WEB_ENTREGA_SECRETO: ${TIENDA_WEB_ENTREGA_SECRETO:?define el secreto que firma las entregas a tienda-web}
+      PASARELA_HOOK_SECRETO: ${PASARELA_HOOK_SECRETO:?define el secreto del webhook de la pasarela}
+      GITHUB_HOOK_SECRETO: ${GITHUB_HOOK_SECRETO:?define el secreto del webhook de github}
+    restart: unless-stopped
+
 volumes:
   nats-data:
   nats-secure-data:
