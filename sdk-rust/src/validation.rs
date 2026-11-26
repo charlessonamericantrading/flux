@@ -75,6 +75,16 @@ pub enum ValidationMode {
     Strict,
 }
 
+/// Las URI de los dos esquemas de una operación de petición/respuesta: **un par**, del mismo mayor
+/// — 11-request-reply.md §11.1.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct RpcSchemas {
+    /// El esquema de la petición: `https://schemas.internal/rpc/<dom>/<agr>/<op>/request/<semver>.json`.
+    pub request: String,
+    /// El esquema de la respuesta: `…/reply/<semver>.json`.
+    pub reply: String,
+}
+
 /// Los esquemas del ecosistema, empaquetados y desplegados **con el servicio**.
 ///
 /// Lo genera `scripts/bundle-schemas.mjs`; su forma en JSON es exactamente la de este
@@ -106,6 +116,16 @@ pub struct SchemaBundle {
     /// eventos no debe dejar de arrancar por ello.
     #[serde(default)]
     pub state: HashMap<String, String>,
+
+    /// Operación de **petición/respuesta** (`clientes.cliente.v1.calcular-descuento`) → las URI de
+    /// sus dos esquemas, con la versión más alta de su mayor — 11-request-reply.md §11.1. Es el
+    /// índice que `state` es para el estado: `request` y `respond` resuelven aquí el `dataschema`
+    /// de cada lado, **nunca por red**.
+    ///
+    /// `#[serde(default)]`: un bundle anterior a la fase 3 no lo tiene, y un servicio que no usa
+    /// peticiones no debe dejar de arrancar por ello.
+    #[serde(default)]
+    pub rpc: HashMap<String, RpcSchemas>,
 
     /// URI (`$id`) → JSON Schema. Incluye los de estado y el de la lápida
     /// (`https://schemas.internal/system/state/eliminado/1.0.0.json`), que **no** está en ningún
@@ -157,6 +177,12 @@ impl SchemaBundle {
     #[must_use]
     pub fn state_uri_for(&self, contract: &str) -> Option<&str> {
         self.state.get(contract).map(String::as_str)
+    }
+
+    /// Las URI de los esquemas de una operación de petición/respuesta, si el bundle las conoce.
+    #[must_use]
+    pub fn rpc_uris_for(&self, operation: &str) -> Option<&RpcSchemas> {
+        self.rpc.get(operation)
     }
 
     /// Cuántos esquemas trae. Útil para un log de arranque: un bundle vacío es un fallo de
@@ -319,25 +345,72 @@ impl Validator {
         self.run(event, &format!("state.{contract}"), true)
     }
 
+    /// ¿Tiene compilado el esquema `uri`? Lo usa `respond()` para fallar al arrancar con un bundle
+    /// que no trae los de la operación.
+    pub(crate) fn knows(&self, uri: &str) -> bool {
+        self.compiled.contains_key(uri)
+    }
+
+    /// Valida el `data` de una **petición** o de una **respuesta** de petición/respuesta contra el
+    /// esquema `schema_uri`, que sale del índice `rpc` del bundle (no del `dataschema` que traiga
+    /// el mensaje: el que responde puede escribir otro).
+    ///
+    /// Como en el estado, un `data` de una petición puede llevar un dato personal: el mensaje de
+    /// cada incumplimiento cita la **ruta** y la **regla**, **nunca el valor** — y reporta
+    /// **todos**, no el primero — 11-request-reply.md §5.2.
+    ///
+    /// `Ok(true)` si cumple; `Ok(false)` si no cumple y el modo es `warn` (se registra y se sigue).
+    ///
+    /// # Errores
+    ///
+    /// Los de [`Validator::validate`], con `operation` como `subject`.
+    pub(crate) fn validate_rpc(
+        &self,
+        operation: &str,
+        schema_uri: &str,
+        data: &serde_json::value::RawValue,
+    ) -> Result<bool, FluxError> {
+        match self.check_raw(operation, schema_uri, data.get(), true) {
+            None => Ok(true),
+            // En `strict` lanza; en `warn` registra y devuelve `false`: el llamante cuenta el
+            // fallo (`outcome="invalid_schema"`) aunque deje seguir al handler — §5.2.
+            Some(error) => self.report(error).map(|()| false),
+        }
+    }
+
     fn run(&self, event: &Event, subject: &str, redact: bool) -> Result<(), FluxError> {
-        let Some(validator) = self.compiled.get(&event.dataschema) else {
-            return self.report(FluxError::SchemaNotFound(SchemaNotFoundError {
+        match self.check_raw(subject, &event.dataschema, event.data.get(), redact) {
+            None => Ok(()),
+            Some(error) => self.report(error),
+        }
+    }
+
+    /// La comprobación en sí, sin política: `None` si `data` cumple el esquema.
+    fn check_raw(
+        &self,
+        subject: &str,
+        dataschema: &str,
+        data: &str,
+        redact: bool,
+    ) -> Option<FluxError> {
+        let Some(validator) = self.compiled.get(dataschema) else {
+            return Some(FluxError::SchemaNotFound(SchemaNotFoundError {
                 subject: subject.to_string(),
-                dataschema: event.dataschema.clone(),
+                dataschema: dataschema.to_string(),
             }));
         };
 
         // El payload viaja como `RawValue` para conservar los bytes exactos, así que hay
         // que interpretarlo para validarlo. Es el coste real de L3 y por eso L3 es opt-in.
-        let instance: Value = match serde_json::from_str(event.data.get()) {
+        let instance: Value = match serde_json::from_str(data) {
             Ok(v) => v,
             Err(e) => {
                 // Aquí no llega un payload no-JSON: `parse_event` ya lo habría rechazado
                 // como POISON y `build_event` no lo habría construido. Si llegara, decirlo
                 // como incumplimiento de esquema es más útil que un panic.
-                return self.report(FluxError::SchemaValidation(SchemaValidationError {
+                return Some(FluxError::SchemaValidation(SchemaValidationError {
                     subject: subject.to_string(),
-                    dataschema: event.dataschema.clone(),
+                    dataschema: dataschema.to_string(),
                     errors: vec![format!("(raíz) el payload no es JSON válido: {e}")],
                 }));
             }
@@ -360,12 +433,12 @@ impl Validator {
             .collect();
 
         if errors.is_empty() {
-            return Ok(());
+            return None;
         }
 
-        self.report(FluxError::SchemaValidation(SchemaValidationError {
+        Some(FluxError::SchemaValidation(SchemaValidationError {
             subject: subject.to_string(),
-            dataschema: event.dataschema.clone(),
+            dataschema: dataschema.to_string(),
             errors,
         }))
     }
@@ -654,6 +727,7 @@ mod tests {
         let bundle = SchemaBundle {
             subjects: HashMap::new(),
             state: HashMap::new(),
+            rpc: HashMap::new(),
             schemas: HashMap::from([(
                 "https://schemas.internal/x/1.0.0.json".to_string(),
                 json!({
@@ -675,6 +749,7 @@ mod tests {
         let bundle = SchemaBundle {
             subjects: HashMap::from([(SUBJECT.to_string(), uri.clone())]),
             state: HashMap::new(),
+            rpc: HashMap::new(),
             schemas: HashMap::from([(
                 uri.clone(),
                 json!({
