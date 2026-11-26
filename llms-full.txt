@@ -108,6 +108,27 @@ https://raw.githubusercontent.com/charlessonamericantrading/flux/main/protocol.j
 15. **`dlq`, `state`, `rpc` y `system` no son dominios.** `publish()` los rechaza
     (`RESERVED_DOMAIN`).
 
+**Petición/respuesta** (extensión opcional, [11-request-reply.md](specification/11-request-reply.md)):
+
+16. **Una orden o un cálculo con respuesta inmediata es una petición; un dato guardado es estado.**
+    `bus.request` / `bus.respond`, nunca un `POST` o un `GET` por HTTP entre servicios propios. **Si lo que pides es un
+    dato que otro sistema guarda, es estado, no petición/respuesta.**
+17. **El que responde deduplica por el `id` de la petición**, y un reintento reutiliza el mismo `id`.
+    `RPC_TIMEOUT` **no** dice que la operación no se ejecutó.
+18. **Una suscripción por operación, al subject exacto** (`rpc.<dominio>.<agregado>.v<major>.<operacion>`, operación
+    en **infinitivo**), con el servicio como grupo de cola. Nunca `rpc.<dominio>.>`. **Ningún stream captura `rpc.>`.**
+19. **Quien llama traduce lo que ve**: `no responders` → `RPC_UNAVAILABLE`, sin respuesta → `RPC_TIMEOUT`, un error →
+    `RetryableError` / `PermanentError`. Timeout **5 s** por defecto, **25 s** como máximo.
+
+**¿Qué primitiva uso?**
+
+| Necesito… | Uso |
+|---|---|
+| Avisar de que algo pasó; que cada interesado reaccione | **Evento** (`bus.publish`) |
+| Un dato que guarda otro sistema; la carga inicial; una copia local al día | **Estado** (`state.get` / `state.watch`) |
+| Una **orden** que necesita respuesta ya; un **cálculo** con parámetros | **Petición/respuesta** (`bus.request` / `bus.respond`) |
+| Encolar trabajo sin esperar | **Evento** del que pide + un evento de resultado, unidos por `correlationid` |
+
 ---
 
 ## 2. Publicar un evento
@@ -233,6 +254,14 @@ Estas no dan error: dan comportamiento incorrecto. Un agente las comete casi sie
 | `put` solo publica | **Es condicional**: lee la secuencia (`DIRECT.GET`), no escribe si la versión no avanza y publica con `Nats-Expected-Last-Subject-Sequence`. Un `publish` de core a un subject de estado sobrescribe **sin chequeo ni acuse**. El conflicto de secuencia tiene **dos** códigos: `10071` (un nodo) y `10164` (cluster, bajo carrera): reconoce los dos o no reintentarás en producción. Reintenta con **el mismo `id`**. |
 | El estado se recupera desde la DLQ | **No se reproduce**: `dlq.state.>` no lleva el dato (`data` es `{ key, revision }`) y republicar un valor viejo pisaría uno nuevo. `flux dlq replay` lo rechaza; la recuperación es `flux state resync`. |
 | Un estado con PII es «lo mismo que un evento con PII» | No: el estado va `confidential` con `x-pii` y **se puede borrar** (`delete` sustituye el valor por una lápida). Pero el borrado **físico** en disco y las **claves** y **tenants** (visibles en `STREAM.INFO`) no los cubre: la clave es un id opaco, nunca un email. |
+| Una petición a algo que no escucha nadie espera su timeout | **No**: `no responders` llega en ~1 ms (A-56)… **si la conexión lo pidió** en CONNECT (`headers` y `no_responders`); sin ello, silencio y timeout (A-57). Y con una suscripción `rpc.<dominio>.>` el servicio *sí* tiene interés en lo que no atiende: timeout (A-64). Una suscripción **por operación, exacta**. |
+| Un stream que captura `rpc.>` es inocuo | **Contesta a cada petición con su acuse** `{"stream":…,"seq":n}`, y casi siempre antes que la respuesta real (394 de 400, A-67). El que responde ejecuta igualmente y el stream **guarda cada petición**, datos personales incluidos. Un filtro `>` solo se crea sin acuse y convierte `no responders` en un timeout. `flux doctor` lo comprueba. |
+| `RPC_TIMEOUT` = la operación no ocurrió | **Ambiguo**: un responder lento la ejecuta y su respuesta llega tarde al inbox (A-61); uno que muere con la petición la pierde (A-62); la que sale justo al irse el último, en un cluster, también (A-70). Por eso se deduplica por `id`. |
+| Una petición denegada por la ACL falla rápido | Con `@nats-io/*` sí (~1 ms, A-66); con **`async-nats` (Rust) solo da un timeout** y el `-ERR` por el evento de la conexión (A-72). El SDK escucha el aviso y lanza `PERMISSION_DENIED`. |
+| `allow_responses: true` basta y es estrecho | Admite **una** respuesta por petición y **no caduca** (A-68). Acótalo: `{ max: 1, expires: 30s }`. Sin él, el dueño no puede contestar y quien llama ve un timeout. |
+| Una respuesta de más de 1 MiB falla con un error | **Falla en silencio**: la librería lanza en quien responde y quien llama solo ve un timeout (A-65). El que responde comprueba el tamaño y contesta `RPC_MESSAGE_TOO_LARGE`. |
+| Parar un responder cerrando la conexión | **Pierde lo que atiende** (A-62). Dejar de escuchar, esperar a lo que está en vuelo y cerrar. |
+| Dos servicios que atienden la misma operación se reparten el trabajo | Cada **grupo de cola** recibe **una copia**: los dos la ejecutan y quien llama ve una sola respuesta (A-60). Solo el dueño responde. |
 
 > Las tres primeras trampas de JetStream comparten forma: **el servidor acepta la
 > petición, no devuelve error, y aplica otra cosa.** Ninguna se detecta leyendo código;
@@ -243,7 +272,7 @@ Estas no dan error: dan comportamiento incorrecto. Un agente las comete casi sie
 Opt-in. Un servicio que no las use sigue siendo conforme, pero si el proyecto ya las
 tiene activas, tu código debe respetarlas.
 
-**Capacidades por SDK:** cada SDK declara las que tiene (`signing`, `security`, `state`: columna *Capacidades* del [`README.md`](README.md)), y uno sin `security` no es compatible con las ACLs de `gen-acl.mjs` ([00-protocol.md §5](specification/00-protocol.md)). Uno sin `state` no puede escribir ni leer estado replicado.
+**Capacidades por SDK:** cada SDK declara las que tiene (`signing`, `security`, `state`, `rpc`: columna *Capacidades* del [`README.md`](README.md)), y uno sin `security` no es compatible con las ACLs de `gen-acl.mjs` ([00-protocol.md §5](specification/00-protocol.md)). Uno sin `state` no puede escribir ni leer estado replicado, y uno sin `rpc` no hace ni atiende peticiones.
 
 ### Validación L3 — [00-protocol.md §5](specification/00-protocol.md)
 
@@ -294,6 +323,34 @@ await bus.state.watch("clientes.cliente.v1", async (entrada) => {         // fot
 - Métrica `flux_state_writes_total{contract,outcome}`; **nunca** la clave ni el tenant como
   etiqueta. Esquemas en `schemas/state/…`, con `aggregateVersion` obligatoria.
 
+### Petición/respuesta — [11-request-reply.md](specification/11-request-reply.md)
+
+Una **orden o un cálculo con respuesta inmediata** entre dos servicios, por core NATS: no se persiste, no tiene stream ni
+DLQ. **Ningún SDK la declara todavía**: la spec y las herramientas llegan antes que las implementaciones.
+
+```ts
+const r = await bus.request("clientes.cliente.v1.calcular-descuento",
+  { clienteId: "cli-1", totalCents: 9990, moneda: "EUR" }, { timeoutMs: 2000 });      // → el `data` de la respuesta
+
+await bus.respond("clientes.cliente.v1.calcular-descuento", async (peticion, ctx) => {
+  return { descuentoCents: 500, moneda: peticion.moneda };          // lanzar PermanentError / RetryableError para fallar
+});
+```
+
+- Subject `rpc.<dominio>.<agregado>.v<M>.<operacion>`: **5 tokens**; el **nombre** de la operación (el que recibe la API) tiene
+  4, sin `rpc.`, y la operación va en **infinitivo** (`obtener`, `calcular-precio`), no en pasado. Sin stream.
+- **Sobre**: el CloudEvent de siempre. La respuesta **hereda** `correlationid` y `tenantid` y su `causationid` es el `id` de la
+  petición. `type`: `com.flux.rpc.<dom>.<agr>.<op>.request.v<M>` / `.reply.v<M>`. **Sin cabeceras** de NATS.
+- **Error**: `com.flux.rpc.error.v1` con `data: { class, code, message, retryAfterMs? }`; `class` es `retryable` o
+  `permanent` (`poison` no viaja). Un error **desconocido** del handler es `permanent`.
+- **Seis códigos**: `RPC_UNAVAILABLE`, `RPC_TIMEOUT` (RETRYABLE), `STALE_REQUEST`, `RPC_INVALID_REPLY`,
+  `RPC_MESSAGE_TOO_LARGE`, `INVALID_RPC_CALL` (PERMANENT) — [04-errors.md §7](specification/04-errors.md).
+- Con la firma en `require`, el que responde rechaza una petición cuyo `time` se aleje **más de 300 s** (`STALE_REQUEST`).
+- Métricas `flux_rpc_client_requests_total{operation,outcome}`, `flux_rpc_server_requests_total{operation,outcome}` y
+  `flux_rpc_duration_seconds{operation,role}`; **nunca** el tenant, el `id` ni quién llama como etiqueta. Esquemas en
+  `schemas/rpc/<dom>/<agr>/<op>/{request,reply}/…`: un **par**; en una petición añadir un valor a un enum no exige
+  `x-extensible-enum`, en una respuesta sí (la dirección se invierte).
+
 ### Firma Ed25519 — [07-signing.md](specification/07-signing.md)
 
 - Se firma `serialize(evento sin `signature` y sin extensiones `dlq*`)`. **No hay
@@ -308,7 +365,7 @@ await bus.state.watch("clientes.cliente.v1", async (entrada) => {         // fot
 ### Métricas — [08-observability.md](specification/08-observability.md)
 
 Los nombres y etiquetas son **contrato**, no decisión de cada servicio. Siete métricas
-`flux_*` (más `flux_state_writes_total` en un SDK con la capacidad `state`).
+`flux_*` (más `flux_state_writes_total` en un SDK con la capacidad `state`, y las tres `flux_rpc_*` en uno con `rpc`).
 
 - **Nunca** etiquetes por `tenantid`, `id` ni `correlationid`: un tenant nuevo no debe
   crear series temporales nuevas. En **trazas** sí.
@@ -341,6 +398,9 @@ Los nombres y etiquetas son **contrato**, no decisión de cada servicio. Siete m
 | Credenciales `.creds`/`.nk` en el repo | Están en `.gitignore` por algo. Van en el gestor de secretos. |
 | Meter el dato personal en un evento «porque el consumidor lo necesita» | Es lo que el **estado** resuelve: el evento lleva `clienteId`, el estado lleva el dato, clasificado y borrable. |
 | Leer un dato de otro servicio con `GET` por HTTP | Es **estado** (`state.get` / `state.watch`), no petición/respuesta. |
+| Una operación `obtener-cliente-por-email` que devuelve lo que otro guarda | Es una consulta a un almacén: **estado**. La petición/respuesta es para órdenes y cálculos. |
+| `rpc.clientes.cliente.v1.creado` (un evento donde va una orden) | La operación va en **infinitivo** (`crear`); el pasado es de un evento. |
+| Suscribirse a `rpc.<dominio>.>` «para atenderlo todo» | Convierte `no responders` en un timeout. Un subject exacto por operación. |
 
 ## 11. Antes de dar por terminado
 
@@ -362,6 +422,9 @@ Los nombres y etiquetas son **contrato**, no decisión de cada servicio. Siete m
 - [ ] Si escribes **estado**: `aggregateVersion` ≥ 1 en `data` y en el esquema (`schemas/state/…`);
       el dato personal con `x-pii` y `confidential`; el consumidor borra su copia al recibir una lápida
 - [ ] Ningún dominio llamado `dlq`, `state`, `rpc` ni `system`; ninguna clave o tenant como etiqueta de métrica
+- [ ] Si haces o atiendes **peticiones**: la operación en infinitivo con su **par** `request`/`reply` en `schemas/rpc/…`; el
+      handler **deduplica por el `id`** de la petición; el timeout ≤ 25 s; los errores traducidos a `RETRYABLE` / `PERMANENT`;
+      ninguna métrica etiquetada por tenant, `id` ni quién llama; ningún stream captura `rpc.>` (`flux doctor`)
 
 ---
 
@@ -381,8 +444,8 @@ Los nombres y etiquetas son **contrato**, no decisión de cada servicio. Siete m
 > **Última revisión:** 2026-11-26
 
 > **1.1 es aditiva.** Las decisiones de v1.0 no cambian; el estado replicado
-> ([10-state.md](10-state.md)) entra como **extensión opcional**, igual que la firma: un servicio
-> que solo use eventos sigue siendo conforme.
+> ([10-state.md](10-state.md)) y la petición/respuesta ([11-request-reply.md](11-request-reply.md)) entran
+> como **extensiones opcionales**, igual que la firma: un servicio que solo use eventos sigue siendo conforme.
 
 ---
 
@@ -431,8 +494,9 @@ dato.**
   siendo posible.
 
 **NO DEBE** usarse como:
-- **Comando disfrazado.** `pedidos.pedido.v1.crear` no es un evento. Si necesitas
-  request/reply, usa NATS Core request/reply — está fuera del alcance de v1.
+- **Comando disfrazado.** `pedidos.pedido.v1.crear` no es un evento. Si necesitas una orden con
+  respuesta inmediata, usa la **petición/respuesta** ([11-request-reply.md](11-request-reply.md)): una operación
+  `rpc.pedidos.pedido.v1.crear`, en infinitivo, que no es un evento ni se persiste.
 - **Transporte de blobs.** Si el payload supera **1 MiB**, publica una referencia
   (URI + checksum), no el contenido. Ver [01-envelope.md §7](01-envelope.md).
 - **Sustituto de una tabla.** Un evento no es una fila. Un evento es un cambio. Si lo que
@@ -524,6 +588,7 @@ conforme; lo que no es, es compatible con aquello que la capacidad habilita.
 | `signing` | [07-signing.md](07-signing.md) | No firma ni verifica. Un evento sin firma sigue siendo válido: el modo por defecto es `off` |
 | `security` | Esta sección, y lo que cita | **No es compatible con la configuración segura** de [06-security.md](06-security.md): con el inbox por defecto el broker le deniega la suscripción a su propio inbox y su primera petición falla |
 | `state` | [10-state.md](10-state.md) | No escribe ni lee **estado replicado** (`put`, `delete`, `get`, `watch`): para leer un dato que guarda otro sistema tiene que llamarle por HTTP. Sigue siendo conforme |
+| `rpc` | [11-request-reply.md](11-request-reply.md) | No hace ni atiende **peticiones con respuesta** (`request`, `respond`): para una orden con respuesta inmediata o un cálculo tiene que llamar por HTTP. Sigue siendo conforme |
 
 El registro de qué SDK declara qué capacidad es [`protocol.json`](../protocol.json) →
 `capabilities`, y la tabla «Estado de los SDKs» del [`README.md`](../README.md) lo muestra.
@@ -569,6 +634,18 @@ completo contra un broker real con los permisos exactos de estado, en los dos se
 `security` no es requisito, pero **sin ella el SDK no puede ejecutar** el ciclo bajo la
 configuración segura.
 
+#### `rpc`
+
+Un SDK **declara** `rpc` solo si cumple **todo** lo de [11-request-reply.md §12](11-request-reply.md): `request` y
+`respond`, **los mismos bytes** que los ejemplos de [11-request-reply.md §3.5](11-request-reply.md) para la petición, la
+respuesta y los dos errores, los **seis** códigos de [04-errors.md §7](04-errors.md), una suscripción exacta por
+operación con el grupo de cola del servicio, la conexión que pide `no responders`, una petición denegada que falla
+rápido con `PERMISSION_DENIED` y un ciclo completo contra un broker real con los permisos exactos de la
+petición/respuesta, en los dos sentidos —una operación atendida por dos instancias reparte las peticiones, y al
+parar ambas quien llama recibe `RPC_UNAVAILABLE` en menos de 100 ms—. `security` no es requisito, pero **sin ella el
+SDK no puede ejecutar** el ciclo bajo la configuración segura (el inbox privado es lo que impide leer las
+respuestas ajenas). **Ningún SDK la declara todavía**: la evidencia llega con las fases de los SDKs.
+
 Una capacidad nueva se añade aquí con su nombre, su documento normativo y la evidencia que la
 acredita, y ningún SDK la declara hasta que pasa esa evidencia.
 
@@ -576,10 +653,11 @@ acredita, y ningún SDK la declara hasta que pasa esa evidencia.
 
 Declarado explícitamente para evitar scope creep:
 
-> El **estado replicado** no está en esta lista: entra en 1.1 como extensión opcional
-> ([10-state.md](10-state.md)).
+> El **estado replicado** ([10-state.md](10-state.md)) y la **petición/respuesta**
+> ([11-request-reply.md](11-request-reply.md)) no están en esta lista: entran en 1.1 como extensiones opcionales.
+> Lo que sigue fuera de la petición/respuesta —flujos de varias respuestas, difusión, contrapresión— está declarado
+> en [11-request-reply.md §13](11-request-reply.md).
 
-- Request/reply y RPC.
 - Sagas y orquestación de procesos de larga duración.
 - Protobuf y Avro (opt-in por subject en v2).
 - Cifrado a nivel de campo.
@@ -599,6 +677,7 @@ Declarado explícitamente para evitar scope creep:
 | [08-observability.md](08-observability.md) | Métricas, trazas y alertas — normativo para L2 |
 | [09-multitenancy.md](09-multitenancy.md) | Modelos de aislamiento entre tenants |
 | [10-state.md](10-state.md) | Estado replicado — extensión **opcional**: `put`, `delete`, `get`, `watch` |
+| [11-request-reply.md](11-request-reply.md) | Petición/respuesta — extensión **opcional**: `request`, `respond`, core NATS, sin stream |
 
 
 ==============================================================================
@@ -1024,7 +1103,7 @@ nombres del protocolo, y un dominio con su nombre colisionaría con él.
 |---|---|
 | `dlq` | Los subjects de la DLQ: `dlq.<subject original>` (§3.1) y `dlq.state.<dominio>.…` |
 | `state` | El estado replicado: `state.<dominio>.<agregado>.v<major>.<tenant>.<clave>` ([10-state.md](10-state.md)), y `schemas/state/` |
-| `rpc` | La petición/respuesta (`rpc.<dominio>.…`, fase 3), y `schemas/rpc/` |
+| `rpc` | La petición/respuesta: `rpc.<dominio>.<agregado>.v<major>.<operacion>` ([11-request-reply.md](11-request-reply.md)), y `schemas/rpc/`. **No hay stream**: es core NATS |
 | `system` | Lo de la plataforma: `schemas/system/…` y el tenant `"system"` ([09-multitenancy.md §5](09-multitenancy.md)) |
 
 **La colisión es del broker, no solo de estilo.** Medido contra NATS 2.14.5 (A-43): con
@@ -1065,6 +1144,17 @@ type:            com.flux.state.clientes.cliente.v1
 lápida:          com.flux.state.clientes.cliente.deleted.v1
 ```
 
+Y la petición/respuesta, el suyo ([11-request-reply.md §3](11-request-reply.md)): el subject de la operación lleva
+**cinco** tokens, y su nombre —lo que reciben `request` y `respond`, el subject sin `rpc.`— **cuatro**, con la
+misma forma sintáctica que el subject de un evento. La operación va en **infinitivo**; el evento, en pasado.
+
+```
+subject (NATS):  rpc.clientes.cliente.v1.calcular-descuento
+type:            com.flux.rpc.clientes.cliente.calcular-descuento.request.v1
+                 com.flux.rpc.clientes.cliente.calcular-descuento.reply.v1
+error:           com.flux.rpc.error.v1                              (el mismo para toda operación)
+```
+
 ## 3. Streams de JetStream
 
 ```
@@ -1082,6 +1172,11 @@ DLQ_CLIENTES         dlq.clientes.>  y  dlq.state.clientes.>
 
 - `STATE_<DOMINIO>` guarda **un valor por clave** y no caduca; su configuración está en
   [10-state.md §2.1](10-state.md). Solo existe si el dominio tiene contratos de estado.
+- **La petición/respuesta NO tiene stream.** `rpc.<dominio>.…` es core NATS: una petición no se persiste y, si
+  nadie responde, quien llama lo sabe al instante ([11-request-reply.md §2.1](11-request-reply.md)). **Ningún stream
+  DEBE capturar `rpc.>`**: si uno lo hace, quien llama recibe el acuse de JetStream como si fuera la respuesta (A-18) y el
+  stream guarda cada petición. Los streams de este documento no lo hacen —`EVT_<DOM>` es `<dom>.>` y `rpc` es un dominio
+  reservado— y `flux doctor` comprueba que ningún otro lo haga ([11-request-reply.md §8](11-request-reply.md)).
 - **El stream `DLQ_<DOMINIO>` de un dominio con estado captura además `dlq.state.<dominio>.>`**:
   la DLQ de estado ([10-state.md §6](10-state.md)). Un dominio sin estado conserva el
   `DLQ_<DOMINIO>` de siempre, sin tocarlo.
@@ -1198,6 +1293,7 @@ estado se limita a 64.
 | `pedidos.pedido.v1.OrderCreated` | Mayúsculas + idioma mezclado. | `pedidos.pedido.v1.creado` |
 | `core.entidad.v1.cambiado` | Dominio genérico = ningún dominio. | Nombra el bounded context real |
 | `state.cliente.v1.creado`, `dlq.pedido.v1.creado` | Un dominio reservado: choca con un stream del protocolo, y el SDK lo rechaza (`RESERVED_DOMAIN`). | Nombra el bounded context real — [§1.3](#13-dominios-reservados) |
+| `rpc.clientes.cliente.v1.creado`, `rpc.clientes.cliente.v1.obtener-por-email` | Un **evento** (pasado) donde va una orden, y una consulta a un almacén donde va una operación | Infinitivo para la orden (`crear`); un dato guardado es **estado** — [11-request-reply.md §2.2](11-request-reply.md) |
 
 > **Sobre `actualizado`:** es el antipatrón más caro de los siete. Obliga a cada
 > consumidor a comparar contra su propia copia para averiguar qué pasó, lo que
@@ -1876,7 +1972,7 @@ SDK inventa.
 | `MISSING_AGGREGATE_VERSION` | **PERMANENT** | `put`, `delete` (y al consumir) | `data` no tiene `aggregateVersion`, o no es un entero ≥ 1 y ≤ 2^53 − 1 ([10-state.md §3.4](10-state.md)) |
 | `STATE_SUBJECT_MISMATCH` | **POISON** | Al consumir: `watch` y `get` | El `tenantid`, el `subject` o el `type` del sobre no coinciden con el subject de NATS en el que llegó la entrada ([10-state.md §5.4](10-state.md)) |
 | `STATE_CONFLICT` | **RETRYABLE** | `put`, `delete` | El chequeo de secuencia agotó sus 3 intentos: alguien escribió la misma clave entre la lectura y la publicación, las tres veces ([10-state.md §3.2](10-state.md)) |
-| `RESERVED_DOMAIN` | **PERMANENT** | `publish`, `subscribe`, `put`, `get`, `delete`, `watch` | Un subject o un contrato usa un dominio reservado: `dlq`, `state`, `rpc` o `system` ([10-state.md §2.7](10-state.md)) |
+| `RESERVED_DOMAIN` | **PERMANENT** | `publish`, `subscribe`, `put`, `get`, `delete`, `watch`, `request`, `respond` | Un subject, un contrato o una operación usa un dominio reservado: `dlq`, `state`, `rpc` o `system` ([10-state.md §2.7](10-state.md), [11-request-reply.md §2.6](11-request-reply.md)) |
 
 **Por qué estas clases.**
 
@@ -1923,6 +2019,67 @@ uno que no existe, y el mensaje **DEBE** nombrar las dos causas, y apuntar a `fl
 `put` y `delete`, `flux_state_writes_total` solo cuenta `MISSING_AGGREGATE_VERSION` e
 `INVALID_SCHEMA`, los dos como `invalid_schema` ([08-observability.md §2.4](08-observability.md));
 el resto son errores de quien llama y quedan en su excepción.
+
+## 7. Errores de la capacidad `rpc`
+
+Un SDK que declara la capacidad `rpc` ([00-protocol.md §5](00-protocol.md),
+[11-request-reply.md](11-request-reply.md)) **DEBE** emitir estos **seis** códigos estables. La lista es
+**cerrada**, como la de estado: un caso que no encaje en ninguno es un hueco de la spec, no un código nuevo que
+cada SDK inventa.
+
+| Código | Clase | Se lanza en | Se emite cuando |
+|---|---|---|---|
+| `RPC_UNAVAILABLE` | **RETRYABLE**, inmediato | `request` | Nadie escucha la operación: el broker contesta `no responders` (estado 503) en milisegundos, sin esperar al timeout. Exige `headers` y `no_responders` en CONNECT: sin ellos solo hay un timeout ([11-request-reply.md §4.3](11-request-reply.md)) |
+| `RPC_TIMEOUT` | **RETRYABLE** | `request` | No llega una respuesta en el timeout (5 s por defecto, 25 s como máximo). **Ambiguo: la operación PUEDE haberse ejecutado**, de ahí que quien responde deduplique por `id` |
+| `STALE_REQUEST` | **PERMANENT** | quien responde, **en un error** | Con la firma en modo `require`, el `time` de la petición se aleja más de **300 s** del reloj de quien responde, por delante o por detrás ([11-request-reply.md §7.4](11-request-reply.md)) |
+| `RPC_INVALID_REPLY` | **PERMANENT** | `request` | Lo que llega **no es la respuesta a esta petición**: no es un CloudEvent válido, su `type` no es el de la respuesta ni `com.flux.rpc.error.v1`, su `causationid` no es el `id` de la petición, o su `correlationid`/`tenantid` no los hereda. Es lo que ve quien llama cuando un stream captura `rpc.>` y contesta con su acuse |
+| `RPC_MESSAGE_TOO_LARGE` | **PERMANENT** | `request`; quien responde, **en un error** | El mensaje serializado no cabe en el mínimo entre 1 MiB y el `max_payload` del broker. En la respuesta es la única forma de que quien llama se entere: publicarla lanzaría **en quien responde** y quien llama solo vería un timeout |
+| `INVALID_RPC_CALL` | **PERMANENT** | `request`, `respond`; quien responde, **en un error** | La llamada o el registro está mal formado y se sabe **sin red**: la operación no cumple el patrón (cuatro tokens, sin el prefijo `rpc.`, minúsculas y `kebab-case`), `timeoutMs` no es un entero entre 1 y 25 000, o `data` no es un objeto. En quien responde, además: un `type` que no es el de la petición de esa operación |
+
+**Por qué estas clases.**
+
+- `RPC_UNAVAILABLE` y `RPC_TIMEOUT` son **RETRYABLE** —el fallo es del entorno— pero **no se gestionan igual**: la
+  primera es inmediata y no gasta tiempo; la segunda cuesta su timeout entero y es **ambigua**. Un handler de
+  eventos que recibe cualquiera de las dos reentrega con el backoff de siempre.
+- `STALE_REQUEST`, `RPC_INVALID_REPLY`, `RPC_MESSAGE_TOO_LARGE` e `INVALID_RPC_CALL` son **PERMANENT**: reintentar
+  da lo mismo ([§5.1](#51-son-permanent)). Un handler que los provoque va a la DLQ en la **primera** entrega.
+  `RPC_INVALID_REPLY` lo es aunque a veces sea intermitente (una carrera con el acuse de un stream, A-67): una
+  respuesta que no es de esta petición es un **incidente** —un productor roto, un stream mal puesto— y se alerta
+  por separado.
+- **Los errores que viajan en la respuesta** (`com.flux.rpc.error.v1`) llevan una `class` **binaria**:
+  `retryable` o `permanent`. **`poison` no viaja**: es la calificación de quien *consume* un mensaje ilegible
+  ([§1.3](#13-poison)); para quien llama, una petición que el otro lado no pudo interpretar es `permanent`. El que
+  responde la cuenta como `poison` en **su** métrica y alerta.
+- Un error **desconocido** de un handler se responde como **`permanent`**: el presupuesto acotado de
+  [§2.1](#21-el-default-para-lo-desconocido-retryable-acotado) se cuenta por *entregas* de un consumidor y una
+  llamada no tiene número de entrega; con `retryable`, el handler de quien llama reintentaría seis veces en 51
+  minutos un bug de otro servicio.
+
+**Qué DEBE decir el mensaje.** Lo mismo que [§5.2](#52-qué-debe-decir-el-mensaje): el código es fijo y la
+aplicación no puede sustituirlo; el mensaje nombra **qué** está mal y **cómo se arregla** (los bytes y el límite;
+el rango del timeout; la operación y el patrón; la ventana de 300 s y la hora local); y **NO DEBE** incluir valores
+de `data` ni, en un error que el handler no lanzó a propósito, el texto de una excepción. `RPC_TIMEOUT` **DEBE**
+decir que la operación puede haberse ejecutado. `RPC_INVALID_REPLY` **DEBERÍA** decir que algún stream captura
+`rpc.>` y apuntar a `flux doctor` cuando el cuerpo parezca el acuse de un stream.
+
+**Lo que no es un código nuevo.** Estos ya existen y se reutilizan tal cual:
+
+| Situación | Código |
+|---|---|
+| Dominio reservado en una operación (`rpc.clientes…` con el prefijo, `state.x…`) | `RESERVED_DOMAIN` — [§6](#6-errores-de-la-capacidad-state) |
+| `data` no cumple el esquema de la petición o de la respuesta | `INVALID_SCHEMA` |
+| `classification` fuera del enum | `INVALID_DATACLASSIFICATION` ([01-envelope.md §3.1](01-envelope.md)) |
+| La ACL deniega la petición (o la suscripción de quien responde) | `PERMISSION_DENIED` — [§5](#5-errores-de-la-capacidad-security), con la regla de [06-security.md §3.7](06-security.md): el SDK escucha el `-ERR` y lo compite con la respuesta |
+| Firma ausente, inválida o con clave desconocida | `MISSING_SIGNATURE`, `INVALID_SIGNATURE`, `UNKNOWN_SIGNING_KEY` ([07-signing.md §7](07-signing.md)) |
+| Sobre ilegible o sin una extensión obligatoria | Los de [01-envelope.md §3.1](01-envelope.md) |
+
+`NOT_PROVISIONED` **no aplica**: no hay streams ni consumidores que aprovisionar. Y una operación sin handler **no
+tiene código propio**: es `RPC_UNAVAILABLE`, porque el SDK se suscribe al subject exacto de cada operación.
+
+**Métricas.** Se cuentan en `flux_rpc_client_requests_total` y `flux_rpc_server_requests_total`
+([08-observability.md §2.5](08-observability.md)) con un `outcome` por código: `unavailable`, `timeout`,
+`invalid_reply`, `stale_request`… `INVALID_RPC_CALL` no se cuenta: es un error de programación, como
+`INVALID_STATE_KEY`.
 
 
 ==============================================================================
@@ -2043,6 +2200,9 @@ schemas/pedidos/pedido/creado/1.0.0.json
 - El `$id` **DEBE** coincidir exactamente con la URI que aparece en `dataschema`.
 - Extensiones flux permitidas en el esquema: `x-pii`, `x-extensible-enum`,
   `x-deprecated-since`.
+- Otras dos ubicaciones, con las mismas reglas: el **estado**
+  (`schemas/state/<dominio>/<agregado>/<semver>.json`, [10-state.md §10](10-state.md)) y la **petición/respuesta**
+  (`schemas/rpc/<dominio>/<agregado>/<operacion>/{request,reply}/<semver>.json`, §6).
 
 ## 5. Verificación en CI
 
@@ -2065,6 +2225,27 @@ parecen**:
 - **Un campo monetario declarado como `number`.** Valida perfectamente hoy y pierde
   precisión en producción — el caso de §2.2 "cambiar unidades o semántica", que ningún
   validador de esquemas detecta por sí solo.
+
+## 6. Petición/respuesta: la dirección invertida
+
+Los esquemas de [11-request-reply.md](11-request-reply.md) se rigen por todo lo anterior, con **una inversión** y
+un orden de despliegue. Un esquema describe datos que fluyen de quien **escribe** a quien **lee**; la regla de §2.3
+—un valor nuevo en un enum exige `x-extensible-enum`— existe para proteger **al lector**, y en una operación los
+lectores son otros:
+
+| | Escribe | Lee | Un valor nuevo en un enum cerrado |
+|---|---|---|---|
+| **Respuesta** (`reply/`) | el dueño | **los llamantes**: muchos, independientes, a su ritmo | Exige `x-extensible-enum`, como un evento |
+| **Petición** (`request/`) | **los llamantes** | el dueño: **uno**, que publica el esquema y lo despliega | **No** lo exige: el lector ya conoce el valor |
+
+Todo lo demás (§2.2) rige igual en los dos lados: quitar o renombrar un campo, cambiar un tipo, pasar opcional a
+requerido —**incluido un campo requerido nuevo en la petición**, que los llamantes viejos no envían—, endurecer una
+restricción o cambiar la semántica obliga a un mayor nuevo. Y un **par** —petición y respuesta del mismo mayor— es
+obligatorio: un lado sin el otro es un error de `bundle-schemas.mjs` y de `check-compat.mjs`.
+
+**El orden de despliegue es primero quien responde, después quien llama.** Una petición con un campo opcional nuevo
+contra una instancia que aún valida con el esquema viejo (y `additionalProperties: false`) es `INVALID_SCHEMA`.
+`check-compat.mjs` lo implementa: en un esquema `request/` no exige `x-extensible-enum`; en `reply/` sí.
 
 
 ==============================================================================
@@ -2921,7 +3102,9 @@ mismo, agrupar deja de funcionar en cuanto el ecosistema es polyglot — que es 
 
 Un SDK L2 **DEBE** exponer estas siete. Nombres en formato Prometheus; un SDK con otro
 backend **DEBE** conservar los nombres y las etiquetas. Un SDK que declara la capacidad `state`
-([10-state.md](10-state.md)) **DEBE** exponer además la de [§2.4](#24-flux_state_writes_total--la-capacidad-state).
+([10-state.md](10-state.md)) **DEBE** exponer además la de [§2.4](#24-flux_state_writes_total--la-capacidad-state), y uno
+que declara `rpc` ([11-request-reply.md](11-request-reply.md)), las tres de
+[§2.5](#25-las-métricas-de-la-capacidad-rpc).
 
 | Métrica | Tipo | Etiquetas |
 |---|---|---|
@@ -3062,6 +3245,62 @@ dominio, y el tenant, una por cada cliente de la plataforma. Es la regla de
   sufijo, cada tenant nuevo crearía series nuevas;
 - `flux_consumer_pending` es la **suma** de los durables del servicio para ese contrato, no el
   valor del último sondeado: varios durables con las mismas etiquetas se pisarían entre sí.
+
+### 2.5 Las métricas de la capacidad `rpc`
+
+| Métrica | Tipo | Etiquetas |
+|---|---|---|
+| `flux_rpc_client_requests_total` | Counter | `operation`, `outcome` |
+| `flux_rpc_server_requests_total` | Counter | `operation`, `outcome` |
+| `flux_rpc_duration_seconds` | Histogram | `operation`, `role` |
+
+```
+operation = <dominio>.<agregado>.v<major>.<operacion>      ("clientes.cliente.v1.calcular-descuento": sin el prefijo rpc.)
+role      = client | server
+```
+
+Van en **su propio bloque** (`protocol.json` → `rpc.metrics`), **no entre las siete**: las suites de los SDKs cuentan
+exactamente siete, y una capacidad opcional no puede cambiar esa cuenta (la de estado, §2.4, hace lo mismo).
+
+**`outcome` del cliente** (`flux_rpc_client_requests_total`), uno por llamada:
+
+| `outcome` | Cuándo |
+|---|---|
+| `ok` | Llegó una respuesta válida |
+| `unavailable` | `RPC_UNAVAILABLE`: nadie escucha la operación |
+| `timeout` | `RPC_TIMEOUT` |
+| `retryable` | Llegó un error con `class: retryable` |
+| `permanent` | Llegó un error con `class: permanent`, o `PERMISSION_DENIED`, `STALE_REQUEST`, `RPC_MESSAGE_TOO_LARGE` o un fallo de firma |
+| `invalid_schema` | `INVALID_SCHEMA`, al construir la petición o al validar la respuesta |
+| `invalid_reply` | `RPC_INVALID_REPLY`: lo que llegó no es la respuesta a esta petición |
+
+**`outcome` del servidor** (`flux_rpc_server_requests_total`), uno por petición recibida:
+
+| `outcome` | Cuándo |
+|---|---|
+| `ok` | El handler devolvió una respuesta |
+| `retryable` / `permanent` | El handler falló con un error de esa clase (un error **desconocido** es `permanent`) |
+| `poison` | La petición **no se pudo interpretar**, o no traía subject de respuesta. **Es lo que debe despertar a alguien**: alguien publica a mano, o hay un SDK roto |
+| `invalid_schema` | La petición no cumple su esquema, o la respuesta del handler no cumple el suyo |
+| `invalid_signature` | Firma ausente o inválida en modo `require` |
+| `stale_request` | `STALE_REQUEST`: `time` a más de 300 s |
+
+**`invalid_schema` se emite también cuando la llamada lanza**, por la misma razón que en [§2.1](#21-valores-de-las-etiquetas).
+Los errores de programación —`INVALID_RPC_CALL`, `RESERVED_DOMAIN`— **no** se cuentan.
+
+**`flux_rpc_duration_seconds`**: en el cliente, desde que sale la petición hasta que llega la respuesta **o falla**
+(un timeout dura su timeout); en el servidor, lo que tarda el handler desde que recibe la petición hasta que sale la
+respuesta. **Mismos buckets** que [§3](#3-histograma-de-duración): el último, `30`, es el `ack_wait`, y una llamada
+cerca de él es una llamada hecha desde un handler que está a punto de reentregarse.
+
+**Cardinalidad.** `operation` está acotado —hay tantas como operaciones declaradas— y sirve como etiqueta.
+**Nunca** el `tenantid`, el `id`, el `correlationid` **ni quién llama** (servicio o cliente): son una serie por cada
+uno. Es la regla de §2.2, aplicada a lo único que la petición/respuesta añade. En **trazas** sí
+([§5](#5-trazas)): un span por llamada y otro por petición atendida.
+
+**Alertas.** Además de las cuatro de [§4](#4-alertas-mínimas): `poison` del servidor (es el POISON de las peticiones),
+`invalid_reply` del cliente (es la trampa de un stream que captura `rpc.>`, [11-request-reply.md §8](11-request-reply.md))
+y la tasa de `unavailable` y de `timeout` por operación.
 
 ## 3. Histograma de duración
 
@@ -4123,5 +4362,895 @@ es barato **ahora** y deja de serlo cuando haya datos en un stream:
 
 
 ==============================================================================
-== FIN — 12 documentos
+== specification/11-request-reply.md
+==============================================================================
+
+# 11 — Petición/respuesta
+
+> **Estado:** extensión **opcional** de v1.1 (capacidad `rpc`, [00-protocol.md §5](00-protocol.md)).
+> Un SDK L1/L2/L3 conforme no necesita implementarla; un servicio que solo use eventos o estado
+> sigue siendo conforme.
+>
+> Cada observación citada como `A-n` está medida contra **nats-server 2.14.5** y descrita en el
+> [Apéndice A del plan v1.1](../docs/plan-v1.1/PLAN.md#apéndice-a--evidencia). Las que son del broker
+> son casos ejecutables de [`conformance/cases/rpc-semantics.json`](../conformance/cases/rpc-semantics.json)
+> que ejecuta [`conformance/rpc-broker.mjs`](../conformance/rpc-broker.mjs). A-15 a A-18 salieron del plan
+> original y se **reprodujeron** (A-56, A-68, A-66 y A-67, en ese orden); la fase añadió el resto hasta A-76, entre
+> ellas las que cambian el diseño: **la «respuesta» de un stream que captura `rpc.>` gana casi siempre a la real**
+> (A-67), **una suscripción con comodín convierte `no responders` en un timeout** (A-64) y **el
+> `allow_responses` por defecto admite UNA respuesta y no caduca** (A-68).
+
+---
+
+## 1. Qué problema resuelve
+
+Un evento dice **qué pasó**. El estado ([10-state.md](10-state.md)) lleva **el dato**. Lo que falta es
+la **orden que necesita respuesta ya** y el **cálculo**: reservar el stock y saber si se pudo, pedir el
+precio de un carrito, validar una dirección. Hoy eso es `POST /accion` y `GET /precio?…` entre servicios
+propios, con todo lo que arrastra un HTTP interno: otro transporte, otras credenciales, otro formato
+de error y ninguna clasificación de reintentos.
+
+La **petición/respuesta** es una llamada con respuesta inmediata entre dos servicios flux, con **el mismo
+sobre, el mismo `tenantid`, la misma clasificación de errores y los mismos permisos** que el resto del
+protocolo:
+
+| Hoy (HTTP) | Con petición/respuesta |
+|---|---|
+| `POST /accion` que necesita respuesta ya | `bus.request("<dominio>.<agregado>.v1.<operacion>", data)` |
+| `GET /precio?…`: un **cálculo**, no un dato guardado | ídem |
+| El servicio de al lado está caído: `ECONNREFUSED`, a veces tras segundos | `RPC_UNAVAILABLE` en milisegundos (A-56) |
+| Un 503 de la otra parte: ¿se reintenta? | El error **lleva su clase** (`retryable` / `permanent`) y quien llama hereda la clasificación |
+
+**La regla que evita recrear el problema.** Si lo que pides es *un dato que otro sistema guarda*, es
+**estado**, no petición/respuesta: `state.get` / `state.watch`. La petición/respuesta queda para
+**órdenes** que necesitan respuesta inmediata y para **cálculos**. Usarla para leer datos es volver a
+tener una API con otro transporte —y devolver el problema que el estado existe para quitar—.
+
+| Necesitas | Usa |
+|---|---|
+| Avisar de que algo ocurrió (y que cada interesado reaccione) | **Evento** |
+| Un dato que guarda otro sistema; la carga inicial; mantener una copia al día | **Estado** |
+| Una **orden** que necesita respuesta ya; un **cálculo** con parámetros | **Petición/respuesta** |
+| Encolar trabajo sin esperar | **Evento** en el dominio de quien pide, más un evento de resultado unidos por `correlationid` |
+
+**Qué no es.** No persiste nada: no hay historia, ni reentrega, ni DLQ. No es difusión: una petición
+la atiende **una** instancia. No es un flujo: **una petición, una respuesta** (§7.2 lo hace cumplir el
+broker). No sustituye al evento: la orden que cambia el mundo sigue publicando **eventos** para que los
+demás reaccionen; la respuesta solo contesta a quien preguntó.
+
+## 2. Modelo
+
+### 2.1 Core NATS, sin stream
+
+La petición/respuesta usa **core NATS**, no JetStream. Una petición no se persiste: es un mensaje con
+subject de respuesta, y si nadie escucha, quien llama **lo sabe al instante** y no tras un timeout. Medido
+(A-56): con un timeout de 5000 ms, la petición a una operación sin nadie falla en **1-2 ms** con
+`no responders`.
+
+```
+rpc.<dominio>.<agregado>.v<major>.<operacion>        subject de NATS. SIN stream. SIN DLQ.
+```
+
+- **Ningún stream DEBE capturar `rpc.>`.** Si uno lo hace, quien llama recibe el acuse de JetStream
+  como si fuera la respuesta y el que responde ejecuta igualmente (A-18, A-67): es la trampa de [§8](#8-la-trampa-un-stream-que-captura-rpc).
+  `flux doctor` lo comprueba y el aprovisionamiento no crea ninguno.
+- Es el espacio de nombres hermano de `dlq.` y `state.`: disjunto por construcción de los eventos, y
+  por eso `rpc` es un dominio **reservado** ([02-naming.md §1.3](02-naming.md)).
+- **Una petición NO se reentrega.** Core NATS es *at-most-once*: una petición recibida por una instancia
+  que muere se pierde (A-62). Quien llama no puede distinguirlo de una operación lenta: por eso
+  `RPC_TIMEOUT` es **ambiguo** y el que responde deduplica por `id` ([§4.5](#45-reintentos-e-idempotencia)).
+
+### 2.2 El subject y la operación
+
+```
+subject de NATS:        rpc.clientes.cliente.v1.calcular-descuento      (5 tokens)
+nombre de la operación:     clientes.cliente.v1.calcular-descuento      (4 tokens: lo que reciben request y respond)
+```
+
+| Token | Regla |
+|---|---|
+| `rpc` | Literal. Espacio de nombres del protocolo |
+| `dominio`, `agregado`, `v<major>` | Los del contrato, como en [02-naming.md §1](02-naming.md): bounded context en plural, agregado en singular |
+| `operacion` | **Infinitivo**, `kebab-case`: `obtener`, `crear`, `calcular-precio`, `reservar-stock` |
+
+El **nombre de la operación** —el subject sin `rpc.`— tiene exactamente la forma sintáctica de un subject
+de evento (`naming.subject.pattern`): cuatro tokens. Lo que separa una operación de un evento es el
+prefijo `rpc.` del subject de NATS, del `type` y de la ruta del esquema, y la **forma gramatical** del
+último token: **el evento va en pasado, la operación en infinitivo**. `clientes.cliente.v1.creado` es un
+hecho; `clientes.cliente.v1.crear` es una orden.
+
+```
+✅ rpc.clientes.cliente.v1.obtener              ❌ rpc.clientes.cliente.v1.creado          pasado: es un evento
+✅ rpc.clientes.cliente.v1.calcular-descuento   ❌ rpc.clientes.cliente.v1.obtener_cliente  guion bajo
+✅ rpc.logistica.linea-envio.v2.reservar-stock  ❌ rpc.Clientes.cliente.v1.obtener          mayúsculas: subject fantasma
+                                                ❌ rpc.clientes.cliente.v1.*                un comodín: el broker lo acepta (A-41)
+```
+
+- **El patrón fija la sintaxis, no la gramática.** Que el último token sea un infinitivo es una convención
+  de revisión del PR de esquema, como lo es el pasado de un evento: ninguna regex distingue `obtener` de
+  `obtenido` en todos los casos. Una operación llamada `…v1.obtener-cliente-por-email` casi siempre es
+  una consulta a un almacén: es **estado**, no una operación.
+- **La versión mayor está en el subject**, como en los eventos, para que la incompatibilidad sea física
+  ([05-compatibility.md §1](05-compatibility.md)): un cliente de `v1` no puede alcanzar un `v2`.
+- Un nombre que lleva el prefijo (`rpc.clientes.cliente.v1.obtener`) es un dominio reservado:
+  **`RESERVED_DOMAIN`**, con un mensaje que diga que el prefijo lo pone el SDK. Uno que no cumple el patrón
+  —mayúsculas, guion bajo, tres tokens, un comodín— es **`INVALID_RPC_CALL`**, siempre antes de tocar la
+  red. Los vectores de [`cross-sdk-rpc-envelope.json`](../conformance/cases/cross-sdk-rpc-envelope.json)
+  fijan el código de cada entrada, con coincidencia **completa** (no `$`: en Python y PHP el `$` acepta un
+  `\n` final).
+
+### 2.3 Quién responde: un subject exacto por operación, un grupo de cola por servicio
+
+```ts
+await bus.respond("clientes.cliente.v1.calcular-descuento", async (peticion, ctx) => {
+  return { descuentoCents: 500, moneda: peticion.moneda };       // lanzar PermanentError / RetryableError para fallar
+});
+```
+
+- **Solo el dueño responde.** La ACL lo hace cumplir: el dueño de un dominio es el único con permiso de
+  suscripción sobre `rpc.<dominio>.>` ([§7](#7-seguridad)). Quien no lo es, no puede.
+- **Una suscripción por operación, al subject EXACTO.** El permiso del dueño es `rpc.<dominio>.>`, pero
+  **el SDK NO se suscribe a eso**: se suscribe a `rpc.<dominio>.<agregado>.v<major>.<operacion>` por cada
+  `respond()`. Medido (A-64): con la suscripción exacta, una petición a una operación que el servicio no
+  atiende (una errata, una versión aún no desplegada) falla en ~1 ms con `no responders`; con
+  `rpc.<dominio>.>`, el servicio **recibe interés sobre todas las operaciones** y esa petición agota su
+  timeout, porque nadie sabe contestarla. Lo que se **concede** no es lo que se **usa**.
+- **Grupo de cola = nombre de servicio** (`naming.service.pattern`), el mismo para todas las operaciones
+  de ese servicio. Dos instancias del mismo servicio se reparten las peticiones (§2.4).
+- **El permiso y el comodín**: un dueño que se suscribe a `rpc.<dominio>.>` sin necesitarlo no es un
+  problema de seguridad (la ACL ya lo concedía), sino de **diagnóstico**: convierte RPC_UNAVAILABLE en
+  RPC_TIMEOUT.
+
+### 2.4 Reparto entre instancias
+
+Medido en un nodo suelto, con la librería de NATS de los SDKs:
+
+| Situación | Qué pasa | Caso |
+|---|---|---|
+| Dos instancias, mismo grupo | Se reparten las peticiones, **al azar** y no por turnos: 295 y 305 de 600; 979 y 1021 de 2000. **Cada petición la atiende una** | A-58 |
+| Una instancia deja de escuchar | Todo va a las demás: 100 de 100. Si era la última, `no responders` en ~1 ms | A-59 |
+| Una instancia recibe la petición y **muere** | La petición **se pierde**: quien llama ve un timeout. La siguiente ya da `no responders` | A-62 |
+| Una instancia está **colgada** (conexión abierta, no contesta) | Se lleva **su parte** (1/N) hasta que el broker nota que murió: de 40 peticiones, 18 a 21 timeouts. Al cerrarse la conexión, vuelve la normalidad | A-63 |
+| Un cluster de 3 nodos, una instancia por nodo | Reparte entre los tres (180 / 221 / 199 de 600): no se queda en el nodo local | A-75 |
+
+El reparto **no mira la salud de nadie**. Una instancia colgada no se detecta desde el protocolo: se
+compensa reintentando con el **mismo `id`** —que de todos modos exige la ambigüedad del timeout— y, aguas
+abajo, es de quien despliega vigilar la salud de sus instancias.
+
+### 2.5 Dos servicios sobre la misma operación
+
+Un grupo de cola solo reparte **dentro de su grupo**: dos grupos (dos **servicios**) sobre el mismo
+subject reciben **una copia cada uno**, y **cada uno ejecuta la petición**. Quien llama recibe **una**
+respuesta —la del servicio que conteste antes— y la otra se pierde en silencio (A-60).
+
+Es el modo de fallo de una operación con dos dueños: un renombrado de servicio a medias, o dos equipos
+que atienden lo mismo. La orden se ejecuta dos veces y nadie lo ve. Por eso **solo el dueño responde**, lo
+impone la ACL, y `gen-acl.mjs` rechaza un manifiesto con un dominio de dos dueños
+([06-security.md §3.0](06-security.md)).
+
+### 2.6 Dominios reservados
+
+`rpc` es un dominio reservado ([02-naming.md §1.3](02-naming.md)), como `dlq`, `state` y `system`. Toda API
+que reciba una operación —`request`, `respond`— **DEBE** rechazar un dominio reservado con
+**`RESERVED_DOMAIN`** (PERMANENT, [04-errors.md §6](04-errors.md)) **antes de tocar la red**, igual que
+`publish`, `subscribe` y las cuatro operaciones de estado. **`publish()` no puede escribir en `rpc.`**:
+publicaría una petición sin respuesta posible, y por core NATS.
+
+## 3. El sobre
+
+Petición y respuesta son **CloudEvents normales** ([01-envelope.md](01-envelope.md)) en *structured mode*,
+con las mismas extensiones obligatorias, la misma validación L3 y la misma firma. **No hay ningún
+atributo raíz nuevo**: todo lo propio de la petición/respuesta está en el subject, en el `type` y en
+`data`. El orden de los atributos es el de siempre ([01-envelope.md §6](01-envelope.md)) y **`data` va
+el último**.
+
+### 3.1 La petición
+
+El desarrollador escribe **la operación, `data` y, opcionalmente, `aggregateId`** (más las opciones de la
+llamada: `timeoutMs`, `tenantId`, `classification`). **Todo lo demás lo rellena el SDK** — la regla 2 de
+`AGENTS.md` no cambia.
+
+| Atributo | Valor en una petición |
+|---|---|
+| `specversion`, `datacontenttype` | `"1.0"`, `application/json` |
+| `id` | UUIDv7 que genera el SDK. **El mismo en todos los intentos** de una llamada (§4.5) |
+| `source` | `/<entorno>/<servicio>` de **quien llama** |
+| `type` | `com.flux.rpc.<dominio>.<agregado>.<operacion>.request.v<major>` |
+| `time` | El instante en que se **construye** la petición. No se pasa de fuera |
+| `dataschema` | `https://schemas.internal/rpc/<dominio>/<agregado>/<operacion>/request/<semver>.json`, resuelto en el índice `rpc` del bundle; sin bundle, `<major>.0.0` ([00-protocol.md §5](00-protocol.md)) |
+| `subject` | El `aggregateId`, **si se da**: la identidad del agregado sobre el que se pide (`cli-1`). **No** es el subject de NATS |
+| `correlationid` | El del evento o la petición **en curso**; si la llamada no nace de otro, **el `id` propio** |
+| `causationid` | El `id` del evento o la petición en curso; **ausente** si no hay |
+| `tenantid` | El del evento en curso; si no, el `tenantId` de `connect()`; si no, `system` — **como en los eventos** ([09-multitenancy.md §5](09-multitenancy.md)). Un estado exige uno explícito; la petición, no |
+| `producerversion` | La de `connect()` |
+| `dataclassification` | La de la llamada; si no, la de la conexión (§3.6) |
+| `partitionkey` | El `aggregateId`, si se da: la misma convención que en los eventos, aunque aquí no particione nada |
+| `traceparent` | El contexto de trazas activo |
+| `data` | Un **objeto** JSON ([01-envelope.md §4](01-envelope.md)) |
+
+**Una llamada hecha dentro de un handler continúa la cadena**: dentro de un handler de eventos o de otra
+operación, `correlationid` y `tenantid` se heredan y el `causationid` es el `id` de lo que está en curso. Es lo
+que hace que un flujo que cruza eventos y operaciones se siga con un solo `correlationid`.
+
+### 3.2 La respuesta
+
+La respuesta **hereda** de la petición y **no se escribe a mano**:
+
+| Atributo | Valor en una respuesta |
+|---|---|
+| `id` | UUIDv7 **nuevo**: nunca el de la petición |
+| `source` | `/<entorno>/<servicio>` de **quien responde** |
+| `type` | `com.flux.rpc.<dominio>.<agregado>.<operacion>.reply.v<major>`; el de un error, `com.flux.rpc.error.v1` (§3.3) |
+| `time` | El instante en que se construye la respuesta |
+| `dataschema` | El de la respuesta de la operación (`…/reply/<semver>.json`); el de un error, el fijo de §3.3 |
+| `correlationid` | **El de la petición** |
+| `causationid` | **El `id` de la petición** |
+| `tenantid` | **El de la petición**, sin modificar |
+| `subject`, `partitionkey` | Los de la petición, si los traía |
+| `dataclassification` | La de la operación; si no, la de la conexión. Un error, `internal` |
+| `traceparent` | El contexto del que responde, **de la misma traza** |
+| `data` | Lo que devuelve el handler: un **objeto** |
+
+Va dirigida al subject de respuesta (`reply`) de la petición, que es un inbox privado y único por llamada
+([§7.3](#73-el-inbox-privado)). **Una petición, una respuesta**: un segundo mensaje al mismo `reply` lo deniega
+el broker ([§7.2](#72-allow_responses-una-respuesta-medida)) y quien llama ignora cualquiera que llegue
+después.
+
+### 3.3 El error
+
+Cuando el handler falla, o cuando el SDK de quien responde rechaza la petición, la respuesta es un
+**error**: un CloudEvent con `type: com.flux.rpc.error.v1` y
+
+```json
+"data": { "class": "retryable", "code": "HTTP_503", "message": "el servicio de tarifas no responde", "retryAfterMs": 5000 }
+```
+
+| Campo | Regla |
+|---|---|
+| `class` | **`retryable` o `permanent`**, y nada más. `poison` **no viaja** (más abajo) |
+| `code` | Identificador **estable** (`errors.codePattern`): el que agrupa el panel y el que ramifica la aplicación. Nunca el mensaje |
+| `message` | Qué falló y cómo se arregla. **NO DEBE** contener valores de `data` (acaba en logs) ni —para un error no lanzado a propósito— el texto de una excepción |
+| `retryAfterMs` | Opcional, entero ≥ 0, **solo con `retryable`**: una sugerencia para el *primer* reintento, como en [04-errors.md §2.2](04-errors.md) |
+
+- **`dataclassification: internal`**, siempre, y `dataschema` fijo:
+  `https://schemas.internal/system/rpc/error/1.0.0.json` (esquema en
+  `schemas/system/rpc/error/1.0.0.json`). Es **el mismo tipo para toda operación**: la respuesta de error
+  no depende del contrato de la operación.
+- **Quien llama lo convierte** en `RetryableError` (con `code`, `message`, `retryAfterMs`) o
+  `PermanentError`. **Un handler de eventos que llama a una operación hereda la clasificación sin
+  hacer nada**: si el otro servicio dice `retryable`, el evento se reentrega con su backoff; si dice
+  `permanent`, va a la DLQ en la primera entrega.
+- **`poison` no viaja.** POISON es la calificación de quien *consume* un mensaje ilegible
+  ([04-errors.md §1.3](04-errors.md)). Para quien llama, una petición que el otro lado no pudo interpretar
+  es `permanent`: reintentarla da lo mismo. El que responde la cuenta como `poison` en **su** métrica
+  (§10) y **alerta** —ese es el aviso que debe despertar a alguien—.
+- **Un error desconocido del handler es `permanent`** (§5.3), no `retryable`. El presupuesto acotado de
+  [04-errors.md §2.1](04-errors.md) se cuenta por **entregas** de un consumidor y una llamada no tiene número
+  de entrega: con `retryable`, el handler de quien llama reintentaría seis veces en 51 minutos un bug del
+  otro servicio. *Decidido provisionalmente.*
+- **De dónde sale cada código.** Los de la aplicación (`PEDIDO_YA_CANCELADO`) los pone el handler con
+  `PermanentError`/`RetryableError`; los que clasifica el SDK (`HTTP_503`, `ECONNRESET`) salen del
+  clasificador ([04-errors.md §1.1](04-errors.md)); y los que pone el **SDK de quien responde** son
+  `INVALID_SCHEMA`, `STALE_REQUEST`, `RPC_MESSAGE_TOO_LARGE`, `INVALID_RPC_CALL`, los de la firma
+  ([07-signing.md §7](07-signing.md)) y los del sobre ([01-envelope.md §3.1](01-envelope.md)).
+
+### 3.4 Sin cabeceras
+
+**Ninguna cabecera de NATS es obligatoria ni la lee el SDK**, salvo el **estado 503** con el que el broker
+dice `no responders` (§4.3). `traceparent`, `correlationid` y `tenantid` viajan **solo en el sobre**.
+
+Se midió que las cabeceras **sí** viajan en peticiones y respuestas (A-74): el que responde ve las de la
+petición y quien llama recibe las que el otro puso. Se decide no usarlas porque:
+
+- **Un mensaje es un JSON completo** ([01-envelope.md §1](01-envelope.md)): se copia, se pega en un test y se
+  reproduce. Con los metadatos en cabeceras, un `nats req` o una captura devuelven el cuerpo sin ellos.
+- **Las cabeceras abren una segunda fuente de verdad** que puede discrepar del sobre (un `tenantid` en
+  cada sitio) sin que nada lo detecte.
+- **Ninguna ACL las ve** y **la firma no las cubre** ([07-signing.md §5](07-signing.md)).
+
+`Nats-Msg-Id` **no deduplica** en core NATS: dos peticiones con el mismo se entregan **dos veces** (A-74).
+La ventana de duplicados es de JetStream. Un SDK **NO DEBE** apoyarse en ella; la dedupe de una orden es
+la del `id` del sobre.
+
+### 3.5 Ejemplos byte a byte
+
+Cuatro líneas, sin espacios ni saltos entre atributos, UTF-8 literal (`Otoño`, `Campaña`, `petición`: sin
+escapes `\u`, [01-envelope.md §1.1](01-envelope.md)). Lo que está entre los bytes es el contrato: si un SDK
+produce otra secuencia para la misma entrada, está mal. Las reproduce el caso
+[`cross-sdk-rpc-envelope`](../conformance/cases/cross-sdk-rpc-envelope.json) con su SHA-256, y
+`rpc-broker.mjs` los reconstruye desde sus datos.
+
+**Petición** a `clientes.cliente.v1.calcular-descuento`, tenant `acme`, sobre el agregado `cli-1`. No nace
+de otro evento: `correlationid` es su propio `id` y no hay `causationid` (subject de NATS:
+`rpc.clientes.cliente.v1.calcular-descuento`; 668 bytes):
+
+```
+{"specversion":"1.0","id":"01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10","source":"/produccion/facturacion-api","type":"com.flux.rpc.clientes.cliente.calcular-descuento.request.v1","time":"2026-08-20T10:41:07.318Z","datacontenttype":"application/json","dataschema":"https://schemas.internal/rpc/clientes/cliente/calcular-descuento/request/1.0.0.json","subject":"cli-1","correlationid":"01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10","tenantid":"acme","producerversion":"3.4.1","dataclassification":"internal","partitionkey":"cli-1","traceparent":"00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01","data":{"clienteId":"cli-1","totalCents":9990,"moneda":"EUR","campana":"Otoño"}}
+```
+
+SHA-256: `43ea71ade9fb6ff81ccb7c1f93047ffebd604d602492229e452b1c97dadf83f5`.
+
+**Respuesta** (703 bytes). Hereda `correlationid`, `tenantid`, `subject` y `partitionkey`; su `causationid` es el `id`
+de la petición; `source`, `producerversion` y `traceparent` (misma traza, otro *span*) son del que responde:
+
+```
+{"specversion":"1.0","id":"01924f91-5d0f-7e03-9b6a-1c2d3e4f5a67","source":"/produccion/crm-api","type":"com.flux.rpc.clientes.cliente.calcular-descuento.reply.v1","time":"2026-08-20T10:41:07.329Z","datacontenttype":"application/json","dataschema":"https://schemas.internal/rpc/clientes/cliente/calcular-descuento/reply/1.0.0.json","subject":"cli-1","correlationid":"01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10","tenantid":"acme","producerversion":"2.1.0","dataclassification":"internal","causationid":"01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10","partitionkey":"cli-1","traceparent":"00-4bf92f3577b34da6a3ce929d0e0e4736-b7ad6b7169203331-01","data":{"descuentoCents":500,"moneda":"EUR","motivo":"Campaña de otoño"}}
+```
+
+SHA-256: `b164fa71fa3e2943f3cb160f1a7cf3c520b09c2d93a0a1da81eef7f17da1f01c`.
+
+**Error de un handler** (el handler lanzó `RetryableError("el servicio de tarifas no responde", { code: "HTTP_503", retryAfterMs: 5000 })`;
+677 bytes). `type` y `dataschema` fijos, `data` con las claves de §3.3 en ese orden:
+
+```
+{"specversion":"1.0","id":"01924f91-5d11-7a62-8f0d-4e5f6a7b8c91","source":"/produccion/crm-api","type":"com.flux.rpc.error.v1","time":"2026-08-20T10:41:07.331Z","datacontenttype":"application/json","dataschema":"https://schemas.internal/system/rpc/error/1.0.0.json","subject":"cli-1","correlationid":"01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10","tenantid":"acme","producerversion":"2.1.0","dataclassification":"internal","causationid":"01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10","partitionkey":"cli-1","traceparent":"00-4bf92f3577b34da6a3ce929d0e0e4736-b7ad6b7169203331-01","data":{"class":"retryable","code":"HTTP_503","message":"el servicio de tarifas no responde","retryAfterMs":5000}}
+```
+
+SHA-256: `fdff124948254dfa3263971aec86bf4d0184db77babe44da5e0714f28fc427f8`.
+
+**Error del SDK** de quien responde, que rechaza la petición por su esquema (791 bytes). El mensaje cita
+**rutas** (`/totalCents`), nunca valores:
+
+```
+{"specversion":"1.0","id":"01924f91-5d13-7b85-a3e1-6a7b8c9d0e22","source":"/produccion/crm-api","type":"com.flux.rpc.error.v1","time":"2026-08-20T10:41:07.333Z","datacontenttype":"application/json","dataschema":"https://schemas.internal/system/rpc/error/1.0.0.json","subject":"cli-1","correlationid":"01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10","tenantid":"acme","producerversion":"2.1.0","dataclassification":"internal","causationid":"01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10","partitionkey":"cli-1","traceparent":"00-4bf92f3577b34da6a3ce929d0e0e4736-b7ad6b7169203331-01","data":{"class":"permanent","code":"INVALID_SCHEMA","message":"la petición no cumple https://schemas.internal/rpc/clientes/cliente/calcular-descuento/request/1.0.0.json: /totalCents debe ser un entero, /moneda es obligatoria"}}
+```
+
+SHA-256: `c6f80891c94a6c64defa825288f9f98201bed5824d7c6e94c58362dccbfc446d`.
+
+Se comprueban con `JSON.stringify` (Node) y con `json.dumps(ensure_ascii=False, separators=(",", ":"))`
+(Python): los mismos bytes. Los tres últimos son alternativas para **la misma petición**: por eso comparten
+su `id` en `causationid`.
+
+### 3.6 Clasificación de datos y datos personales
+
+- **`dataclassification`**: la de la llamada o la operación; si no, la de la conexión, como en un evento.
+  Lo que decide es **qué se registra**: `confidential` y `restricted` no se escriben en logs
+  ([06-security.md §5](06-security.md)). **El error es siempre `internal`.**
+- **Leer un dato personal guardado por otro sistema NO es una operación: es estado**
+  ([10-state.md §7](10-state.md)). `obtener-cliente` devolviendo su email es un `GET /clientes/123` con otro
+  transporte.
+- **Un dato personal como PARÁMETRO de una orden o RESULTADO de un cálculo SÍ PUEDE viajar** en `data`, con
+  `"x-pii": true` en el esquema y la clasificación que corresponda (`confidential`; un dato de los de
+  `restricted` exige además la aprobación que pide [06-security.md §5](06-security.md)). La diferencia con
+  un evento es que **el broker no lo persiste**: no hay stream, ni 30 días de retención, ni derecho de supresión
+  que un log append-only no pueda cumplir. *Decidido provisionalmente.*
+- **Eso solo es verdad mientras ningún stream capture `rpc.>`.** Con uno, cada petición y su dato
+  personal quedarían **guardados con la retención del stream** (A-67, el stream guardó las 20 peticiones):
+  de ahí que `flux doctor` ([§8](#8-la-trampa-un-stream-que-captura-rpc)) sea obligatorio y no una comodidad.
+- Un SDK **DEBERÍA** redactar los campos `x-pii` en logs y **NO DEBE** poner `data` en métricas ni en
+  atributos de traza ([08-observability.md §6](08-observability.md)).
+
+## 4. Llamar
+
+```ts
+const r = await bus.request("clientes.cliente.v1.calcular-descuento",
+  { clienteId: "cli-1", totalCents: 9990, moneda: "EUR" }, { timeoutMs: 2000, aggregateId: "cli-1" });
+// → { descuentoCents: 500, moneda: "EUR", motivo: "…" }
+```
+
+`request` resuelve con el **`data` de la respuesta**. Un SDK **PUEDE** exponer también el sobre
+(`id`, `time`, `correlationid`).
+
+### 4.1 El algoritmo
+
+```
+0. Validar y construir SIN red, en este orden (el primero que falla gana):
+     RESERVED_DOMAIN → INVALID_RPC_CALL (operación, timeoutMs, data objeto) → INVALID_DATACLASSIFICATION →
+     L3: data contra el esquema de la petición (INVALID_SCHEMA, todos los errores) →
+     construir el sobre UNA vez (id, time, bytes) → tamaño (RPC_MESSAGE_TOO_LARGE).
+1. Publicar por core NATS en rpc.<operación>, con un subject de respuesta propio (el inbox privado), por una
+   conexión que anunció `headers` y `no_responders` en CONNECT.
+2. Esperar, lo primero que ocurra:
+     · un mensaje de estado 503 sin cuerpo          → RPC_UNAVAILABLE
+     · un -ERR 'Permissions Violation' de la conexión
+       que nombra el subject de la operación         → PERMISSION_DENIED
+     · un mensaje de respuesta                       → paso 3
+     · se agota el timeout                           → RPC_TIMEOUT
+3. Comprobar que es la respuesta a ESTA petición (§4.3): si no, RPC_INVALID_REPLY.
+   Con la firma en `require`: verificar (MISSING_SIGNATURE, INVALID_SIGNATURE, UNKNOWN_SIGNING_KEY).
+4. Si es un error (`com.flux.rpc.error.v1`): lanzar RetryableError o PermanentError según su `class`.
+5. Si es una respuesta: con L3, validar `data` contra el esquema de la respuesta (INVALID_SCHEMA); devolverla.
+```
+
+- **El broker no contesta a lo que deniega** (A-28): descarta el mensaje y avisa aparte con un
+  `-ERR 'Permissions Violation for Publish to "…"'` por la conexión. Por eso el paso 2 compite el aviso con
+  la respuesta ([§4.3](#43-qué-ve-quien-llama)).
+- **Una petición, una respuesta.** Tras la primera respuesta válida, cualquier otra que llegue al mismo inbox se
+  ignora. Una respuesta **tardía** —tras el timeout— también: el broker no la descarta (A-61), la ignora quien
+  llama.
+- **El tenant** de la llamada se resuelve como en los eventos (§3.1): el del evento en curso, el de `connect()` y,
+  si no hay, `system`.
+
+### 4.2 El timeout
+
+| | |
+|---|---|
+| **Por defecto** | **5 s** (5000 ms) |
+| **Mínimo / máximo** | 1 ms / **25 s** (25 000 ms): un entero. Fuera de rango es **`INVALID_RPC_CALL`**, no se recorta en silencio |
+| **Por qué 25 s** | **Por debajo del `ack_wait` de 30 s** ([03-delivery.md §2](03-delivery.md)): para que una llamada hecha desde un handler de eventos no provoque su reentrega mientras espera |
+| **Qué cuenta** | **Un intento.** La suma de varias llamadas dentro de un handler es de la aplicación (con *work-in-progress* el handler puede superar los 30 s) |
+
+### 4.3 Qué ve quien llama
+
+Cada fila está medida contra un broker real (los casos son los de [§2](#2-modelo) y [§7](#7-seguridad)).
+**Todo lo que no es una respuesta se traduce a un código estable**:
+
+| Situación | Qué ocurre | Qué ve quien llama | Clase |
+|---|---|---|---|
+| Nadie escucha la operación | El broker contesta `no responders` (estado 503) en 1-2 ms (A-56). **Solo si la conexión lo pidió en CONNECT**: sin ello, silencio (A-57) | **`RPC_UNAVAILABLE`** | RETRYABLE, **inmediato** |
+| El servicio existe pero no atiende **esa** operación | Lo mismo, porque se suscribe al subject exacto (A-64) | `RPC_UNAVAILABLE` | RETRYABLE |
+| Responde **más tarde** que el timeout | La operación **se ejecuta**; la respuesta llega al inbox y se ignora (A-61) | **`RPC_TIMEOUT`** | RETRYABLE |
+| La instancia **muere** con la petición en la mano | Se pierde, sin reentrega (A-62) | `RPC_TIMEOUT` | RETRYABLE |
+| Una instancia **colgada** se llevó su parte | Sin respuesta hasta que el broker note la caída (A-63) | `RPC_TIMEOUT` | RETRYABLE |
+| La petición sale **justo** cuando se va el último que responde (cluster) | Una ventana de unos ms: timeout en vez de 503 (A-70) | `RPC_TIMEOUT` | RETRYABLE |
+| La ACL **deniega** la petición | Con `@nats-io/*`: `RequestError` en ~1 ms que nombra el subject (A-66). Con `async-nats`: **solo un timeout**, y el `-ERR` por el evento de la conexión (A-72) | **`PERMISSION_DENIED`** — el SDK **DEBE** escuchar el aviso y competirlo con la respuesta; si no, se ve como `RPC_TIMEOUT` | PERMANENT |
+| La **respuesta** no cabe en `max_payload` | La librería de **quien responde** lanza; sin más, quien llama solo ve un timeout (A-65). Por eso el que responde contesta con un error | **`RPC_MESSAGE_TOO_LARGE`** | PERMANENT |
+| Un **stream** captura la operación | Quien llama recibe el acuse `{"stream":…}` (A-67). Con un stream `no_ack`: timeout (el stream cuenta como interés) | **`RPC_INVALID_REPLY`** (o `RPC_TIMEOUT`) | PERMANENT |
+| El que responde falló | Un error `com.flux.rpc.error.v1` | `RetryableError` / `PermanentError` con su `code` | Su `class` |
+| El dueño **no tiene permiso** de suscripción | Parece un servicio caído (A-73): `no responders` | `RPC_UNAVAILABLE` — el problema se ve en **el dueño**, que DEBE fallar al arrancar (§7.1) | — |
+
+**Qué comprueba quien llama de lo que recibe** (si falla cualquiera: **`RPC_INVALID_REPLY`**, PERMANENT):
+
+1. Es un **CloudEvent válido** (parsea, con las cuatro extensiones y los tipos exactos).
+2. Su `type` es **el de la respuesta de esa operación** o `com.flux.rpc.error.v1`.
+3. Su `causationid` es **el `id` de la petición**.
+4. Su `correlationid` y su `tenantid` **son los de la petición**.
+5. Si es un error, su `data` cumple el esquema del error (`class` ∈ `retryable | permanent`, `code` y `message`).
+
+Una respuesta que no es de esta petición es **un incidente** —un productor roto, un stream mal puesto,
+algo hostil— y no un fallo que esperar: de ahí PERMANENT y su propio `outcome` en la métrica (§10). Si el
+cuerpo parece el acuse de un stream (`{"stream":…,"seq":…}`), el mensaje **DEBERÍA** decir que algún stream
+captura `rpc.>` y apuntar a `flux doctor`.
+
+### 4.4 Tamaño
+
+El mensaje serializado **NO DEBE** superar el **mínimo** entre **1 MiB** ([01-envelope.md §7](01-envelope.md)) y el
+`max_payload` que anuncia el broker en su `INFO`. Las **cabeceras cuentan** (A-65); como no usamos ninguna, el
+límite efectivo es el del cuerpo.
+
+- Un SDK **DEBE** fallar **antes de abrir nada** con **`RPC_MESSAGE_TOO_LARGE`** y un mensaje que nombre los
+  bytes y el límite y apunte al *claim-check* ([01-envelope.md §7](01-envelope.md)), o a paginar con un cursor
+  en `data`. Medido (A-65): `max_payload` por defecto **1 048 576**; **exactamente** ese tamaño pasa; uno más lo
+  rechaza la librería al instante (Node: `InvalidArgumentError`; `async-nats`: `MaxPayloadExceeded`); y un
+  cliente en bruto que lo envía recibe `-ERR 'Maximum Payload Violation'` y **le cierran la conexión**.
+- **La respuesta tiene el mismo límite** y es la que falla en silencio (§5.4).
+
+### 4.5 Reintentos e idempotencia
+
+**Una orden puede llegar dos veces.** Un reintento tras un timeout —la operación **pudo haberse ejecutado**
+(A-61, A-62, A-63, A-70)— o dos copias. El broker **no deduplica** en core (A-74). Por eso:
+
+- **El que responde DEBE deduplicar por el `id` de la petición**, con una de las tres estrategias de
+  [03-delivery.md §4](03-delivery.md) (tabla de procesados, operación idempotente, clave de idempotencia
+  externa derivada del `id`). Un handler de una orden sin deduplicación está roto aunque los tests pasen.
+- **`request` hace UN intento.** Un SDK **PUEDE** ofrecer reintentos (`retries`, por defecto **0**), solo ante
+  **`RPC_UNAVAILABLE` y `RPC_TIMEOUT`**; nunca ante un error permanente. **Cada reintento reutiliza el mismo
+  `id` y los mismos bytes** —`time` incluido—: un `id` nuevo por intento haría imposible reconocerlo.
+- **Lo que NO cubre.** Un handler de **eventos** que reintenta por *reentrega* construye una petición
+  **nueva** (otro `id`). Si la orden debe aplicarse exactamente una vez a través de reentregas, el que
+  responde deduplica por una **clave de negocio** que viaja en `data` (`pedidoId`), no solo por el `id`.
+- **Sin ventana en el SDK.** Un SDK **NO DEBE** recordar ids para rechazar repetidos: rechazaría un reintento
+  legítimo. La dedupe vive donde vive el efecto.
+
+## 5. Responder
+
+### 5.1 El algoritmo
+
+```
+1. Recibir en la suscripción exacta de la operación (grupo de cola = nombre de servicio).
+2. Sin subject de respuesta → NO se atiende: nadie espera el resultado de una orden. Log + outcome `poison`.
+3. Interpretar el sobre (01-envelope.md): JSON, atributos obligatorios, extensiones, tipos exactos.
+     Falla → error `permanent` con el código del sobre (MALFORMED_JSON, MISSING_REQUIRED_EXTENSION, …). outcome `poison`.
+4. `type` = el de la petición de ESTA operación. Si no → error `permanent` INVALID_RPC_CALL. outcome `poison`.
+5. Con la firma en `require`: verificar (MISSING_SIGNATURE, INVALID_SIGNATURE, UNKNOWN_SIGNING_KEY → error
+     `permanent`, outcome `invalid_signature`) y comprobar que |ahora − time| ≤ 300 s (si no, STALE_REQUEST, outcome `stale_request`).
+6. Con L3: validar `data` contra el esquema de la petición. Falla → error `permanent` INVALID_SCHEMA con TODAS
+     las rutas, el handler NO se invoca. outcome `invalid_schema`. (Modo `warn`: log y métrica, y se sigue.)
+7. Invocar el handler con (data, ctx).
+8. Su resultado es un objeto. Con L3: validar contra el esquema de la respuesta (si falla: error `permanent`
+     INVALID_SCHEMA, outcome `invalid_schema`). Tamaño: si no cabe, error RPC_MESSAGE_TOO_LARGE.
+9. Construir la respuesta (§3.2), firmarla si procede, publicarla al `reply` de la petición. outcome `ok`.
+   Si el handler lanzó: §5.3.
+```
+
+`ctx` lleva **el sobre de la petición** (`event`), su `id`, `correlationId`, `tenantId`, `aggregateId` y `time`.
+**Un handler de operación continúa la cadena**: lo que publique o llame desde él hereda `correlationid` y
+`tenantid` y su `causationid` es el `id` de la petición ([§3.1](#31-la-petición)).
+
+### 5.2 Lo que no cumple, y qué se contesta
+
+**Siempre se contesta con un error, nunca en silencio**: callar dejaría a quien llama esperando su timeout
+para un fallo que no se arregla esperando —el modo de fallo que la taxonomía existe para evitar—.
+
+| Lo que llega | Qué hace el que responde | `code` | outcome |
+|---|---|---|---|
+| Sin subject de respuesta (`nats pub` a mano) | **No se atiende**; log | — | `poison` |
+| JSON roto, falta una extensión, tipo equivocado, `specversion` desconocido | Error `permanent` con el código del sobre | los de [01-envelope.md §3.1](01-envelope.md) | `poison` |
+| `type` que no es el de la petición de esta operación | Error `permanent` | `INVALID_RPC_CALL` | `poison` |
+| Firma ausente, inválida o con clave desconocida (modo `require`) | Error `permanent` | `MISSING_SIGNATURE`, `INVALID_SIGNATURE`, `UNKNOWN_SIGNING_KEY` | `invalid_signature` |
+| `time` a más de 300 s del reloj (modo `require`) | Error `permanent` | `STALE_REQUEST` | `stale_request` |
+| `data` que no cumple el esquema (L3) | Error `permanent`, **sin invocar al handler**; **todas** las rutas, **ningún valor** | `INVALID_SCHEMA` | `invalid_schema` |
+| La respuesta del handler no cumple su esquema (L3) | Error `permanent`: el fallo es **del que responde**, no de quien llama | `INVALID_SCHEMA` | `invalid_schema` |
+| La respuesta no cabe en `max_payload` | Error `permanent` | `RPC_MESSAGE_TOO_LARGE` | `permanent` |
+| El handler lanza | §5.3 | el del error | `retryable` / `permanent` |
+
+- **Si la petición ni siquiera se puede leer**, no hay `correlationid` ni `tenantid` que heredar: el error lleva
+  `correlationid` = su propio `id`, `tenantid` = `system` (es un aviso de plataforma sobre un mensaje que no se
+  pudo atribuir) y `causationid` = el `id` de la petición **solo si es una cadena válida**. *Decidido
+  provisionalmente.*
+- **El mensaje cita rutas, no valores**, con una frase que diga **qué** estaba mal —«la petición no cumple…» o
+  «la respuesta no cumple…»— porque quien llama recibe el mismo `INVALID_SCHEMA` en los dos casos y debe saber a
+  quién arreglar. Es la regla de [10-state.md §3.6](10-state.md), por la misma razón.
+- **Con `warn`**, un fallo de esquema no detiene al handler: queda en el log y en la métrica
+  (`invalid_schema`). Con L3 apagado no se valida nada.
+
+### 5.3 Los errores del handler
+
+| El handler… | Se responde | `code` | `message` |
+|---|---|---|---|
+| lanza `RetryableError` | `retryable` (con `retryAfterMs` si lo da) | el suyo, o el del clasificador | el de la aplicación |
+| lanza `PermanentError` | `permanent` | el suyo, o `PERMANENT` | el de la aplicación |
+| lanza un error que el **clasificador reconoce** (un 503 de una dependencia, `ECONNRESET`) | su clase (`retryable` / `permanent`) | el del clasificador (`HTTP_503`) | **genérico** («dependencia no disponible») |
+| lanza un error **desconocido** | **`permanent`** | `UNKNOWN` | **genérico**: «error interno del servicio» |
+| devuelve algo que no es un objeto | `permanent` | `INVALID_SCHEMA` | «la respuesta no es un objeto» |
+
+- **Un error que no lanzó a propósito la aplicación NO reenvía el texto de la excepción**: puede llevar valores
+  de `data`, rutas del servidor o datos personales. Va al log del que responde, con el `id` de la petición para
+  encontrarlo.
+- **Lo desconocido es `permanent`** y no «retryable acotado» (§3.3): sin número de entrega no se puede acotar.
+  La política configurable de [04-errors.md §2.1](04-errors.md) (`permanent` / `retryable` / `retryable-bounded`)
+  se aplica así: `permanent` y `retryable-bounded` dan `permanent`; `retryable` da `retryable`.
+  *Decidido provisionalmente.*
+
+### 5.4 El tamaño de la respuesta
+
+Si es la **respuesta** la que no cabe, la librería de NATS lanza **en quien responde** y **quien llama solo ve un
+timeout** (A-65: `async-nats` da `MaxPayloadExceeded` al que responde y `TimedOut` al que llama; `@nats-io/*`,
+`InvalidArgumentError` y `TimeoutError`). Por eso el que responde **DEBE comprobar el tamaño serializado antes
+de publicar** y, si excede, **contestar con un error `RPC_MESSAGE_TOO_LARGE`** (PERMANENT) que diga los bytes y el
+límite. Es la única vía por la que quien llama se entera.
+
+### 5.5 Parar un responder
+
+El orden es **dejar de escuchar, esperar a lo que está en vuelo, cerrar**:
+
+1. **Dejar de escuchar** cada operación con el mecanismo de **drenaje** de la librería (UNSUB y espera a lo que ya
+   viaja), no con una baja que descarte lo que aún llega. Desde ese instante, las peticiones nuevas dan
+   `no responders` al instante (A-62) y no caen en una instancia que se va.
+2. **Esperar a los handlers en vuelo**, con un tope de **25 s** (el timeout máximo: una petición más lenta ya
+   la dio por perdida quien llamó).
+3. **Cerrar** la conexión.
+
+**Cerrar la conexión de golpe pierde lo que se atiende**: medido (A-62), con un handler de 400 ms, cerrar a los
+100 ms deja la petición sin respuesta; con `unsubscribe` a los 100 ms, la petición en vuelo termina con su
+respuesta y la siguiente falla en ~1 ms con `no responders`.
+
+> **No medido.** Con latencia de red real, un `unsubscribe` que descarta lo ya enviado por el servidor
+> **PUEDE** perder una petición que viajaba; el *drain* de la librería espera al viaje de ida y vuelta que lo
+> evita. Localmente, 4 ejecuciones de 400 peticiones seguidas no perdieron ninguna con ninguno de los dos:
+> no hay una medida que fije cuál usar, y por eso se pide el drenaje. Y en un **cluster**, el interés
+> se propaga de forma asíncrona: la petición que sale justo cuando se va el último puede agotar su timeout en
+> vez de recibir `no responders` (A-70: 4 de 10 sin esperar, 0 de 10 a los 5 ms). Un SDK **DEBERÍA** esperar un
+> margen breve tras dejar de escuchar antes de cerrar.
+
+### 5.6 Tenants y concurrencia
+
+- **El responder NO filtra por el tenant de `connect()`.** El grupo de cola es **el servicio**, y no sabe de
+  tenants: una instancia atada a `acme` y otra a `globex` bajo el mismo grupo recibirían cada una **la mitad
+  de las peticiones de los dos**, y quien llama vería timeouts. El tenant de la petición llega al handler
+  (`ctx.tenantId`) y **es suyo autorizar**. Si lo que se necesita es que un tenant no pueda alcanzar el servicio
+  de otro, es el **Modelo B** (una account por tenant, [09-multitenancy.md](09-multitenancy.md)): cada account
+  tiene su propio espacio `rpc.`. `tenantIsolation: "strict"` no afecta a `respond`. *Decidido provisionalmente.*
+- **Concurrencia y contrapresión: no se especifican ni se han medido.** Core NATS no tiene acuse: un responder
+  sobrecargado no puede decir «ahora no» ([§13](#13-lo-que-la-peticiónrespuesta-no-resuelve)). Un SDK **DEBERÍA** limitar los
+  handlers concurrentes (el mismo orden que `max_ack_pending`, 256), y el exceso espera en la cola de la
+  suscripción.
+
+## 6. Errores
+
+La lista de códigos propios es **cerrada**: **seis**. Un caso que no encaje en ninguno es un hueco de la spec,
+no un código que cada SDK inventa. Se documentan en [04-errors.md §7](04-errors.md) y en `protocol.json` →
+`errors.codes`, con su capacidad `rpc`.
+
+| Código | Clase | Lo lanza | Cuándo |
+|---|---|---|---|
+| `RPC_UNAVAILABLE` | **RETRYABLE**, inmediato | `request` | Nadie escucha la operación: `no responders` (A-56) |
+| `RPC_TIMEOUT` | **RETRYABLE** | `request` | No llega respuesta a tiempo. **Ambiguo: la operación pudo ejecutarse** |
+| `STALE_REQUEST` | **PERMANENT** | quien responde (en un error) | Firma en `require` y `time` a más de 300 s |
+| `RPC_INVALID_REPLY` | **PERMANENT** | `request` | Lo que llega no es la respuesta a esta petición (§4.3) |
+| `RPC_MESSAGE_TOO_LARGE` | **PERMANENT** | `request`; quien responde (en un error) | El mensaje no cabe (§4.4, §5.4) |
+| `INVALID_RPC_CALL` | **PERMANENT** | `request`, `respond`; quien responde (en un error) | Operación mal formada, `timeoutMs` fuera de rango, `data` que no es un objeto; o, en quien responde, un `type` que no es el de la operación |
+
+**Por qué estos seis y no menos.** `RPC_UNAVAILABLE` y `RPC_TIMEOUT` son las dos situaciones que **solo existe
+aquí** y con **clases distintas en la práctica**: la primera no gasta tiempo, la segunda sí y es ambigua.
+`STALE_REQUEST` y `RPC_INVALID_REPLY` son las dos defensas del protocolo —contra una petición repetida y contra
+una respuesta que no es de quien debe— y cada una se alerta por separado. `RPC_MESSAGE_TOO_LARGE` es el **único
+fallo silencioso** (la respuesta que no cabe se ve como un timeout, A-65), y por eso necesita un código que lo
+saque a la luz. `INVALID_RPC_CALL` agrupa tres equivocaciones de quien programa con **un** código, como
+`INVALID_TLS_OPTIONS` con las opciones de TLS: el remedio y quien lo aplica son los mismos, y el mensaje dice
+cuál.
+
+**Lo que no es un código nuevo.** Se reutilizan:
+
+| Situación | Código |
+|---|---|
+| Dominio reservado (`rpc.clientes…` con el prefijo, `state.x…`) | `RESERVED_DOMAIN` ([04-errors.md §6](04-errors.md)) |
+| `data` no cumple el esquema de la petición o de la respuesta | `INVALID_SCHEMA` |
+| Clasificación fuera del enum | `INVALID_DATACLASSIFICATION` |
+| La ACL deniega la petición o la suscripción | `PERMISSION_DENIED` ([04-errors.md §5](04-errors.md)) |
+| Firma ausente, inválida o con clave desconocida | `MISSING_SIGNATURE`, `INVALID_SIGNATURE`, `UNKNOWN_SIGNING_KEY` |
+| Sobre ilegible o incompleto | Los de [01-envelope.md §3.1](01-envelope.md) |
+
+`NOT_PROVISIONED` **no aplica**: no hay streams ni consumidores que aprovisionar. Un dueño sin permiso de
+suscripción es `PERMISSION_DENIED` (§7.1), no `NOT_PROVISIONED`.
+
+## 7. Seguridad
+
+### 7.1 Quién puede qué
+
+| Quién | Permisos |
+|---|---|
+| **Quien llama** | **Publicar** en el subject **exacto** de cada operación concedida (`rpc.clientes.cliente.v1.obtener`), y **suscribirse** a su inbox privado `_INBOX.<servicio>.>`. Nada más |
+| **El dueño** | **Suscribirse** a `rpc.<dominio>.>` y `allow_responses`. **Ningún permiso de publicación sobre inboxes** |
+
+- **Nunca** a quien llama `rpc.>`, `rpc.<dominio>.>` ni un comodín por token: podría llamar a todo.
+  `protocol.json` → `rpc.acl` fija los patrones (`callerPublish`, `ownerSubscribe`) y lo que nunca se concede.
+- **El generador** (`gen-acl.mjs`, las claves del manifiesto y los casos de seguridad) lo documentará
+  [06-security.md §3](06-security.md) cuando llegue; esta sección fija **lo medido** que debe producir.
+- **Una petición denegada**: con `@nats-io/*` falla en ~1 ms con `Permissions Violation for Publish to
+  "rpc.clientes.cliente.v1.obtener"` (A-66); con `async-nats`, **agota su timeout** y el aviso solo se ve en el
+  evento de la conexión (A-72). La regla de [06-security.md §3.7](06-security.md) rige aquí: el SDK **DEBE**
+  escuchar el `-ERR` y competirlo con la respuesta, y lanzar `PERMISSION_DENIED` con el subject. Si no, un
+  permiso que falta se ve como `RPC_TIMEOUT` (RETRYABLE) y el handler que llama **reintenta 51 minutos** algo
+  que nunca va a funcionar.
+- **Un dueño sin permiso de suscripción parece un servicio caído**: quien llama recibe `no responders` (A-73) y el
+  dueño arranca «sano». `respond()` **DEBE** fallar con `PERMISSION_DENIED` nombrando el subject —la
+  suscripción denegada no lanza al suscribirse: el aviso llega aparte, A-8f—, no arrancar mudo.
+
+### 7.2 `allow_responses`: una respuesta, medida
+
+El dueño **no** necesita permiso de publicación sobre ningún inbox: lo da `allow_responses` (A-16). Medido
+(A-68), con el dueño sin ningún permiso de publicación sobre `_INBOX.*`:
+
+| | `allow_responses` | Resultado |
+|---|---|---|
+| El dueño responde **tres veces** a una petición | `true` | Se entrega **una**; las otras dos son una violación de permiso en su conexión |
+| Responde a los **2 s** | `true` | Se entrega: **no caduca** por defecto |
+| Cuatro respuestas | `{ max: 3 }` | Se entregan 3 y se deniega 1 |
+| Responde a los **1,5 s** | `{ max: 1, expires: "1s" }` | **Se deniega**; la de 0,3 s sí pasa |
+| Publica en **otro** inbox, no el `reply` de la petición | `true` | **Se deniega**; la respuesta legítima llega |
+| Responde | *ausente* | **Se deniega**; quien llama ve un timeout |
+
+- **`true` admite una respuesta y no caduca**: lo que cierra «una petición, una respuesta» (§3.2).
+- **DEBERÍA acotarse**: `allow_responses: { max: 1, expires: 30s }`. Como el timeout máximo es 25 s (§4.2), una
+  respuesta legítima **nunca** llega después, y un dueño comprometido deja de poder escribir en los inboxes
+  que ha visto. Lo decide el generador de permisos.
+- **Sin `allow_responses` el dueño no puede contestar** y desde fuera solo se ve `RPC_TIMEOUT`: es el fallo
+  de una ACL que lo olvida. Un `-ERR` por cada respuesta denegada queda en el log del servidor y en los avisos
+  de la conexión del que responde, que el SDK **DEBE** registrar ([06-security.md §3.7](06-security.md)).
+
+### 7.3 El inbox privado
+
+Las respuestas viajan por el inbox de quien llama. **Sin el inbox privado de la Fase 1, cualquiera leería las
+respuestas ajenas**: medido (A-71, el H2 de [06-security.md §3.3](06-security.md) con respuestas), un servicio
+con `_INBOX.>` recibió **la respuesta completa** dirigida a otro; uno con `_INBOX.<servicio>.>` vio denegada la
+suscripción al inbox ajeno. En petición/respuesta esto importa más que en los eventos, porque una respuesta
+**puede llevar datos personales** (§3.6). El SDK fija `_INBOX.<servicio>` desde el nombre de servicio; no es
+una opción.
+
+### 7.4 Firma y ventana de 300 s
+
+La respuesta, y los errores, van **firmados por el que responde** si tiene la firma activa
+([07-signing.md](07-signing.md)); quien llama las verifica en `require`.
+
+**Con la firma en `require`, el que responde rechaza una petición cuyo `time` se aleje más de 300 s de su reloj**
+—por delante o por detrás— con **`STALE_REQUEST`** (PERMANENT). La firma por sí sola **no impide reenviar una
+petición capturada**: es un mensaje firmado y válido para siempre. La ventana acota cuánto tiempo sirve.
+
+- **Solo con `require`.** Sin firma, `time` es un campo que cualquiera escribe y la ventana no protegería
+  nada; en `warn` el SDK tampoco rechaza, y por coherencia tampoco aplica la ventana.
+- **Es simétrica**: una petición del futuro (reloj adelantado) es tan sospechosa como una vieja. El mensaje
+  dice el `time`, la ventana y la hora local.
+- **Dentro de la ventana, la defensa es la idempotencia por `id`**, la misma que protege los reintentos. El
+  SDK **NO** recuerda ids ([§4.5](#45-reintentos-e-idempotencia)).
+- **Presupone relojes sincronizados** (NTP). Un servicio con un reloj desviado más de 300 s recibe
+  `STALE_REQUEST` en todas sus llamadas: es PERMANENT para que se note, no para que se reintente.
+
+## 8. La trampa: un stream que captura `rpc.>`
+
+Un stream de JetStream que captura el subject de una operación contesta a cada petición con **su acuse**,
+`{"stream":"TRAMPA","seq":1}`, **porque la petición es un `publish` más y el stream confirma lo que guarda**.
+Medido (A-18, A-67):
+
+- Con un stream sobre `rpc.x.>` **y un responder real escuchando**, de 20 peticiones **entre 18 y 20 de las
+  «respuestas» fueron el acuse** (en una exploración de 400 seguidas, 394 y 6; con 400 concurrentes, 341 y
+  59). Es una **carrera** entre el acuse y la respuesta real: casi siempre gana el acuse, **no siempre** —el
+  síntoma es intermitente, peor de diagnosticar que uno constante—.
+- **El que responde ejecuta igualmente.** La orden se aplica y quien llama recibe una respuesta que no es suya.
+- **El stream persiste cada petición** —sus datos personales incluidos— con la retención del stream.
+- Con el stream sin nadie escuchando, la petición **también «responde»**.
+- Un stream **sin acuse** (`no_ack`) no contesta, pero **cuenta como interés**: `no responders` pasa a ser un
+  timeout.
+
+Es el mismo fallo que un `publish` de core a un subject sin stream, al revés: **acepta, no da error y aplica
+otra cosa**.
+
+**Cómo se evita:**
+
+1. **`flux provision` no crea ningún stream cuyos subjects se solapen con `rpc.*.*.*.*`**: los suyos son
+   `EVT_<DOM>` (`<dom>.>`, y `rpc` es un dominio reservado), `DLQ_<DOM>` (`dlq.…`) y `STATE_<DOM>` (`state.…`).
+2. **`flux doctor` DEBE** comprobar, con credenciales de operación, que **ningún stream** de la account
+   captura una operación: para cada subject de cada stream, **¿se solapa con `rpc.*.*.*.*`?** Es **error**, no
+   aviso.
+3. **Quien llama valida la respuesta** (§4.3): el acuse no es un CloudEvent y da `RPC_INVALID_REPLY` con la pista.
+
+**El solape** es token a token: `*` casa un token y `>` casa uno o más al final; dos subjects se solapan si
+**algún subject concreto casa con los dos**. Se compara contra `rpc.*.*.*.*` —**la forma de todo subject de
+operación**, `rpc.` y cuatro tokens— y no contra `rpc.>`, que marcaría de más un filtro de seis tokens que no
+puede capturar ninguna. El algoritmo está en `protocol.json` → `rpc.doctor` y el runner lo ejecuta contra un
+broker con **16 patrones** (A-69): el broker captura exactamente donde el algoritmo predice.
+
+| Filtro de stream | ¿Captura? | Se crea… |
+|---|---|---|
+| `rpc.>`, `rpc.*.>`, `rpc.clientes.>`, la operación, `rpc.*.*.*.*`, `rpc.*.cliente.v1.*` | **Sí** | con acuse: responde con él |
+| `>`, `*.>`, `*.*.*.*.*` | **Sí** | **solo sin acuse**: JetStream exige `no_ack` cuando captura todo o se solapa con su API (`$JS.API.>`) |
+| `clientes.>`, `dlq.>`, `state.>`, `rpc.otro.>`, `rpc.clientes.cliente.v1.crear` | No | con acuse (el doctor marca `rpc.otro.>` y la última: se solapan con la forma de rpc) |
+| `*.*.*.*`, `*.*.*.*.*.*` | No | solo sin acuse; no capturan una operación de cinco tokens |
+
+Un filtro de auditoría `>` es el caso real: un operador que «quiere verlo todo» lo crea sin acuse —única forma
+posible— y **persiste cada petición y cada respuesta** sin que nadie se entere, porque no devuelve ningún
+acuse. Por eso el doctor marca los anchos igual.
+
+## 9. Un cluster de tres nodos
+
+Medido con tres nodos locales (A-70, A-75):
+
+- **El reparto no se queda en el nodo local**: quien llama en el nodo 0 y una instancia del grupo en cada nodo
+  recibe 180 / 221 / 199 de 600 (286 / 312 / 302 de 900 en la exploración). No se asume lo contrario: una
+  preferencia por el nodo local habría concentrado toda la carga en una instancia, sin ningún error.
+- **Un responder en otro nodo** contesta en **p50 0,55 ms, p99 1,14 ms** (local, sin latencia de red real:
+  exploración, sin caso).
+- **Ventana al irse el último**: el interés se propaga de forma asíncrona. Si la petición sale **justo** cuando
+  el último responder se va, puede **agotar su timeout** en vez de dar `no responders` (4 de 10 sin esperar, 0
+  de 10 con 5 ms; en un nodo suelto, 1 de 10). Pasados ~150 ms, `no responders` en ~1 ms. Es la tercera razón
+  —tras A-61 y A-62— de que `RPC_TIMEOUT` no diga «no se ejecutó».
+- Lo que **no** se midió: la latencia entre nodos de una red real, ni una partición.
+
+## 10. Observabilidad
+
+[08-observability.md §2.5](08-observability.md) define tres métricas para los SDKs con la capacidad `rpc`, en su
+bloque (`protocol.json` → `rpc.metrics`), **fuera de las siete** de todo SDK L2:
+
+| Métrica | Tipo | Etiquetas |
+|---|---|---|
+| `flux_rpc_client_requests_total` | Counter | `operation`, `outcome` |
+| `flux_rpc_server_requests_total` | Counter | `operation`, `outcome` |
+| `flux_rpc_duration_seconds` | Histogram | `operation`, `role` |
+
+```
+operation = <dominio>.<agregado>.v<major>.<operacion>        ("clientes.cliente.v1.calcular-descuento")
+role      = client | server
+```
+
+**Nunca** `tenantid`, `id`, `correlationid`, ni **quién llama** (servicio o cliente) como etiqueta: una serie
+por cada uno. En **trazas** sí: un span por llamada y otro por petición atendida, con `traceparent` en el sobre.
+Las alertas que importan: **`poison` del servidor** (alguien publica a mano o un SDK roto), **`invalid_reply`
+del cliente** (la trampa de §8) y la tasa de **`unavailable`** y **`timeout`** por operación.
+
+## 11. Esquemas y compatibilidad
+
+### 11.1 Dónde viven
+
+```
+schemas/rpc/<dominio>/<agregado>/<operacion>/request/<major>.<minor>.<patch>.json
+schemas/rpc/<dominio>/<agregado>/<operacion>/reply/<major>.<minor>.<patch>.json
+schemas/system/rpc/error/1.0.0.json                       el error, fijo para toda operación
+```
+
+Inmutables una vez publicados, con el `$id` igual a su ruta ([05-compatibility.md §4](05-compatibility.md)). Dos
+cosas que `bundle-schemas.mjs` y `check-compat.mjs` comprueban y que son **error con pista**, no aviso:
+
+- **Una operación es un PAR**: petición y respuesta **del mismo mayor**. Un esquema sin su par —o suelto en la
+  carpeta de la operación, o con un nombre que no es SemVer— falla.
+- **`data` es un objeto en la raíz**, en los dos lados.
+
+El bundle gana un índice **`rpc`**: nombre de la operación → `{ request, reply }`, con la URI de **la versión más
+alta de su mayor**, de cada lado. El error **no** está en el índice (su URI es constante) pero sí en `schemas`.
+Con alguna operación, el esquema del error es obligatorio.
+
+### 11.2 Compatibilidad, con la dirección invertida
+
+[05-compatibility.md](05-compatibility.md) vale igual, **con la dirección invertida donde corresponde**. Un
+esquema describe datos que fluyen de quien **escribe** a quien **lee**, y en cada lado son otros:
+
+| | Escribe | Lee | |
+|---|---|---|---|
+| **Respuesta** | el dueño | **los llamantes**: muchos, independientes, a su ritmo | Como un evento |
+| **Petición** | **los llamantes** | el dueño: **uno**, que publica el esquema y lo despliega | **Invertido** |
+
+- **Un valor nuevo en un enum de una RESPUESTA exige `x-extensible-enum`**: los llamantes que no lo conocen
+  tienen que tolerarlo (log y seguir, nunca lanzar).
+- **En una PETICIÓN no**: el que lee es el dueño, que se despliega con el esquema y ya conoce el valor. Añadirlo no
+  rompe a ningún llamante.
+- **Todo lo demás rige igual en los dos lados**: quitar o renombrar un campo, cambiar un tipo, pasar opcional a
+  requerido (**incluido un campo requerido nuevo en la petición**: los llamantes viejos no lo envían), endurecer
+  una restricción o cambiar la semántica obliga a un **mayor** nuevo y a doble publicación durante 90 días.
+- **El orden de despliegue: primero quien responde, después quien llama.** Una petición con un campo opcional
+  nuevo contra una instancia que aún valida con el esquema viejo (y `additionalProperties: false`) es
+  `INVALID_SCHEMA`. Los llamantes toman el esquema nuevo del bundle cuando el dueño ya lo ha desplegado.
+
+`check-compat.mjs` aplica la inversión: en un esquema `request/`, no exige `x-extensible-enum` al añadir un valor;
+en `reply/` sí. Ver sus pruebas en negativo.
+
+## 12. Qué DEBE un SDK `rpc`
+
+Un SDK declara la capacidad `rpc` ([00-protocol.md §5](00-protocol.md)) solo si cumple **todo**:
+
+1. `request` y `respond` según §4 y §5, y los **mismos bytes** que §3.5 para la petición, la respuesta y los dos
+   errores (arnés cruzado: `rpc-request`, `rpc-reply`, `rpc-error`, `rpc-operation`, `rpc-timeout`).
+2. Los **seis** códigos de [04-errors.md §7](04-errors.md), con su clase, y `RESERVED_DOMAIN` en `request` y `respond`
+   (hoy solo lo comprueba `check-sdk-codes.mjs` en quien declara `state`, porque el código cuelga de esa capacidad).
+3. **Una suscripción exacta por operación** y el grupo de cola = nombre de servicio.
+4. La conexión anuncia **`headers` y `no_responders`**.
+5. **Valida la respuesta contra la petición** (las cinco comprobaciones de §4.3).
+6. **Una petición denegada falla rápido** con `PERMISSION_DENIED`, también con una librería que no entrega la
+   denegación (§7.1), y un dueño sin permiso falla al arrancar.
+7. **Parada ordenada** (§5.5) y el tamaño de la respuesta comprobado antes de publicar (§5.4).
+8. Resuelve la operación en el índice `rpc` del bundle, no por red.
+9. Ejecuta, contra un broker real y con los permisos que genera `gen-acl.mjs`, el ciclo del criterio de
+   aceptación: **una operación atendida por dos instancias reparte las peticiones; al parar ambas, quien llama
+   recibe `RPC_UNAVAILABLE` en menos de 100 ms**, y quitar un permiso **se nota**.
+
+**Herramientas.** `flux doctor` comprueba §8. `flux call <operacion> --data '{…}'` **PUEDE** existir para depurar:
+construye un sobre **como un SDK** (`id` generado, `source` `/<entorno>/flux-cli`, tenant explícito) y nunca lo
+escribe a mano.
+
+## 13. Lo que la petición/respuesta NO resuelve
+
+Declarado para que nadie asuma de más:
+
+- **No es exactamente-una-vez.** Un timeout es ambiguo y el broker no deduplica. La garantía es la **idempotencia
+  del que responde** (§4.5), y a través de reentregas de un handler de eventos, una clave de negocio.
+- **No hay flujos, varias respuestas ni *scatter-gather*.** Una petición, una respuesta (§7.2). Para pedir a todos,
+  un evento; para paginar, un cursor en `data`.
+- **No propaga el plazo** de quien llama al que responde: un handler puede seguir trabajando cuando ya nadie
+  espera, y su efecto se aplica. La idempotencia por `id` cubre el caso peligroso.
+- **No hay contrapresión ni *load shedding*.** Core NATS no tiene acuse: un responder sobrecargado no puede decir
+  «ahora no», y quien llama solo ve `RPC_TIMEOUT`. No se ha medido el límite de mensajes pendientes por
+  suscripción (*slow consumer*).
+- **No elige instancias por salud** (§2.4): una colgada se lleva su parte.
+- **No oculta la existencia de una operación** a quien tenga permiso de publicar en ella, y `no responders` dice
+  si **hay** alguien escuchando.
+- **No se probó sobre una red real** (latencia entre nodos, particiones) ni con carga sostenida.
+
+## 14. Decidido provisionalmente
+
+Puntos que el plan dejaba abiertos y que se cierran aquí con el criterio que se explica en cada sección. Son del
+dueño del proyecto si prefiere otra cosa; cambiar cualquiera de ellos más tarde es barato **ahora** y deja de
+serlo cuando haya servicios en producción:
+
+| # | Decisión | Sección |
+|---|---|---|
+| 1 | El nombre de la operación va en **infinitivo**, `kebab-case`; la regex fija la sintaxis, no la gramática | §2.2 |
+| 2 | Una **suscripción exacta** por operación, nunca `rpc.<dominio>.>` (el permiso sí lo es) | §2.3 |
+| 3 | Sin cabeceras de NATS: el sobre es la única fuente de `traceparent`, `correlationid` y `tenantid` | §3.4 |
+| 4 | `class` del error es **binaria**; `poison` no viaja | §3.3 |
+| 5 | Un error **desconocido** del handler es `permanent`, con mensaje genérico | §3.3, §5.3 |
+| 6 | Si la petición no se puede leer, el error lleva `correlationid` propio y `tenantid: system` | §5.2 |
+| 7 | Una petición **sin subject de respuesta** no se atiende | §5.1 |
+| 8 | **Seis** códigos; `INVALID_RPC_CALL` agrupa operación, timeout y `data` | §6 |
+| 9 | Timeout 1 ms – 25 s, por defecto 5 s; fuera de rango es un error, no se recorta | §4.2 |
+| 10 | `request` hace **un** intento; reintentos opcionales, por defecto 0, con el mismo `id` | §4.5 |
+| 11 | Ventana de `STALE_REQUEST` de **300 s**, simétrica, solo con la firma en `require`; el SDK no recuerda ids | §7.4 |
+| 12 | El responder **no filtra** por el tenant de `connect()` | §5.6 |
+| 13 | El dato personal **PUEDE** viajar como parámetro o resultado, con `x-pii`; el broker no lo persiste | §3.6 |
+| 14 | La respuesta se valida contra la petición (cinco comprobaciones): `RPC_INVALID_REPLY` | §4.3 |
+| 15 | `allow_responses: { max: 1, expires: 30s }` recomendado (DEBERÍA) | §7.2 |
+| 16 | El doctor compara contra `rpc.*.*.*.*` y marca también los filtros anchos sin acuse | §8 |
+| 17 | La compatibilidad se invierte para la petición: sin `x-extensible-enum`; el dueño despliega primero | §11.2 |
+| 18 | El SDK limita los handlers concurrentes (~256) | §5.6 |
+
+
+==============================================================================
+== FIN — 13 documentos
 ==============================================================================

@@ -56,6 +56,12 @@ jobs:
       - name: bundle.json al día
         run: node scripts/bundle-schemas.mjs --check
 
+      # Una comprobación que solo se ha visto en verde no demuestra nada: esto escribe esquemas rpc ROTOS (una
+      # petición sin su respuesta, un data que no es un objeto…) en una copia y exige que cada uno falle por su razón,
+      # y que la compatibilidad se invierta donde toca (11-request-reply.md §11).
+      - name: Las herramientas de esquemas detectan lo roto (en negativo)
+        run: node scripts/test-schema-tools.mjs
+
       # 05-compatibility.md §4: los esquemas publicados son inmutables.
       # Editar 1.0.0 in situ invalida todos los eventos ya emitidos que lo referencian.
       #
@@ -173,6 +179,23 @@ jobs:
             exit 1
           fi
           echo "✓ el mutante fue detectado"
+      # La petición/respuesta (11-request-reply.md): los casos medidos contra un broker (un nodo, una ACL a mano y un
+      # cluster de tres nodos) y contra `async-nats` por una sonda de Rust, que compila con el cargo de arriba.
+      - name: Ejecutar la suite de petición/respuesta
+        env:
+          FLUX_REQUIRE_BROKER: '1'
+        run: node conformance/rpc-broker.mjs
+      # Cuatro fallos que los casos DEBEN notar: sin grupo de cola, con una suscripción de comodín, sin allow_responses
+      # y con un stream que captura `rpc.>`. Con cualquiera de ellos el runner DEBE fallar.
+      - name: Los casos detectan cuatro fallos de configuración (deben FALLAR)
+        run: |
+          for m in no-queue-group wildcard-subscription no-allow-responses stream-captures-rpc; do
+            if node conformance/rpc-broker.mjs --no-rust --no-cluster --mutant "$m" > /dev/null 2>&1; then
+              echo "✗ el mutante $m NO hizo fallar la suite: los casos no vigilan lo que dicen"
+              exit 1
+            fi
+            echo "✓ el mutante $m fue detectado"
+          done
 
   protocol-json-valid:
     name: protocol.json coherente

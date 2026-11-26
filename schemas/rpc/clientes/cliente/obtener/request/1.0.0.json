@@ -1,0 +1,18 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.internal/rpc/clientes/cliente/obtener/request/1.0.0.json",
+  "title": "rpc clientes.cliente.v1.obtener — petición",
+  "description": "La PETICIÓN de la operación `clientes.cliente.v1.obtener` (subject `rpc.clientes.cliente.v1.obtener`), con `type: com.flux.rpc.clientes.cliente.obtener.request.v1`. Ejemplo de FORMA: cómo se declara un esquema de petición y su respuesta con `x-pii`. Ojo: leer un dato que el dueño GUARDA es estado (`state.get` / `state.watch`, 10-state.md), no petición/respuesta (11-request-reply.md §1); una operación así solo se justifica si el dueño no replica el agregado como estado. Quien escribe este esquema es el DUEÑO, que es quien lo lee: ver la regla de compatibilidad de 11-request-reply.md §11.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "clienteId"
+  ],
+  "properties": {
+    "clienteId": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$",
+      "description": "Identificador del cliente: una referencia opaca, nunca PII. Es el mismo `clienteId` que llevan los eventos y la clave del estado de `clientes.cliente.v1`."
+    }
+  }
+}

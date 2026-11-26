@@ -358,7 +358,7 @@ SDK inventa.
 | `MISSING_AGGREGATE_VERSION` | **PERMANENT** | `put`, `delete` (y al consumir) | `data` no tiene `aggregateVersion`, o no es un entero ≥ 1 y ≤ 2^53 − 1 ([10-state.md §3.4](10-state.md)) |
 | `STATE_SUBJECT_MISMATCH` | **POISON** | Al consumir: `watch` y `get` | El `tenantid`, el `subject` o el `type` del sobre no coinciden con el subject de NATS en el que llegó la entrada ([10-state.md §5.4](10-state.md)) |
 | `STATE_CONFLICT` | **RETRYABLE** | `put`, `delete` | El chequeo de secuencia agotó sus 3 intentos: alguien escribió la misma clave entre la lectura y la publicación, las tres veces ([10-state.md §3.2](10-state.md)) |
-| `RESERVED_DOMAIN` | **PERMANENT** | `publish`, `subscribe`, `put`, `get`, `delete`, `watch` | Un subject o un contrato usa un dominio reservado: `dlq`, `state`, `rpc` o `system` ([10-state.md §2.7](10-state.md)) |
+| `RESERVED_DOMAIN` | **PERMANENT** | `publish`, `subscribe`, `put`, `get`, `delete`, `watch`, `request`, `respond` | Un subject, un contrato o una operación usa un dominio reservado: `dlq`, `state`, `rpc` o `system` ([10-state.md §2.7](10-state.md), [11-request-reply.md §2.6](11-request-reply.md)) |
 
 **Por qué estas clases.**
 
@@ -405,3 +405,64 @@ uno que no existe, y el mensaje **DEBE** nombrar las dos causas, y apuntar a `fl
 `put` y `delete`, `flux_state_writes_total` solo cuenta `MISSING_AGGREGATE_VERSION` e
 `INVALID_SCHEMA`, los dos como `invalid_schema` ([08-observability.md §2.4](08-observability.md));
 el resto son errores de quien llama y quedan en su excepción.
+
+## 7. Errores de la capacidad `rpc`
+
+Un SDK que declara la capacidad `rpc` ([00-protocol.md §5](00-protocol.md),
+[11-request-reply.md](11-request-reply.md)) **DEBE** emitir estos **seis** códigos estables. La lista es
+**cerrada**, como la de estado: un caso que no encaje en ninguno es un hueco de la spec, no un código nuevo que
+cada SDK inventa.
+
+| Código | Clase | Se lanza en | Se emite cuando |
+|---|---|---|---|
+| `RPC_UNAVAILABLE` | **RETRYABLE**, inmediato | `request` | Nadie escucha la operación: el broker contesta `no responders` (estado 503) en milisegundos, sin esperar al timeout. Exige `headers` y `no_responders` en CONNECT: sin ellos solo hay un timeout ([11-request-reply.md §4.3](11-request-reply.md)) |
+| `RPC_TIMEOUT` | **RETRYABLE** | `request` | No llega una respuesta en el timeout (5 s por defecto, 25 s como máximo). **Ambiguo: la operación PUEDE haberse ejecutado**, de ahí que quien responde deduplique por `id` |
+| `STALE_REQUEST` | **PERMANENT** | quien responde, **en un error** | Con la firma en modo `require`, el `time` de la petición se aleja más de **300 s** del reloj de quien responde, por delante o por detrás ([11-request-reply.md §7.4](11-request-reply.md)) |
+| `RPC_INVALID_REPLY` | **PERMANENT** | `request` | Lo que llega **no es la respuesta a esta petición**: no es un CloudEvent válido, su `type` no es el de la respuesta ni `com.flux.rpc.error.v1`, su `causationid` no es el `id` de la petición, o su `correlationid`/`tenantid` no los hereda. Es lo que ve quien llama cuando un stream captura `rpc.>` y contesta con su acuse |
+| `RPC_MESSAGE_TOO_LARGE` | **PERMANENT** | `request`; quien responde, **en un error** | El mensaje serializado no cabe en el mínimo entre 1 MiB y el `max_payload` del broker. En la respuesta es la única forma de que quien llama se entere: publicarla lanzaría **en quien responde** y quien llama solo vería un timeout |
+| `INVALID_RPC_CALL` | **PERMANENT** | `request`, `respond`; quien responde, **en un error** | La llamada o el registro está mal formado y se sabe **sin red**: la operación no cumple el patrón (cuatro tokens, sin el prefijo `rpc.`, minúsculas y `kebab-case`), `timeoutMs` no es un entero entre 1 y 25 000, o `data` no es un objeto. En quien responde, además: un `type` que no es el de la petición de esa operación |
+
+**Por qué estas clases.**
+
+- `RPC_UNAVAILABLE` y `RPC_TIMEOUT` son **RETRYABLE** —el fallo es del entorno— pero **no se gestionan igual**: la
+  primera es inmediata y no gasta tiempo; la segunda cuesta su timeout entero y es **ambigua**. Un handler de
+  eventos que recibe cualquiera de las dos reentrega con el backoff de siempre.
+- `STALE_REQUEST`, `RPC_INVALID_REPLY`, `RPC_MESSAGE_TOO_LARGE` e `INVALID_RPC_CALL` son **PERMANENT**: reintentar
+  da lo mismo ([§5.1](#51-son-permanent)). Un handler que los provoque va a la DLQ en la **primera** entrega.
+  `RPC_INVALID_REPLY` lo es aunque a veces sea intermitente (una carrera con el acuse de un stream, A-67): una
+  respuesta que no es de esta petición es un **incidente** —un productor roto, un stream mal puesto— y se alerta
+  por separado.
+- **Los errores que viajan en la respuesta** (`com.flux.rpc.error.v1`) llevan una `class` **binaria**:
+  `retryable` o `permanent`. **`poison` no viaja**: es la calificación de quien *consume* un mensaje ilegible
+  ([§1.3](#13-poison)); para quien llama, una petición que el otro lado no pudo interpretar es `permanent`. El que
+  responde la cuenta como `poison` en **su** métrica y alerta.
+- Un error **desconocido** de un handler se responde como **`permanent`**: el presupuesto acotado de
+  [§2.1](#21-el-default-para-lo-desconocido-retryable-acotado) se cuenta por *entregas* de un consumidor y una
+  llamada no tiene número de entrega; con `retryable`, el handler de quien llama reintentaría seis veces en 51
+  minutos un bug de otro servicio.
+
+**Qué DEBE decir el mensaje.** Lo mismo que [§5.2](#52-qué-debe-decir-el-mensaje): el código es fijo y la
+aplicación no puede sustituirlo; el mensaje nombra **qué** está mal y **cómo se arregla** (los bytes y el límite;
+el rango del timeout; la operación y el patrón; la ventana de 300 s y la hora local); y **NO DEBE** incluir valores
+de `data` ni, en un error que el handler no lanzó a propósito, el texto de una excepción. `RPC_TIMEOUT` **DEBE**
+decir que la operación puede haberse ejecutado. `RPC_INVALID_REPLY` **DEBERÍA** decir que algún stream captura
+`rpc.>` y apuntar a `flux doctor` cuando el cuerpo parezca el acuse de un stream.
+
+**Lo que no es un código nuevo.** Estos ya existen y se reutilizan tal cual:
+
+| Situación | Código |
+|---|---|
+| Dominio reservado en una operación (`rpc.clientes…` con el prefijo, `state.x…`) | `RESERVED_DOMAIN` — [§6](#6-errores-de-la-capacidad-state) |
+| `data` no cumple el esquema de la petición o de la respuesta | `INVALID_SCHEMA` |
+| `classification` fuera del enum | `INVALID_DATACLASSIFICATION` ([01-envelope.md §3.1](01-envelope.md)) |
+| La ACL deniega la petición (o la suscripción de quien responde) | `PERMISSION_DENIED` — [§5](#5-errores-de-la-capacidad-security), con la regla de [06-security.md §3.7](06-security.md): el SDK escucha el `-ERR` y lo compite con la respuesta |
+| Firma ausente, inválida o con clave desconocida | `MISSING_SIGNATURE`, `INVALID_SIGNATURE`, `UNKNOWN_SIGNING_KEY` ([07-signing.md §7](07-signing.md)) |
+| Sobre ilegible o sin una extensión obligatoria | Los de [01-envelope.md §3.1](01-envelope.md) |
+
+`NOT_PROVISIONED` **no aplica**: no hay streams ni consumidores que aprovisionar. Y una operación sin handler **no
+tiene código propio**: es `RPC_UNAVAILABLE`, porque el SDK se suscribe al subject exacto de cada operación.
+
+**Métricas.** Se cuentan en `flux_rpc_client_requests_total` y `flux_rpc_server_requests_total`
+([08-observability.md §2.5](08-observability.md)) con un `outcome` por código: `unavailable`, `timeout`,
+`invalid_reply`, `stale_request`… `INVALID_RPC_CALL` no se cuenta: es un error de programación, como
+`INVALID_STATE_KEY`.

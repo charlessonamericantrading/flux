@@ -20,7 +20,9 @@ mismo, agrupar deja de funcionar en cuanto el ecosistema es polyglot — que es 
 
 Un SDK L2 **DEBE** exponer estas siete. Nombres en formato Prometheus; un SDK con otro
 backend **DEBE** conservar los nombres y las etiquetas. Un SDK que declara la capacidad `state`
-([10-state.md](10-state.md)) **DEBE** exponer además la de [§2.4](#24-flux_state_writes_total--la-capacidad-state).
+([10-state.md](10-state.md)) **DEBE** exponer además la de [§2.4](#24-flux_state_writes_total--la-capacidad-state), y uno
+que declara `rpc` ([11-request-reply.md](11-request-reply.md)), las tres de
+[§2.5](#25-las-métricas-de-la-capacidad-rpc).
 
 | Métrica | Tipo | Etiquetas |
 |---|---|---|
@@ -161,6 +163,62 @@ dominio, y el tenant, una por cada cliente de la plataforma. Es la regla de
   sufijo, cada tenant nuevo crearía series nuevas;
 - `flux_consumer_pending` es la **suma** de los durables del servicio para ese contrato, no el
   valor del último sondeado: varios durables con las mismas etiquetas se pisarían entre sí.
+
+### 2.5 Las métricas de la capacidad `rpc`
+
+| Métrica | Tipo | Etiquetas |
+|---|---|---|
+| `flux_rpc_client_requests_total` | Counter | `operation`, `outcome` |
+| `flux_rpc_server_requests_total` | Counter | `operation`, `outcome` |
+| `flux_rpc_duration_seconds` | Histogram | `operation`, `role` |
+
+```
+operation = <dominio>.<agregado>.v<major>.<operacion>      ("clientes.cliente.v1.calcular-descuento": sin el prefijo rpc.)
+role      = client | server
+```
+
+Van en **su propio bloque** (`protocol.json` → `rpc.metrics`), **no entre las siete**: las suites de los SDKs cuentan
+exactamente siete, y una capacidad opcional no puede cambiar esa cuenta (la de estado, §2.4, hace lo mismo).
+
+**`outcome` del cliente** (`flux_rpc_client_requests_total`), uno por llamada:
+
+| `outcome` | Cuándo |
+|---|---|
+| `ok` | Llegó una respuesta válida |
+| `unavailable` | `RPC_UNAVAILABLE`: nadie escucha la operación |
+| `timeout` | `RPC_TIMEOUT` |
+| `retryable` | Llegó un error con `class: retryable` |
+| `permanent` | Llegó un error con `class: permanent`, o `PERMISSION_DENIED`, `STALE_REQUEST`, `RPC_MESSAGE_TOO_LARGE` o un fallo de firma |
+| `invalid_schema` | `INVALID_SCHEMA`, al construir la petición o al validar la respuesta |
+| `invalid_reply` | `RPC_INVALID_REPLY`: lo que llegó no es la respuesta a esta petición |
+
+**`outcome` del servidor** (`flux_rpc_server_requests_total`), uno por petición recibida:
+
+| `outcome` | Cuándo |
+|---|---|
+| `ok` | El handler devolvió una respuesta |
+| `retryable` / `permanent` | El handler falló con un error de esa clase (un error **desconocido** es `permanent`) |
+| `poison` | La petición **no se pudo interpretar**, o no traía subject de respuesta. **Es lo que debe despertar a alguien**: alguien publica a mano, o hay un SDK roto |
+| `invalid_schema` | La petición no cumple su esquema, o la respuesta del handler no cumple el suyo |
+| `invalid_signature` | Firma ausente o inválida en modo `require` |
+| `stale_request` | `STALE_REQUEST`: `time` a más de 300 s |
+
+**`invalid_schema` se emite también cuando la llamada lanza**, por la misma razón que en [§2.1](#21-valores-de-las-etiquetas).
+Los errores de programación —`INVALID_RPC_CALL`, `RESERVED_DOMAIN`— **no** se cuentan.
+
+**`flux_rpc_duration_seconds`**: en el cliente, desde que sale la petición hasta que llega la respuesta **o falla**
+(un timeout dura su timeout); en el servidor, lo que tarda el handler desde que recibe la petición hasta que sale la
+respuesta. **Mismos buckets** que [§3](#3-histograma-de-duración): el último, `30`, es el `ack_wait`, y una llamada
+cerca de él es una llamada hecha desde un handler que está a punto de reentregarse.
+
+**Cardinalidad.** `operation` está acotado —hay tantas como operaciones declaradas— y sirve como etiqueta.
+**Nunca** el `tenantid`, el `id`, el `correlationid` **ni quién llama** (servicio o cliente): son una serie por cada
+uno. Es la regla de §2.2, aplicada a lo único que la petición/respuesta añade. En **trazas** sí
+([§5](#5-trazas)): un span por llamada y otro por petición atendida.
+
+**Alertas.** Además de las cuatro de [§4](#4-alertas-mínimas): `poison` del servidor (es el POISON de las peticiones),
+`invalid_reply` del cliente (es la trampa de un stream que captura `rpc.>`, [11-request-reply.md §8](11-request-reply.md))
+y la tasa de `unavailable` y de `timeout` por operación.
 
 ## 3. Histograma de duración
 

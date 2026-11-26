@@ -91,8 +91,8 @@ Esto es lo que «completo» significa. Cada fila es algo que hoy se hace con HTT
 | 2 | Polling: `GET /cambios?desde=` | **Evento** | ✅ existe |
 | 3 | `GET /clientes/123`: leer un dato de otro sistema | **Estado replicado** | ❌ Fase 2 |
 | 4 | Carga inicial: `GET /clientes?page=` | **Estado replicado** | ❌ Fase 2 |
-| 5 | `POST /accion` que necesita respuesta ya | **Petición/respuesta** | ❌ Fase 3 |
-| 6 | `GET /precio?…`: un cálculo, no un dato guardado | **Petición/respuesta** | ❌ Fase 3 |
+| 5 | `POST /accion` que necesita respuesta ya | **Petición/respuesta** | ⏳ Fase 3: spec y esquemas hechos; SDKs, permisos y CLI pendientes |
+| 6 | `GET /precio?…`: un cálculo, no un dato guardado | **Petición/respuesta** | ⏳ Fase 3: ídem |
 | 7 | `POST /accion` asíncrona (encolar trabajo) | **Evento** en el dominio de quien pide + evento de resultado, unidos por `correlationid` | ✅ existe — falta documentarlo (Fase 5) |
 | 8 | Webhook entrante de un tercero (pasarela de pago…) | **Gateway**: HTTP → evento | ❌ Fase 4 |
 | 9 | Webhook saliente a quien no puede conectarse | **Gateway**: evento → HTTP firmado | ❌ Fase 4 |
@@ -109,8 +109,8 @@ tener una API, con otro transporte.
 
 ## 3. Lo que está roto hoy
 
-Verificado ejecutando, no leyendo. Reproducible con
-[`evidencia/ejecutar.sh`](evidencia/ejecutar.sh).
+Verificado ejecutando, no leyendo. Reproducible con `node conformance/security.mjs`,
+`node conformance/state-broker.mjs` y `node conformance/rpc-broker.mjs` (los experimentos ad-hoc de `evidencia/` ya son casos).
 
 | # | Hallazgo | Evidencia |
 |---|---|---|
@@ -247,7 +247,7 @@ Reglas nuevas. Todas tienen evidencia en el Apéndice A.
   **y de la DLQ de cada stream consumido**: `subscribe()` también consulta `DLQ_<DOM>`, y sin
   ese permiso intenta crearlo y falla. *(A-3, A-4, A-8b)*
 
-  > **Corregido tras medir.** La versión original de este plan, y `evidencia/candidata.conf`,
+  > **Corregido tras medir.** La versión original de este plan, y la candidata a mano de entonces,
   > no incluían `STREAM.INFO.DLQ_<DOM>`. Con la candidata, el SDK de Node **no** podía
   > suscribirse (`Permissions Violation for Publish to "$JS.API.STREAM.CREATE.DLQ_PEDIDOS"`).
 - **El dueño lee su propia DLQ con un pull consumer**, no con una suscripción a
@@ -308,10 +308,10 @@ Añade a `AGENTS.md` §8 dos trampas: «los permisos de subject no gobiernan Jet
   error. Motivo: el nombre del durable es un único token y NATS no permite comodines
   dentro de un token; hay que conocer el subject exacto.
 - Emite los permisos de 1.1. La forma objetivo se escribió a mano en
-  [`evidencia/candidata.conf`](evidencia/candidata.conf), con las dos diferencias de arriba
-  (la DLQ de los streams consumidos y la DLQ propia). Ese fichero ya no la contiene: tras la 1.5
-  la genera `gen-acl.mjs` y la ejecuta la suite, y solo quedan los usuarios de las Fases 2 y 3
-  (la versión anterior está en el historial de git).
+  `evidencia/candidata.conf`, con las dos diferencias de arriba
+  (la DLQ de los streams consumidos y la DLQ propia). Tras la 1.5 la genera `gen-acl.mjs` y la ejecuta
+  la suite; los usuarios de estado y de petición/respuesta son `acls.estado` de `state-broker.json` y `acls.rpc` de
+  `rpc-semantics.json` (la carpeta `evidencia/` ya no existe; está en el historial de git).
 - `--nkeys <mapa.json>`: sustituye cada `<NKEY_DE_*>` por la clave pública real. Rechaza una
   **semilla** (es un secreto), una clave repetida entre servicios (credencial compartida) y un
   servicio sin clave.
@@ -450,7 +450,7 @@ node conformance/security.mjs --acl conformance/fixtures/acl-v1.conf # DEBE fall
 ```
 
 Borra de `docs/plan-v1.1/evidencia/` lo que ya sea un caso (`acl-generada.mjs` y la
-parte 3 de `diseno-candidato.mjs`). *(Hecho.)*
+parte 3 de `diseno-candidato.mjs`). *(Hecho; y la Fase 3 se llevó lo que quedaba.)*
 
 ---
 
@@ -650,7 +650,37 @@ recibe la lápida, y `get` de esa clave devuelve `null`.
 
 **Objetivo:** órdenes y cálculos con respuesta inmediata, sin HTTP. Filas 5 y 6.
 
-Documento nuevo: `specification/11-request-reply.md`.
+Documento nuevo: [`specification/11-request-reply.md`](../../specification/11-request-reply.md), **normativo**. Lo que
+sigue es el plan tal como quedó **tras medir y escribir la spec**: la fase se hizo, como la 2, en un frente de spec,
+herramientas de esquemas y casos medidos, y los de SDKs (Node y Rust), permisos y CLI implementan sobre ese contrato. Donde
+esto y la spec discrepen, manda la spec.
+
+> **Corregido tras medir.** Lo que la ejecución contra nats-server 2.14.5 (Apéndice A, A-56 … A-76) cambió respecto al
+> plan original, y por qué:
+>
+> - **El dueño se suscribe al subject EXACTO de cada operación, no a `rpc.<dominio>.>`.** El plan decía lo segundo. El
+>   *permiso* sigue siendo `rpc.<dominio>.>`, pero con la suscripción ancha una operación que el servicio no atiende
+>   recibe interés y quien llama espera un timeout en vez de `no responders` en 1 ms. *(A-64)*
+> - **El `no responders` no llega solo.** Exige `headers` y `no_responders` en CONNECT; sin ellos, silencio. Un SDK nuevo cuya
+>   librería no lo active convierte `RPC_UNAVAILABLE` en un timeout. *(A-57)*
+> - **La trampa A-18 es una carrera, no un fallo constante.** El acuse del stream gana casi siempre (394 de 400), no
+>   siempre: el síntoma es intermitente. Y los filtros más anchos (`>`, `*.>`, `*.*.*.*.*`) solo se pueden crear sin
+>   acuse: no contestan, pero convierten `no responders` en un timeout y persisten la petición. `flux doctor` compara
+>   contra `rpc.*.*.*.*`, la forma de toda operación. *(A-67, A-69)*
+> - **`allow_responses: true` admite UNA respuesta y NO caduca.** El plan lo daba por suficiente; se recomienda
+>   `{ max: 1, expires: 30s }`. *(A-68)*
+> - **Una petición denegada falla rápido con `@nats-io/*` y NO con `async-nats`** (timeout; el `-ERR` solo se ve en el
+>   evento de la conexión): el SDK de Rust tiene que competirlo con la respuesta. *(A-66, A-72)*
+> - **Una respuesta que no cabe falla en silencio**: la librería lanza en quien responde y quien llama ve un timeout. El que
+>   responde comprueba el tamaño y contesta con un error. *(A-65)*
+> - **`RPC_TIMEOUT` es ambiguo por cuatro vías**: responder lento (A-61), responder que muere (A-62), instancia colgada
+>   (A-63) y la ventana de un cluster al irse el último (A-70). Por eso el que responde deduplica por `id`.
+> - **Los códigos son seis, no cuatro**: a los del plan (`RPC_UNAVAILABLE`, `RPC_TIMEOUT`, `STALE_REQUEST`, y `INVALID_SCHEMA`,
+>   que ya existía) se añaden `RPC_INVALID_REPLY`, `RPC_MESSAGE_TOO_LARGE` e `INVALID_RPC_CALL`.
+> - **El error binario**: `class` es `retryable` o `permanent`; `poison` no viaja. Un error desconocido del handler se responde
+>   como `permanent`.
+> - **La compatibilidad se invierte para la petición**: añadir un valor a un enum de una petición no exige
+>   `x-extensible-enum` (el lector es el dueño); el orden de despliegue es primero quien responde.
 
 #### 3.1 Modelo
 
@@ -660,8 +690,8 @@ Documento nuevo: `specification/11-request-reply.md`.
   llama lo sabe al instante *(A-15)*.
 - **Ningún stream DEBE capturar `rpc.>`.** Si uno lo hace, quien llama recibe el acuse de
   JetStream como si fuera la respuesta *(A-18)*. `flux doctor` lo comprueba.
-- **Solo el dueño responde**, suscrito a `rpc.<dominio>.>` con *queue group* = su nombre
-  de servicio. Así varias instancias se reparten las peticiones.
+- **Solo el dueño responde**: su permiso es `rpc.<dominio>.>` pero **se suscribe al subject exacto de cada operación** que
+  atiende, con *queue group* = su nombre de servicio. Así varias instancias se reparten las peticiones *(A-58, A-64)*.
 - **Sobre:** petición y respuesta son CloudEvents. La respuesta hereda `correlationid` y
   `tenantid`; su `causationid` es el `id` de la petición.
 
@@ -675,9 +705,14 @@ Así, un handler de eventos que llama a una operación hereda la clasificación 
 | Situación | Código | Clase |
 |---|---|---|
 | Nadie escucha | `RPC_UNAVAILABLE` | RETRYABLE — inmediato |
-| No llega respuesta a tiempo | `RPC_TIMEOUT` | RETRYABLE |
+| No llega respuesta a tiempo | `RPC_TIMEOUT` | RETRYABLE — **ambiguo** |
 | La petición no cumple su esquema | `INVALID_SCHEMA` | PERMANENT |
 | Petición firmada fuera de la ventana | `STALE_REQUEST` | PERMANENT |
+| Lo que llega no es la respuesta a esta petición (p. ej. el acuse de un stream) | `RPC_INVALID_REPLY` | PERMANENT |
+| El mensaje no cabe en `max_payload` | `RPC_MESSAGE_TOO_LARGE` | PERMANENT |
+| Operación mal formada, `timeoutMs` fuera de rango, `data` que no es un objeto | `INVALID_RPC_CALL` | PERMANENT |
+
+La lista es **cerrada** y está en [04-errors.md §7](../../specification/04-errors.md).
 
 Timeout por defecto **5 s**, máximo **25 s**: por debajo del `ack_wait`, para que una
 llamada hecha desde un handler no provoque su reentrega.
@@ -686,15 +721,17 @@ llamada hecha desde un handler no provoque su reentrega.
 
 - **Idempotencia.** Una orden puede llegar dos veces. El handler **DEBE** deduplicar por
   el `id` de la petición. Si el SDK reintenta, **reutiliza el mismo `id`**.
-- **Tamaño.** 1 MiB en cada sentido. Más: claim-check, o paginar con un cursor en `data`.
+- **Tamaño.** 1 MiB en cada sentido (o el `max_payload` del broker, si es menor). Más: claim-check, o paginar con un cursor
+  en `data`. Una respuesta que no cabe se contesta con `RPC_MESSAGE_TOO_LARGE`: de otro modo quien llama solo vería un timeout *(A-65)*.
 - **No es para leer datos guardados.** Eso es estado — §2.
 
 #### 3.4 Seguridad
 
 - Quien llama: publicación sobre el subject **exacto** de cada operación concedida. Clave
   `calls` en el manifiesto *(A-17)*.
-- El dueño: suscripción a `rpc.<dominio>.>` y `allow_responses: true`. No necesita
-  permiso de publicación sobre ningún inbox *(A-16)*.
+- El dueño: suscripción a `rpc.<dominio>.>` y `allow_responses`. No necesita permiso de publicación sobre ningún inbox *(A-16)*.
+  Medido: `true` admite **una** respuesta y **no caduca**; se recomienda `{ max: 1, expires: 30s }` *(A-68)*. Un dueño sin permiso de
+  suscripción parece un servicio caído (`no responders`): `respond()` falla al arrancar con `PERMISSION_DENIED` *(A-73)*.
 - **Sin el inbox privado de la Fase 1, cualquiera leería las respuestas ajenas.**
 - Con firma en modo `require`: el dueño rechaza peticiones cuyo `time` se aleje más de
   300 s. La firma por sí sola no impide reenviar una petición capturada. La respuesta va
@@ -713,25 +750,27 @@ await bus.respond("clientes.cliente.v1.calcular-descuento", async (peticion, ctx
 
 #### 3.6 Entregables
 
-| Dónde | Qué |
-|---|---|
-| `specification/11-request-reply.md` | Todo lo anterior |
-| `specification/00-protocol.md` §6 | Quitar «request/reply» de fuera de alcance |
-| `specification/08-observability.md` | `flux_rpc_client_requests_total{operation,outcome}`, `flux_rpc_server_requests_total{operation,outcome}`, `flux_rpc_duration_seconds{operation,role}` |
-| `protocol.json`, `check-protocol-json.mjs` | Bloque `rpc`; quitar de `outOfScopeV1`; patrones |
-| `scripts/bundle-schemas.mjs`, `check-compat.mjs` | `schemas/rpc/`; índice `rpc` |
-| `scripts/gen-acl.mjs` | Clave `calls`; `allow_responses` para el dueño |
-| `cli/` | `doctor`: ningún stream captura `rpc.>`. `flux call <operacion> --data '{…}'` para depurar |
-| `sdk-node/`, `sdk-rust/` | `request` y `respond` |
-| `conformance/cases/` | A-15 … A-18, y reparto por *queue group* |
-| `conformance/harness/` | Operaciones `rpc-request`, `rpc-reply`, `rpc-error`, con vectores |
-| `conformance/security.mjs` | Llamada no concedida denegada; respuesta ajena no legible |
+| Dónde | Qué | Estado |
+|---|---|---|
+| `specification/11-request-reply.md` | Todo lo anterior, con el porqué y lo medido | **Hecho** |
+| `specification/00-protocol.md` §5, §6 | La capacidad `rpc`; quitar «request/reply» de fuera de alcance | **Hecho** |
+| `specification/02-naming.md`, `04-errors.md` §7, `05-compatibility.md` §6 | El subject y que no hay stream; los seis códigos; la dirección invertida | **Hecho** |
+| `specification/08-observability.md` §2.5 | `flux_rpc_client_requests_total{operation,outcome}`, `flux_rpc_server_requests_total{operation,outcome}`, `flux_rpc_duration_seconds{operation,role}`, en su bloque (las siete siguen siendo siete) | **Hecho** |
+| `protocol.json`, `check-protocol-json.mjs` | Bloque `rpc`; `errors.codes`; la capacidad `rpc` (sin ningún SDK que la declare); quitar de `outOfScopeV1`; 54 patrones y 78 mutaciones | **Hecho** |
+| `scripts/bundle-schemas.mjs`, `check-compat.mjs`, `schema-rules.mjs` | `schemas/rpc/`; índice `rpc`; pares; la dirección invertida (`scripts/test-schema-tools.mjs` las prueba en negativo) | **Hecho** |
+| `schemas/rpc/clientes/cliente/{obtener,calcular-descuento}/…`, `schemas/system/rpc/error/1.0.0.json` | Esquemas de ejemplo, con `x-pii` donde toca, y el error | **Hecho** |
+| `conformance/cases/rpc-semantics.json`, `cross-sdk-rpc-envelope.json`; `conformance/rpc-broker.mjs` | A-56 … A-76 como casos con `observed`, cuatro mutantes, y los ejemplos byte a byte | **Hecho** |
+| `scripts/gen-acl.mjs` | Claves de llamada y de servicio; `allow_responses` para el dueño | Pendiente (agente de permisos) |
+| `cli/` | `doctor`: ningún stream captura `rpc.*.*.*.*` (algoritmo en `protocol.json` → `rpc.doctor`). `flux call <operacion> --data '{…}'` para depurar | Pendiente (agente de CLI) |
+| `sdk-node/`, `sdk-rust/` | `request` y `respond` | Pendiente |
+| `conformance/harness/` | Operaciones `rpc-request`, `rpc-reply`, `rpc-error`, `rpc-operation`, `rpc-timeout`, con los vectores de `cross-sdk-rpc-envelope.json` | Pendiente (integración) |
+| `conformance/security.mjs` | Llamada no concedida denegada; respuesta ajena no legible | Pendiente (agente de permisos). Medido a mano contra una ACL escrita a mano en `rpc-semantics.json` (`acls.rpc`) |
 
 **Aceptación:** la definición de hecho, más: una operación atendida por dos instancias
 reparte las peticiones; al parar ambas, quien llama recibe `RPC_UNAVAILABLE` en menos de
 100 ms.
 
-Borra lo que quede en `docs/plan-v1.1/evidencia/`.
+`docs/plan-v1.1/evidencia/` **ya no existe**: lo que quedaba (A-15 … A-18) es ahora `rpc-semantics.json`.
 
 ---
 
@@ -936,7 +975,7 @@ Documento `specification/13-encryption.md`. Diseño de partida:
 ## Apéndice A — Evidencia
 
 Observado el **2026-11-26** contra **nats-server 2.14.5**, con `@nats-io/jetstream` 3.4.0.
-Reproducible: [`evidencia/ejecutar.sh`](evidencia/ejecutar.sh).
+Reproducible con los runners de `conformance/` (cada fila dice cuál).
 
 | # | Qué se probó | Resultado observado |
 |---|---|---|
@@ -1001,14 +1040,44 @@ Reproducible: [`evidencia/ejecutar.sh`](evidencia/ejecutar.sh).
 | A-53 | `streams.update` de `STATE_<DOM>` con `max_age: 60s` y `duplicate_window` de 2 m | Err «duplicates window can not be larger then max age»: un `max_age` corto no es una forma de que el estado caduque con la ventana de la 1.0; el estado usa `max_age: 0` |
 | A-54 | La ACL generada ejecutada de extremo a extremo (S15 a S20): el dueño, un observador confinado a `acme` y uno sin confinar | Sin una sola violación en los ciclos positivos. Con `DIRECT.GET…v1.acme.*` se lee una clave de `acme` y un `…acme.>` (sigue siendo su tenant); se deniegan `globex`, `…v1.*.<clave>`, `state.<dom>.>` y la forma de cuerpo. Un `publish` de core a un subject de estado se deniega a todos menos al dueño. `STREAM.INFO.STATE_<DOM>`, `STREAM.MSG.GET`, `STREAM.PURGE` y el durable de otro: denegados a los cuatro roles. Quitar cualquiera de los permisos de estado rompe el ciclo (`verify-acl.mjs`, 5b) |
 | A-55 | Qué pide `@nats-io/jetstream` 3.4.0 bajo los permisos de estado generados (observador confinado y dueño) | `DirectStreamAPIImpl.getMessage(stream, { last_by_subj })` emite exactamente `$JS.API.DIRECT.GET.<stream>.<subject>`, sin cuerpo y **sin ninguna violación**; **no es público** (`jetstream(nc).direct` es `undefined`), así que un SDK pide `nc.request` a ese subject y mira `headers.code` (404 = no hay valor; las cabeceras traen `Nats-Sequence`). `jsm.streams.getMessage` usa `STREAM.MSG.GET` y `jsm.streams.info("STATE_…")` usa `STREAM.INFO`: **denegados**, también al dueño. `consumers.get` (CONSUMER.INFO) y `publish` con `expect: { lastSubjectSequence }` funcionan; el conflicto llega como `JetStreamApiError` con `code` 10071 |
+| A-56 | Petición a una operación sin nadie escuchando, con un timeout de 5000 ms. Reproduce A-15 | `no responders` en **1-2 ms** (`RequestError: no responders: '<subject>'`). Caso `no-responders-is-instant` |
+| A-57 | La misma petición por un cliente en bruto, con y sin `no_responders` en CONNECT | Con `"headers":true,"no_responders":true`: un mensaje HMSG de estado `NATS/1.0 503` sin cuerpo en ~0,6 ms. **Sin la bandera: silencio** (en 500 ms no llega nada): quien llama espera su timeout. Caso `no-responders-needs-the-connect-flags` |
+| A-58 | Dos instancias en el mismo grupo de cola; 600 y 2000 peticiones seguidas | Todas respondidas, **cada una por UNA instancia**, repartidas **al azar**, no por turnos: 295 / 305 de 600; 979 / 1021 de 2000. Sin grupo de cola cada instancia las recibe todas (mutante `no-queue-group`). Caso `queue-group-splits-requests` |
+| A-59 | Una instancia deja de escuchar; después, la última | Las 100 siguientes van a la que queda (100 de 100); tras irse la última, `no responders` en ~1 ms. Caso `queue-group-instance-leaving` |
+| A-60 | Dos SERVICIOS (dos grupos de cola) sobre la misma operación | **Cada grupo recibe y ejecuta la petición.** Quien llama ve UNA respuesta, la del que conteste antes (`svc-a` o `svc-b` según la ejecución). Caso `two-services-on-one-operation-both-execute` |
+| A-61 | Un responder de 600 ms con un timeout de 300 ms; después, una petición en bruto sin timeout | `TimeoutError` a los ~300 ms, **pero el responder recibió y respondió una vez**; la respuesta tardía **llega al inbox** a los ~600 ms (el broker no la descarta) y la conexión de quien llamó sigue sana. Caso `slow-responder-times-out-but-executes-and-the-late-reply-arrives` |
+| A-62 | La única instancia recibe la petición y cierra su conexión sin responder; y parar con un handler de 400 ms: cerrar la conexión a los 100 ms frente a `unsubscribe` a los 100 ms | `TimeoutError` a los ~1000 ms; la siguiente petición, `no responders`. **Cerrar de golpe pierde la petición en vuelo** (timeout); con `unsubscribe` la petición nueva falla en ~1 ms con `no responders` y la que estaba en vuelo termina con su respuesta. Casos `responder-dies-mid-request-looks-like-a-timeout`, `stopping-gracefully-does-not-lose-what-is-in-flight` |
+| A-63 | Una instancia viva y un cliente en bruto suscrito al mismo grupo que **no responde**; 40 peticiones con timeout de 150 ms | Entre 19 y 22 respondidas y entre 18 y 21 con timeout (se lleva su parte, 1/N, al azar); al destruir su socket, 20 de 20. Caso `a-hung-instance-takes-its-share-of-the-requests` |
+| A-64 | Suscripción al subject exacto de la operación frente a `rpc.<dominio>.>`, con una petición a una operación sin handler | Exacta: `no responders` en ~1 ms. Con el comodín el servicio **tiene interés** y quien llama espera su timeout. Caso `exact-subscription-gives-no-responders-for-an-unknown-operation` |
+| A-65 | `max_payload` y qué pasa al superarlo: la librería de Node, un cliente en bruto y una respuesta que no cabe | `max_payload` anunciado: **1048576**. EXACTAMENTE ese tamaño se entrega y se responde; con 1048577 la librería lanza **al instante** (`InvalidArgumentError: 'payload' max_payload size exceeded`; `async-nats`, `MaxPayloadExceeded`) sin tocar la red; **las cabeceras cuentan** (1048576 de cuerpo y una cabecera ya lo supera). Un PUB en bruto de 1048577: `-ERR 'Maximum Payload Violation'` y **cierre de la conexión**. Una respuesta de 1048577: quien responde recibe el error de la librería y **quien llama, un timeout**. Caso `max-payload-and-oversize` |
+| A-66 | Reproduce A-17: llamar a una operación no concedida con la librería de Node; y a una concedida sin nadie | `RequestError` con causa `PermissionViolationError` en **~1 ms**: `Permissions Violation for Publish to "rpc.clientes.cliente.v1.obtener"`. La concedida sin nadie: `no responders` en ~1 ms. Caso `denied-call-fails-fast-in-node` |
+| A-67 | Reproduce A-18: un stream sobre `rpc.x.>` con un responder real; sin nadie; y un stream `no_ack` | De 20 peticiones, **entre 18 y 20 «respuestas» son el acuse del stream** `{"stream":"TRAMPA","seq":n}` (394 de 400 seguidas, 341 de 400 concurrentes: **una carrera**, gana casi siempre el acuse); el responder ejecuta todas y el stream **guarda las 20**. Sin nadie escuchando, la petición también se «responde» con el acuse. Con `no_ack`: sin acuse y **sin `no responders`**: timeout. Casos `stream-on-rpc-answers-with-its-ack`, `a-stream-without-acks-turns-no-responders-into-a-timeout` |
+| A-68 | `allow_responses` en el dueño, sin permiso de publicación sobre inboxes. Reproduce A-16 | `true`: de **tres** respuestas se entrega **una** y las otras dos son `Permissions Violation for Publish to "_INBOX.llama.…"`; una respuesta a los **2 s** se entrega (**no caduca**). `{ max: 3 }`: de 4, 3. `{ max: 1, expires: "1s" }`: a los 1,5 s se **deniega**, a los 0,3 s pasa. Publicar a un inbox que no es el `reply` de la petición: **denegado**. Sin `allow_responses`: el dueño no puede contestar y quien llama ve un timeout. Casos `allow-responses-*`, `without-allow-responses-the-owner-cannot-reply`, `the-owner-can-only-reply-to-the-requests-reply-subject` |
+| A-69 | 16 subjects de stream como filtro (`rpc.>`, `>`, `*.>`, `*.*.*.*.*`, `rpc.otro.>`…): ¿capturan una operación? ¿Se pueden crear con acuse? | El broker captura la operación **exactamente donde predice el algoritmo de solape** (token a token, contra `rpc.*.*.*.*`). **`>`, `*.>`, `*.*.*.*.*`, `*.*.*.*` y `*.*.*.*.*.*` solo se pueden crear SIN acuse** (`capturing all subjects requires no-ack to be true` / `subjects that overlap with jetstream api require no-ack to be true`); los tres primeros capturan (timeout), los dos últimos no. Caso `which-stream-subjects-capture-rpc` |
+| A-70 | Cluster de 3 nodos: el responder (nodo 2) cierra y la petición del nodo 0 sale a 0, 5, 20 y 100 ms | **Ventana**: sin esperar, **4 de 10** peticiones agotan su timeout (el resto, `no responders`); a los 5 ms, 0 de 10; a 20 y 100 ms, 0 de 10. En un nodo suelto, 1 de 10 sin esperar. Pasados ~150 ms, `no responders` en ~1 ms. Caso `cluster-window-after-the-last-responder-leaves` |
+| A-71 | Un servicio con `_INBOX.>` (la ACL v1) y otro con inbox privado, mientras `llama` recibe una respuesta de `crm` | El primero **oye la respuesta completa** dirigida a otro; el segundo ve **denegada** la suscripción a `_INBOX.llama.>` y su iterador lanza `PermissionViolationError`. Caso `shared-inbox-leaks-replies-and-a-private-inbox-does-not` |
+| A-72 | `async-nats` 0.50 (el SDK de Rust): la petición DENEGADA de A-66 | **No falla rápido**: `TimedOut` a los ~2500 ms (el timeout); mientras, el evento `ServerError` de la conexión recibe `Permissions Violation for Publish to "rpc.clientes.cliente.v1.obtener"`. Caso `denied-call-times-out-in-async-nats` (sonda `conformance/probes/rpc-async-nats`) |
+| A-73 | Un dueño con permiso de publicar pero **no de suscribirse** a `rpc.clientes.>`, y `llama` | El servidor registra `Permissions Violation for Subscription to "rpc.clientes.cliente.v1.obtener" using queue "crm"` en la conexión del dueño (la suscripción **no lanza al crearse**; el iterador sí) y `llama` recibe `no responders` en ~1 ms: **parece un servicio caído**. Caso `owner-without-subscribe-permission-looks-like-no-responders` |
+| A-74 | Una petición con las cabeceras `traceparent` y `Nats-Msg-Id`; la misma `Nats-Msg-Id` otra vez; una publicación sin `reply` | **Las cabeceras viajan** en los dos sentidos (el responder ve las de la petición y quien llama recibe las que el otro puso). Dos peticiones con el mismo `Nats-Msg-Id`: **se entregan las dos** (core no deduplica). Una publicación sin subject de respuesta llega, con `reply` ausente. Caso `headers-travel-and-core-does-not-deduplicate` |
+| A-75 | Cluster de 3 nodos: una instancia del mismo grupo en cada nodo; quien llama en el nodo 0 | **Reparte entre los tres** (180 / 221 / 199 de 600; 286 / 312 / 302 de 900), no se queda en el nodo local. Un responder solo en otro nodo: p50 0,55 ms, p99 1,14 ms (exploración; sin caso). Caso `cluster-queue-group-spreads-across-nodes` |
+| A-76 | `async-nats` 0.50 frente a las demás situaciones de §4.3 | Sin nadie: `NoResponders` en 0-1 ms. Responder de 600 ms con timeout de 300: `TimedOut` a los ~301 ms. Petición de max_payload + 1: `MaxPayloadExceeded` al instante; justo max_payload se publica. Una respuesta de max_payload + 1: quien responde recibe `MaxPayloadExceeded` y quien llama, `TimedOut`. Atendida: ~0,5 ms. Caso `async-nats-no-responders-timeout-and-oversize` |
 A-19 a A-27 los reproduce `sdk-node/test/integration/` (`acl.test.ts`, `auth.test.ts`,
 `tls.test.ts`), contra nats-server 2.14.5 y `@nats-io/*` 3.4.0. A-28 a A-30 los reproduce
 `sdk-rust/tests/security.rs`, contra nats-server 2.14.5 y `async-nats` 0.50.
 A-31 a A-50 los ejecuta [`conformance/state-broker.mjs`](../../conformance/state-broker.mjs) contra
 nats-server 2.14.5 y `@nats-io/*` 3.4.0 (`NATS_SERVER=… node conformance/state-broker.mjs`: 35 casos más 5 comprobaciones de los
 ejemplos byte a byte; un nodo, una ACL escrita a mano y un cluster de tres nodos).
+A-56 a A-76 los ejecuta [`conformance/rpc-broker.mjs`](../../conformance/rpc-broker.mjs) contra nats-server 2.14.5 y
+`@nats-io/*` 3.4.0, y contra `async-nats` 0.50 por una sonda de Rust (`NATS_SERVER=… node conformance/rpc-broker.mjs`: 27 casos más 7
+comprobaciones de los ejemplos byte a byte y de los vectores; un nodo, una ACL escrita a mano y un cluster de tres nodos; con cuatro
+mutantes, `--mutant`, que deben hacer fallar el runner).
 
-**Qué caso cubre cada una.** Las observaciones **del broker** ya son casos de
+**Qué caso cubre cada una.** Las de la **petición/respuesta** (A-15 … A-18 y A-56 … A-76) son casos de
+[`conformance/cases/rpc-semantics.json`](../../conformance/cases/rpc-semantics.json): cada caso lleva su lista `covers` (A-15 → A-56, A-16 → A-68,
+A-17 → A-66, A-18 → A-67). **Sin caso**, medido a mano en una exploración: la latencia p50/p99 de un responder en otro nodo (A-75), el recuento
+de la carrera del acuse con 400 peticiones (A-67) y que `unsubscribe` y `drain` no pierden nada con 400 peticiones seguidas contra un nodo local
+(no concluyente: no se pudo reproducir la ventana de red).
+Las observaciones **del broker** ya son casos de
 [`conformance/cases/security-acl.json`](../../conformance/cases/security-acl.json) (el mapa
 completo es su bloque `brokerObservations`): A-1 → S9 · A-2 → S6, S9 · A-3 → S1 · A-4 → S2 ·
 A-5 → S3 · A-6 → S4 · A-7 → S6 · A-8 → S5 · A-8a → S1, S2 · A-8c → S10 · A-8f → S6, S13 ·
@@ -1019,7 +1088,7 @@ Las del **estado** (A-9 … A-14 y A-31 … A-50; las que dependen de la ACL —
 [`conformance/cases/state-broker.json`](../../conformance/cases/state-broker.json) y
 [`state-semantics.json`](../../conformance/cases/state-semantics.json): cada caso lleva su lista `covers`.
 **No tienen caso** porque son del SDK o de la librería (A-8b, A-26, A-28, A-30; los cubren
-`verify-acl.mjs` y los tests de los SDKs), de la Fase 3 (A-15 … A-18, aún en `evidencia/`) o
+`verify-acl.mjs` y los tests de los SDKs) o
 necesitan otra forma de arrancar el servidor (A-8d, la misma nkey en dos accounts: no arranca;
 A-23, el modo operador/JWT; A-8e y A-24, la parte de `connect()` que se cuelga: son de la
 librería y de la CLI).
