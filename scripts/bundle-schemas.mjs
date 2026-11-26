@@ -2,8 +2,10 @@
 /**
  * Empaqueta schemas/ en un único JSON, indexado por la URI de `dataschema`.
  *
- *   node scripts/bundle-schemas.mjs           → schemas/bundle.json
- *   node scripts/bundle-schemas.mjs --check   → falla si está desactualizado (CI)
+ *   node scripts/bundle-schemas.mjs                     → schemas/bundle.json
+ *   node scripts/bundle-schemas.mjs --check             → falla si está desactualizado (CI)
+ *   node scripts/bundle-schemas.mjs --schemas <dir>     → el `schemas/` de OTRO proyecto (su `<dir>/bundle.json`): lo que
+ *                                                         usan `flux new` y examples/ecosistema/. Sin la opción, el de este repo.
  *
  * Por qué un bundle y no resolución HTTP en tiempo de ejecución: validar en
  * `publish()` está en la ruta caliente. Una petición de red por evento es
@@ -31,7 +33,7 @@
  */
 
 import { readFile, writeFile, readdir } from "node:fs/promises";
-import { join, dirname, relative } from "node:path";
+import { join, dirname, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import {
@@ -40,7 +42,13 @@ import {
 } from "./schema-rules.mjs";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
-const SCHEMAS = join(ROOT, "schemas");
+/** El árbol de esquemas: el de este repo, o el que dé `--schemas <dir>` (el `schemas/` de un proyecto que usa flux). */
+const iDir = process.argv.indexOf("--schemas");
+if (iDir > 0 && (!process.argv[iDir + 1] || process.argv[iDir + 1].startsWith("--"))) {
+  console.error("✗ --schemas necesita un directorio. Uso: node scripts/bundle-schemas.mjs [--check] [--schemas <dir>]");
+  process.exit(2);
+}
+const SCHEMAS = iDir > 0 ? resolve(process.argv[iDir + 1]) : join(ROOT, "schemas");
 const OUT = join(SCHEMAS, "bundle.json");
 const BUNDLE_NAME = "bundle.json";
 
@@ -170,13 +178,14 @@ const json = JSON.stringify(bundle, null, 2) + "\n";
 if (process.argv.includes("--check")) {
   const current = await readFile(OUT, "utf8").catch(() => "");
   if (current !== json) {
-    console.error("✗ schemas/bundle.json está desactualizado.\n  Ejecuta: node scripts/bundle-schemas.mjs");
+    const rel = relative(process.cwd(), OUT).replace(/\\/g, "/") || "bundle.json";
+    console.error(`✗ ${rel} está desactualizado.\n  Ejecuta: node scripts/bundle-schemas.mjs${iDir > 0 ? ` --schemas ${process.argv[iDir + 1]}` : ""}`);
     process.exit(1);
   }
   console.log(`✓ bundle.json al día (${bundle.count} esquema(s))`);
 } else {
   await writeFile(OUT, json, "utf8");
   console.log(
-    `✓ schemas/bundle.json — ${bundle.count} esquema(s), ${Object.keys(bySubject).length} subject(s), ${Object.keys(byState).length} contrato(s) de estado, ${Object.keys(byRpc).length} operación(es) rpc`,
+    `✓ ${relative(process.cwd(), OUT).replace(/\\/g, "/")} — ${bundle.count} esquema(s), ${Object.keys(bySubject).length} subject(s), ${Object.keys(byState).length} contrato(s) de estado, ${Object.keys(byRpc).length} operación(es) rpc`,
   );
 }

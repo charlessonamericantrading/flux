@@ -3,8 +3,8 @@
  * Verificador de compatibilidad de esquemas.
  * Contrato normativo: specification/05-compatibility.md §5
  *
- *   node scripts/check-compat.mjs            # todos los esquemas
- *   node scripts/check-compat.mjs --base HEAD~1   # solo lo que cambia el diff
+ *   node scripts/check-compat.mjs                      # todos los esquemas
+ *   node scripts/check-compat.mjs --schemas <dir>      # el `schemas/` de OTRO proyecto (examples/ecosistema/, el tuyo)
  *
  * "Sin (1) y (2) automatizados, el resto de 05-compatibility.md es una sugerencia
  * amable." Esto es (1) y (2).
@@ -29,7 +29,7 @@
  */
 
 import { readFile, readdir } from "node:fs/promises";
-import { join, dirname, relative } from "node:path";
+import { join, dirname, relative, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import {
@@ -38,7 +38,13 @@ import {
 } from "./schema-rules.mjs";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
-const SCHEMAS = join(ROOT, "schemas");
+/** El árbol de esquemas: el de este repo, o el que dé `--schemas <dir>` (el `schemas/` de un proyecto que usa flux). */
+const iDir = process.argv.indexOf("--schemas");
+if (iDir > 0 && (!process.argv[iDir + 1] || process.argv[iDir + 1].startsWith("-"))) {
+  console.error("✗ --schemas necesita un directorio. Uso: node scripts/check-compat.mjs [-v] [--schemas <dir>]");
+  process.exit(2);
+}
+const SCHEMAS = iDir > 0 ? resolve(process.argv[iDir + 1]) : join(ROOT, "schemas");
 const problemas = [];
 const notas = [];
 
@@ -173,7 +179,7 @@ const porMajor = new Map();
 for (const abs of files) {
   const meta = parsePath(abs);
   if (!meta) {
-    err(relative(ROOT, abs).replace(/\\/g, "/"), "ruta fuera de convención",
+    err(`schemas/${relative(SCHEMAS, abs).replace(/\\/g, "/")}`, "ruta fuera de convención",
       "Formato: schemas/<dominio>/<agregado>/<evento>/<major>.<minor>.<patch>.json (evento), " +
       "schemas/state/<dominio>/<agregado>/<major>.<minor>.<patch>.json (estado) o " +
       "schemas/rpc/<dominio>/<agregado>/<operacion>/{request,reply}/<major>.<minor>.<patch>.json (petición/respuesta)");
