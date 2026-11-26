@@ -243,6 +243,21 @@ jobs:
           components: rustfmt, clippy
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
+      # `signing` y `validation` van detrás de feature: sin esto el README llama L3 a Rust y
+      # CI nunca compilaría —ni probaría— el código que lo hace L3.
+      - run: cargo clippy --all-targets --all-features -- -D warnings
+      # `tests/security.rs` arranca su PROPIO nats-server con ACLs (no sirve el contenedor de
+      # abajo, que no tiene usuarios ni TLS). Se compila desde la fuente porque no hay Docker
+      # en todos los entornos donde se desarrolla, y fijar la versión es fijar la semántica del
+      # broker que las ACLs asumen. v2.14.5 exige Go 1.25 en su go.mod.
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+          cache: false
+      - name: Compilar nats-server 2.14.5
+        run: |
+          GOBIN="$GITHUB_WORKSPACE/bin" go install github.com/nats-io/nats-server/v2@v2.14.5
+          "$GITHUB_WORKSPACE/bin/nats-server" --version
       # Los tests de integración necesitan un NATS con JetStream.
       - name: Levantar NATS con JetStream
         run: |
@@ -252,7 +267,18 @@ jobs:
             sleep 1
           done
           echo "NATS no arrancó"; docker logs flux-nats-rust; exit 1
-      - run: cargo test
+      # FLUX_REQUIRE_BROKER=1: sin broker los tests de integración y de seguridad FALLAN en vez
+      # de saltarse con un aviso. Un job verde que no ejecutó nada aparenta cobertura.
+      - name: Tests (sin features)
+        env:
+          NATS_SERVER: ${{ github.workspace }}/bin/nats-server
+          FLUX_REQUIRE_BROKER: '1'
+        run: cargo test
+      - name: Tests (--all-features)
+        env:
+          NATS_SERVER: ${{ github.workspace }}/bin/nats-server
+          FLUX_REQUIRE_BROKER: '1'
+        run: cargo test --all-features
 
   cross-sdk:
     name: Conformidad cruzada entre SDKs

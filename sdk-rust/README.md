@@ -440,6 +440,166 @@ comprometido que lee el subject entero—. Para eso hace falta el Modelo B (una 
 NATS por tenant). Lo que sí añade la firma es que alterar el `tenantid` en tránsito o en
 reposo **invalida la firma** (§4).
 
+## Seguridad: permisos, inbox, TLS y credenciales
+
+[06-security.md §2 y §3](../specification/06-security.md). Lo que sigue **está ejecutado
+contra un `nats-server` real** en [`tests/security.rs`](tests/security.rs), no solo escrito:
+cada afirmación tiene un test que pasa con lo correcto y otro que falla con lo incorrecto.
+
+> **Mientras el generador de ACL v2 (`scripts/gen-acl.mjs`) no esté en `main`, la lista de
+> permisos requeridos es la de esta sección, que es la del informe del PR.** La ACL que
+> genera hoy el v1 **no sirve** para este SDK: no concede nada de `$JS.API.*` y JetStream se
+> consume por ahí. Con ella `publish()` y `subscribe()` fallan con `PERMISSION_DENIED` —al
+> instante y nombrando el subject denegado— en vez de colgarse.
+
+### El inbox es privado y no es una opción
+
+El SDK conecta **siempre** con `_INBOX.<servicio>` como prefijo de inbox
+(`flux::inbox_prefix`). `async-nats` lo aplica a todo lo que viaja por un inbox: las
+peticiones a la API de JetStream, las entregas de los consumidores pull y el acuse de cada
+publicación —comprobado sniffeando un flujo completo—; los acks, en cambio, son un `publish` a
+`$JS.ACK.…` y no pasan por él. Con el inbox común `_INBOX.>` cualquier servicio con permiso de
+suscripción sobre él **lee las entregas de los demás**: `facturacion-api` leyó un evento de
+`inventario` sin tener concedido ese dominio (el test
+`d_con_el_inbox_comun_antiguo_el_espia_lee_el_evento` lo reproduce, y su contrario,
+`d_el_espia_confinado_no_lee_nada`, lo confina). No es una opción porque un servicio que
+eligiera otro prefijo se quedaría sin permiso de suscripción y sin una pista de por qué.
+
+### Permisos exactos por rol
+
+Sin **ningún** permiso de suscripción sobre subjects de dominio: se consume por pull y lo que
+confina es `$JS.API`. Nunca a un servicio: `$JS.API.CONSUMER.DURABLE.CREATE.*`,
+`$JS.API.STREAM.MSG.GET.*` ni crear, modificar, borrar o purgar streams en producción.
+
+| Rol | `publish` | `subscribe` |
+|---|---|---|
+| **Dueño de `<dom>`** | `<dom>.>` · `$JS.API.STREAM.INFO.EVT_<DOM>` | `_INBOX.<servicio>.>` |
+| **Consumidor** de `<subject>` (dominio `<dom>`, durable `<d>`) | `$JS.API.STREAM.INFO.EVT_<DOM>` · `$JS.API.STREAM.INFO.DLQ_<DOM>` · `$JS.API.CONSUMER.CREATE.EVT_<DOM>.<d>.<subject>` · `$JS.API.CONSUMER.INFO.EVT_<DOM>.<d>` · `$JS.API.CONSUMER.MSG.NEXT.EVT_<DOM>.<d>` · `$JS.ACK.EVT_<DOM>.<d>.>` · `dlq.<subject>` | `_INBOX.<servicio>.>` |
+
+`<d>` es `flux::durable_name(servicio, subject)`, por ejemplo
+`facturacion-api__pedidos_pedido_v1_creado`. Un servicio suele ser las dos cosas: la unión de
+sus filas. El test `a_extremo_a_extremo_con_inbox_privado_y_permisos_exactos` comprueba la
+lista **en los dos sentidos** sobre el tráfico real del SDK: todo subject al que publica está
+concedido, **y cada permiso concedido se usa** —ni falta ni sobra—.
+
+Matices que la tabla no dice:
+
+- **`$JS.API.STREAM.INFO.DLQ_<DOM>`** lo exige `subscribe()`: comprueba que la DLQ existe
+  antes de empezar, para no descubrir en el primer fallo que no hay dónde enrutarlo.
+- **`$JS.API.CONSUMER.INFO…`** lo usan el sondeo de `flux_consumer_pending` (solo si hay
+  `metrics`) y el camino de «consumidor ya aprovisionado» de abajo. Sin el permiso el sondeo
+  no rompe nada, pero el broker deniega una petición cada 15 s.
+- **`$JS.API.CONSUMER.CREATE…` es prescindible en producción.** Si el consumidor lo crea
+  `flux provision`, la ACL puede omitirlo: el SDK intenta crear, ve la denegación, consulta el
+  que ya existe y lo usa (`assert_config_honored` sigue comparando su config con la canónica).
+- **`$JS.API.INFO`, `STREAM.CREATE` y `STREAM.MSG.GET` no los usa el SDK.** Un `$JS.API.INFO`
+  en una ACL candidata sobra.
+- **El ack va por `$JS.ACK.<stream>.<d>.>`**, y el mismo permiso cubre `+ACK`, `+WPI`
+  (work-in-progress), `-NAK` y `+TERM`. Formato observado en nats-server 2.14.5:
+  `$JS.ACK.EVT_PEDIDOS.<d>.<entrega>.<sec. stream>.<sec. consumidor>.<ts>.<pendientes>`. Si
+  una versión futura lo cambiara (dominios de JetStream), la ACL fallaría en alto, no en
+  silencio: el test de extremo a extremo lo detecta.
+
+### Cuando falta un permiso: un error, no un timeout
+
+Un `publish` denegado **no devuelve un error**: el servidor descarta el mensaje y manda un
+`-ERR 'Permissions Violation for Publish to "…"'` aparte. La petición no recibe respuesta, y
+`async-nats` lo cuenta como *timed out* a los 5–30 s sin una palabra sobre permisos. El SDK
+escucha esas denegaciones y las compite con la respuesta: gana la que llega antes, y la
+denegación llega en milisegundos.
+
+| Situación | Error | Código | Clase |
+|---|---|---|---|
+| El stream o el consumidor **no existe** y la ACL no concede crearlo | `FluxError::NotProvisioned` | `NOT_PROVISIONED` | PERMANENT |
+| Ni siquiera hay permiso para **consultar** el recurso, o para publicar en un subject | `FluxError::PermissionDenied` | `PERMISSION_DENIED` | PERMANENT |
+
+`NOT_PROVISIONED` nombra el recurso y dice que en producción se aprovisiona con
+`flux provision`; no es un timeout. Las dos son PERMANENT por la misma razón que un 403:
+esperar no crea el recurso ni concede el permiso. `PERMISSION_DENIED` es la que verás con una
+ACL de la v1, y al publicar en un dominio ajeno (`solo el servicio dueño del dominio publica
+en él`). Ninguna expone un tipo de NATS: el texto de la denegación es el del servidor, para
+poder buscarlo tal cual en su log.
+
+⚠️ **Lo que no se puede convertir en `Result`:** un `subscribe()` que ya devolvió `Ok` y
+después pierde el permiso de `MSG.NEXT` o de `$JS.ACK` no tiene a quién devolver el error: el
+ack es un `publish` sin respuesta. Esas denegaciones llegan por el `logger`
+(`[flux] el broker denegó Publish to "$JS.ACK.…"`), y el síntoma en el broker es un mensaje
+que sigue pendiente y se reentrega. Configura siempre `with_logger`.
+
+### TLS
+
+```rust
+let tls = flux::TlsOptions::new()
+    .with_ca_file("/etc/flux/ca.pem")                              // CA propia
+    .with_client_cert("/etc/flux/cert.pem", "/etc/flux/key.pem");  // mTLS, opcional
+let opts = flux::ConnectOptions::new("tls://nats.interno:4222", "pedidos-api", "produccion", "1.0.0")
+    .with_tls(tls);
+```
+
+- **`with_tls` exige TLS** (`required = true` por defecto): contra un broker que solo habla
+  texto plano falla en `connect()`, no degrada en silencio —que enviaría la credencial en
+  claro—. `with_required(false)` solo para el docker-compose de desarrollo.
+- Una **CA propia sustituye** a las raíces del sistema, no las amplía: con una CA propia,
+  solo esa CA es de fiar.
+- Los ficheros se comprueban **antes de tocar la red** (existen, son PEM): un fichero
+  equivocado es `FluxError::Config`, no un handshake que falla con un error que no lo dice.
+- Se traducen a `require_tls`, `add_root_certificates` y `add_client_certificate` de
+  `async-nats`; ningún tipo de `rustls` ni de NATS aparece en la API.
+
+### Credenciales
+
+```rust
+.with_credentials(flux::Credentials::CredsFile("/run/secrets/pedidos-api.creds".into()))
+```
+
+| Variante | Qué es |
+|---|---|
+| `CredsFile(ruta)` | `.creds` de `nsc`: JWT de usuario + semilla. La forma recomendada con un operador |
+| `NkeySeed(semilla)` / `NkeyFile(ruta)` | Semilla nkey de usuario (`SU…`), con las cuentas en la config del broker |
+| `Token(token)` | Token estático |
+| `UserPassword { user, password }` | Usuario y contraseña |
+
+- **Un valor mal formado falla en `connect()`, antes de tocar la red**, y sin volcar el
+  secreto en el mensaje: un `.creds` ilegible o sin las dos secciones, una semilla que no es
+  de usuario (`SA…`, `SO…`), un fichero que no existe. `Debug` de las credenciales nunca
+  imprime secretos.
+- **Una credencial bien formada pero rechazada también falla en `connect()`**, con
+  `rechazó la credencial de este servicio`. Antes el SDK usaba `retry_on_initial_connect` de
+  `async-nats`, que reintenta **para siempre y sin distinguir causas**: una contraseña
+  equivocada o una CA que no encaja se volvían un servicio que arranca, pasa el healthcheck y
+  se queda mudo hasta el primer timeout. Ahora `connect()` espera —con backoff y jitter— al
+  broker que aún no ha arrancado (un servicio que arranca antes que el broker no debe morir),
+  pero **no reintenta lo que reintentar no arregla**: credencial rechazada, TLS que no encaja.
+  Los fallos de TLS llegan de `async-nats` como `ConnectErrorKind::Io` con un `io::Error
+  InvalidData` dentro, no como `Tls`: por eso se mira la cadena de causas.
+
+### Qué está verificado y cómo
+
+```bash
+NATS_SERVER=/ruta/a/nats-server cargo test --test security   # 23 tests, ~16 s
+```
+
+Cada test arranca su propio broker en un puerto libre (rango `FLUX_TEST_PORT_BASE`, por defecto
+4450–4499) con una config escrita por el propio test. Sin `NATS_SERVER` (ni `nats-server` en el
+`PATH`) se **saltan con un aviso**… salvo que `FLUX_REQUIRE_BROKER=1`, en cuyo caso fallan: es
+lo que usa CI, para que un job verde no pueda significar «no se ejecutó nada».
+
+| Se comprueba | Test |
+|---|---|
+| Publicar, suscribir, ack, WIP, DLQ por permanente y reintento, de extremo a extremo bajo permisos exactos, sin una denegación | `a_*` |
+| Con los permisos de la ACL antigua falla **claro y rápido**, y con los exactos la misma operación funciona | `b_*` |
+| `NOT_PROVISIONED` (stream, consumidor), consumidor aprovisionado sin permiso de crear, y creación con permiso | `c_*` |
+| Sin concesión sobre un dominio: ni lo recibe, ni espía el inbox ajeno; con el `_INBOX.>` antiguo **sí** lo lee | `d_*` |
+| Aislamiento estricto de tenant bajo la ACL: los eventos ajenos se descartan **con ack** | `e_*` |
+| Autenticación nkey, usuario/contraseña, token —correctas e incorrectas— y `.creds` | `f_*` |
+| TLS con CA propia, mTLS, TLS exigido contra un broker sin TLS | `tls_*` |
+
+⚠️ **`.creds`**: verificado contra un broker en **modo operador/JWT** real
+(`f_creds_contra_un_broker_en_modo_operador_jwt`): operador, cuenta con JetStream y usuario con
+sus permisos dentro del JWT, firmados por el propio test con `nkeys` —no hace falta `nsc`—.
+Incluye los dos casos incorrectos (semilla que no es la del JWT; JWT de una cuenta que el
+operador no conoce).
+
 ---
 
 ## Diferencias con los SDKs de referencia
@@ -705,59 +865,90 @@ La validación añade un matiz que la firma no tiene: **el nivel de conformidad 
 depende de la compilación**. `CONFORMANCE_LEVEL` es `"L3"` con la feature y `"L2"` sin ella,
 porque un binario que no valida no es L3 por mucho que el repositorio lo sea.
 
+### L. Un permiso denegado no es un error: es un timeout
+
+**Hallazgo de este port, medido contra nats-server 2.14.5**, y es la razón de ser de
+`FluxError::PermissionDenied` y `NotProvisioned`. Cuando una ACL deniega una publicación el
+servidor **no responde a la petición**: descarta el mensaje y manda un `-ERR` por la conexión.
+En `async-nats` eso solo existe como `Event::ServerError(ServerError::Other(texto))` —el enum
+solo distingue `AuthorizationViolation` y `SlowConsumer`, el resto es una cadena—, que nadie
+escucha por defecto; quien hizo la petición ve *timed out* a los 5 s (API de JetStream) o 30 s
+(acuse de publicación). Y el log del **servidor** dice otra cosa que el cliente
+(`Publish Violation - Subject "…"` frente a `Permissions Violation for Publish to "…"`): un
+test que busque en el log el texto del cliente pasa en vacío.
+
+Sugerencia para la spec: `06-security.md` debería exigir que un SDK convierta una denegación
+de permisos en un error propio y rápido, y reservar el código `NOT_PROVISIONED` para cuando el
+recurso falta. Sin ello cada SDK reportará un timeout, y un timeout es RETRYABLE: el handler
+reintentaría 51 minutos lo que nunca se va a arreglar.
+
 ---
 
 ## Ficheros
 
 | Fichero | Contenido |
 |---|---|
-| `protocol.rs` | Constantes verificadas y naming (`parse_subject`, `subject_to_type`, `stream_name`, `durable_name`, `dlq_subject`, `source_uri`, `validate_service_name`) |
+| `protocol.rs` | Constantes verificadas y naming (`parse_subject`, `subject_to_type`, `stream_name`, `durable_name`, `dlq_subject`, `source_uri`, `validate_service_name`, `inbox_prefix`) |
 | `envelope.rs` | `Event`, `build_event`, `serialize`, `parse_event`, `Event::data_as`, `to_dlq_event`, `strip_dlq_extensions` |
-| `errors.rs` | `ErrorClass`, `FluxError`, `Failure`, `Classification`, `as_classified`, `describe`, `SchemaValidationError`, `SchemaNotFoundError` |
+| `errors.rs` | `ErrorClass`, `FluxError`, `Failure`, `Classification`, `as_classified`, `describe`, `SchemaValidationError`, `SchemaNotFoundError`, `ResourceKind` (y las variantes `NotProvisioned`, `PermissionDenied`) |
 | `classify.rs` | `Classifier`, `ClassifierOptions`, `UnknownPolicy`, `HttpError` |
 | `context.rs` | Propagación por task-local con override explícito |
 | `metrics.rs` | `MetricsSink`, `NoMetrics`, `InMemoryMetrics`, `DURATION_BUCKETS` y los enums de etiqueta |
 | `signing.rs` | `Signer`, `Verifier`, `SigningOptions`, `VerificationMode`, `generate_key_pair` — feature `signing` |
 | `validation.rs` | `Validator`, `SchemaBundle`, `ValidationOptions`, `ValidationMode` — feature `validation` |
-| `client.rs` | `connect`, `Bus::publish`, `Bus::subscribe`, `Bus::close`, `Bus::replay_from_dlq`, `TenantIsolation` |
+| `client.rs` | `connect`, `Bus::publish`, `Bus::subscribe`, `Bus::close`, `Bus::replay_from_dlq`, `TenantIsolation`, `Credentials` |
+| `security.rs` | `TlsOptions`; el registro de denegaciones del broker y la validación de credenciales y de errores de conexión |
 | `tests/cross_sdk.rs` | Los fixtures compartidos de `conformance/cases/`, sin broker |
 | `tests/integration.rs` | Conformidad contra un NATS real |
+| `tests/security.rs` | Seguridad contra un `nats-server` real con ACLs, TLS, nkey y modo operador/JWT |
 
 ## Desarrollo
 
 ```bash
 cargo fmt --check
 cargo clippy --all-targets --all-features -- -D warnings
-cargo test --all-features        # 200 tests
+cargo test --all-features        # 248 tests
 ```
 
 | Suite | Tests (`--all-features`) | Sin features | Requiere broker |
 |---|--:|--:|---|
-| Unitarios (en cada módulo) | 170 | 122 | no |
+| Unitarios (en cada módulo) | 194 | 146 | no |
 | `tests/cross_sdk.rs` | 3 | 3 | no |
-| `tests/integration.rs` | 17 | 13 | **sí** |
-| Doctests | 10 | 8 | no |
+| `tests/integration.rs` | 17 | 13 | **sí** (NATS en `FLUX_NATS_URL`) |
+| `tests/security.rs` | 23 | 23 | **sí** (binario `nats-server`, `NATS_SERVER`) |
+| Doctests | 11 | 9 | no |
+| **Total** | **248** | **194** | |
 
 La diferencia entre las dos columnas son los tests de `signing` y `validation`, que solo
 existen con su feature activa. **Conviene ejecutar las dos formas en CI**: sin ellas se
 comprueba que el crate compila y pasa cuando nadie usa la firma ni la validación —que es el
 caso por defecto y el único que le cuesta algo a quien no las usa—, y con ellas que las dos
-funcionan.
+funcionan. CI ejecuta las dos —`clippy` y `cargo test`, con y sin `--all-features`—.
 
 Los unitarios cubren naming, envelope, clasificación, métricas y firma, que es donde vive la
 semántica del protocolo. `cross_sdk.rs` ejecuta **los fixtures compartidos de
 [`conformance/cases/`](../conformance/cases/)** —los mismos ficheros que verifican los otros
 cinco SDKs— e incluye la comprobación del `expectedKeyOrder` exacto del evento de DLQ.
 
-Los de integración requieren un broker y **se saltan solos** si no lo encuentran, para que
-`cargo test` siga siendo verde en una máquina sin Docker:
+Los de integración y los de seguridad requieren un broker y **se saltan solos, con un
+aviso**, si no lo encuentran, para que `cargo test` siga siendo verde en una máquina sin Docker.
+Con `FLUX_REQUIRE_BROKER=1` **fallan** en vez de saltarse: es lo que usa CI, porque un fixture
+que nadie ejecuta aparenta cobertura.
 
 ```bash
 docker compose up -d                             # en la raíz del repo
 cargo test --all-features --test integration     # 17 tests contra NATS real
 ```
 
-Cubren lo que los unitarios no pueden: que la config canónica de consumidor sobreviva al
+Los de seguridad no necesitan Docker: arrancan su propio `nats-server` (ver
+[Seguridad](#seguridad-permisos-inbox-tls-y-credenciales)).
+
+```bash
+GOBIN=$PWD/bin go install github.com/nats-io/nats-server/v2@v2.14.5      # Go 1.25
+NATS_SERVER=$PWD/bin/nats-server FLUX_REQUIRE_BROKER=1 cargo test --all-features
+```
+
+Los de integración cubren lo que los unitarios no pueden: que la config canónica de consumidor sobreviva al
 servidor (`ack_wait = 30 s`, `max_deliver = 6`, `backoff = [30s, 1m, 5m, 15m, 30m]`
 verificados en la respuesta), que el ack explícito funcione, que un PERMANENT no gaste
 reintentos, que el presupuesto acotado mande a la DLQ en la 2ª entrega, que un mensaje
