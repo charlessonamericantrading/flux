@@ -14,9 +14,24 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 serde = { version = "1", features = ["derive"] }
 ```
 
-Requiere **Rust 1.83+** (por `io::ErrorKind::{HostUnreachable, NetworkUnreachable}`, que
-el clasificador usa para reconocer lo transitorio por semántica), `async-nats` 0.50+ y un
-runtime Tokio.
+Requiere **Rust 1.88+** (el mínimo lo impone `async-nats` 0.50, que declara
+`rust-version = "1.88.0"`; la cadena de dependencias, en `Cargo.toml`), `async-nats` 0.50.x
+y un runtime Tokio.
+
+Esa cifra se **mide**, no se hereda: con 1.87 `cargo` se niega a compilar
+(`async-nats@0.50.0 requires rustc 1.88.0`) y con 1.88 compila, con y sin features. El job
+`sdk-rust` de CI lo ejecuta en cada PR: lee `rust-version` de `Cargo.toml`, instala ese
+toolchain y hace `cargo check --all-targets` con y sin `--all-features`, así que la
+declaración y la realidad no pueden separarse sin que CI lo diga. En local es lo mismo:
+
+```bash
+msrv=$(sed -n 's/^rust-version *= *"\([^"]*\)".*/\1/p' Cargo.toml)
+rustup toolchain install "$msrv" --profile minimal   # no cambia tu toolchain por defecto
+cargo "+$msrv" check --all-targets --all-features
+```
+
+Antes valía 1.83 —el mínimo de nuestro propio código, no el del árbol de dependencias— y
+nada lo comprobaba: CI usa `stable`.
 
 | Feature | Por defecto | Qué añade | Coste |
 |---|---|---|---|

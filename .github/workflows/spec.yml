@@ -290,7 +290,7 @@ jobs:
       - run: vendor/bin/phpunit --group integration --fail-on-skipped
 
   sdk-rust:
-    name: SDK Rust — fmt, clippy y tests
+    name: SDK Rust — fmt, clippy, MSRV y tests
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -305,6 +305,29 @@ jobs:
       # `signing` y `validation` van detrás de feature: sin esto el README llama L3 a Rust y
       # CI nunca compilaría —ni probaría— el código que lo hace L3.
       - run: cargo clippy --all-targets --all-features -- -D warnings
+      # `rust-version` es una afirmación («este crate compila con X») y ningún job la
+      # ejecutaba: CI usa `stable`, así que nadie notó que `1.83` llevaba tiempo siendo falso
+      # (`async-nats` 0.50 exige 1.88). Se LEE de Cargo.toml en vez de repetirla aquí, para que
+      # la declaración y su comprobación no puedan separarse: subirla o bajarla sin que las
+      # dependencias lo respalden rompe este paso.
+      #
+      # Se instala con `rustup` y no con un segundo `dtolnay/rust-toolchain`: esa acción fija
+      # el toolchain como DEFAULT y los `cargo test` de más abajo pasarían a correr con el
+      # mínimo en vez de con `stable`. `+<versión>` lo usa solo este paso, y con un target
+      # aparte para no mezclar artefactos de dos compiladores con los de los tests.
+      #
+      # Las dos invocaciones, por lo mismo que clippy: sin features se compila otro código
+      # (los stubs `#[cfg(not(feature = ...))]`), y que uno pase no implica que pase el otro.
+      - name: MSRV — cargo check con el toolchain de `rust-version`
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/msrv-target
+        run: |
+          msrv=$(sed -n 's/^rust-version *= *"\([^"]*\)".*/\1/p' Cargo.toml)
+          test -n "$msrv" || { echo "✗ Cargo.toml no declara rust-version"; exit 1; }
+          echo "rust-version declarada: $msrv"
+          rustup toolchain install "$msrv" --profile minimal --no-self-update
+          cargo "+$msrv" check --all-targets
+          cargo "+$msrv" check --all-targets --all-features
       # `tests/security.rs` arranca su PROPIO nats-server con ACLs (no sirve el contenedor de
       # abajo, que no tiene usuarios ni TLS). Se compila desde la fuente porque no hay Docker
       # en todos los entornos donde se desarrolla, y fijar la versión es fijar la semántica del
