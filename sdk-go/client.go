@@ -15,6 +15,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math/rand"
 	"strings"
 	"sync"
 	"time"
@@ -25,15 +26,6 @@ import (
 )
 
 // ─── Opciones ────────────────────────────────────────────────────────────────
-
-// Credentials son las credenciales de NATS. NUNCA versionadas — 06-security.md §2.
-type Credentials struct {
-	// CredsFile es la ruta a un fichero .creds. Es la forma recomendada.
-	CredsFile string
-	Token     string
-	User      string
-	Password  string
-}
 
 // ConnectOptions configura la conexión al bus.
 type ConnectOptions struct {
@@ -111,7 +103,15 @@ type ConnectOptions struct {
 	// Classifier es la política de clasificación de errores. Ver classify.go.
 	Classifier ClassifierOptions
 
+	// Credentials son las credenciales de NATS: UN método (.creds, nkey, token o usuario y contraseña). Ver
+	// Credentials y los constructores CredentialsFrom*. Un valor mal formado falla en Connect() con
+	// INVALID_CREDENTIALS, antes de abrir ningún socket (04-errors.md §5.3).
 	Credentials Credentials
+
+	// TLS es el TLS del listener (06-security.md §2). Nil no pide TLS; &TLSOptions{} lo EXIGE y verifica contra
+	// las CA del sistema; con CAFile, contra una CA propia. Un valor mal formado falla en Connect() con
+	// INVALID_TLS_OPTIONS. No hay forma de desactivar la verificación.
+	TLS *TLSOptions
 
 	// Traceparent extrae el traceparent W3C del contexto. Ver TraceparentFunc.
 	Traceparent TraceparentFunc
@@ -124,6 +124,10 @@ type ConnectOptions struct {
 	OnDLQ func(info DLQEventInfo)
 
 	// Logger opcional. Nil significa silencio.
+	//
+	// ⚠️ Con la capacidad `security` CONFIGÚRALO. Un `ack` denegado por la ACL no falla en ningún sitio: es una
+	// publicación sin respuesta, el evento se procesa y se reentrega cada ack_wait para siempre, y la única
+	// salida es una línea de este logger (06-security.md §3.7). Sin él, no deja rastro en ninguna parte.
 	Logger *slog.Logger
 }
 
@@ -331,6 +335,12 @@ type Bus struct {
 	validate *schemaValidator
 	metrics  MetricsSink
 
+	// denials reparte las denegaciones de permisos que `nats.go` solo entrega de forma asíncrona. Ver denials.go.
+	denials *denialHub
+
+	state *State
+	rpc   *rpcClient
+
 	mu            sync.Mutex
 	subscriptions map[*Subscription]struct{}
 	ensured       map[string]struct{}
@@ -338,13 +348,36 @@ type Bus struct {
 
 // Connect abre la conexión al bus.
 //
-// Reconecta indefinidamente con backoff y JITTER: sin jitter, mil servicios
-// reconectan en el mismo milisegundo y tiran el cluster que acaba de levantarse
-// — 03-delivery.md §6.
+// Espera a un broker que aún no ha arrancado —un servicio que arranca antes que NATS es lo normal en un
+// compose— con la misma espera con jitter que la reconexión, pero FALLA DE INMEDIATO ante lo que esperar no
+// arregla (03-delivery.md §6.1): credenciales rechazadas o un TLS que no encaja (CONNECTION_REJECTED), y
+// opciones mal formadas (INVALID_CREDENTIALS, INVALID_TLS_OPTIONS, antes de abrir ningún socket). El bucle es
+// de este SDK y no de la librería: `RetryOnFailedConnect` de nats.go devuelve una conexión «viva», sin error,
+// ante esos fallos, y el servicio queda arrancado y mudo (ver security.go).
+//
+// Una vez conectado, reconecta indefinidamente con backoff y JITTER: sin jitter, mil servicios reconectan en
+// el mismo milisegundo y tiran el cluster que acaba de levantarse — 03-delivery.md §6.
+//
+// El ctx gobierna la ESPERA al broker: si se cancela o vence antes de conectar, Connect devuelve su error.
 func Connect(ctx context.Context, opts ConnectOptions) (*Bus, error) {
 	if opts.Service == "" || opts.Environment == "" || opts.Version == "" {
 		return nil, errors.New("flux: Service, Environment y Version son obligatorios: " +
 			"alimentan `source` y `producerversion`, que son atributos obligatorios del envelope")
+	}
+	inboxPrefix, err := inboxPrefixFor(opts.Service)
+	if err != nil {
+		return nil, err
+	}
+
+	// Todo lo que se puede comprobar sin red se comprueba AQUÍ, ANTES de dialar: una opción mal formada debe
+	// fallar con su nombre y no degradarse a «sin credenciales» o a «sin TLS».
+	authOpts, err := authOptions(opts.Credentials)
+	if err != nil {
+		return nil, err
+	}
+	tlsOpts, err := tlsOptions(opts.TLS)
+	if err != nil {
+		return nil, err
 	}
 
 	// Las claves se validan ANTES de abrir la conexión: una clave mal formada es un
@@ -369,15 +402,24 @@ func Connect(ctx context.Context, opts ConnectOptions) (*Bus, error) {
 	if metrics == nil {
 		metrics = NoMetrics{}
 	}
+	denials := newDenialHub(opts.Service, opts.Logger)
 
+	const reconnectWait = 1 * time.Second
 	natsOpts := []nats.Option{
 		nats.Name(opts.Service + "@" + opts.Environment),
 		nats.MaxReconnects(-1),
-		nats.ReconnectWait(1 * time.Second),
+		nats.ReconnectWait(reconnectWait),
 		nats.ReconnectJitter(500*time.Millisecond, 1*time.Second),
-		// RetryOnFailedConnect equivale al waitOnFirstConnect de Node: un servicio que
-		// arranca antes que el broker no debe morir en el primer intento.
-		nats.RetryOnFailedConnect(true),
+		// Inbox PRIVADO, siempre y no configurable: ver inboxPrefixFor. Rige también las peticiones de la
+		// API de JetStream y las entregas del pull.
+		nats.CustomInboxPrefix(inboxPrefix),
+		// NO se usa RetryOnFailedConnect: devuelve una conexión sin error ante una credencial rechazada, una CA
+		// que no firmó el certificado, un host fuera de los SAN, TLS exigido sin TLS y un mTLS sin certificado
+		// (medido). El bucle de la primera conexión es el de connectWhenAvailable. Lo que viene DESPUÉS de
+		// conectar, las reconexiones, sí es de la librería (MaxReconnects(-1)).
+		nats.RetryOnFailedConnect(false),
+		// Las denegaciones de permisos: la librería solo las entrega aquí (ver denials.go).
+		nats.ErrorHandler(denials.handle),
 
 		// flux_connection_state: 1 conectado, 0 desconectado, 2 reconectando
 		// — 08-observability.md §2.1. Sin estos callbacks el gauge valdría 1 hasta
@@ -389,18 +431,12 @@ func Connect(ctx context.Context, opts ConnectOptions) (*Bus, error) {
 		nats.ReconnectHandler(func(*nats.Conn) { metrics.ConnectionState(StateConnected) }),
 		nats.ClosedHandler(func(*nats.Conn) { metrics.ConnectionState(StateDisconnected) }),
 	}
-	switch {
-	case opts.Credentials.CredsFile != "":
-		natsOpts = append(natsOpts, nats.UserCredentials(opts.Credentials.CredsFile))
-	case opts.Credentials.Token != "":
-		natsOpts = append(natsOpts, nats.Token(opts.Credentials.Token))
-	case opts.Credentials.User != "":
-		natsOpts = append(natsOpts, nats.UserInfo(opts.Credentials.User, opts.Credentials.Password))
-	}
+	natsOpts = append(natsOpts, authOpts...)
+	natsOpts = append(natsOpts, tlsOpts...)
 
-	nc, err := nats.Connect(opts.Servers, natsOpts...)
+	nc, err := connectWhenAvailable(ctx, opts.Servers, natsOpts, reconnectWait, 500*time.Millisecond)
 	if err != nil {
-		return nil, fmt.Errorf("flux: no se pudo conectar a %q: %w", opts.Servers, err)
+		return nil, err
 	}
 
 	js, err := jetstream.New(nc)
@@ -410,7 +446,7 @@ func Connect(ctx context.Context, opts ConnectOptions) (*Bus, error) {
 	}
 
 	metrics.ConnectionState(StateConnected)
-	return &Bus{
+	b := &Bus{
 		nc:            nc,
 		js:            js,
 		opts:          opts,
@@ -420,9 +456,41 @@ func Connect(ctx context.Context, opts ConnectOptions) (*Bus, error) {
 		verifier:      verifier,
 		validate:      validate,
 		metrics:       metrics,
+		denials:       denials,
 		subscriptions: make(map[*Subscription]struct{}),
 		ensured:       make(map[string]struct{}),
-	}, nil
+	}
+	b.state = newState(b)
+	b.rpc = newRPCClient(b)
+	return b, nil
+}
+
+// connectWhenAvailable espera a que el broker esté disponible pero NO espera lo que no va a cambiar.
+func connectWhenAvailable(ctx context.Context, servers string, opts []nats.Option, wait, jitter time.Duration) (*nats.Conn, error) {
+	var ultimo error
+	for {
+		nc, err := nats.Connect(servers, opts...)
+		if err == nil {
+			return nc, nil
+		}
+		if rechazo := permanentConnectError(err, servers); rechazo != nil {
+			return nil, rechazo
+		}
+		if !esTransitorio(err) {
+			// Ni el broker que aún no está ni un rechazo que reconozcamos: un bucle sobre un error que no cambia
+			// es justo el servicio mudo que esta capa existe para evitar.
+			return nil, fmt.Errorf("flux: no se pudo conectar a %q: %w", servers, err)
+		}
+		ultimo = err
+		// Con jitter: mil servicios que esperan a un NATS que arranca no deben llamar a la vez — 03-delivery.md §6.
+		espera := wait + time.Duration(rand.Int63n(int64(jitter)+1))
+		select {
+		case <-ctx.Done():
+			return nil, fmt.Errorf("flux: no se pudo conectar a %q antes de que terminara el contexto (%v): %w",
+				servers, ultimo, ctx.Err())
+		case <-time.After(espera):
+		}
+	}
 }
 
 // Connected informa si la conexión sigue viva. Expuesto para el healthcheck que
@@ -431,8 +499,15 @@ func (b *Bus) Connected() bool {
 	return b.nc != nil && !b.nc.IsClosed()
 }
 
-// Close detiene las suscripciones y drena la conexión.
+// Close detiene a quien responde, detiene las suscripciones y drena la conexión.
+//
+// Primero los `Respond`: dejar de escuchar, esperar a lo que está en vuelo y SOLO entonces cerrar. Un
+// `nc.Drain()` de la conexión con un handler en vuelo pierde su respuesta: la publicación devuelve
+// `connection closed` y quien llamó solo ve un timeout (medido con nats.go: 3 de 3 respuestas perdidas;
+// con `Drain` por suscripción, 3 de 3 llegaron — A-83).
 func (b *Bus) Close() error {
+	b.rpc.stopAll(context.Background())
+
 	b.mu.Lock()
 	subs := make([]*Subscription, 0, len(b.subscriptions))
 	for s := range b.subscriptions {
@@ -443,6 +518,7 @@ func (b *Bus) Close() error {
 	for _, s := range subs {
 		s.Unsubscribe()
 	}
+	b.state.stopAll()
 	b.metrics.ConnectionState(StateDisconnected)
 	// Drain y no Close: los acks pendientes no se pierden en silencio.
 	return b.nc.Drain()
@@ -581,8 +657,17 @@ func (b *Bus) Publish(ctx context.Context, subject string, data any, opts ...Pub
 	// NO deduplica reentregas de consumo. Un nak reentrega el mismo mensaje con el
 	// mismo Nats-Msg-Id y eso es correcto y deseado. Nunca sustituye a la
 	// idempotencia del consumidor — 03-delivery.md §3.
-	if _, err := b.js.Publish(ctx, subject, payload, jetstream.WithMsgID(event.ID)); err != nil {
+	//
+	// Bajo `guard`: un publish a un subject que la ACL no concede no devuelve error —el servidor descarta el
+	// mensaje y avisa aparte—, y esperaría el timeout de la API sin decir nada (06-security.md §3.7).
+	gctx, done := b.guard(ctx, subject)
+	_, err = b.js.Publish(gctx, subject, payload, jetstream.WithMsgID(event.ID))
+	done()
+	if err != nil {
 		b.metrics.EventPublished(subject, PublishError)
+		if pd := deniedCause(gctx); pd != nil {
+			return Event{}, pd
+		}
 		return Event{}, fmt.Errorf("flux: fallo al publicar en %q: %w", subject, err)
 	}
 	b.metrics.EventPublished(subject, PublishOK)
@@ -670,17 +755,22 @@ func (b *Bus) Subscribe(ctx context.Context, subject string, handler Handler, op
 	}
 
 	stream := StreamName(parsed.Domain)
-	consumer, err := b.js.CreateOrUpdateConsumer(ctx, stream, requested)
+	// Info ANTES de crear: en producción el consumidor lo aprovisiona `flux provision`, y entonces el SDK no
+	// necesita permiso de creación (06-security.md §3.4). Si no existe y crearlo está denegado, es
+	// NOT_PROVISIONED y no un timeout.
+	consumer, effective, err := b.ensureConsumer(ctx, stream, requested)
 	if err != nil {
-		return nil, fmt.Errorf("flux: no se pudo crear el consumidor %q en %q: %w", durable, stream, err)
+		return nil, err
 	}
 
 	// El servidor no siempre devuelve lo que se le pide. Requisito L2.
-	info, err := consumer.Info(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("flux: no se pudo leer la config efectiva de %q: %w", durable, err)
+	if err := assertConfigHonored(durable, requested, effective); err != nil {
+		return nil, err
 	}
-	if err := assertConfigHonored(durable, requested, info.Config); err != nil {
+
+	// Un pull denegado no da error y deja un consumidor inerte que parece sano: `subscribe()` DEBE fallar
+	// (06-security.md §3.7). Antes de arrancar el consumo: si falla, no queda nada abierto.
+	if err := b.ensurePullAllowed(ctx, stream, durable); err != nil {
 		return nil, err
 	}
 
@@ -1115,7 +1205,7 @@ func (b *Bus) sendRawToDLQ(subject string, raw []byte, consumer, errText string)
 		DLQReason:          DLQReasonPoison,
 		DLQAttempts:        1,
 		DLQConsumer:        consumer,
-		DLQError:           truncateRunes(errText, 1024),
+		DLQError:           truncateUTF8Bytes(errText, 1024),
 		DLQTime:            now,
 		Data:               data,
 	}
@@ -1137,8 +1227,8 @@ func (b *Bus) ensureStream(ctx context.Context, domain string) error {
 		Name:     StreamName(domain),
 		Subjects: []string{domain + ".>"},
 		Storage:  jetstream.FileStorage,
-		// LimitsPolicy: el stream retiene por edad, no hasta que alguien consuma. Un
-		// consumidor lento no debe poder hacer crecer el disco sin límite.
+		// LimitsPolicy: el stream retiene por edad, no hasta que alguien consuma. Un consumidor lento no debe
+		// poder hacer crecer el disco sin límite.
 		Retention: jetstream.LimitsPolicy,
 		Discard:   jetstream.DiscardOld,
 		MaxAge:    StreamMaxAge,
@@ -1160,12 +1250,13 @@ func (b *Bus) ensureDLQStream(ctx context.Context, domain string) error {
 	})
 }
 
-// ensure crea el stream si no existe, y si existe lo deja tal cual.
+// ensure comprueba que el stream existe y, solo si NO existe, lo crea.
 //
-// No se usa CreateOrUpdateStream a propósito: un SDK que actualiza streams ajenos en
-// cada arranque puede pisar en silencio la configuración que puso el equipo de
-// plataforma (replicas, límites, mirrors). En producción los streams los provisiona
-// infraestructura; esto es una comodidad de desarrollo.
+// No se usa CreateOrUpdateStream a propósito: un SDK que actualiza streams ajenos en cada arranque puede
+// pisar en silencio la configuración que puso el equipo de plataforma (replicas, límites, mirrors). En
+// producción los streams los provisiona infraestructura (`flux provision`); crearlos aquí es una comodidad
+// de desarrollo. Si crearlo está denegado, es NOT_PROVISIONED; si ni siquiera se puede CONSULTAR, es
+// PERMISSION_DENIED: no se sabe si falta (04-errors.md §5).
 //
 // Replicas se deja sin fijar: la spec pide 3, pero un cluster de un solo nodo —el
 // docker-compose de desarrollo— rechazaría la creación.
@@ -1177,19 +1268,129 @@ func (b *Bus) ensure(ctx context.Context, name string, cfg jetstream.StreamConfi
 	}
 	b.mu.Unlock()
 
-	_, err := b.js.Stream(ctx, name)
-	if errors.Is(err, jetstream.ErrStreamNotFound) {
-		if _, err = b.js.CreateStream(ctx, cfg); err != nil &&
-			!errors.Is(err, jetstream.ErrStreamNameAlreadyInUse) {
+	// La consulta bajo `guard`: con una ACL sin `STREAM.INFO` la librería no devuelve error, espera su timeout.
+	gctx, done := b.guard(ctx, "$JS.API.STREAM.INFO."+name)
+	_, err := b.js.Stream(gctx, name)
+	done()
+	switch {
+	case err == nil:
+	case errors.Is(err, jetstream.ErrStreamNotFound):
+		// Solo «no existe» autoriza a crearlo. Antes cualquier fallo de la consulta —un permiso denegado,
+		// un JetStream apagado— caía en la creación, y el error que llegaba era el de crear.
+		cctx, cdone := b.guard(ctx, "$JS.API.STREAM.CREATE."+name)
+		_, err = b.js.CreateStream(cctx, cfg)
+		cdone()
+		if pd := deniedCause(cctx); pd != nil {
+			return newNotProvisioned(ResourceStream, name, "", b.opts.Service, pd.Subject, "", pd)
+		}
+		if err != nil && !errors.Is(err, jetstream.ErrStreamNameAlreadyInUse) {
 			return fmt.Errorf("flux: no se pudo crear el stream %q: %w", name, err)
 		}
-	} else if err != nil {
+	default:
+		if pd := deniedCause(gctx); pd != nil {
+			return pd
+		}
 		return fmt.Errorf("flux: no se pudo consultar el stream %q: %w", name, err)
 	}
 
 	b.mu.Lock()
 	b.ensured[name] = struct{}{}
 	b.mu.Unlock()
+	return nil
+}
+
+// ensureConsumer toma el consumidor durable si existe y, solo si no existe, lo crea.
+//
+// Se pregunta ANTES de crear: en producción lo aprovisiona `flux provision`, y entonces el SDK no necesita
+// permiso de creación. Intentar crear primero provocaba una denegación espuria en cada arranque (una
+// `Publish Violation` en el log del servidor, que es una señal de alerta: una por arranque la vuelve ruido y
+// tapa las reales) y obligaba a conceder `CONSUMER.CREATE` a quien no lo usa nunca (06-security.md §3.4).
+// Que el consumidor ya exista con otra config no es un error de aquí: lo decide assertConfigHonored.
+//
+// Si no existe y crearlo está DENEGADO, no es un fallo de red ni un timeout: es que nadie lo aprovisionó —
+// NOT_PROVISIONED—. Si ni siquiera se puede consultar, es PERMISSION_DENIED.
+func (b *Bus) ensureConsumer(ctx context.Context, stream string, cfg jetstream.ConsumerConfig) (jetstream.Consumer, jetstream.ConsumerConfig, error) {
+	durable := cfg.Durable
+	gctx, done := b.guard(ctx, "$JS.API.CONSUMER.INFO."+stream+"."+durable)
+	c, err := b.js.Consumer(gctx, stream, durable)
+	done()
+	switch {
+	case err == nil:
+		return c, c.CachedInfo().Config, nil
+	case errors.Is(err, jetstream.ErrStreamNotFound):
+		return nil, cfg, newNotProvisioned(ResourceStream, stream, "", b.opts.Service,
+			"$JS.API.CONSUMER.INFO."+stream+"."+durable, "", err)
+	case !errors.Is(err, jetstream.ErrConsumerNotFound):
+		if pd := deniedCause(gctx); pd != nil {
+			return nil, cfg, pd
+		}
+		return nil, cfg, fmt.Errorf("flux: no se pudo consultar el consumidor %q de %q: %w", durable, stream, err)
+	}
+
+	// `CONSUMER.CREATE.<stream>.<durable>.<filtro>`: la librería compone el subject, con el filtro detrás.
+	prefijo := "$JS.API.CONSUMER.CREATE." + stream + "." + durable
+	cctx, cdone := b.guardMatch(ctx, func(d denial) bool {
+		return d.op == "publish" && (d.subject == prefijo || strings.HasPrefix(d.subject, prefijo+"."))
+	})
+	c, err = b.js.CreateConsumer(cctx, stream, cfg)
+	cdone()
+	if pd := deniedCause(cctx); pd != nil {
+		return nil, cfg, newNotProvisioned(ResourceConsumer, durable, stream, b.opts.Service, pd.Subject, "", pd)
+	}
+	if err != nil {
+		// Otra instancia del servicio pudo crearlo entre la pregunta y la creación.
+		if c2, err2 := b.js.Consumer(ctx, stream, durable); err2 == nil {
+			return c2, c2.CachedInfo().Config, nil
+		}
+		return nil, cfg, fmt.Errorf("flux: no se pudo crear el consumidor %q en %q: %w", durable, stream, err)
+	}
+	return c, c.CachedInfo().Config, nil
+}
+
+// pullProbeTimeout es cuánto espera la sonda del permiso de pull antes de darse por no concluyente. Una
+// respuesta o una denegación llegan en ~0,3 ms; 2 s solo se agotan con un broker que no contesta, y entonces
+// el SDK sigue —no poder comprobar un permiso no es lo mismo que no tenerlo— y avisa por el Logger.
+const pullProbeTimeout = 2 * time.Second
+
+// ensurePullAllowed comprueba que el servicio PUEDE pedir mensajes de su consumidor, o falla con
+// PERMISSION_DENIED nombrando el subject denegado.
+//
+// Por qué una sonda y no mirar el primer pull de la librería: un pull denegado no da error. El servidor
+// descarta el mensaje y manda un `-ERR` aparte (A-20, A-28), y `nats.go` lo entrega a un goroutine que corre
+// DESPUÉS: tras un `Flush()` la denegación aún no se había notificado en 180 de 2 000 intentos. Lo
+// determinista es no depender del pull de la librería: se pregunta lo mismo sobre EL MISMO subject
+// (`$JS.API.CONSUMER.MSG.NEXT.<stream>.<durable>`) con una petición propia y se compite su respuesta con la
+// denegación. El cuerpo es un JSON truncado, `{`, a propósito: el servidor lo contesta `400 Bad Request` al
+// instante, sin apuntar la petición como pendiente y sin sacar ningún mensaje del consumidor —cualquier pull
+// válido podría llevarse uno, que quedaría sin ack hasta `ack_wait`—. Medido contra nats-server 2.14.5: `400
+// Bad Request - unexpected end of JSON input` en ~0,3 ms. Lo único que importa es que NO sea una denegación.
+func (b *Bus) ensurePullAllowed(ctx context.Context, stream, durable string) error {
+	subject := "$JS.API.CONSUMER.MSG.NEXT." + stream + "." + durable
+	gctx, done := b.guard(ctx, subject)
+	defer done()
+	pctx, cancel := context.WithTimeout(gctx, pullProbeTimeout)
+	defer cancel()
+	msg, err := b.nc.RequestWithContext(pctx, subject, []byte("{"))
+	if pd := deniedCause(gctx); pd != nil {
+		return newPermissionDenied(b.opts.Service, "publish", pd.Subject, fmt.Sprintf(
+			"Es el permiso de PEDIR MENSAJES del consumidor %q del stream %q: sin él el consumidor se quedaría "+
+				"inerte, sin recibir nada y sin ningún error, y por eso Subscribe falla al arrancar y no en silencio. "+
+				"Se concede exacto por durable (06-security.md §3.4, §3.7).", durable, stream), nil)
+	}
+	if err == nil && msg.Header.Get("Status") == "400" {
+		return nil
+	}
+	if b.opts.Logger != nil {
+		motivo := "sin respuesta"
+		if err != nil {
+			motivo = err.Error()
+		} else {
+			motivo = "respuesta " + msg.Header.Get("Status")
+		}
+		b.logf(slog.LevelWarn, "no se pudo comprobar el permiso de pull de %s en %s: la sonda no obtuvo el 400 esperado (%s). "+
+			"Si la ACL no concede %s, el consumidor se quedará inerte y solo lo dirá este logger",
+			durable, stream, motivo, subject)
+	}
 	return nil
 }
 

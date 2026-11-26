@@ -1181,8 +1181,16 @@
       },
       "go": {
         "capabilities": [
-          "signing"
-        ]
+          "signing",
+          "security"
+        ],
+        "evidence": {
+          "security": [
+            "sdk-go/security_integration_test.go",
+            "sdk-go/security_connect_test.go",
+            "sdk-go/security_test.go"
+          ]
+        }
       },
       "java": {
         "capabilities": [

@@ -152,6 +152,84 @@ Para que el clasificador reconozca un status HTTP, envuelve el fallo con
 
 ---
 
+## Seguridad: permisos, inbox, TLS y credenciales
+
+Con la capacidad **`security`** el SDK funciona bajo la configuración segura de
+[`06-security.md`](../specification/06-security.md): los permisos exactos que genera
+[`scripts/gen-acl.mjs`](../scripts/gen-acl.mjs), sin ningún permiso de suscripción sobre subjects de
+dominio y con un inbox privado por servicio. Sin esta capacidad, el broker le deniega al SDK la suscripción a su
+propio inbox (`_INBOX.<aleatorio>`) y su primera petición falla.
+
+```go
+bus, err := flux.Connect(ctx, flux.ConnectOptions{
+    Servers: "nats://nats.interno:4222", Service: "facturacion-api", Environment: "produccion", Version: "3.4.1",
+
+    // UN método: .creds (el recomendado), semilla nkey, token, o usuario y contraseña.
+    Credentials: flux.CredentialsFromFile("/run/secrets/facturacion-api.creds"),
+    // `&flux.TLSOptions{}` EXIGE TLS con las CA del sistema; con CAFile, contra una CA propia. No hay forma de
+    // desactivar la verificación.
+    TLS: &flux.TLSOptions{CAFile: "/etc/flux/ca.pem"}, // + CertFile y KeyFile para mTLS
+
+    // ⚠️ CONFIGÚRALO. Un `ack` denegado por la ACL no falla en ningún sitio (es una publicación sin respuesta):
+    // el evento se procesa y se reentrega cada ack_wait, para siempre. La única salida es este logger.
+    Logger: slog.Default(),
+})
+```
+
+| Qué | Cómo lo cumple el SDK de Go |
+|---|---|
+| **Inbox privado** | Fija `nats.CustomInboxPrefix("_INBOX.<servicio>")` a partir de `Service`. **No es una opción**, y el nombre de servicio no admite puntos, así que el prefijo de un servicio nunca es prefijo de otro. |
+| **TLS** | `TLSOptions{CAFile, CertFile, KeyFile}`: CA propia y mTLS. `ConnectOptions.TLS == nil` no pide TLS; `&TLSOptions{}` lo exige. |
+| **Credenciales** | `.creds` por ruta (se **relee en cada reconexión**: rotar no exige reiniciar) o por contenido, semilla nkey de usuario, token y usuario+contraseña. Todo lo mal formado falla en `Connect()` **antes de abrir ningún socket**. |
+| **La primera conexión** | Espera a un broker que aún no ha arrancado (con jitter) y **falla de inmediato** ante lo que esperar no arregla. Ver abajo: no usa `RetryOnFailedConnect`. |
+| **`subscribe`** | *Info antes de crear*: pregunta por el consumidor (`CONSUMER.INFO`) y solo lo crea si no existe, así que en producción no necesita `CONSUMER.CREATE`. **Falla** con `PERMISSION_DENIED` si se deniega `$JS.API.CONSUMER.MSG.NEXT.…` (`06-security.md §3.7`: un pull denegado deja un consumidor inerte que parece sano). |
+| **Denegaciones** | Una petición a la API de JetStream, o un `publish`, a un subject denegado falla en milisegundos con `PERMISSION_DENIED` y el subject **completo**, no por timeout. Un `ack` o un WIP denegados se registran en el `Logger`, una vez por subject. |
+
+### Los cinco códigos
+
+Todos **PERMANENT** (reintentar da lo mismo), con un `code` fijo que la aplicación no puede sustituir. Implementan
+`ClassifiedError` y se reconocen con `errors.As`:
+
+| Código | Tipo | Se emite cuando |
+|---|---|---|
+| `CONNECTION_REJECTED` | `*ConnectionRejectedError` (`Reason`: `auth` o `tls`) | El broker **contestó** y rechazó la primera conexión: credencial equivocada, certificado que no verifica (CA ausente o equivocada, host fuera de los SAN), TLS exigido y no ofrecido, o mTLS sin certificado de cliente |
+| `INVALID_CREDENTIALS` | `*InvalidCredentialsError` | Opciones mal formadas, **sin hablar con el broker**: vacías (una variable de entorno sin definir), `User` sin `Password`, más de un método, un `.creds` ilegible o sin JWT y semilla, una semilla que no es de usuario |
+| `INVALID_TLS_OPTIONS` | `*InvalidTLSOptionsError` | Una CA que no existe o no es un PEM, un certificado de cliente sin su clave (o al revés) o un par que no casa |
+| `NOT_PROVISIONED` | `*NotProvisionedError` | Falta un stream o un consumidor **y** el broker deniega crearlo. Apunta a `flux provision` |
+| `PERMISSION_DENIED` | `*PermissionDeniedError` | El broker deniega una operación y no se sabe que el recurso falte (ni siquiera se puede consultar), un `publish` o una suscripción |
+
+La frontera importa y está probada **en los dos sentidos**: una credencial bien formada pero equivocada es `CONNECTION_REJECTED`
+(`auth`), nunca `INVALID_CREDENTIALS`; un certificado que el broker no acepta es `CONNECTION_REJECTED` (`tls`), nunca
+`INVALID_TLS_OPTIONS`; y un broker que aún no ha arrancado no es ninguno de los tres (se espera).
+
+> **Divergencia con Node, por el cero de Go.** El cero de un `string` es «no lo he puesto» y no se distingue de «lo puse vacío»:
+> `Credentials{CredsFile: os.Getenv("NATS_CREDS")}` con la variable sin definir conectaría **sin credenciales**. Para que falle con
+> `INVALID_CREDENTIALS`, usa los constructores (`CredentialsFromFile`, `CredentialsFromNKeySeed`, `CredentialsFromToken`,
+> `CredentialsFromUserPass`, `CredentialsFromContent`): recuerdan qué método se pidió. Con `TLSOptions` el equivalente es
+> inocuo (una CA vacía verifica contra las CA del sistema y, si el broker usa una propia, falla con `CONNECTION_REJECTED`).
+
+### Lo que se midió de `nats.go`
+
+Medido contra `nats-server` 2.14.5 con `nats.go` v1.37.0 (Apéndice A del plan, A-190 a A-199). Es lo que justifica cada línea de
+`security.go` y `denials.go`:
+
+- **`RetryOnFailedConnect(true)` no sirve para la primera conexión.** `Connect()` vuelve en 0–2 ms **sin error** y con la
+  conexión en `RECONNECTING` ante una credencial rechazada, una CA que no firmó el certificado, un host fuera de los SAN, TLS
+  exigido sin TLS en el broker y un mTLS sin certificado de cliente. Solo la credencial rechazada acaba cerrándose, tras dos
+  intentos y sin avisar; las demás reintentan **para siempre**, con la causa solo en `nc.LastError()`: un servicio arrancado y mudo.
+  Con `RetryOnFailedConnect(false)` los mismos cinco fallos son un error en 1–3 ms con su causa (`ErrAuthorization`,
+  `*tls.CertificateVerificationError`, `ErrSecureConnWanted`…) y un broker caído es `ErrNoServers`. Por eso el bucle de la primera
+  conexión es del SDK (`connectWhenAvailable`); las reconexiones posteriores siguen siendo de la librería.
+- **`nats.go` no entrega las denegaciones a la operación.** Una petición a un subject denegado es un `ErrTimeout`; una suscripción
+  denegada devuelve `nil`. El `-ERR 'Permissions Violation…'` llega **solo** al `ErrorHandler` de la conexión. El SDK lo escucha y
+  lo **compite con la respuesta** (`guard`): `PERMISSION_DENIED` en milisegundos en vez de un timeout de 5 s.
+- **Detectar una suscripción denegada**: tras un `Flush()` (PING/PONG), `nc.LastError()` ya tiene la denegación (0 fallos en
+  2 000 intentos), mientras que el `ErrorHandler` —una goroutine aparte— aún no se había ejecutado en 180 de 2 000. Por eso se mira
+  `LastError()` y no se «espera un poco».
+- **El pull denegado** se detecta con una petición propia sobre el **mismo subject** (`CONSUMER.MSG.NEXT.<stream>.<durable>`)
+  con un cuerpo `{` que el servidor contesta `400` sin sacar ningún mensaje: se compite su respuesta con la denegación. No depende
+  de ningún temporizador.
+
 ## Aislamiento entre tenants
 
 ```go
@@ -605,6 +683,9 @@ servidor**, no solo sobre la solicitada.
 | `metrics.go` | `MetricsSink`, `NoMetrics`, `InMemoryMetrics`, `DurationBuckets` |
 | `tenant.go` | `TenantIsolation`, `TenantIsolationError`, resolución del filtro de tenant |
 | `client.go` | `Connect`, `Bus.Publish`, `Bus.Subscribe`, `Bus.Close` |
+| `security.go` | `Credentials`, `TLSOptions`, `ConnectionRejectedError`, `InvalidCredentialsError`, `InvalidTLSOptionsError`, `NotProvisionedError`, `PermissionDeniedError`, y la traducción de las opciones a `nats.go` |
+| `denials.go` | Las denegaciones de permisos que `nats.go` solo entrega de forma asíncrona, y `guard` (competirlas con la respuesta) |
+| `text.go`, `canonical.go` | UTF-8 literal y la forma canónica de `data` (`01-envelope.md §4.1`) |
 
 ## Desarrollo
 
@@ -614,7 +695,18 @@ go test -race ./...
 gofmt -l .          # sin salida
 ```
 
-Los tests no requieren un broker: cubren naming, envelope, clasificación, firma, métricas,
+Las **pruebas de integración** (`security_*_test.go`) levantan un `nats-server` **real** con TLS, la ACL que genera
+`scripts/gen-acl.mjs` y `flux provision` (`testenv_test.go`): un broker abierto no prueba nada de seguridad. Necesitan
+`nats-server` (`NATS_SERVER=…`), `node` y `(cd cli && npm install)`; sin ellos **se saltan con un aviso**, salvo con
+`FLUX_REQUIRE_BROKER=1`, que lo convierte en un fallo (CI lo pone: un salto no es un pase). Los puertos salen de
+`FLUX_TEST_PORTS=desde-hasta` (por defecto 7300-7399).
+
+```bash
+NATS_SERVER=/ruta/a/nats-server FLUX_REQUIRE_BROKER=1 go test -race ./...
+node sdk-go/tools/mutantes.mjs      # rompe a propósito cada garantía: las pruebas DEBEN fallar
+```
+
+Los demás tests no requieren un broker: cubren naming, envelope, clasificación, firma, métricas,
 validación L3 y aislamiento de tenant, que es donde vive la semántica del protocolo. Los de
 métricas leen `../protocol.json` —incluido el intervalo por defecto del sondeo de
 `num_pending`— y los de validación leen `../schemas/bundle.json`, para que una divergencia

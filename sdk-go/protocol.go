@@ -135,6 +135,45 @@ var SubjectPattern = regexp.MustCompile(
 	`^[a-z0-9]+(-[a-z0-9]+)*\.[a-z0-9]+(-[a-z0-9]+)*\.v[1-9][0-9]{0,3}\.[a-z0-9]+(-[a-z0-9]+)*$`,
 )
 
+// ServicePattern valida el nombre de un servicio: `[a-z0-9]` y guiones, sin puntos. Alimenta los nombres de
+// durable consumer y el prefijo del inbox (`_INBOX.<servicio>`), así que no puede contener un punto: el
+// prefijo de un servicio nunca es un prefijo de otro — 02-naming.md §4, 06-security.md §3.3.
+var ServicePattern = regexp.MustCompile(`^[a-z0-9]+(-[a-z0-9]+)*$`)
+
+// InvalidServiceNameError señala un nombre de servicio que no cumple ServicePattern. No lleva ninguno de los
+// códigos de `connect()` (04-errors.md §5.3): no es ninguna de esas situaciones.
+type InvalidServiceNameError struct{ Service string }
+
+func (e *InvalidServiceNameError) Error() string {
+	return fmt.Sprintf("nombre de servicio inválido %q: debe cumplir ^[a-z0-9]+(-[a-z0-9]+)*$ (minúsculas, dígitos y "+
+		"guiones, sin puntos). Alimenta los nombres de durable y el inbox privado `_INBOX.<servicio>`; un punto "+
+		"haría que el prefijo de un servicio fuera el de otro (02-naming.md §4)", e.Service)
+}
+
+// reservedDomains son los dominios que no son dominios — 02-naming.md §1.3, protocol.json
+// `naming.reservedDomains`. Cada uno es un espacio de nombres del protocolo (`dlq.`, `state.`, `rpc.`), y un
+// dominio con ese nombre colisionaría con él EN EL BROKER (`subjects overlap with an existing stream`, A-43).
+// Peor: un evento publicado en `state.` no pasaría por el chequeo de secuencia del estado, y uno de core
+// sobrescribe sin acuse (A-45).
+var reservedDomains = [...]string{"dlq", "state", "rpc", "system"}
+
+// ReservedDomains devuelve los dominios reservados del protocolo.
+func ReservedDomains() []string { return append([]string(nil), reservedDomains[:]...) }
+
+// assertNotReservedDomain devuelve RESERVED_DOMAIN si el primer token de un subject, un contrato o una
+// operación es un dominio reservado. Se comprueba ANTES que la forma: `dlq.pedidos.pedido.v1.creado` tiene
+// cinco tokens y «debe tener cuatro» no diría qué pasa de verdad. La coincidencia es EXACTA: `states` no es
+// `state`, y `State` es una operación mal formada, no un dominio reservado.
+func assertNotReservedDomain(subjectOrContract, what string) error {
+	domain, _, _ := strings.Cut(subjectOrContract, ".")
+	for _, r := range reservedDomains {
+		if domain == r {
+			return &ReservedDomainError{baseError{CodeReservedDomain, ClassPermanent, nil}, domain, what}
+		}
+	}
+	return nil
+}
+
 // ParsedSubject son los cuatro tokens de un subject ya validado.
 type ParsedSubject struct {
 	Domain    string
@@ -164,6 +203,11 @@ func (e *InvalidSubjectError) Error() string {
 // AGREGADO ("ped-123"). En este SDK ese atributo se llama AggregateID y solo se
 // mapea a `subject` al serializar — 01-envelope.md §2.1.
 func ParseSubject(subject string) (ParsedSubject, error) {
+	// Todo lo que recibe un subject —Publish, Subscribe, DurableName…— pasa por aquí: un dominio reservado se
+	// rechaza antes de tocar la red (10-state.md §2.7).
+	if err := assertNotReservedDomain(subject, "subject"); err != nil {
+		return ParsedSubject{}, err
+	}
 	// La comprobación de minúsculas va ANTES que el patrón para poder dar un mensaje
 	// útil: los subjects de NATS son case-sensitive, así que "Pedidos.pedido.v1.creado"
 	// crea un subject fantasma al que nadie está suscrito y no produce ningún error.

@@ -136,7 +136,7 @@ protocolo a v2.
 |---|---|---|---|---|
 | [Node / TypeScript](sdk-node/) | **L3** | 105 | ✅ | `signing` `security` `state` `rpc` |
 | [Python](sdk-python/) | **L3** | 205 | ✅ | `signing` |
-| [Go](sdk-go/) | **L3** | 162 | ✅ (también con `-race`) | `signing` |
+| [Go](sdk-go/) | **L3** | 162 | ✅ (también con `-race`) | `signing` `security` |
 | [Java](sdk-java/) | **L3** | 144 | ✅ (Maven en el runner) | `signing` |
 | [.NET](sdk-dotnet/) | **L3** | 189 | ✅ | `signing` |
 | [Rust](sdk-rust/) | L2 | 175 | ✅ (incl. 14 contra NATS real) | `signing` `security` `state` `rpc` |

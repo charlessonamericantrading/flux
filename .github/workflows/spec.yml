@@ -475,20 +475,52 @@ jobs:
           python -m pytest sdk-python/tests -q
 
   sdk-go:
-    name: SDK Go — vet, test y gofmt
+    name: SDK Go — vet, test, gofmt y NATS real con los permisos que genera gen-acl.mjs
     runs-on: ubuntu-latest
     defaults:
       run:
         working-directory: sdk-go
     steps:
       - uses: actions/checkout@v4
+      # Las pruebas de integración montan el entorno de la suite de seguridad (testenv_test.go): un nats-server con TLS, los
+      # permisos que genera `scripts/gen-acl.mjs` y `flux provision` (CLI de Node). Un broker abierto no prueba nada de seguridad.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm install --no-audit --no-fund
+        working-directory: cli
+      # nats-server 2.14.5 exige Go 1.25 (su go.mod): se compila la versión exacta que la spec dice haber medido, igual que en
+      # `acl-verify` y `security`. Las pruebas del SDK corren después con Go 1.22, el mínimo que declara su go.mod.
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+          cache: false
+      - name: Compilar nats-server 2.14.5
+        working-directory: .
+        run: |
+          GOBIN="$PWD/bin" go install github.com/nats-io/nats-server/v2@v2.14.5
+          echo "NATS_SERVER=$PWD/bin/nats-server" >> "$GITHUB_ENV"
       - uses: actions/setup-go@v5
         with:
           go-version: '1.22'
+          cache: false
       - run: go vet ./...
-      - run: go test -race ./...
+      # FLUX_REQUIRE_BROKER=1: que falte nats-server, node o la CLI es un FALLO y no un salto con aviso. Sin ella, las pruebas de
+      # seguridad se saltarían en silencio y el job quedaría verde sin haber ejecutado nunca los permisos contra un broker.
+      - name: Pruebas (con un nats-server real, TLS y los permisos generados)
+        env:
+          FLUX_REQUIRE_BROKER: '1'
+        run: go test -race -count=1 ./...
       - name: gofmt sin cambios pendientes
         run: test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
+      # En los dos sentidos también aquí: sin nats-server, las pruebas con broker DEBEN fallar y no saltarse.
+      - name: Sin nats-server, las pruebas con broker FALLAN (no se saltan)
+        run: |
+          if NATS_SERVER=/no/existe/nats-server FLUX_REQUIRE_BROKER=1 go test -count=1 -run 'TestSeguridad' ./... > /dev/null 2>&1; then
+            echo "✗ las pruebas de seguridad pasaron SIN nats-server con FLUX_REQUIRE_BROKER=1: la comprobación no vigila nada"
+            exit 1
+          fi
+          echo "✓ sin nats-server las pruebas con broker fallan"
 
   sdk-java:
     name: SDK Java — tests

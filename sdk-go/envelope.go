@@ -13,9 +13,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
-	"unicode/utf8"
 )
 
 // DataClassification es la clasificación del dato transportado — 06-security.md §5.
@@ -399,12 +399,19 @@ func marshalDataObject(data any) (json.RawMessage, error) {
 		raw = encoded
 	}
 
-	trimmed := bytes.TrimLeft(raw, " \t\r\n")
-	if len(trimmed) == 0 || trimmed[0] != '{' {
+	// La forma canónica (01-envelope.md §4.1): sin espacios, los escapes `\uXXXX` resueltos a UTF-8 literal, y solo los
+	// escapes que el formato exige. Sin ella, dos SDKs escriben secuencias de bytes distintas para el mismo `data`, y flux
+	// depende de los bytes para el replay, la firma y la dedupe por hash.
+	canon, err := canonicalizeJSON(raw)
+	if err != nil {
+		return nil, &EnvelopeError{Message: "`data` no se puede escribir en su forma canónica: " + err.Error() +
+			" (01-envelope.md §4.1)"}
+	}
+	if len(canon) == 0 || canon[0] != '{' {
 		return nil, &EnvelopeError{Message: "`data` debe ser un objeto JSON en la raíz (ni array ni escalar), " +
 			"para poder añadir campos sin romper el contrato (01-envelope.md §4)"}
 	}
-	return raw, nil
+	return canon, nil
 }
 
 // ─── Serialización ───────────────────────────────────────────────────────────
@@ -414,10 +421,7 @@ func marshalDataObject(data any) (json.RawMessage, error) {
 // Falla aquí y no en el broker al superar 1 MiB: el broker devuelve "maximum payload
 // exceeded", que no dice qué hacer al respecto — 01-envelope.md §6.
 func Serialize(e Event) ([]byte, error) {
-	b, err := marshalNoHTMLEscape(e)
-	if err != nil {
-		return nil, &EnvelopeError{Message: "el evento no es serializable a JSON: " + err.Error()}
-	}
+	b := appendEvent(make([]byte, 0, 512+len(e.Data)), e)
 	if len(b) > MaxMessageBytes {
 		return nil, &EnvelopeError{Message: fmt.Sprintf(
 			"evento de %d bytes supera el límite de %d (1 MiB). Aplica claim-check: sube el "+
@@ -427,6 +431,65 @@ func Serialize(e Event) ([]byte, error) {
 			len(b), MaxMessageBytes)}
 	}
 	return b, nil
+}
+
+// appendEvent escribe el evento con el orden de atributos NORMATIVO y `data` el último
+// (01-envelope.md §6): flux depende de la secuencia de bytes para el replay, la firma y la dedupe por
+// hash. Se escribe a mano y no con encoding/json porque éste escapa U+2028 y U+2029 aunque se le pida
+// no escapar el HTML, y `JSON.stringify` no: el mismo evento daría dos secuencias de bytes en Go y en
+// Node (ver text.go). `data` se copia tal cual: un evento parseado y vuelto a serializar es byte a byte
+// el mismo, que es lo que hace del replay un `del(.dlq*)` y republicar.
+func appendEvent(dst []byte, e Event) []byte {
+	first := true
+	str := func(name, value string, omitEmpty bool) {
+		if omitEmpty && value == "" {
+			return
+		}
+		if !first {
+			dst = append(dst, ',')
+		}
+		first = false
+		dst = appendJSONString(dst, name)
+		dst = append(dst, ':')
+		dst = appendJSONString(dst, value)
+	}
+	dst = append(dst, '{')
+	str("specversion", e.SpecVersion, false)
+	str("id", e.ID, false)
+	str("source", e.Source, false)
+	str("type", e.Type, false)
+	str("time", e.Time, false)
+	str("datacontenttype", e.DataContentType, false)
+	str("dataschema", e.DataSchema, false)
+	str("subject", e.AggregateID, true)
+	str("correlationid", e.CorrelationID, false)
+	str("tenantid", e.TenantID, false)
+	str("producerversion", e.ProducerVersion, false)
+	str("dataclassification", string(e.DataClassification), false)
+	str("causationid", e.CausationID, true)
+	str("partitionkey", e.PartitionKey, true)
+	str("traceparent", e.TraceParent, true)
+	str("tracestate", e.TraceState, true)
+	str("signkeyid", e.SignKeyID, true)
+	str("signature", e.Signature, true)
+	str("dlqreason", string(e.DLQReason), true)
+	if e.DLQAttempts != 0 {
+		dst = append(dst, ',')
+		dst = appendJSONString(dst, "dlqattempts")
+		dst = append(dst, ':')
+		dst = strconv.AppendInt(dst, int64(e.DLQAttempts), 10)
+	}
+	str("dlqconsumer", e.DLQConsumer, true)
+	str("dlqerror", e.DLQError, true)
+	str("dlqtime", e.DLQTime, true)
+	dst = append(dst, ',')
+	dst = appendJSONString(dst, "data")
+	dst = append(dst, ':')
+	if len(e.Data) == 0 {
+		return append(dst, "null}"...)
+	}
+	dst = append(dst, e.Data...)
+	return append(dst, '}')
 }
 
 // marshalNoHTMLEscape serializa sin escapar <, > ni &.
@@ -653,7 +716,7 @@ func ToDLQEvent(e Event, info DLQInfo) Event {
 	e.DLQReason = info.Reason
 	e.DLQAttempts = info.Attempts
 	e.DLQConsumer = info.Consumer
-	e.DLQError = truncateRunes(info.Error, 1024)
+	e.DLQError = truncateUTF8Bytes(info.Error, 1024)
 	e.DLQTime = FormatTime(time.Now())
 	return e
 }
@@ -670,21 +733,4 @@ func StripDLQExtensions(e Event) Event {
 	e.DLQError = ""
 	e.DLQTime = ""
 	return e
-}
-
-// truncateRunes recorta a n bytes sin partir un carácter multibyte.
-//
-// El SDK de Node hace `.slice(0, 1024)` sobre unidades UTF-16 y aquí se corta por
-// bytes UTF-8, así que el punto de corte de un mensaje con acentos puede diferir.
-// Es intencionado: partir un rune produciría un JSON con U+FFFD en el `dlqerror`,
-// que es peor que un mensaje unos bytes más corto.
-func truncateRunes(s string, n int) string {
-	if len(s) <= n {
-		return s
-	}
-	cut := n
-	for cut > 0 && !utf8.RuneStart(s[cut]) {
-		cut--
-	}
-	return s[:cut]
 }
