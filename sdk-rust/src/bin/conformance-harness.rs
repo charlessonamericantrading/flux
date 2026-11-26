@@ -358,7 +358,7 @@ fn instante(s: &str) -> Result<DateTime<Utc>, Fallo> {
 fn entero_de_decimal(valor: Option<f64>) -> Option<i64> {
     let v = valor?;
     // 2^63 como f64 es exacto; `i64::MAX as f64` redondea hacia arriba, así que se compara con `<`.
-    (v.fract() == 0.0 && v >= -9_223_372_036_854_775_808.0 && v < 9_223_372_036_854_775_808.0)
+    (v.fract() == 0.0 && (-9_223_372_036_854_775_808.0..9_223_372_036_854_775_808.0).contains(&v))
         .then_some(v as i64)
 }
 

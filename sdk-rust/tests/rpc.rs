@@ -1012,6 +1012,44 @@ async fn broker_una_peticion_que_no_cabe_falla_antes_de_la_red_y_el_limite_exact
     );
 }
 
+/// Lo que `async-nats` pone en el cable: el subject de respuesta de la petición es el inbox privado del servicio,
+/// `_INBOX.<servicio>.<aleatorio>.<id>` —cuatro tokens—, que cubre el `_INBOX.<servicio>.>` de la ACL (A-94).
+#[tokio::test]
+async fn broker_el_subject_de_respuesta_es_el_inbox_privado_del_servicio() {
+    let bin = broker_bin!();
+    let broker = Broker::con_acl(&bin);
+    let llama = bus(&broker.url(), "llama").await;
+    let espia = bruto(&broker.url()).await;
+    let mut cable = espia.subscribe(format!("rpc.{OBTENER}")).await.unwrap();
+    barrera(&espia).await;
+    for _ in 0..3 {
+        let _ = llama
+            .request_with(
+                OBTENER,
+                &json!({ "clienteId": "cli-1" }),
+                RequestOptions::default().with_timeout_ms(50),
+            )
+            .await;
+        let visto = tokio::time::timeout(Duration::from_secs(1), cable.next())
+            .await
+            .unwrap()
+            .unwrap();
+        let reply = visto
+            .reply
+            .expect("una petición lleva su subject de respuesta")
+            .to_string();
+        let tokens: Vec<&str> = reply.split('.').collect();
+        assert_eq!(tokens.len(), 4, "{reply}");
+        assert_eq!(
+            (tokens[0], tokens[1]),
+            ("_INBOX", "llama"),
+            "el inbox es privado: {reply}"
+        );
+    }
+    // Sin una violación: el multiplexor de la librería se suscribe bajo `_INBOX.llama.>`.
+    assert!(broker.violations().is_empty(), "{:?}", broker.violations());
+}
+
 /// El acuse de un stream que captura `rpc.>` llega como si fuera la respuesta (A-18, A-67). Sin nadie
 /// escuchando, además, la petición «se responde» sola: lo que ve quien llama es `RPC_INVALID_REPLY`.
 #[tokio::test]
@@ -3034,4 +3072,317 @@ mod esquemas {
         )
         .await;
     }
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+//  Medidas: lo que la spec no había medido y el SDK usa (se ejecutan con `-- --ignored --nocapture`)
+// ═════════════════════════════════════════════════════════════════════════════
+
+fn percentil(mut v: Vec<f64>, p: f64) -> f64 {
+    v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let i = ((v.len() as f64 - 1.0) * p).round() as usize;
+    v[i]
+}
+
+/// A-90: cuánto tarda en llegar el aviso de una suscripción denegada. `respond()` espera ese aviso hasta
+/// `SUBSCRIBE_SETTLE` (100 ms): si llegara más tarde, un dueño sin permiso arrancaría «sano». El tiempo que
+/// tarda `respond()` en FALLAR es exactamente la latencia del aviso (no espera el tope entero).
+#[tokio::test]
+async fn medida_la_denegacion_de_una_suscripcion_llega_en_milisegundos() {
+    let bin = broker_bin!();
+    let broker = Broker::sin_permiso(&bin, "crm", "subscribe");
+    let crm = bus(&broker.url(), "crm").await;
+    let mut tiempos = Vec::new();
+    for _ in 0..200 {
+        let t = Instant::now();
+        let e = crm
+            .respond(DESCUENTO, |_: RpcRequest, _: RpcContext| async move {
+                Ok::<Value, flux::HandlerError>(json!({}))
+            })
+            .await
+            .expect_err("denegado");
+        assert_eq!(code(&e), "PERMISSION_DENIED", "{e}");
+        tiempos.push(t.elapsed().as_secs_f64() * 1000.0);
+    }
+    eprintln!(
+        "A-90: aviso de suscripción denegada, 200 intentos: p50 {:.2} ms, p99 {:.2} ms, máx {:.2} ms (tope de espera: 100 ms)",
+        percentil(tiempos.clone(), 0.5),
+        percentil(tiempos.clone(), 0.99),
+        percentil(tiempos.clone(), 1.0)
+    );
+    assert!(
+        percentil(tiempos, 1.0) < 100.0,
+        "el aviso tardó más que el tope de espera: respond() habría arrancado «sano»"
+    );
+}
+
+/// A-72 (SDK): una petición denegada llega como `PERMISSION_DENIED` en milisegundos, con `async-nats`, que
+/// por sí solo la dejaría en un timeout de 5 s.
+#[tokio::test]
+async fn medida_una_peticion_denegada_llega_como_permission_denied_en_milisegundos() {
+    let bin = broker_bin!();
+    let broker = Broker::con_acl(&bin);
+    let ajeno = bus(&broker.url(), "ajeno").await;
+    let mut tiempos = Vec::new();
+    for _ in 0..100 {
+        let t = Instant::now();
+        let e = ajeno
+            .request_with(
+                OBTENER,
+                &json!({ "clienteId": "cli-1" }),
+                RequestOptions::default().with_timeout_ms(5_000),
+            )
+            .await
+            .expect_err("denegado");
+        assert_eq!(code(&e), "PERMISSION_DENIED", "{e}");
+        tiempos.push(t.elapsed().as_secs_f64() * 1000.0);
+    }
+    eprintln!(
+        "A-72 (SDK): petición denegada → PERMISSION_DENIED, 100 intentos: p50 {:.2} ms, p99 {:.2} ms, máx {:.2} ms (el timeout era 5000 ms)",
+        percentil(tiempos.clone(), 0.5),
+        percentil(tiempos.clone(), 0.99),
+        percentil(tiempos.clone(), 1.0)
+    );
+    assert!(percentil(tiempos, 1.0) < 1_000.0);
+}
+
+/// Copia de `origen` a `destino` retrasando cada trozo `retardo`, **conservando el orden**.
+async fn copia_con_latencia<R, W>(mut origen: R, mut destino: W, retardo: Duration)
+where
+    R: tokio::io::AsyncRead + Unpin + Send + 'static,
+    W: tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(tokio::time::Instant, Vec<u8>)>();
+    tokio::spawn(async move {
+        let mut b = vec![0u8; 65_536];
+        loop {
+            match origen.read(&mut b).await {
+                Ok(n) if n > 0 => {
+                    if tx
+                        .send((tokio::time::Instant::now() + retardo, b[..n].to_vec()))
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+                _ => return,
+            }
+        }
+    });
+    while let Some((vence, datos)) = rx.recv().await {
+        tokio::time::sleep_until(vence).await;
+        if destino.write_all(&datos).await.is_err() {
+            return;
+        }
+    }
+}
+
+/// Un proxy TCP que añade `un_sentido` de latencia en cada dirección entre un cliente y el servidor: es
+/// lo que un nats-server local no puede dar. Devuelve el puerto en el que escucha.
+async fn proxy_con_latencia(destino: u16, un_sentido: Duration) -> u16 {
+    let puerto = free_port();
+    let escucha = tokio::net::TcpListener::bind(("127.0.0.1", puerto))
+        .await
+        .unwrap();
+    tokio::spawn(async move {
+        loop {
+            let Ok((cliente, _)) = escucha.accept().await else {
+                return;
+            };
+            let Ok(servidor) = tokio::net::TcpStream::connect(("127.0.0.1", destino)).await else {
+                return;
+            };
+            let (cr, cw) = cliente.into_split();
+            let (sr, sw) = servidor.into_split();
+            tokio::spawn(copia_con_latencia(cr, sw, un_sentido));
+            tokio::spawn(copia_con_latencia(sr, cw, un_sentido));
+        }
+    });
+    puerto
+}
+
+/// A-91: parar un responder con carga CONTINUA y latencia de red real. `async-nats` 0.50 implementa
+/// `Subscriber::drain` retirando la suscripción de su tabla en cuanto el `UNSUB` sale al socket, sin esperar
+/// al `PONG` (`lib.rs`, `drain_pings`): lo que el servidor ya envió y aún viaja se descarta. Con un servidor
+/// local no se ve; con latencia, cada petición en ese viaje de ida y vuelta es un timeout para quien llama.
+///
+/// La carga lleva *jitter*: con los ocho bucles sincronizados todas las peticiones salen a la vez y parar
+/// entre dos ráfagas no pierde nada (así lo hizo la primera versión de esta medida).
+///
+/// `cargo test --test rpc -- --ignored --nocapture medida_parar`: imprime cuántas peticiones se pierden con
+/// 0, 5 y 15 ms de latencia en cada sentido, sumando 10 paradas de cada una.
+#[tokio::test]
+#[ignore = "medida: imprime resultados, no es una prueba de regresión"]
+async fn medida_parar_con_carga_y_latencia_no_pierde_peticiones() {
+    let bin = broker_bin!();
+    let broker = Broker::con_acl(&bin);
+    let llama = bus(&broker.url(), "llama").await;
+    for un_sentido in [0_u64, 5, 15] {
+        let via = if un_sentido == 0 {
+            broker.port
+        } else {
+            proxy_con_latencia(broker.port, Duration::from_millis(un_sentido)).await
+        };
+        let (ok, no_hay, perdidas, otras) = (
+            Arc::new(AtomicUsize::new(0)),
+            Arc::new(AtomicUsize::new(0)),
+            Arc::new(AtomicUsize::new(0)),
+            Arc::new(AtomicUsize::new(0)),
+        );
+        for repeticion in 0..10_u64 {
+            let crm = bus(&format!("nats://127.0.0.1:{via}"), "crm").await;
+            let r = dueno_responde(&crm, OBTENER, json!({ "clienteId": "cli-1" })).await;
+            let parar = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let tareas: Vec<_> = (0..16_u64)
+                .map(|n| {
+                    let (llama, parar) = (llama.clone(), Arc::clone(&parar));
+                    let (ok, no_hay, perdidas, otras) = (
+                        Arc::clone(&ok),
+                        Arc::clone(&no_hay),
+                        Arc::clone(&perdidas),
+                        Arc::clone(&otras),
+                    );
+                    tokio::spawn(async move {
+                        let mut estado = n * 7919 + repeticion * 104_729 + 1;
+                        while !parar.load(Ordering::SeqCst) {
+                            // Un generador de congruencia lineal: pausas de 0 a 9 ms, distintas por bucle.
+                            estado = estado
+                                .wrapping_mul(6_364_136_223_846_793_005)
+                                .wrapping_add(1_442_695_040_888_963_407);
+                            tokio::time::sleep(Duration::from_millis((estado >> 33) % 10)).await;
+                            match llama
+                                .request_with(
+                                    OBTENER,
+                                    &json!({ "clienteId": "cli-1" }),
+                                    RequestOptions::default().with_timeout_ms(400),
+                                )
+                                .await
+                            {
+                                Ok(_) => ok.fetch_add(1, Ordering::SeqCst),
+                                Err(e) if code(&e) == "RPC_UNAVAILABLE" => {
+                                    no_hay.fetch_add(1, Ordering::SeqCst)
+                                }
+                                Err(e) if code(&e) == "RPC_TIMEOUT" => {
+                                    perdidas.fetch_add(1, Ordering::SeqCst)
+                                }
+                                Err(_) => otras.fetch_add(1, Ordering::SeqCst),
+                            };
+                        }
+                    })
+                })
+                .collect();
+            tokio::time::sleep(Duration::from_millis(250 + repeticion * 13)).await;
+            r.stop().await;
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            parar.store(true, Ordering::SeqCst);
+            for t in tareas {
+                t.await.unwrap();
+            }
+            crm.close().await.unwrap();
+        }
+        eprintln!(
+            "A-91: latencia {un_sentido} ms por sentido, 10 paradas: {} ok, {} no responders tras parar, {} PERDIDAS (RPC_TIMEOUT), {} otras",
+            ok.load(Ordering::SeqCst),
+            no_hay.load(Ordering::SeqCst),
+            perdidas.load(Ordering::SeqCst),
+            otras.load(Ordering::SeqCst)
+        );
+    }
+}
+
+/// A-92: la cola de la suscripción es acotada. §5.6 dice que el exceso de peticiones «espera en la cola de la
+/// suscripción»: `async-nats` 0.50 la limita a `subscription_capacity` (65 536 mensajes por defecto) y, llena,
+/// **descarta** lo que llega (evento `SlowConsumer`) sin que quien llama sepa más que `RPC_TIMEOUT`. El
+/// responder se queda a 1 handler y un handler bloqueado mientras ~70 000 peticiones llegan de golpe.
+///
+/// `cargo test --test rpc -- --ignored --nocapture medida_cola`
+#[tokio::test]
+#[ignore = "medida: imprime resultados, no es una prueba de regresión"]
+async fn medida_cola_de_la_suscripcion_acotada() {
+    let bin = broker_bin!();
+    let broker = Broker::con_acl(&bin);
+    let (log, lineas) = logger_espia();
+    let crm = bus_con(&broker.url(), "crm", |o| o.with_logger(log)).await;
+    let liberar = Arc::new(tokio::sync::Notify::new());
+    let atendidas = Arc::new(AtomicUsize::new(0));
+    let (l2, a2) = (Arc::clone(&liberar), Arc::clone(&atendidas));
+    crm.respond_with(
+        OBTENER,
+        move |_: RpcRequest, _: RpcContext| {
+            let (l2, a2) = (Arc::clone(&l2), Arc::clone(&a2));
+            async move {
+                if a2.fetch_add(1, Ordering::SeqCst) == 0 {
+                    l2.notified().await; // el primero bloquea: el resto se acumula
+                }
+                Ok::<Value, flux::HandlerError>(json!({ "clienteId": "cli-1" }))
+            }
+        },
+        RespondOptions::default().with_max_concurrent(1),
+    )
+    .await
+    .unwrap();
+    let ops = bruto(&broker.url()).await;
+    let mut respuestas = ops.subscribe("_INBOX.ops.cola.>").await.unwrap();
+    barrera(&ops).await;
+    let contadas = Arc::new(AtomicUsize::new(0));
+    let c2 = Arc::clone(&contadas);
+    tokio::spawn(async move {
+        while respuestas.next().await.is_some() {
+            c2.fetch_add(1, Ordering::SeqCst);
+        }
+    });
+    const ENVIADAS: usize = 70_000;
+    let peticion = {
+        let mut e = respuesta_buena(
+            &flux::build_rpc_request(flux::RpcRequestInput {
+                operation: OBTENER.into(),
+                tenant_id: "acme".into(),
+                aggregate_id: None,
+                id: uuid_nuevo(),
+                source: "/produccion/llama".into(),
+                time: chrono::Utc::now(),
+                correlationid: uuid_nuevo(),
+                causationid: None,
+                producerversion: "1.0.0".into(),
+                classification: DataClassification::Internal,
+                dataschema: flux::rpc_dataschema(BASE, OBTENER, flux::RpcSide::Request).unwrap(),
+                traceparent: None,
+                tracestate: None,
+                data: serde_json::value::to_raw_value(&json!({ "clienteId": "cli-1" })).unwrap(),
+            })
+            .unwrap(),
+        );
+        e.event_type = "com.flux.rpc.clientes.cliente.obtener.request.v1".into();
+        e.causationid = None;
+        bytes_de(&e)
+    };
+    for i in 0..ENVIADAS {
+        ops.publish_with_reply(
+            format!("rpc.{OBTENER}"),
+            format!("_INBOX.ops.cola.{i}"),
+            peticion.clone().into(),
+        )
+        .await
+        .unwrap();
+    }
+    ops.flush().await.unwrap();
+    tokio::time::sleep(Duration::from_millis(1_500)).await;
+    liberar.notify_one();
+    tokio::time::sleep(Duration::from_secs(20)).await;
+    let avisos = lock(&lineas)
+        .iter()
+        .filter(|l| l.contains("DESCARTANDO"))
+        .count();
+    eprintln!(
+        "A-92: {ENVIADAS} peticiones con un handler bloqueado y max_concurrent 1: {} atendidas, {} respuestas recibidas ({} descartadas por la cola de la suscripción); el SDK avisó {avisos} vez/veces por el logger",
+        atendidas.load(Ordering::SeqCst),
+        contadas.load(Ordering::SeqCst),
+        ENVIADAS - atendidas.load(Ordering::SeqCst)
+    );
+    assert!(
+        avisos >= 1,
+        "un responder desbordado no puede parecer sano: {:?}",
+        lock(&lineas).len()
+    );
 }

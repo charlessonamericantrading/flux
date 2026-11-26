@@ -118,7 +118,7 @@ path = "src/bin/conformance-harness.rs"
 required-features = ["signing"]
 
 [dev-dependencies]
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "net", "io-util"] }
 # Los tests de integración leen la DLQ con la API CRUDA de NATS a propósito: comprueban
 # los BYTES que el SDK escribió, no su propia interpretación de ellos.
 async-nats = "0.50"
