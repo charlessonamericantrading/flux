@@ -21,10 +21,10 @@ import { readFile } from "node:fs/promises";
 export const SERVICE_RE = /^[a-z0-9]+(-[a-z0-9]+)*$/;
 export const DOMAIN_RE = SERVICE_RE;
 export const SUBJECT_RE =
-  /^[a-z0-9]+(-[a-z0-9]+)*\.[a-z0-9]+(-[a-z0-9]+)*\.v[1-9][0-9]*\.[a-z0-9]+(-[a-z0-9]+)*$/;
+  /^[a-z0-9]+(-[a-z0-9]+)*\.[a-z0-9]+(-[a-z0-9]+)*\.v[1-9][0-9]{0,3}\.[a-z0-9]+(-[a-z0-9]+)*$/;
 /** Contrato de ESTADO: el subject sin `state.`, sin tenant y sin clave — 10-state.md §2.2. */
 export const STATE_CONTRACT_RE =
-  /^[a-z0-9]+(-[a-z0-9]+)*\.[a-z0-9]+(-[a-z0-9]+)*\.v[1-9][0-9]*$/;
+  /^[a-z0-9]+(-[a-z0-9]+)*\.[a-z0-9]+(-[a-z0-9]+)*\.v[1-9][0-9]{0,3}$/;
 /** El tenant de un ESTADO (no el de un evento, que es cualquier cadena): 10-state.md §2.4. */
 export const STATE_TENANT_RE = /^[a-z0-9]+(-[a-z0-9]+)*$/;
 export const STATE_TENANT_MAX = 64;
