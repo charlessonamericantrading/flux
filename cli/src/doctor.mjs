@@ -8,6 +8,7 @@
  */
 
 import { c, OK, FAIL, WARN, fmtDuration, table } from "./ui.mjs";
+import { auditarDlqDeEstado, auditarDurableEstado, auditarStreamEstado, dominioDeStream } from "./doctor-state.mjs";
 
 const S = 1e9;
 
@@ -37,8 +38,12 @@ export async function doctor(jsm, { verbose } = {}) {
 
   const evtStreams = streams.filter((s) => s.config.name.startsWith("EVT_"));
   const dlqStreams = streams.filter((s) => s.config.name.startsWith("DLQ_"));
+  const estadoStreams = streams.filter((s) => s.config.name.startsWith("STATE_"));
   const otros = streams.filter(
-    (s) => !s.config.name.startsWith("EVT_") && !s.config.name.startsWith("DLQ_"),
+    (s) =>
+      !s.config.name.startsWith("EVT_") &&
+      !s.config.name.startsWith("DLQ_") &&
+      !s.config.name.startsWith("STATE_"),
   );
 
   // ─── Streams ───────────────────────────────────────────────────────────────
@@ -83,6 +88,13 @@ export async function doctor(jsm, { verbose } = {}) {
       }
     }
 
+    // Un STATE_<DOM> tiene su propia auditoría (doctor-state.mjs): su `max_age` es 0 A
+    // PROPÓSITO (el estado no caduca) y estos tres genéricos lo darían por un fallo.
+    if (n.startsWith("STATE_")) {
+      for (const f of auditarStreamEstado(s.config)) add(f.level, n, f.message, f.hint);
+      continue;
+    }
+
     if (s.config.discard !== "old") {
       add("warn", n, `discard=${s.config.discard}`, "El canónico es 'old' — 02-naming.md §3.3");
     }
@@ -113,7 +125,9 @@ export async function doctor(jsm, { verbose } = {}) {
         s.config.name,
         (s.config.subjects ?? []).join(", "),
         String(s.state.messages),
-        s.config.max_age ? fmtDuration(s.config.max_age) : c.yellow("∞"),
+        s.config.max_age
+          ? fmtDuration(s.config.max_age)
+          : s.config.name.startsWith("STATE_") ? c.gray("∞") : c.yellow("∞"), // en estado, ∞ es lo correcto
         String(s.config.num_replicas ?? 1),
       ]),
       ["STREAM", "SUBJECTS", "MSGS", "MAX_AGE", "REPL"],
@@ -134,7 +148,14 @@ export async function doctor(jsm, { verbose } = {}) {
     }
   }
   for (const o of otros) {
-    add("info", o.config.name, "no sigue la convención EVT_/DLQ_", "02-naming.md §3");
+    add("info", o.config.name, "no sigue la convención EVT_/DLQ_/STATE_", "02-naming.md §3");
+  }
+
+  // Todo dominio con estado necesita que su DLQ capture `dlq.state.<dom>.>` (10-state.md §6):
+  // si no, el fallo de un observador no tiene dónde caer y el publish de la DLQ falla.
+  for (const s of estadoStreams) {
+    const dlq = dlqStreams.find((d) => d.config.name.slice(4) === dominioDeStream(s.config.name));
+    for (const f of auditarDlqDeEstado(s.config, dlq?.config)) add(f.level, s.config.name, f.message, f.hint);
   }
 
   // ─── Consumidores ──────────────────────────────────────────────────────────
@@ -197,6 +218,12 @@ export async function doctor(jsm, { verbose } = {}) {
           "max_deliver ilimitado",
           "Un evento envenenado reintenta para siempre y nunca llega a la DLQ — 04-errors.md",
         );
+      }
+      // Un durable de un STATE_<DOM>: deliver_policy, filtro coherente con el nombre y config.
+      if (s.config.name.startsWith("STATE_")) {
+        const e = auditarDurableEstado(cfg);
+        for (const f of e.findings) add(f.level, target, f.message, f.hint);
+        problemas.push(...e.problemas);
       }
       if (cfg.durable_name && !DURABLE_RE.test(cfg.durable_name)) {
         add(

@@ -1,0 +1,2894 @@
+{
+  "suite": "state-broker",
+  "title": "Estado replicado: lo que hace el BROKER",
+  "spec": "specification/10-state.md",
+  "plan": "docs/plan-v1.1/PLAN.md, Fase 2",
+  "runner": "conformance/state-broker.mjs",
+  "verifiedAgainst": "nats-server 2.14.5",
+  "verifiedOn": "2026-11-26",
+  "$comment": "Estos casos son DATOS: conformance/state-broker.mjs no sabe qué es «un valor por clave», solo ejecuta las operaciones de `vocabulary` y compara lo observado con `expect`. Un campo desconocido en un caso, o una expectativa sobre algo que la operación no observa, es un ERROR al cargar: una errata no puede degradarse a «no se comprueba nada». Un caso DEBE llevar `spec`, `rationale` (qué se rompe si deja de ser cierto), `observed` (versión del servidor, fecha y resultado) y, si nace de un bug, `counterExample`. Los pasos marcados `control` demuestran que la sonda puede fallar: su resultado esperado es lo MALO. Cada observación A-n es la del Apéndice A de docs/plan-v1.1/PLAN.md. NO cubren (necesitan el SDK o otra infraestructura): la lectura de réplica con latencia real (10-state.md §3.7), una partición de red, el borrado físico en disco ni el rendimiento.",
+  "vocabulary": {
+    "$comment": "`as` es un actor: `ops` (por defecto, sin restricciones: es quien aprovisiona) o un usuario de `acls.<nombre>` (conecta con SU inbox privado `_INBOX.<usuario>`). `expect` compara con lo que la operación observa: valor exacto, o { match: regex }, { includes }, { gte }, { lte }, { not }, { present: bool }; una clave con puntos entra en objetos (`reply.error.err_code`, `bodies.3`). `{ \"ref\": nombre, \"plus\": n }` usa un valor guardado con `save` en un paso anterior. `{repeat:x:N}` dentro de una cadena la repite N veces. `control: true` marca un paso cuyo resultado esperado es lo MALO. `denied` se observa por el aviso asíncrono del broker (-ERR 'Permissions Violation', A-28): no hay excepción.",
+    "ops": {
+      "stream_add": {
+        "doc": "Lo hace ops: crea un stream (con `config` sobre la configuración de estado de referencia si `state: true`).",
+        "args": [
+          "name",
+          "subjects"
+        ],
+        "optional": [
+          "state",
+          "config"
+        ],
+        "observes": [
+          "outcome",
+          "errCode",
+          "text",
+          "config.max_msgs_per_subject",
+          "config.allow_direct",
+          "config.max_age",
+          "config.discard",
+          "config.num_replicas",
+          "config.duplicate_window",
+          "config.subjects",
+          "leader"
+        ]
+      },
+      "stream_update": {
+        "doc": "Lo hace ops: cambia los subjects de un stream existente.",
+        "args": [
+          "name",
+          "subjects"
+        ],
+        "observes": [
+          "outcome",
+          "errCode",
+          "text",
+          "subjects"
+        ]
+      },
+      "stream_state": {
+        "doc": "Lo mira ops: el estado REAL del stream.",
+        "args": [
+          "name"
+        ],
+        "observes": [
+          "messages",
+          "numSubjects",
+          "firstSeq",
+          "lastSeq"
+        ]
+      },
+      "stream_subjects": {
+        "doc": "STREAM.INFO con `subjects_filter` en el cuerpo (como actor): ¿qué subjects, y por tanto qué claves y tenants, revela?",
+        "args": [
+          "name",
+          "filter"
+        ],
+        "observes": [
+          "outcome",
+          "text",
+          "subjects",
+          "count"
+        ]
+      },
+      "js_publish": {
+        "doc": "Publicación por JetStream esperando el acuse, con cabeceras opcionales. `msgId`: Nats-Msg-Id. `expectedLastSubjectSeq`: Nats-Expected-Last-Subject-Sequence.",
+        "args": [
+          "subject"
+        ],
+        "optional": [
+          "data",
+          "msgId",
+          "expectedLastSubjectSeq"
+        ],
+        "observes": [
+          "outcome",
+          "stream",
+          "seq",
+          "duplicate",
+          "errCode",
+          "text"
+        ]
+      },
+      "core_publish": {
+        "doc": "Publicación de CORE: sin acuse y sin chequeo. Si el broker la deniega no hay excepción: se observa por el aviso de la conexión.",
+        "args": [
+          "subject"
+        ],
+        "optional": [
+          "data"
+        ],
+        "observes": [
+          "outcome",
+          "text"
+        ]
+      },
+      "direct_get": {
+        "doc": "DIRECT.GET por subject (`$JS.API.DIRECT.GET.<stream>.<subject>`). `body` se envía tal cual (el broker lo rechaza: 408).",
+        "args": [
+          "stream",
+          "subject"
+        ],
+        "optional": [
+          "body"
+        ],
+        "observes": [
+          "outcome",
+          "status",
+          "seq",
+          "subject",
+          "data",
+          "header.Nats-Msg-Id",
+          "header.Nats-Sequence",
+          "header.Nats-Subject",
+          "header.Nats-Stream",
+          "header.Nats-Time-Stamp",
+          "headerNames",
+          "text"
+        ],
+        "outcomes": [
+          "found",
+          "not_found",
+          "bad_request",
+          "no_responders",
+          "denied"
+        ]
+      },
+      "direct_get_body": {
+        "doc": "DIRECT.GET en su forma de CUERPO (`$JS.API.DIRECT.GET.<stream>` + JSON): lee cualquier mensaje y ninguna ACL ve el cuerpo.",
+        "args": [
+          "stream",
+          "request"
+        ],
+        "observes": [
+          "outcome",
+          "status",
+          "seq",
+          "subject",
+          "data",
+          "text"
+        ],
+        "outcomes": [
+          "found",
+          "not_found",
+          "bad_request",
+          "no_responders",
+          "denied"
+        ]
+      },
+      "api_request": {
+        "doc": "Petición a la API de JetStream (`$JS.API.…`) con un cuerpo JSON; observa la respuesta parseada.",
+        "args": [
+          "subject"
+        ],
+        "optional": [
+          "body"
+        ],
+        "observes": [
+          "outcome",
+          "text",
+          "reply.error.err_code",
+          "reply.error.description",
+          "reply.error.code",
+          "reply.config.name",
+          "reply.state.subjects"
+        ],
+        "outcomes": [
+          "answered",
+          "denied",
+          "no_responders",
+          "timeout"
+        ]
+      },
+      "consumer_add": {
+        "doc": "Lo hace ops (o un actor, con `api: subject`): crea un durable con la config canónica de 03-delivery.md §2. `deliver`: all | last_per_subject | new.",
+        "args": [
+          "stream",
+          "durable"
+        ],
+        "optional": [
+          "filter",
+          "deliver",
+          "replicas"
+        ],
+        "observes": [
+          "outcome",
+          "errCode",
+          "text",
+          "numPending",
+          "deliverPolicy",
+          "numReplicas"
+        ]
+      },
+      "consumer_delete": {
+        "doc": "Lo hace ops: borra un durable.",
+        "args": [
+          "stream",
+          "durable"
+        ],
+        "observes": [
+          "outcome"
+        ]
+      },
+      "consumer_info": {
+        "doc": "CONSUMER.INFO: el estado REAL del consumidor.",
+        "args": [
+          "stream",
+          "durable"
+        ],
+        "optional": [],
+        "observes": [
+          "outcome",
+          "errCode",
+          "numPending",
+          "numAckPending",
+          "numRedelivered",
+          "deliveredStreamSeq",
+          "ackFloorStreamSeq",
+          "text"
+        ]
+      },
+      "pull": {
+        "doc": "Pide hasta `max` mensajes del durable y los trata según `then`: ack | nak | none. Devuelve, por entrega, la clave (último token), la secuencia del stream, los `pending` de los metadatos y el cuerpo.",
+        "args": [
+          "stream",
+          "durable"
+        ],
+        "optional": [
+          "max",
+          "then"
+        ],
+        "observes": [
+          "count",
+          "keys",
+          "seqs",
+          "pendings",
+          "bodies",
+          "lastPending",
+          "firstPendingZeroIndex"
+        ]
+      },
+      "pull_shared": {
+        "doc": "Dos clientes piden a la vez del MISMO durable: ¿se reparten los mensajes?",
+        "args": [
+          "stream",
+          "durable",
+          "perClient"
+        ],
+        "observes": [
+          "a",
+          "b",
+          "disjoint",
+          "total"
+        ]
+      },
+      "cas_race": {
+        "doc": "`writers` publicaciones SIMULTÁNEAS a un subject con el mismo Nats-Expected-Last-Subject-Sequence leído antes, durante `rounds` rondas. Observa cuántas se aceptaron por ronda y qué err_code devolvieron las rechazadas.",
+        "args": [
+          "stream",
+          "subject",
+          "writers",
+          "rounds"
+        ],
+        "observes": [
+          "accepted",
+          "perRound",
+          "errCodes",
+          "errMessages"
+        ]
+      },
+      "state_put": {
+        "doc": "REFERENCIA de `put` (10-state.md §3.2): leer, comparar versiones, publicar con el chequeo de secuencia, reintentar.",
+        "args": [
+          "contract",
+          "tenant",
+          "key",
+          "version"
+        ],
+        "optional": [
+          "id",
+          "classification",
+          "hook"
+        ],
+        "observes": [
+          "outcome",
+          "applied",
+          "result",
+          "revision",
+          "attempts",
+          "ownWrite",
+          "errCode",
+          "text"
+        ],
+        "outcomes": [
+          "ok",
+          "stale",
+          "error"
+        ]
+      },
+      "state_delete": {
+        "doc": "REFERENCIA de `delete`: el mismo algoritmo con una lápida.",
+        "args": [
+          "contract",
+          "tenant",
+          "key",
+          "version"
+        ],
+        "optional": [
+          "id",
+          "hook"
+        ],
+        "observes": [
+          "outcome",
+          "applied",
+          "result",
+          "revision",
+          "attempts",
+          "ownWrite",
+          "errCode",
+          "text"
+        ],
+        "outcomes": [
+          "ok",
+          "stale",
+          "error"
+        ]
+      },
+      "state_get": {
+        "doc": "REFERENCIA de `get`: DIRECT.GET por subject; `null` si no hay clave o es una lápida.",
+        "args": [
+          "contract",
+          "tenant",
+          "key"
+        ],
+        "observes": [
+          "entry",
+          "isNull",
+          "revision",
+          "aggregateVersion",
+          "deleted"
+        ]
+      },
+      "state_watch": {
+        "doc": "REFERENCIA de `watch` (§5.2, §5.5): crea el durable `last_per_subject`, lo drena y observa las entradas y cuándo se invocaría `onSynced`.",
+        "args": [
+          "contract",
+          "durable"
+        ],
+        "optional": [
+          "tenant",
+          "service",
+          "afterCreate"
+        ],
+        "observes": [
+          "count",
+          "keys",
+          "entries",
+          "syncedAtIndex",
+          "syncedImmediately"
+        ]
+      },
+      "state_race": {
+        "doc": "`instances` instancias del dueño escriben las versiones `from`..`to` de UNA clave, repartidas al azar y con pausas aleatorias.",
+        "args": [
+          "contract",
+          "tenant",
+          "key",
+          "instances",
+          "from",
+          "to"
+        ],
+        "observes": [
+          "finalVersion",
+          "ok",
+          "stale",
+          "conflict",
+          "other"
+        ]
+      },
+      "violations": {
+        "doc": "Las violaciones de permiso que el broker notificó a la conexión de ese actor.",
+        "args": [],
+        "observes": [
+          "count",
+          "text"
+        ]
+      }
+    }
+  },
+  "acls": {
+    "estado": {
+      "title": "dueño (crm), observador del tenant acme (tienda), uno con STREAM.INFO (tienda-info) y uno con CREATE en modo dev (tienda-dev)",
+      "users": [
+        {
+          "name": "crm",
+          "permissions": {
+            "publish": [
+              "state.clientes.>",
+              "$JS.API.DIRECT.GET.STATE_CLIENTES.state.clientes.>"
+            ],
+            "subscribe": [
+              "_INBOX.crm.>"
+            ]
+          }
+        },
+        {
+          "name": "tienda",
+          "permissions": {
+            "publish": [
+              "$JS.API.CONSUMER.INFO.STATE_CLIENTES.tienda__state_clientes_cliente_v1__acme",
+              "$JS.API.CONSUMER.MSG.NEXT.STATE_CLIENTES.tienda__state_clientes_cliente_v1__acme",
+              "$JS.ACK.STATE_CLIENTES.tienda__state_clientes_cliente_v1__acme.>",
+              "$JS.API.DIRECT.GET.STATE_CLIENTES.state.clientes.cliente.v1.acme.*",
+              "dlq.state.clientes.cliente.v1",
+              "$JS.API.STREAM.INFO.DLQ_CLIENTES"
+            ],
+            "subscribe": [
+              "_INBOX.tienda.>"
+            ]
+          }
+        },
+        {
+          "name": "tienda-info",
+          "permissions": {
+            "publish": [
+              "$JS.API.STREAM.INFO.STATE_CLIENTES"
+            ],
+            "subscribe": [
+              "_INBOX.tienda-info.>"
+            ]
+          }
+        },
+        {
+          "name": "tienda-dev",
+          "permissions": {
+            "publish": [
+              "$JS.API.CONSUMER.CREATE.STATE_CLIENTES.tienda__state_clientes_cliente_v1__acme.state.clientes.cliente.v1.acme.*"
+            ],
+            "subscribe": [
+              "_INBOX.tienda-dev.>"
+            ]
+          }
+        }
+      ]
+    }
+  },
+  "cases": [
+    {
+      "id": "one-value-per-key",
+      "title": "max_msgs_per_subject: 1 convierte un log en un mapa: un valor por clave",
+      "spec": "10-state.md §2.1",
+      "covers": [
+        "A-31",
+        "A-9"
+      ],
+      "rationale": "Es lo que hace que el stream SEA el estado actual. Sin él, un observador nuevo recibiría la historia de cada clave y no podría distinguir el valor vigente. El control lo demuestra: el mismo stream sin esa línea de configuración conserva las tres escrituras. Y el servidor devuelve la configuración que se le pide, sin sobrescribirla (a diferencia de ack_wait con backoff, 03-delivery.md §2.1): se comprueba igualmente, porque es la familia de trampas de este broker.",
+      "observed": {
+        "server": "nats-server 2.14.5",
+        "date": "2026-11-26",
+        "result": "3 escrituras sobre 2 claves dejan 2 mensajes. La configuración devuelta es la pedida: max_msgs_per_subject 1, allow_direct true, max_age 0, discard old, duplicate_window 2 min. Sin max_msgs_per_subject, las mismas 3 escrituras dejan 3 mensajes."
+      },
+      "steps": [
+        {
+          "op": "stream_add",
+          "name": "STATE_CLIENTES",
+          "subjects": [
+            "state.clientes.>"
+          ],
+          "state": true,
+          "expect": {
+            "outcome": "ok",
+            "config.max_msgs_per_subject": 1,
+            "config.allow_direct": true,
+            "config.max_age": 0,
+            "config.discard": "old",
+            "config.duplicate_window": 120000000000
+          }
+        },
+        {
+          "op": "js_publish",
+          "subject": "state.clientes.cliente.v1.acme.cli-1",
+          "data": "{\"v\":1}",
+          "expect": {
+            "outcome": "ok"
+          }
+        },
+        {
+          "op": "js_publish",
+          "subject": "state.clientes.cliente.v1.acme.cli-2",
+          "data": "{\"v\":1}",
+          "expect": {
+            "outcome": "ok"
+          }
+        },
+        {
+          "op": "js_publish",
+          "subject": "state.clientes.cliente.v1.acme.cli-1",
+          "data": "{\"v\":2}",
+          "expect": {
+            "outcome": "ok"
+          }
+        },
+        {
+          "op": "stream_state",
+          "name": "STATE_CLIENTES",
+          "title": "2 claves, 3 escrituras",
+          "expect": {
+            "messages": 2,
+            "numSubjects": 2
+          }
+        },
+        {
+          "op": "stream_add",
+          "name": "STATE_LOG",
+          "subjects": [
+            "state.log.>"
+          ],
+          "title": "control: el mismo stream SIN max_msgs_per_subject",
+          "expect": {
+            "outcome": "ok"
+          },
+          "control": true
+        },
+        {
+          "op": "js_publish",
+          "subject": "state.log.x.v1.acme.k",
+          "data": "{\"v\":1}",
+          "expect": {
+            "outcome": "ok"
+          }
+        },
+        {
+          "op": "js_publish",
+          "subject": "state.log.x.v1.acme.k",
+          "data": "{\"v\":2}",
+          "expect": {
+            "outcome": "ok"
+          }
+        },
+        {
+          "op": "js_publish",
+          "subject": "state.log.x.v1.acme.k",
+          "data": "{\"v\":3}",
+          "expect": {
+            "outcome": "ok"
+          }
+        },
+        {
+          "op": "stream_state",
+          "name": "STATE_LOG",
+          "title": "control: sin la línea de configuración, 3 mensajes",
+          "expect": {
+            "messages": 3
+          },
+          "control": true
+        }
+      ]
+    },
+    {
+      "id": "direct-get-by-subject",
+      "title": "DIRECT.GET por subject: el último valor de una clave, 404 si no hay, y nada si el stream no responde",
+      "spec": "10-state.md §5.1",
+      "covers": [
+        "A-32",
+        "A-10"
+      ],
+      "rationale": "Es la lectura de `get` y el paso 1 de `put`. Tres cosas hay que saber: que devuelve la secuencia (S del chequeo condicional) y las cabeceras que se publicaron, `Nats-Msg-Id` incluida (con ella el paso 1b reconoce la propia escritura); que una clave inexistente es un 404 y no una ausencia de respuesta; y que un stream inexistente, o sin allow_direct, NO contesta nadie y se ve igual en los dos casos — de ahí que NOT_PROVISIONED nombre las dos causas.",
+      "observed": {
+        "server": "nats-server 2.14.5",
+        "date": "2026-11-26",
+        "result": "La respuesta lleva el cuerpo y las cabeceras Nats-Stream, Nats-Subject, Nats-Sequence, Nats-Time-Stamp y las publicadas (Nats-Msg-Id). Clave inexistente: 404 «Message Not Found». Stream inexistente, o con allow_direct false: «no responders». Con un comodín en el subject devuelve el último mensaje escrito que lo cumple."
+      },
+      "steps": [
+        {
+          "op": "stream_add",
+          "name": "STATE_CLIENTES",
+          "subjects": [
+            "state.clientes.>"
+          ],
+          "state": true,
+          "expect": {
+            "outcome": "ok"
+          }
+        },
+        {
+          "op": "js_publish",
+          "subject": "state.clientes.cliente.v1.acme.cli-1",
+          "data": "{\"t\":\"acme\"}",
+          "msgId": "id-1",
+          "expect": {
+            "outcome": "ok"
+          },
+          "save": {
+            "seq": "s1"
+          }
+        },
+        {
+          "op": "direct_get",
+          "stream": "STATE_CLIENTES",
+          "subject": "state.clientes.cliente.v1.acme.cli-1",
+          "expect": {
+            "outcome": "found",
+            "status": 200,
+            "subject": "state.clientes.cliente.v1.acme.cli-1",
+            "data": "{\"t\":\"acme\"}",
+            "seq": {
+              "ref": "s1"
+            },
+            "header.Nats-Msg-Id": "id-1",
+            "header.Nats-Stream": "STATE_CLIENTES",
+            "headerNames": {
+              "includes": "Nats-Sequence"
+            }
+          }
+        },
+        {
+          "op": "direct_get",
+          "stream": "STATE_CLIENTES",
+          "subject": "state.clientes.cliente.v1.acme.nadie",
+          "title": "clave inexistente",
+          "expect": {
+            "outcome": "not_found",
+            "status": 404
+          }
+        },
+        {
+          "op": "direct_get",
+          "stream": "STATE_CLIENTES",
+          "subject": "state.clientes.cliente.v1.acme.*",
+          "title": "con un comodín: el último mensaje que lo cumple",
+          "expect": {
+            "outcome": "found",
+            "subject": "state.clientes.cliente.v1.acme.cli-1"
+          }
+        },
+        {
+          "op": "direct_get",
+          "stream": "STATE_NOPE",
+          "subject": "state.nope.x.v1.acme.k",
+          "title": "stream inexistente",
+          "expect": {
+            "outcome": "no_responders"
+          }
+        },
+        {
+          "op": "stream_add",
+          "name": "STATE_SINDIRECT",
+          "subjects": [
+            "state.sindirect.>"
+          ],
+          "state": true,
+          "config": {
+            "allow_direct": false
+          },
+          "expect": {
+            "outcome": "ok",
+            "config.allow_direct": false
+          }
+        },
+        {
+          "op": "js_publish",
+          "subject": "state.sindirect.x.v1.acme.k",
+          "data": "{\"v\":1}",
+          "expect": {
+            "outcome": "ok"
+          }
+        },
+        {
+          "op": "direct_get",
+          "stream": "STATE_SINDIRECT",
+          "subject": "state.sindirect.x.v1.acme.k",
+          "title": "stream SIN allow_direct: se ve igual que uno inexistente",
+          "expect": {
+            "outcome": "no_responders"
+          }
+        }
+      ]
+    },
+    {
+      "id": "conditional-write",
+      "title": "Nats-Expected-Last-Subject-Sequence: crear con 0, rechazar una S vieja, y el chequeo va ANTES que el de duplicados",
+      "spec": "10-state.md §3.2",
+      "covers": [
+        "A-33",
+        "A-11"
+      ],
+      "rationale": "Es el corazón de `put`. (1) `0` significa «la clave no existe»: dos escritores concurrentes sobre una clave nueva no se pisan. (2) Una S vieja se rechaza con 10071 y el número de la secuencia real. (3) El chequeo de secuencia se evalúa ANTES que el de duplicados: reenviar el mismo Nats-Msg-Id con la S vieja da el error, no `duplicate`, así que `duplicate_window` no protege a `put` y hace falta el paso 1b (reconocer la propia escritura por el id). (4) Un publish rechazado por secuencia NO gasta el Nats-Msg-Id: reintentarlo con la S corregida se aplica. (5) Control: sin la cabecera de secuencia, el mismo id SÍ cae como duplicado — la ventana funciona, simplemente no interviene en las escrituras de estado.",
+      "observed": {
+        "server": "nats-server 2.14.5",
+        "date": "2026-11-26",
+        "result": "expected=0 sobre clave nueva: ok. Sobre clave existente: err 10071 «wrong last sequence: N» (N = la secuencia real). S desfasada: 10071. Reenvío del mismo Nats-Msg-Id con la S vieja: 10071, no duplicate. Un publish rechazado y reintentado con el mismo id y la S correcta: ok, duplicate false. Sin cabecera de secuencia, el mismo id: ok con duplicate true."
+      },
+      "counterExample": {
+        "what": "Un `put` que solo publica, sin Nats-Expected-Last-Subject-Sequence",
+        "effect": "Dos instancias del dueño, o una lenta, pisan un valor nuevo con uno viejo: gana la última escritura en llegar al broker, no la de versión más alta, y un observador nuevo recibe el valor viejo como la verdad."
+      },
+      "steps": [
+        {
+          "op": "stream_add",
+          "name": "STATE_CLIENTES",
+          "subjects": [
+            "state.clientes.>"
+          ],
+          "state": true,
+          "expect": {
+            "outcome": "ok"
+          }
+        },
+        {
+          "op": "js_publish",
+          "subject": "state.clientes.cliente.v1.acme.k",
+          "data": "{\"v\":1}",
+          "msgId": "a1",
+          "expectedLastSubjectSeq": 0,
+          "title": "crear con expected=0",
+          "expect": {
+            "outcome": "ok",
+            "duplicate": false
+          },
+          "save": {
+            "seq": "sA"
+          }
+        },
+        {
+          "op": "js_publish",
+          "subject": "state.clientes.cliente.v1.acme.k",
+          "data": "{\"v\":2}",
+          "msgId": "a2",
+          "expectedLastSubjectSeq": 0,
+          "title": "crear con expected=0 una clave que YA existe",
+          "expect": {
+            "outcome": "error",
+            "errCode": 10071,
+            "text": {
+              "match": "^wrong last sequence: [0-9]+$"
+            }
+          }
+        },
+        {
+          "op": "js_publish",
+          "subject": "state.clientes.cliente.v1.acme.k",
+          "data": "{\"v\":2}",
+          "msgId": "a3",
+          "expectedLastSubjectSeq": {
+            "ref": "sA",
+            "plus": -1
+          },
+          "title": "S desfasada",
+          "expect": {
+            "outcome": "error",
+            "errCode": 10071
+          }
+        },
+        {
+          "op": "js_publish",
+          "subject": "state.clientes.cliente.v1.acme.k",
+          "data": "{\"v\":2}",
+          "msgId": "a4",
+          "expectedLastSubjectSeq": {
+            "ref": "sA"
+          },
+          "title": "S correcta",
+          "expect": {
+            "outcome": "ok"
+          },
+          "save": {
+            "seq": "sB"
+          }
+        },
+        {
+          "op": "js_publish",
+          "subject": "state.clientes.cliente.v1.acme.k",
+          "data": "{\"v\":2}",
+          "msgId": "a4",
+          "expectedLastSubjectSeq": {
+            "ref": "sA"
+          },
+          "title": "el MISMO Nats-Msg-Id reenviado con la S vieja",
+          "expect": {
+            "outcome": "error",
+            "errCode": 10071,
+            "duplicate": {
+              "present": false
+            }
+          }
+        },
+        {
+          "op": "js_publish",
+          "subject": "state.clientes.cliente.v1.acme.k",
+          "data": "{\"v\":3}",
+          "msgId": "a5",
+          "expectedLastSubjectSeq": 9999,
+          "title": "rechazado por secuencia",
+          "expect": {
+            "outcome": "error",
+            "errCode": 10071
+          }
+        },
+        {
+          "op": "js_publish",
+          "subject": "state.clientes.cliente.v1.acme.k",
+          "data": "{\"v\":3}",
+          "msgId": "a5",
+          "expectedLastSubjectSeq": {
+            "ref": "sB"
+          },
+          "title": "el MISMO id con la S corregida: el rechazo no lo gastó",
+          "expect": {
+            "outcome": "ok",
+            "duplicate": false
+          }
+        },
+        {
+          "op": "js_publish",
+          "subject": "state.clientes.cliente.v1.acme.k",
+          "data": "{\"v\":3}",
+          "msgId": "a5",
+          "title": "control: el mismo id SIN cabecera de secuencia cae como duplicado",
+          "expect": {
+            "outcome": "ok",
+            "duplicate": true
+          },
+          "control": true
+        }
+      ]
+    },
+    {
+      "id": "tombstone-replaces-and-recreates",
+      "title": "Una lápida sustituye al valor, y la clave se recrea con el chequeo contra la secuencia de la lápida",
+      "spec": "10-state.md §4",
+      "covers": [
+        "A-34",
+        "A-13"
+      ],
+      "rationale": "Si la lápida no sacara el valor anterior del stream, el derecho de supresión no se cumpliría en el broker. Y la decisión de que una clave borrada se pueda recrear depende de que el chequeo condicional funcione contra la lápida: con expected=0 falla (el subject ya tiene mensaje) y con la secuencia de la lápida se aplica.",
+      "observed": {
+        "server": "nats-server 2.14.5",
+        "date": "2026-11-26",
+        "result": "Tras publicar la lápida sobre una clave, el stream sigue con un mensaje por clave (el valor anterior desaparece) y DIRECT.GET devuelve la lápida. Recrear con expected=0: 10071 «wrong last sequence» con la secuencia de la lápida. Recrear con expected = la secuencia de la lápida: ok, y la lápida sale del stream."
+      },
+      "steps": [
+        {
+          "op": "stream_add",
+          "name": "STATE_CLIENTES",
+          "subjects": [
+            "state.clientes.>"
+          ],
+          "state": true,
+          "expect": {
+            "outcome": "ok"
+          }
+        },
+        {
+          "op": "js_publish",
+          "subject": "state.clientes.cliente.v1.acme.cli-1",
+          "data": "{\"v\":1}",
+          "expect": {
+            "outcome": "ok"
+          },
+          "save": {
+            "seq": "s1"
+          }
+        },
+        {
+          "op": "stream_state",
+          "name": "STATE_CLIENTES",
+          "expect": {
+            "messages": 1
+          }
+        },
+        {
+          "op": "js_publish",
+          "subject": "state.clientes.cliente.v1.acme.cli-1",
+          "data": "{\"aggregateVersion\":8}",
+          "expectedLastSubjectSeq": {
+            "ref": "s1"
+          },
+          "title": "la lápida",
+          "expect": {
+            "outcome": "ok"
+          },
+          "save": {
+            "seq": "sT"
+          }
+        },
+        {
+          "op": "stream_state",
+          "name": "STATE_CLIENTES",
+          "title": "el valor anterior SALIÓ del stream",
+          "expect": {
+            "messages": 1
+          }
+        },
+        {
+          "op": "direct_get",
+          "stream": "STATE_CLIENTES",
+          "subject": "state.clientes.cliente.v1.acme.cli-1",
+          "expect": {
+            "outcome": "found",
+            "data": "{\"aggregateVersion\":8}",
+            "seq": {
+              "ref": "sT"
+            }
+          }
+        },
+        {
+          "op": "js_publish",
+          "subject": "state.clientes.cliente.v1.acme.cli-1",
+          "data": "{\"v\":9}",
+          "expectedLastSubjectSeq": 0,
+          "title": "recrear con expected=0",
+          "expect": {
+            "outcome": "error",
+            "errCode": 10071,
+            "text": {
+              "match": "^wrong last sequence: [0-9]+$"
+            }
+          }
+        },
+        {
+          "op": "js_publish",
+          "subject": "state.clientes.cliente.v1.acme.cli-1",
+          "data": "{\"v\":9}",
+          "expectedLastSubjectSeq": {
+            "ref": "sT"
+          },
+          "title": "recrear con la secuencia de la lápida",
+          "expect": {
+            "outcome": "ok"
+          }
+        },
+        {
+          "op": "stream_state",
+          "name": "STATE_CLIENTES",
+          "title": "la lápida salió: sigue habiendo un mensaje",
+          "expect": {
+            "messages": 1
+          }
+        }
+      ]
+    },
+    {
+      "id": "snapshot-last-per-subject",
+      "title": "Un consumidor last_per_subject entrega una foto: el último valor de cada clave, en orden, con `pending` hasta 0",
+      "spec": "10-state.md §5.2, §5.5",
+      "covers": [
+        "A-35",
+        "A-12"
+      ],
+      "rationale": "Es la carga inicial de `watch`. De ella dependen tres reglas: que `num_pending` es el número de CLAVES del filtro (lápidas incluidas), no de mensajes escritos; que las entregas llegan en orden de secuencia con los metadatos `pending` bajando hasta 0 en la última (es la señal de `onSynced`); y que en un stream de un valor por clave `deliver_policy: all` entrega lo mismo (`last_per_subject` es una defensa, no una diferencia).",
+      "observed": {
+        "server": "nats-server 2.14.5",
+        "date": "2026-11-26",
+        "result": "8 escrituras de claves distintas más 1 actualización y 1 lápida dejan 8 mensajes. El consumidor sobre acme.* (5 claves, 1 de ellas la lápida) informa num_pending 5; entrega cli-1, cli-4, cli-5, cli-2 (la actualizada, con su secuencia nueva) y cli-3 (la lápida) con pending 4,3,2,1,0. Con deliver_policy all, el mismo num_pending y las mismas entregas."
+      },
+      "steps": [
+        {
+          "op": "stream_add",
+          "name": "STATE_CLIENTES",
+          "subjects": [
+            "state.clientes.>"
+          ],
+          "state": true,
+          "expect": {
+            "outcome": "ok"
+          }
+        },
+        {
+          "op": "js_publish",
+          "subject": "state.clientes.cliente.v1.acme.cli-1",
+          "data": "{\"k\":1,\"v\":1}"
+        },
+        {
+          "op": "js_publish",
+          "subject": "state.clientes.cliente.v1.acme.cli-2",
+          "data": "{\"k\":2,\"v\":1}"
+        },
+        {
+          "op": "js_publish",
+          "subject": "state.clientes.cliente.v1.acme.cli-3",
+          "data": "{\"k\":3,\"v\":1}"
+        },
+        {
+          "op": "js_publish",
+          "subject": "state.clientes.cliente.v1.acme.cli-4",
+          "data": "{\"k\":4,\"v\":1}"
+        },
+        {
+          "op": "js_publish",
+          "subject": "state.clientes.cliente.v1.acme.cli-5",
+          "data": "{\"k\":5,\"v\":1}"
+        },
+        {
+          "op": "js_publish",
+          "subject": "state.clientes.cliente.v1.globex.cli-1",
+          "data": "{\"k\":1,\"v\":1}"
+        },
+        {
+          "op": "js_publish",
+          "subject": "state.clientes.cliente.v1.globex.cli-2",
+          "data": "{\"k\":2,\"v\":1}"
+        },
+        {
+          "op": "js_publish",
+          "subject": "state.clientes.cliente.v1.globex.cli-3",
+          "data": "{\"k\":3,\"v\":1}"
+        },
+        {
+          "op": "js_publish",
+          "subject": "state.clientes.cliente.v1.acme.cli-2",
+          "data": "{\"k\":2,\"v\":2}",
+          "title": "una actualización: el v1 desaparece"
+        },
+        {
+          "op": "js_publish",
+          "subject": "state.clientes.cliente.v1.acme.cli-3",
+          "data": "{\"tombstone\":true,\"k\":3}",
+          "title": "una lápida"
+        },
+        {
+          "op": "stream_state",
+          "name": "STATE_CLIENTES",
+          "expect": {
+            "messages": 8
+          }
+        },
+        {
+          "op": "consumer_add",
+          "stream": "STATE_CLIENTES",
+          "durable": "b1",
+          "filter": "state.clientes.cliente.v1.acme.*",
+          "deliver": "last_per_subject",
+          "expect": {
+            "outcome": "ok",
+            "numPending": 5,
+            "deliverPolicy": "last_per_subject"
+          }
+        },
+        {
+          "op": "consumer_add",
+          "stream": "STATE_CLIENTES",
+          "durable": "b-all",
+          "filter": "state.clientes.cliente.v1.acme.*",
+          "deliver": "all",
+          "title": "con deliver_policy all",
+          "expect": {
+            "outcome": "ok",
+            "numPending": 5
+          }
+        },
+        {
+          "op": "pull",
+          "stream": "STATE_CLIENTES",
+          "durable": "b1",
+          "expect": {
+            "count": 5,
+            "keys": [
+              "cli-1",
+              "cli-4",
+              "cli-5",
+              "cli-2",
+              "cli-3"
+            ],
+            "pendings": [
+              4,
+              3,
+              2,
+              1,
+              0
+            ],
+            "lastPending": 0,
+            "firstPendingZeroIndex": 4,
+            "bodies.3": "{\"k\":2,\"v\":2}",
+            "bodies.4": "{\"tombstone\":true,\"k\":3}"
+          }
+        },
+        {
+          "op": "consumer_info",
+          "stream": "STATE_CLIENTES",
+          "durable": "b1",
+          "expect": {
+            "numPending": 0,
+            "numAckPending": 0
+          }
+        },
+        {
+          "op": "pull",
+          "stream": "STATE_CLIENTES",
+          "durable": "b-all",
+          "title": "deliver_policy all entrega lo mismo en este stream",
+          "expect": {
+            "keys": [
+              "cli-1",
+              "cli-4",
+              "cli-5",
+              "cli-2",
+              "cli-3"
+            ],
+            "pendings": [
+              4,
+              3,
+              2,
+              1,
+              0
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "id": "snapshot-of-an-empty-stream",
+      "title": "Con el stream vacío, num_pending es 0 y no se entrega nada: `onSynced` no puede esperar a una entrada",
+      "spec": "10-state.md §5.5",
+      "covers": [
+        "A-35"
+      ],
+      "rationale": "Si `onSynced` esperase a recibir una entrada, un servicio que observa un contrato todavía vacío se quedaría «sincronizando» para siempre. El único modo de saber que está sincronizado es preguntar por el consumidor y ver num_pending 0 al abrir.",
+      "observed": {
+        "server": "nats-server 2.14.5",
+        "date": "2026-11-26",
+        "result": "Un consumidor last_per_subject sobre un stream vacío informa num_pending 0 y num_ack_pending 0 nada más crearse; pedir mensajes no entrega ninguno."
+      },
+      "steps": [
+        {
+          "op": "stream_add",
+          "name": "STATE_CLIENTES",
+          "subjects": [
+            "state.clientes.>"
+          ],
+          "state": true,
+          "expect": {
+            "outcome": "ok"
+          }
+        },
+        {
+          "op": "consumer_add",
+          "stream": "STATE_CLIENTES",
+          "durable": "c1",
+          "filter": "state.clientes.cliente.v1.acme.*",
+          "deliver": "last_per_subject",
+          "expect": {
+            "outcome": "ok",
+            "numPending": 0
+          }
+        },
+        {
+          "op": "consumer_info",
+          "stream": "STATE_CLIENTES",
+          "durable": "c1",
+          "expect": {
+            "numPending": 0,
+            "numAckPending": 0
+          }
+        },
+        {
+          "op": "pull",
+          "stream": "STATE_CLIENTES",
+          "durable": "c1",
+          "expect": {
+            "count": 0,
+            "lastPending": {
+              "present": false
+            },
+            "firstPendingZeroIndex": -1
+          }
+        }
+      ]
+    },
+    {
+      "id": "writes-during-the-snapshot",
+      "title": "Una clave reescrita mientras se sincroniza aparece UNA vez, con su valor más reciente; una nueva, al final",
+      "spec": "10-state.md §5.5",
+      "covers": [
+        "A-35"
+      ],
+      "rationale": "Define qué garantiza `onSynced` con un dueño que escribe mientras otro sincroniza: la foto se entrega en orden de secuencia, lo reescrito sale con su secuencia nueva (el valor viejo ya no existe) y los `pending` de los metadatos siguen contando atrás hasta 0 sobre lo que se escribió durante la sincronización. Una escritura de OTRO tenant no cuenta para este filtro.",
+      "observed": {
+        "server": "nats-server 2.14.5",
+        "date": "2026-11-26",
+        "result": "4 claves escritas, consumidor creado (num_pending 4), cli-1 reescrita, cli-9 nueva y una escritura de globex: num_pending 5. Se entregan cli-2, cli-3, cli-4, cli-1 (v2, con su secuencia nueva) y cli-9 con pending 4,3,2,1,0."
+      },
+      "steps": [
+        {
+          "op": "stream_add",
+          "name": "STATE_CLIENTES",
+          "subjects": [
+            "state.clientes.>"
+          ],
+          "state": true,
+          "expect": {
+            "outcome": "ok"
+          }
+        },
+        {
+          "op": "js_publish",
+          "subject": "state.clientes.cliente.v1.acme.cli-1",
+          "data": "{\"k\":1,\"v\":1}"
+        },
+        {
+          "op": "js_publish",
+          "subject": "state.clientes.cliente.v1.acme.cli-2",
+          "data": "{\"k\":2,\"v\":1}"
+        },
+        {
+          "op": "js_publish",
+          "subject": "state.clientes.cliente.v1.acme.cli-3",
+          "data": "{\"k\":3,\"v\":1}"
+        },
+        {
+          "op": "js_publish",
+          "subject": "state.clientes.cliente.v1.acme.cli-4",
+          "data": "{\"k\":4,\"v\":1}"
+        },
+        {
+          "op": "consumer_add",
+          "stream": "STATE_CLIENTES",
+          "durable": "d1",
+          "filter": "state.clientes.cliente.v1.acme.*",
+          "deliver": "last_per_subject",
+          "expect": {
+            "outcome": "ok",
+            "numPending": 4
+          }
+        },
+        {
+          "op": "js_publish",
+          "subject": "state.clientes.cliente.v1.acme.cli-1",
+          "data": "{\"k\":1,\"v\":2}",
+          "title": "reescribe una clave aún no entregada"
+        },
+        {
+          "op": "js_publish",
+          "subject": "state.clientes.cliente.v1.acme.cli-9",
+          "data": "{\"k\":9,\"v\":1}",
+          "title": "una clave nueva"
+        },
+        {
+          "op": "js_publish",
+          "subject": "state.clientes.cliente.v1.globex.cli-1",
+          "data": "{\"k\":1,\"v\":1}",
+          "title": "otro tenant: no casa con el filtro"
+        },
+        {
+          "op": "consumer_info",
+          "stream": "STATE_CLIENTES",
+          "durable": "d1",
+          "expect": {
+            "numPending": 5
+          }
+        },
+        {
+          "op": "pull",
+          "stream": "STATE_CLIENTES",
+          "durable": "d1",
+          "expect": {
+            "count": 5,
+            "keys": [
+              "cli-2",
+              "cli-3",
+              "cli-4",
+              "cli-1",
+              "cli-9"
+            ],
+            "pendings": [
+              4,
+              3,
+              2,
+              1,
+              0
+            ],
+            "bodies.3": "{\"k\":1,\"v\":2}"
+          }
+        }
+      ]
+    },
+    {
+      "id": "replaced-message-is-not-redelivered",
+      "title": "Un valor reemplazado mientras estaba en vuelo no se reentrega",
+      "spec": "10-state.md §5.2",
+      "covers": [
+        "A-36"
+      ],
+      "rationale": "Si el broker reentregara la revisión 10 después de que entrase la 20, el handler podría aplicar un valor que ya no existe. Que no ocurra es lo que hace que el estado tenga MÁS defensas que un evento ante la reentrega; lo que queda (dos entradas de la misma clave en vuelo a la vez) lo resuelve WHERE aggregate_version < $n.",
+      "observed": {
+        "server": "nats-server 2.14.5",
+        "date": "2026-11-26",
+        "result": "Se entrega la revisión 1 de una clave y se hace nak; entra la revisión 2, que sustituye a la 1. El siguiente pull entrega solo la 2: la 1 no se reentrega. El consumidor termina con num_pending 0, num_ack_pending 0 y num_redelivered 0."
+      },
+      "steps": [
+        {
+          "op": "stream_add",
+          "name": "STATE_CLIENTES",
+          "subjects": [
+            "state.clientes.>"
+          ],
+          "state": true,
+          "expect": {
+            "outcome": "ok"
+          }
+        },
+        {
+          "op": "js_publish",
+          "subject": "state.clientes.cliente.v1.acme.cli-1",
+          "data": "{\"k\":1,\"v\":1}"
+        },
+        {
+          "op": "consumer_add",
+          "stream": "STATE_CLIENTES",
+          "durable": "f1",
+          "filter": "state.clientes.cliente.v1.acme.*",
+          "deliver": "all",
+          "expect": {
+            "outcome": "ok"
+          }
+        },
+        {
+          "op": "pull",
+          "stream": "STATE_CLIENTES",
+          "durable": "f1",
+          "max": 1,
+          "then": "nak",
+          "title": "se entrega la v1 y se hace nak",
+          "expect": {
+            "count": 1,
+            "bodies": [
+              "{\"k\":1,\"v\":1}"
+            ]
+          }
+        },
+        {
+          "op": "js_publish",
+          "subject": "state.clientes.cliente.v1.acme.cli-1",
+          "data": "{\"k\":1,\"v\":2}",
+          "title": "entra la v2: sustituye a la v1",
+          "expect": {
+            "outcome": "ok"
+          }
+        },
+        {
+          "op": "pull",
+          "stream": "STATE_CLIENTES",
+          "durable": "f1",
+          "title": "solo llega la v2",
+          "expect": {
+            "count": 1,
+            "bodies": [
+              "{\"k\":1,\"v\":2}"
+            ],
+            "seqs": [
+              2
+            ]
+          }
+        },
+        {
+          "op": "consumer_info",
+          "stream": "STATE_CLIENTES",
+          "durable": "f1",
+          "expect": {
+            "numPending": 0,
+            "numAckPending": 0,
+            "numRedelivered": 0
+          }
+        }
+      ]
+    },
+    {
+      "id": "resync-by-recreating-the-durable",
+      "title": "Borrar y recrear el durable entrega de nuevo todo el estado (`flux state resync`)",
+      "spec": "10-state.md §5.2, §6",
+      "covers": [
+        "A-37"
+      ],
+      "rationale": "Es la recuperación de la DLQ de estado, que no se reproduce: en vez de republicar valores viejos, se vuelve a entregar el actual de cada clave. Un servicio no puede hacerlo (no tiene CONSUMER.DELETE), así que es una operación de operación; el caso fija que funciona.",
+      "observed": {
+        "server": "nats-server 2.14.5",
+        "date": "2026-11-26",
+        "result": "Un durable que ha consumido las 3 claves informa num_pending 0. Tras borrarlo y recrearlo, num_pending es 3 y vuelven a entregarse las 3."
+      },
+      "steps": [
+        {
+          "op": "stream_add",
+          "name": "STATE_CLIENTES",
+          "subjects": [
+            "state.clientes.>"
+          ],
+          "state": true,
+          "expect": {
+            "outcome": "ok"
+          }
+        },
+        {
+          "op": "js_publish",
+          "subject": "state.clientes.cliente.v1.acme.cli-1",
+          "data": "{\"k\":1,\"v\":1}"
+        },
+        {
+          "op": "js_publish",
+          "subject": "state.clientes.cliente.v1.acme.cli-2",
+          "data": "{\"k\":2,\"v\":1}"
+        },
+        {
+          "op": "js_publish",
+          "subject": "state.clientes.cliente.v1.acme.cli-3",
+          "data": "{\"k\":3,\"v\":1}"
+        },
+        {
+          "op": "consumer_add",
+          "stream": "STATE_CLIENTES",
+          "durable": "e1",
+          "filter": "state.clientes.cliente.v1.acme.*",
+          "deliver": "last_per_subject",
+          "expect": {
+            "outcome": "ok",
+            "numPending": 3
+          }
+        },
+        {
+          "op": "pull",
+          "stream": "STATE_CLIENTES",
+          "durable": "e1",
+          "expect": {
+            "count": 3
+          }
+        },
+        {
+          "op": "consumer_info",
+          "stream": "STATE_CLIENTES",
+          "durable": "e1",
+          "expect": {
+            "numPending": 0
+          }
+        },
+        {
+          "op": "consumer_delete",
+          "stream": "STATE_CLIENTES",
+          "durable": "e1",
+          "expect": {
+            "outcome": "ok"
+          }
+        },
+        {
+          "op": "consumer_add",
+          "stream": "STATE_CLIENTES",
+          "durable": "e1",
+          "filter": "state.clientes.cliente.v1.acme.*",
+          "deliver": "last_per_subject",
+          "title": "recrearlo",
+          "expect": {
+            "outcome": "ok",
+            "numPending": 3
+          }
+        },
+        {
+          "op": "pull",
+          "stream": "STATE_CLIENTES",
+          "durable": "e1",
+          "title": "vuelve a entregar todo",
+          "expect": {
+            "count": 3,
+            "keys": [
+              "cli-1",
+              "cli-2",
+              "cli-3"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "id": "broker-does-not-validate-keys",
+      "title": "El broker acepta como clave `*`, `a.b`, `café` y 2000 caracteres: la validación es del SDK",
+      "spec": "10-state.md §2.3",
+      "covers": [
+        "A-41"
+      ],
+      "rationale": "Una clave sin validar es un subject fantasma: `a.b` son dos tokens, y la entrada queda fuera del filtro de TODOS los observadores sin ningún error. Es la misma familia de trampas que las mayúsculas de 02-naming.md §1.1: el servidor acepta, no avisa y aplica otra cosa. Por eso INVALID_STATE_KEY se lanza ANTES de abrir ninguna petición.",
+      "observed": {
+        "server": "nats-server 2.14.5",
+        "date": "2026-11-26",
+        "result": "Se aceptan por JetStream las claves `*`, `>` dentro de `a>b`, `a.b`, `café` y una de 2000 caracteres. Solo se rechaza la que lleva un espacio (illegal subject). Un consumidor con filtro acme.* cuenta 4 de las 5 aceptadas: `a.b` tiene siete tokens y no casa."
+      },
+      "steps": [
+        {
+          "op": "stream_add",
+          "name": "STATE_CLIENTES",
+          "subjects": [
+            "state.clientes.>"
+          ],
+          "state": true,
+          "expect": {
+            "outcome": "ok"
+          }
+        },
+        {
+          "op": "js_publish",
+          "subject": "state.clientes.cliente.v1.acme.*",
+          "data": "{\"v\":1}",
+          "title": "clave `*`",
+          "expect": {
+            "outcome": "ok"
+          }
+        },
+        {
+          "op": "js_publish",
+          "subject": "state.clientes.cliente.v1.acme.a>b",
+          "data": "{\"v\":1}",
+          "title": "clave `a>b`",
+          "expect": {
+            "outcome": "ok"
+          }
+        },
+        {
+          "op": "js_publish",
+          "subject": "state.clientes.cliente.v1.acme.a.b",
+          "data": "{\"v\":1}",
+          "title": "clave `a.b`: DOS tokens",
+          "expect": {
+            "outcome": "ok"
+          }
+        },
+        {
+          "op": "js_publish",
+          "subject": "state.clientes.cliente.v1.acme.café",
+          "data": "{\"v\":1}",
+          "title": "clave con no-ASCII",
+          "expect": {
+            "outcome": "ok"
+          }
+        },
+        {
+          "op": "js_publish",
+          "subject": "state.clientes.cliente.v1.acme.{repeat:a:2000}",
+          "data": "{\"v\":1}",
+          "title": "clave de 2000 caracteres",
+          "expect": {
+            "outcome": "ok"
+          }
+        },
+        {
+          "op": "js_publish",
+          "subject": "state.clientes.cliente.v1.acme.a b",
+          "data": "{\"v\":1}",
+          "title": "control: un espacio SÍ lo rechaza",
+          "expect": {
+            "outcome": "error",
+            "errCode": "illegal_subject"
+          },
+          "control": true
+        },
+        {
+          "op": "stream_state",
+          "name": "STATE_CLIENTES",
+          "expect": {
+            "numSubjects": 5
+          }
+        },
+        {
+          "op": "consumer_add",
+          "stream": "STATE_CLIENTES",
+          "durable": "k1",
+          "filter": "state.clientes.cliente.v1.acme.*",
+          "deliver": "last_per_subject",
+          "title": "un observador de acme.*",
+          "expect": {
+            "outcome": "ok",
+            "numPending": 4
+          }
+        }
+      ]
+    },
+    {
+      "id": "name-length-limits",
+      "title": "Un nombre de consumidor admite 255 caracteres como máximo: de ahí el límite de 64 del tenant",
+      "spec": "10-state.md §2.4",
+      "covers": [
+        "A-42"
+      ],
+      "rationale": "El durable de un `watch` por tenant lleva el tenant en el nombre. Sin un límite, un tenant de 300 caracteres produciría un error de NATS ajeno a flux al crear el consumidor. Fijar 64 deja margen para el nombre de servicio y el contrato.",
+      "observed": {
+        "server": "nats-server 2.14.5",
+        "date": "2026-11-26",
+        "result": "Un durable de 255 caracteres se acepta; de 256 da «consumer name is too long, maximum allowed is 255» (err 10102). Un stream con nombre de 255 caracteres también se acepta."
+      },
+      "steps": [
+        {
+          "op": "stream_add",
+          "name": "STATE_CLIENTES",
+          "subjects": [
+            "state.clientes.>"
+          ],
+          "state": true,
+          "expect": {
+            "outcome": "ok"
+          }
+        },
+        {
+          "op": "consumer_add",
+          "stream": "STATE_CLIENTES",
+          "durable": "{repeat:y:255}",
+          "deliver": "all",
+          "title": "255 caracteres",
+          "expect": {
+            "outcome": "ok"
+          }
+        },
+        {
+          "op": "consumer_add",
+          "stream": "STATE_CLIENTES",
+          "durable": "{repeat:y:256}",
+          "deliver": "all",
+          "title": "256 caracteres",
+          "expect": {
+            "outcome": "error",
+            "errCode": 10102
+          }
+        }
+      ]
+    },
+    {
+      "id": "reserved-domains-collide-in-the-broker",
+      "title": "Un dominio llamado `state` o `dlq` choca con un stream del protocolo",
+      "spec": "02-naming.md §1.3, 10-state.md §2.7",
+      "covers": [
+        "A-43"
+      ],
+      "rationale": "Justifica la reserva de `dlq`, `state`, `rpc` y `system`: no es estilo, es que el broker no permite dos streams con subjects solapados. O el dominio no se puede crear, o es el estado el que no puede existir. Y el control: `state-clientes` NO está reservado y convive sin problema.",
+      "observed": {
+        "server": "nats-server 2.14.5",
+        "date": "2026-11-26",
+        "result": "Con STATE_CLIENTES (state.clientes.>) creado, EVT_STATE (state.>) da «subjects overlap with an existing stream» (err 10065). Con DLQ_PEDIDOS (dlq.pedidos.>), EVT_DLQ (dlq.>) da lo mismo. EVT_STATE_CLIENTES (state-clientes.>) se crea."
+      },
+      "steps": [
+        {
+          "op": "stream_add",
+          "name": "STATE_CLIENTES",
+          "subjects": [
+            "state.clientes.>"
+          ],
+          "state": true,
+          "expect": {
+            "outcome": "ok"
+          }
+        },
+        {
+          "op": "stream_add",
+          "name": "DLQ_PEDIDOS",
+          "subjects": [
+            "dlq.pedidos.>"
+          ],
+          "expect": {
+            "outcome": "ok"
+          }
+        },
+        {
+          "op": "stream_add",
+          "name": "EVT_STATE",
+          "subjects": [
+            "state.>"
+          ],
+          "title": "dominio `state`",
+          "expect": {
+            "outcome": "error",
+            "errCode": 10065,
+            "text": {
+              "includes": "overlap"
+            }
+          }
+        },
+        {
+          "op": "stream_add",
+          "name": "EVT_DLQ",
+          "subjects": [
+            "dlq.>"
+          ],
+          "title": "dominio `dlq`",
+          "expect": {
+            "outcome": "error",
+            "errCode": 10065
+          }
+        },
+        {
+          "op": "stream_add",
+          "name": "EVT_STATE_CLIENTES",
+          "subjects": [
+            "state-clientes.>"
+          ],
+          "title": "control: `state-clientes` no está reservado",
+          "expect": {
+            "outcome": "ok"
+          },
+          "control": true
+        }
+      ]
+    },
+    {
+      "id": "dlq-stream-can-be-widened",
+      "title": "El stream DLQ de un dominio con estado captura además `dlq.state.<dom>.>`, y ampliarlo no pierde mensajes",
+      "spec": "10-state.md §6, 02-naming.md §3",
+      "covers": [
+        "A-44"
+      ],
+      "rationale": "Hace posible que 1.1 sea aditiva: un dominio que ya tiene DLQ_<DOM> la amplía al adoptar estado, sin recrearla. Y fija que publicar por JetStream a un subject que ningún stream captura FALLA (a diferencia de core, que lo evapora): es la red de seguridad si la DLQ de estado no se ha provisionado.",
+      "observed": {
+        "server": "nats-server 2.14.5",
+        "date": "2026-11-26",
+        "result": "Con DLQ_CLIENTES (dlq.clientes.>) y un mensaje dentro, publicar a dlq.state.clientes.cliente.v1 por JetStream no obtiene respuesta de ningún stream. Tras ampliar los subjects con dlq.state.clientes.>, el stream sigue con su mensaje y captura el nuevo. El DLQ de otro dominio no captura dlq.state.clientes.>."
+      },
+      "steps": [
+        {
+          "op": "stream_add",
+          "name": "DLQ_CLIENTES",
+          "subjects": [
+            "dlq.clientes.>"
+          ],
+          "expect": {
+            "outcome": "ok"
+          }
+        },
+        {
+          "op": "js_publish",
+          "subject": "dlq.clientes.cliente.v1.creado",
+          "data": "{\"x\":1}",
+          "expect": {
+            "outcome": "ok"
+          }
+        },
+        {
+          "op": "js_publish",
+          "subject": "dlq.state.clientes.cliente.v1",
+          "data": "{\"x\":1}",
+          "title": "antes de ampliar: ningún stream lo captura",
+          "expect": {
+            "outcome": "no_responders"
+          }
+        },
+        {
+          "op": "stream_update",
+          "name": "DLQ_CLIENTES",
+          "subjects": [
+            "dlq.clientes.>",
+            "dlq.state.clientes.>"
+          ],
+          "title": "ampliar el stream con datos",
+          "expect": {
+            "outcome": "ok",
+            "subjects": [
+              "dlq.clientes.>",
+              "dlq.state.clientes.>"
+            ]
+          }
+        },
+        {
+          "op": "stream_state",
+          "name": "DLQ_CLIENTES",
+          "title": "no se perdió nada",
+          "expect": {
+            "messages": 1
+          }
+        },
+        {
+          "op": "js_publish",
+          "subject": "dlq.state.clientes.cliente.v1",
+          "data": "{\"x\":2}",
+          "title": "después de ampliar",
+          "expect": {
+            "outcome": "ok",
+            "stream": "DLQ_CLIENTES"
+          }
+        },
+        {
+          "op": "js_publish",
+          "subject": "dlq.state.pedidos.pedido.v1",
+          "data": "{\"x\":2}",
+          "title": "la DLQ de otro dominio no captura el subject de clientes",
+          "expect": {
+            "outcome": "no_responders"
+          }
+        }
+      ]
+    },
+    {
+      "id": "core-publish-bypasses-the-conditional-write",
+      "title": "Un publish de CORE a un subject de estado se almacena sin acuse y sin chequeo de secuencia",
+      "spec": "10-state.md §3.3",
+      "covers": [
+        "A-45"
+      ],
+      "rationale": "Es el atajo que anula la escritura condicional: lo captura el stream y sobrescribe el valor sin comprobar nada, ni versión ni secuencia. Por eso `put` publica siempre por JetStream, y por eso `publish()` rechaza state., rpc. y dlq. (RESERVED_DOMAIN): un evento ahí tampoco pasaría por el chequeo.",
+      "observed": {
+        "server": "nats-server 2.14.5",
+        "date": "2026-11-26",
+        "result": "Tras un publish por JetStream, un publish de core al mismo subject sustituye el valor (el stream sigue con un mensaje y su última secuencia avanza) y no recibe acuse. Una escritura condicional con la S anterior ya falla con 10071."
+      },
+      "steps": [
+        {
+          "op": "stream_add",
+          "name": "STATE_CLIENTES",
+          "subjects": [
+            "state.clientes.>"
+          ],
+          "state": true,
+          "expect": {
+            "outcome": "ok"
+          }
+        },
+        {
+          "op": "js_publish",
+          "subject": "state.clientes.cliente.v1.acme.cli-1",
+          "data": "{\"v\":\"jetstream\"}",
+          "expect": {
+            "outcome": "ok"
+          },
+          "save": {
+            "seq": "s1"
+          }
+        },
+        {
+          "op": "core_publish",
+          "subject": "state.clientes.cliente.v1.acme.cli-1",
+          "data": "{\"v\":\"core\"}",
+          "expect": {
+            "outcome": "sent"
+          }
+        },
+        {
+          "op": "direct_get",
+          "stream": "STATE_CLIENTES",
+          "subject": "state.clientes.cliente.v1.acme.cli-1",
+          "title": "el valor es el de core",
+          "expect": {
+            "outcome": "found",
+            "data": "{\"v\":\"core\"}"
+          }
+        },
+        {
+          "op": "stream_state",
+          "name": "STATE_CLIENTES",
+          "expect": {
+            "messages": 1,
+            "lastSeq": 2
+          }
+        },
+        {
+          "op": "js_publish",
+          "subject": "state.clientes.cliente.v1.acme.cli-1",
+          "data": "{\"v\":\"jetstream-2\"}",
+          "expectedLastSubjectSeq": {
+            "ref": "s1"
+          },
+          "title": "una escritura condicional con la S anterior",
+          "expect": {
+            "outcome": "error",
+            "errCode": 10071
+          }
+        }
+      ]
+    },
+    {
+      "id": "discard-new-per-subject-is-create-only",
+      "title": "Con discard new + discard_new_per_subject el broker rechazaría la segunda escritura: sería «crear si no existe»",
+      "spec": "10-state.md §2.1",
+      "covers": [
+        "A-46"
+      ],
+      "rationale": "Documenta la alternativa descartada para el stream de estado: con `discard: new` el broker rechaza escribir sobre una clave que ya existe (err 10077), que es un create-only, no un estado. Con `discard: old`, que es lo elegido, el mensaje nuevo sustituye al anterior.",
+      "observed": {
+        "server": "nats-server 2.14.5",
+        "date": "2026-11-26",
+        "result": "Con discard new y discard_new_per_subject, la primera escritura en una clave se acepta y la segunda da «maximum messages per subject exceeded» (err 10077)."
+      },
+      "steps": [
+        {
+          "op": "stream_add",
+          "name": "STATE_CREATEONLY",
+          "subjects": [
+            "state.createonly.>"
+          ],
+          "state": true,
+          "config": {
+            "discard": "new",
+            "discard_new_per_subject": true
+          },
+          "expect": {
+            "outcome": "ok",
+            "config.discard": "new"
+          }
+        },
+        {
+          "op": "js_publish",
+          "subject": "state.createonly.x.v1.acme.k",
+          "data": "{\"v\":1}",
+          "expect": {
+            "outcome": "ok"
+          }
+        },
+        {
+          "op": "js_publish",
+          "subject": "state.createonly.x.v1.acme.k",
+          "data": "{\"v\":2}",
+          "title": "la segunda escritura",
+          "expect": {
+            "outcome": "error",
+            "errCode": 10077,
+            "text": {
+              "includes": "maximum messages per subject"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "shared-durable-splits-messages",
+      "title": "Dos clientes del MISMO durable se reparten los mensajes: por eso el durable de estado lleva el tenant",
+      "spec": "10-state.md §5.2, 02-naming.md §4.1",
+      "covers": [
+        "A-47"
+      ],
+      "rationale": "Dos instancias del mismo servicio, una por tenant, con un durable sin sufijo, se quitarían cada una la mitad de los mensajes. Para estado el durable lleva `__<tenant>`. Para EVENTOS (Modelo A) el durable no lleva tenant y el SDK descarta con ack lo que no es de su tenant: el riesgo del plan §7 existe hoy, y este caso fija la parte que es del broker.",
+      "observed": {
+        "server": "nats-server 2.14.5",
+        "date": "2026-11-26",
+        "result": "6 mensajes, dos clientes que piden a la vez del mismo durable: reciben 3 y 3, conjuntos disjuntos; ninguno ve todo."
+      },
+      "steps": [
+        {
+          "op": "stream_add",
+          "name": "EVT_COMPARTIDO",
+          "subjects": [
+            "compartido.>"
+          ],
+          "expect": {
+            "outcome": "ok"
+          }
+        },
+        {
+          "op": "js_publish",
+          "subject": "compartido.pedido.v1.creado",
+          "data": "{\"i\":1}"
+        },
+        {
+          "op": "js_publish",
+          "subject": "compartido.pedido.v1.creado",
+          "data": "{\"i\":2}"
+        },
+        {
+          "op": "js_publish",
+          "subject": "compartido.pedido.v1.creado",
+          "data": "{\"i\":3}"
+        },
+        {
+          "op": "js_publish",
+          "subject": "compartido.pedido.v1.creado",
+          "data": "{\"i\":4}"
+        },
+        {
+          "op": "js_publish",
+          "subject": "compartido.pedido.v1.creado",
+          "data": "{\"i\":5}"
+        },
+        {
+          "op": "js_publish",
+          "subject": "compartido.pedido.v1.creado",
+          "data": "{\"i\":6}"
+        },
+        {
+          "op": "consumer_add",
+          "stream": "EVT_COMPARTIDO",
+          "durable": "svc__compartido_pedido_v1_creado",
+          "filter": "compartido.pedido.v1.creado",
+          "deliver": "all",
+          "expect": {
+            "outcome": "ok"
+          }
+        },
+        {
+          "op": "pull_shared",
+          "stream": "EVT_COMPARTIDO",
+          "durable": "svc__compartido_pedido_v1_creado",
+          "perClient": 3,
+          "expect": {
+            "disjoint": true,
+            "total": 6
+          }
+        }
+      ]
+    },
+    {
+      "id": "consumer-info-distinguishes-missing-stream-and-consumer",
+      "title": "CONSUMER.INFO distingue «el consumidor no existe» (10014) de «el stream no existe» (10059)",
+      "spec": "10-state.md §5.2",
+      "covers": [
+        "A-48"
+      ],
+      "rationale": "Es lo que permite a `watch` dar NOT_PROVISIONED o PERMISSION_DENIED sin STREAM.INFO.STATE_<DOM>, que no se concede a observadores porque lista claves y tenants (A-39). Si CONSUMER.INFO no distinguiera los dos, el SDK necesitaría el permiso peligroso.",
+      "observed": {
+        "server": "nats-server 2.14.5",
+        "date": "2026-11-26",
+        "result": "CONSUMER.INFO de un durable inexistente en un stream existente: 404 err 10014 «consumer not found». Sobre un stream inexistente: 404 err 10059 «stream not found»."
+      },
+      "steps": [
+        {
+          "op": "stream_add",
+          "name": "STATE_CLIENTES",
+          "subjects": [
+            "state.clientes.>"
+          ],
+          "state": true,
+          "expect": {
+            "outcome": "ok"
+          }
+        },
+        {
+          "op": "consumer_info",
+          "stream": "STATE_CLIENTES",
+          "durable": "nadie",
+          "title": "consumidor inexistente, stream existente",
+          "expect": {
+            "outcome": "error",
+            "errCode": 10014
+          }
+        },
+        {
+          "op": "consumer_info",
+          "stream": "STATE_NOEXISTE",
+          "durable": "nadie",
+          "title": "stream inexistente",
+          "expect": {
+            "outcome": "error",
+            "errCode": 10059
+          }
+        },
+        {
+          "op": "api_request",
+          "subject": "$JS.API.CONSUMER.INFO.STATE_NOEXISTE.nadie",
+          "title": "la respuesta cruda de la API",
+          "expect": {
+            "outcome": "answered",
+            "reply.error.err_code": 10059,
+            "reply.error.code": 404
+          }
+        }
+      ]
+    },
+    {
+      "id": "subject-form-direct-get-rejects-a-body",
+      "title": "DIRECT.GET por subject rechaza una petición con cuerpo (408); la forma de cuerpo lee cualquier mensaje",
+      "spec": "10-state.md §5.1, §8",
+      "covers": [
+        "A-38"
+      ],
+      "rationale": "Si la forma por subject honrase un cuerpo `{seq: n}`, un permiso confinado a `…acme.*` leería cualquier mensaje del stream mandando el cuerpo adecuado: la ACL por tenant no confinaría nada. Que el broker lo rechace es lo que permite conceder DIRECT.GET por subject (y solo por subject). La forma de cuerpo, en cambio, lee todo, y por eso no se concede nunca.",
+      "observed": {
+        "server": "nats-server 2.14.5",
+        "date": "2026-11-26",
+        "result": "`$JS.API.DIRECT.GET.<stream>.<subject>` con un cuerpo {seq}, {last_by_subj} o {next_by_subj}: 408 «Bad Request». `$JS.API.DIRECT.GET.<stream>` con {seq: 2} o {last_by_subj}: devuelve el mensaje, de cualquier tenant."
+      },
+      "steps": [
+        {
+          "op": "stream_add",
+          "name": "STATE_CLIENTES",
+          "subjects": [
+            "state.clientes.>"
+          ],
+          "state": true,
+          "expect": {
+            "outcome": "ok"
+          }
+        },
+        {
+          "op": "js_publish",
+          "subject": "state.clientes.cliente.v1.acme.cli-1",
+          "data": "{\"t\":\"acme\"}"
+        },
+        {
+          "op": "js_publish",
+          "subject": "state.clientes.cliente.v1.globex.cli-9",
+          "data": "{\"t\":\"globex\"}"
+        },
+        {
+          "op": "direct_get",
+          "stream": "STATE_CLIENTES",
+          "subject": "state.clientes.cliente.v1.acme.cli-1",
+          "body": {
+            "seq": 2
+          },
+          "title": "forma por subject con {seq} de OTRO tenant",
+          "expect": {
+            "outcome": "bad_request",
+            "status": 408
+          }
+        },
+        {
+          "op": "direct_get",
+          "stream": "STATE_CLIENTES",
+          "subject": "state.clientes.cliente.v1.acme.cli-1",
+          "body": {
+            "last_by_subj": "state.clientes.cliente.v1.globex.cli-9"
+          },
+          "title": "forma por subject con {last_by_subj}",
+          "expect": {
+            "outcome": "bad_request",
+            "status": 408
+          }
+        },
+        {
+          "op": "direct_get",
+          "stream": "STATE_CLIENTES",
+          "subject": "state.clientes.cliente.v1.acme.cli-1",
+          "body": {
+            "next_by_subj": "state.clientes.cliente.v1.*.*",
+            "seq": 1
+          },
+          "title": "forma por subject con {next_by_subj}",
+          "expect": {
+            "outcome": "bad_request",
+            "status": 408
+          }
+        },
+        {
+          "op": "direct_get_body",
+          "stream": "STATE_CLIENTES",
+          "request": {
+            "seq": 2
+          },
+          "title": "control: la forma de CUERPO lee el mensaje de otro tenant",
+          "expect": {
+            "outcome": "found",
+            "subject": "state.clientes.cliente.v1.globex.cli-9",
+            "data": "{\"t\":\"globex\"}"
+          },
+          "control": true
+        },
+        {
+          "op": "direct_get_body",
+          "stream": "STATE_CLIENTES",
+          "request": {
+            "last_by_subj": "state.clientes.cliente.v1.globex.cli-9"
+          },
+          "expect": {
+            "outcome": "found",
+            "subject": "state.clientes.cliente.v1.globex.cli-9"
+          },
+          "control": true
+        }
+      ]
+    },
+    {
+      "id": "single-node-cas-conflict-code",
+      "title": "En un nodo, una carrera de escritores con la misma S da 10071 «wrong last sequence: N»",
+      "spec": "10-state.md §3.2",
+      "covers": [
+        "A-33",
+        "A-49"
+      ],
+      "rationale": "Es la mitad «cómoda» de la trampa: en un solo nodo el conflicto es siempre 10071 con el número. Un SDK que solo reconozca este código pasa todas sus pruebas locales. El caso de cluster (cluster-r3-cas-conflict-code) fija la otra mitad.",
+      "observed": {
+        "server": "nats-server 2.14.5",
+        "date": "2026-11-26",
+        "result": "30 rondas de 8 escritores con la misma S: exactamente 1 aceptado por ronda; los 7 rechazados dan err 10071 con el número de la secuencia real."
+      },
+      "steps": [
+        {
+          "op": "stream_add",
+          "name": "STATE_CLIENTES",
+          "subjects": [
+            "state.clientes.>"
+          ],
+          "state": true,
+          "expect": {
+            "outcome": "ok"
+          }
+        },
+        {
+          "op": "cas_race",
+          "stream": "STATE_CLIENTES",
+          "subject": "state.clientes.cliente.v1.acme.carrera",
+          "writers": 8,
+          "rounds": 15,
+          "expect": {
+            "accepted": 15,
+            "perRound": [
+              1
+            ],
+            "errCodes": [
+              10071
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "id": "stream-info-lists-keys-and-tenants",
+      "title": "STREAM.INFO con subjects_filter lista TODAS las claves y TODOS los tenants del stream",
+      "spec": "10-state.md §8",
+      "covers": [
+        "A-39"
+      ],
+      "rationale": "Es la razón de que STREAM.INFO.STATE_<DOM> no se conceda a observadores: con ese único permiso, un servicio confinado a un tenant conoce los de los demás y todas sus claves. Por eso la clave es un identificador opaco, nunca PII, y por eso `watch` y `get` no lo necesitan.",
+      "observed": {
+        "server": "nats-server 2.14.5",
+        "date": "2026-11-26",
+        "result": "STREAM.INFO con {subjects_filter: «state.>»} devuelve el recuento de cada subject del stream: las claves de acme y de globex, completas."
+      },
+      "steps": [
+        {
+          "op": "stream_add",
+          "name": "STATE_CLIENTES",
+          "subjects": [
+            "state.clientes.>"
+          ],
+          "state": true,
+          "expect": {
+            "outcome": "ok"
+          }
+        },
+        {
+          "op": "js_publish",
+          "subject": "state.clientes.cliente.v1.acme.cli-1",
+          "data": "{\"v\":1}"
+        },
+        {
+          "op": "js_publish",
+          "subject": "state.clientes.cliente.v1.globex.cli-9",
+          "data": "{\"v\":1}"
+        },
+        {
+          "op": "stream_subjects",
+          "name": "STATE_CLIENTES",
+          "filter": "state.>",
+          "expect": {
+            "outcome": "answered",
+            "count": 2,
+            "subjects": [
+              "state.clientes.cliente.v1.acme.cli-1",
+              "state.clientes.cliente.v1.globex.cli-9"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "id": "acl-owner-writes-observer-reads-only-its-tenant",
+      "title": "El dueño escribe y lee su dominio; el observador lee solo su tenant, y ni escribe ni lee el de otro",
+      "spec": "10-state.md §8",
+      "covers": [
+        "A-38",
+        "A-14"
+      ],
+      "acl": "estado",
+      "rationale": "Es el confinamiento por tenant que el subject de 6 tokens hace posible: lo aplica el broker, no el SDK. Cada negativa es una forma de saltárselo que se probó: otro tenant, un comodín en el tenant, un `>`, la forma de cuerpo de DIRECT.GET, STREAM.MSG.GET. El comodín EN LA CLAVE sí pasa, y es correcto: es su tenant. Y lo que el observador SÍ necesita (INFO, pull y ack de SU durable; la DLQ de estado de SU contrato) funciona, y el de otro servicio no.",
+      "observed": {
+        "server": "nats-server 2.14.5",
+        "date": "2026-11-26",
+        "result": "El dueño publica en cualquier tenant de su dominio y lee por DIRECT.GET; no puede publicar en state.pedidos.> ni consultar STREAM.INFO. El observador de acme: no puede publicar estado; lee acme.cli-1; se le deniega globex.cli-1, `v1.*.*`, `state.clientes.>`, la forma de cuerpo y STREAM.MSG.GET; `acme.*` devuelve el último mensaje escrito de acme. CONSUMER.INFO, MSG.NEXT y ACK de su durable funcionan; los del durable de otro servicio, no. Publica en dlq.state.clientes.cliente.v1 y no en v2 ni en dlq.clientes.…"
+      },
+      "steps": [
+        {
+          "op": "stream_add",
+          "name": "STATE_CLIENTES",
+          "subjects": [
+            "state.clientes.>"
+          ],
+          "state": true,
+          "expect": {
+            "outcome": "ok"
+          }
+        },
+        {
+          "op": "stream_add",
+          "name": "DLQ_CLIENTES",
+          "subjects": [
+            "dlq.clientes.>",
+            "dlq.state.clientes.>"
+          ],
+          "expect": {
+            "outcome": "ok"
+          }
+        },
+        {
+          "op": "consumer_add",
+          "stream": "STATE_CLIENTES",
+          "durable": "tienda__state_clientes_cliente_v1__acme",
+          "filter": "state.clientes.cliente.v1.acme.*",
+          "deliver": "last_per_subject",
+          "expect": {
+            "outcome": "ok"
+          }
+        },
+        {
+          "op": "consumer_add",
+          "stream": "STATE_CLIENTES",
+          "durable": "otro__state_clientes_cliente_v1__acme",
+          "filter": "state.clientes.cliente.v1.acme.*",
+          "deliver": "last_per_subject",
+          "expect": {
+            "outcome": "ok"
+          }
+        },
+        {
+          "op": "js_publish",
+          "subject": "state.clientes.cliente.v1.acme.cli-1",
+          "data": "{\"v\":1}",
+          "as": "crm",
+          "msgId": "id-1",
+          "expectedLastSubjectSeq": 0,
+          "title": "dueño: put en acme",
+          "expect": {
+            "outcome": "ok"
+          }
+        },
+        {
+          "op": "js_publish",
+          "subject": "state.clientes.cliente.v1.globex.cli-1",
+          "data": "{\"v\":1}",
+          "as": "crm",
+          "title": "dueño: put en globex (todos los tenants de su dominio)",
+          "expect": {
+            "outcome": "ok"
+          }
+        },
+        {
+          "op": "direct_get",
+          "as": "crm",
+          "stream": "STATE_CLIENTES",
+          "subject": "state.clientes.cliente.v1.acme.cli-1",
+          "title": "dueño: get",
+          "expect": {
+            "outcome": "found"
+          }
+        },
+        {
+          "op": "js_publish",
+          "subject": "state.pedidos.x.v1.acme.k",
+          "data": "{\"v\":1}",
+          "as": "crm",
+          "title": "dueño: publica en un dominio ajeno",
+          "expect": {
+            "outcome": "denied"
+          }
+        },
+        {
+          "op": "api_request",
+          "as": "crm",
+          "subject": "$JS.API.STREAM.INFO.STATE_CLIENTES",
+          "title": "dueño: STREAM.INFO no concedido",
+          "expect": {
+            "outcome": "denied"
+          }
+        },
+        {
+          "op": "js_publish",
+          "subject": "state.clientes.cliente.v1.acme.cli-1",
+          "data": "{\"v\":9}",
+          "as": "tienda",
+          "title": "observador: put (no es dueño)",
+          "expect": {
+            "outcome": "denied"
+          }
+        },
+        {
+          "op": "direct_get",
+          "as": "tienda",
+          "stream": "STATE_CLIENTES",
+          "subject": "state.clientes.cliente.v1.acme.cli-1",
+          "title": "observador: get de SU tenant",
+          "expect": {
+            "outcome": "found",
+            "data": "{\"v\":1}"
+          }
+        },
+        {
+          "op": "direct_get",
+          "as": "tienda",
+          "stream": "STATE_CLIENTES",
+          "subject": "state.clientes.cliente.v1.globex.cli-1",
+          "title": "observador: get del OTRO tenant",
+          "expect": {
+            "outcome": "denied"
+          }
+        },
+        {
+          "op": "direct_get",
+          "as": "tienda",
+          "stream": "STATE_CLIENTES",
+          "subject": "state.clientes.cliente.v1.*.*",
+          "title": "observador: comodín en el tenant",
+          "expect": {
+            "outcome": "denied"
+          }
+        },
+        {
+          "op": "direct_get",
+          "as": "tienda",
+          "stream": "STATE_CLIENTES",
+          "subject": "state.clientes.>",
+          "title": "observador: `>`",
+          "expect": {
+            "outcome": "denied"
+          }
+        },
+        {
+          "op": "direct_get",
+          "as": "tienda",
+          "stream": "STATE_CLIENTES",
+          "subject": "state.clientes.cliente.v1.acme.*",
+          "title": "observador: comodín en la CLAVE (es su tenant)",
+          "expect": {
+            "outcome": "found",
+            "subject": "state.clientes.cliente.v1.acme.cli-1"
+          }
+        },
+        {
+          "op": "direct_get_body",
+          "as": "tienda",
+          "stream": "STATE_CLIENTES",
+          "request": {
+            "seq": 2
+          },
+          "title": "observador: forma de CUERPO",
+          "expect": {
+            "outcome": "denied"
+          }
+        },
+        {
+          "op": "api_request",
+          "as": "tienda",
+          "subject": "$JS.API.STREAM.MSG.GET.STATE_CLIENTES",
+          "body": {
+            "seq": 2
+          },
+          "title": "observador: STREAM.MSG.GET",
+          "expect": {
+            "outcome": "denied"
+          }
+        },
+        {
+          "op": "consumer_info",
+          "as": "tienda",
+          "stream": "STATE_CLIENTES",
+          "durable": "tienda__state_clientes_cliente_v1__acme",
+          "title": "observador: CONSUMER.INFO de SU durable",
+          "expect": {
+            "outcome": "ok",
+            "numPending": 1
+          }
+        },
+        {
+          "op": "consumer_info",
+          "as": "tienda",
+          "stream": "STATE_CLIENTES",
+          "durable": "otro__state_clientes_cliente_v1__acme",
+          "title": "observador: CONSUMER.INFO del durable de OTRO servicio",
+          "expect": {
+            "outcome": "denied"
+          }
+        },
+        {
+          "op": "violations",
+          "as": "tienda",
+          "title": "(la denegación del paso anterior se ve como violación)",
+          "expect": {
+            "count": {
+              "gte": 7
+            }
+          }
+        },
+        {
+          "op": "pull",
+          "as": "tienda",
+          "stream": "STATE_CLIENTES",
+          "durable": "tienda__state_clientes_cliente_v1__acme",
+          "title": "observador: pull + ack de SU durable",
+          "expect": {
+            "count": 1,
+            "keys": [
+              "cli-1"
+            ]
+          }
+        },
+        {
+          "op": "consumer_info",
+          "stream": "STATE_CLIENTES",
+          "durable": "tienda__state_clientes_cliente_v1__acme",
+          "title": "el broker confirma el ack: nada pendiente",
+          "expect": {
+            "numPending": 0,
+            "numAckPending": 0
+          }
+        },
+        {
+          "op": "js_publish",
+          "subject": "dlq.state.clientes.cliente.v1",
+          "data": "{\"dlq\":1}",
+          "as": "tienda",
+          "title": "observador: DLQ de estado de SU contrato",
+          "expect": {
+            "outcome": "ok",
+            "stream": "DLQ_CLIENTES"
+          }
+        },
+        {
+          "op": "js_publish",
+          "subject": "dlq.state.clientes.cliente.v2",
+          "data": "{\"dlq\":1}",
+          "as": "tienda",
+          "title": "observador: DLQ de estado de OTRA versión",
+          "expect": {
+            "outcome": "denied"
+          }
+        },
+        {
+          "op": "js_publish",
+          "subject": "dlq.clientes.cliente.v1.creado",
+          "data": "{\"dlq\":1}",
+          "as": "tienda",
+          "title": "observador: DLQ de eventos que no consume",
+          "expect": {
+            "outcome": "denied"
+          }
+        },
+        {
+          "op": "api_request",
+          "as": "tienda",
+          "subject": "$JS.API.STREAM.INFO.DLQ_CLIENTES",
+          "title": "observador: STREAM.INFO de la DLQ (el SDK la comprueba al abrir)",
+          "expect": {
+            "outcome": "answered",
+            "reply.config.name": "DLQ_CLIENTES"
+          }
+        },
+        {
+          "op": "api_request",
+          "as": "tienda",
+          "subject": "$JS.API.CONSUMER.CREATE.STATE_CLIENTES.tienda__state_clientes_cliente_v1__acme.state.clientes.cliente.v1.acme.*",
+          "body": {
+            "stream_name": "STATE_CLIENTES",
+            "config": {
+              "durable_name": "tienda__state_clientes_cliente_v1__acme"
+            }
+          },
+          "title": "observador: CREATE (solo en modo dev)",
+          "expect": {
+            "outcome": "denied"
+          }
+        }
+      ]
+    },
+    {
+      "id": "acl-stream-info-needs-its-own-permission",
+      "title": "Sin STREAM.INFO.STATE_<DOM> un observador no puede listar claves ni tenants, y el ciclo funciona igual",
+      "spec": "10-state.md §8",
+      "covers": [
+        "A-39"
+      ],
+      "acl": "estado",
+      "rationale": "La alternativa —conceder STREAM.INFO a los observadores, como a los de eventos— filtraría los nombres de todos los tenants y claves a quien está confinado a uno. El caso demuestra las dos mitades: con el permiso la fuga existe; sin él, el observador del caso anterior hace su ciclo completo.",
+      "observed": {
+        "server": "nats-server 2.14.5",
+        "date": "2026-11-26",
+        "result": "Con STREAM.INFO.STATE_CLIENTES concedido, subjects_filter devuelve las claves de acme y de globex. El observador sin ese permiso recibe una violación al intentarlo y, aun así, hace INFO, pull y ack de su durable."
+      },
+      "steps": [
+        {
+          "op": "stream_add",
+          "name": "STATE_CLIENTES",
+          "subjects": [
+            "state.clientes.>"
+          ],
+          "state": true,
+          "expect": {
+            "outcome": "ok"
+          }
+        },
+        {
+          "op": "stream_add",
+          "name": "DLQ_CLIENTES",
+          "subjects": [
+            "dlq.clientes.>",
+            "dlq.state.clientes.>"
+          ],
+          "expect": {
+            "outcome": "ok"
+          }
+        },
+        {
+          "op": "js_publish",
+          "subject": "state.clientes.cliente.v1.acme.cli-1",
+          "data": "{\"v\":1}",
+          "as": "crm",
+          "expect": {
+            "outcome": "ok"
+          }
+        },
+        {
+          "op": "js_publish",
+          "subject": "state.clientes.cliente.v1.globex.cli-7",
+          "data": "{\"v\":1}",
+          "as": "crm",
+          "expect": {
+            "outcome": "ok"
+          }
+        },
+        {
+          "op": "stream_subjects",
+          "as": "tienda-info",
+          "name": "STATE_CLIENTES",
+          "filter": "state.>",
+          "title": "con el permiso: la fuga",
+          "expect": {
+            "outcome": "answered",
+            "subjects": [
+              "state.clientes.cliente.v1.acme.cli-1",
+              "state.clientes.cliente.v1.globex.cli-7"
+            ]
+          }
+        },
+        {
+          "op": "stream_subjects",
+          "as": "tienda",
+          "name": "STATE_CLIENTES",
+          "filter": "state.>",
+          "title": "sin el permiso",
+          "expect": {
+            "outcome": "denied"
+          }
+        },
+        {
+          "op": "consumer_add",
+          "stream": "STATE_CLIENTES",
+          "durable": "tienda__state_clientes_cliente_v1__acme",
+          "filter": "state.clientes.cliente.v1.acme.*",
+          "deliver": "last_per_subject",
+          "expect": {
+            "outcome": "ok"
+          }
+        },
+        {
+          "op": "pull",
+          "as": "tienda",
+          "stream": "STATE_CLIENTES",
+          "durable": "tienda__state_clientes_cliente_v1__acme",
+          "title": "…y el ciclo del observador funciona igual",
+          "expect": {
+            "count": 1,
+            "keys": [
+              "cli-1"
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "id": "acl-consumer-create-filter-cannot-be-widened",
+      "title": "Con CREATE por subject, el filtro del cuerpo no puede ampliar el del subject (ni con filter_subjects)",
+      "spec": "10-state.md §8",
+      "covers": [
+        "A-40",
+        "A-4"
+      ],
+      "acl": "estado",
+      "rationale": "El permiso de CREATE (solo en modo dev) lleva el filtro en el subject, que es lo único que una ACL ve. Si el cuerpo pudiera traer otro, el servicio crearía un consumidor sobre el tenant de otro. Se comprueba también `filter_subjects` (array, 2.10+), que es otra vía, y la ausencia de filtro, por si el servidor lo heredara del subject.",
+      "observed": {
+        "server": "nats-server 2.14.5",
+        "date": "2026-11-26",
+        "result": "CREATE con el filtro de acme en el subject y en el cuerpo: creado. Con un filter_subject de globex en el cuerpo: err 10131 «Consumer create request did not match filtered subject from create subject». Con filter_subjects: err 10137 «consumer with multiple subject filters cannot use subject based API». Sin filtro en el cuerpo: 10131 (no lo hereda)."
+      },
+      "steps": [
+        {
+          "op": "stream_add",
+          "name": "STATE_CLIENTES",
+          "subjects": [
+            "state.clientes.>"
+          ],
+          "state": true,
+          "expect": {
+            "outcome": "ok"
+          }
+        },
+        {
+          "op": "stream_add",
+          "name": "DLQ_CLIENTES",
+          "subjects": [
+            "dlq.clientes.>",
+            "dlq.state.clientes.>"
+          ],
+          "expect": {
+            "outcome": "ok"
+          }
+        },
+        {
+          "op": "api_request",
+          "as": "tienda-dev",
+          "subject": "$JS.API.CONSUMER.CREATE.STATE_CLIENTES.tienda__state_clientes_cliente_v1__acme.state.clientes.cliente.v1.acme.*",
+          "body": {
+            "stream_name": "STATE_CLIENTES",
+            "config": {
+              "durable_name": "tienda__state_clientes_cliente_v1__acme",
+              "ack_policy": "explicit",
+              "deliver_policy": "last_per_subject",
+              "filter_subject": "state.clientes.cliente.v1.acme.*"
+            }
+          },
+          "title": "el mismo filtro en el subject y en el cuerpo",
+          "expect": {
+            "outcome": "answered",
+            "reply.error": {
+              "present": false
+            }
+          }
+        },
+        {
+          "op": "consumer_delete",
+          "stream": "STATE_CLIENTES",
+          "durable": "tienda__state_clientes_cliente_v1__acme"
+        },
+        {
+          "op": "api_request",
+          "as": "tienda-dev",
+          "subject": "$JS.API.CONSUMER.CREATE.STATE_CLIENTES.tienda__state_clientes_cliente_v1__acme.state.clientes.cliente.v1.acme.*",
+          "body": {
+            "stream_name": "STATE_CLIENTES",
+            "config": {
+              "durable_name": "tienda__state_clientes_cliente_v1__acme",
+              "ack_policy": "explicit",
+              "filter_subject": "state.clientes.cliente.v1.globex.*"
+            }
+          },
+          "title": "filter_subject del OTRO tenant en el cuerpo",
+          "expect": {
+            "outcome": "answered",
+            "reply.error.err_code": 10131
+          }
+        },
+        {
+          "op": "api_request",
+          "as": "tienda-dev",
+          "subject": "$JS.API.CONSUMER.CREATE.STATE_CLIENTES.tienda__state_clientes_cliente_v1__acme.state.clientes.cliente.v1.acme.*",
+          "body": {
+            "stream_name": "STATE_CLIENTES",
+            "config": {
+              "durable_name": "tienda__state_clientes_cliente_v1__acme",
+              "ack_policy": "explicit",
+              "filter_subjects": [
+                "state.clientes.cliente.v1.globex.*"
+              ]
+            }
+          },
+          "title": "filter_subjects con el otro tenant",
+          "expect": {
+            "outcome": "answered",
+            "reply.error.err_code": 10137
+          }
+        },
+        {
+          "op": "api_request",
+          "as": "tienda-dev",
+          "subject": "$JS.API.CONSUMER.CREATE.STATE_CLIENTES.tienda__state_clientes_cliente_v1__acme.state.clientes.cliente.v1.acme.*",
+          "body": {
+            "stream_name": "STATE_CLIENTES",
+            "config": {
+              "durable_name": "tienda__state_clientes_cliente_v1__acme",
+              "ack_policy": "explicit",
+              "filter_subjects": [
+                "state.clientes.cliente.v1.acme.*",
+                "state.clientes.cliente.v1.globex.*"
+              ]
+            }
+          },
+          "title": "filter_subjects con los dos",
+          "expect": {
+            "outcome": "answered",
+            "reply.error.err_code": 10137
+          }
+        },
+        {
+          "op": "api_request",
+          "as": "tienda-dev",
+          "subject": "$JS.API.CONSUMER.CREATE.STATE_CLIENTES.tienda__state_clientes_cliente_v1__acme.state.clientes.cliente.v1.acme.*",
+          "body": {
+            "stream_name": "STATE_CLIENTES",
+            "config": {
+              "durable_name": "tienda__state_clientes_cliente_v1__acme",
+              "ack_policy": "explicit"
+            }
+          },
+          "title": "sin filtro en el cuerpo: NO lo hereda",
+          "expect": {
+            "outcome": "answered",
+            "reply.error.err_code": 10131
+          }
+        }
+      ]
+    },
+    {
+      "id": "cluster-r3-cas-conflict-code",
+      "title": "En un cluster de 3 nodos, el stream de estado se crea con R3, y una carrera de escritores da 10164 (sin número), no 10071",
+      "spec": "10-state.md §3.2",
+      "covers": [
+        "A-49",
+        "A-33"
+      ],
+      "topology": "cluster3",
+      "rationale": "Es la mitad que el nodo suelto esconde. Con réplicas, un conflicto detectado al aplicar la entrada devuelve «wrong last sequence» con el código 10164 y SIN número; el 10071 con número solo sale cuando el chequeo se hace antes de proponer. Un SDK que solo reconozca el 10071 pasa sus pruebas contra un nodo, y en producción trata un conflicto corriente como un error desconocido y NO reintenta. También fija que el servidor devuelve la configuración de estado con R3 sin sobrescribirla.",
+      "observed": {
+        "server": "nats-server 2.14.5",
+        "date": "2026-11-26",
+        "result": "Cluster de 3 nodos locales: stream R3 con max_msgs_per_subject 1 y allow_direct true. 30 rondas de 8 escritores con la misma S: 1 aceptado por ronda y 210 de 210 rechazos con err 10164 «wrong last sequence» (sin número). Un reenvío secuencial con la S vieja sigue dando 10071 con número. 400 put reconocidos seguidos de su lectura directa inmediata: 0 lecturas obsoletas (no demuestra que no ocurra con latencia de red real)."
+      },
+      "steps": [
+        {
+          "op": "stream_add",
+          "name": "STATE_CLIENTES",
+          "subjects": [
+            "state.clientes.>"
+          ],
+          "state": true,
+          "config": {
+            "num_replicas": 3
+          },
+          "expect": {
+            "outcome": "ok",
+            "config.num_replicas": 3,
+            "config.max_msgs_per_subject": 1,
+            "config.allow_direct": true
+          }
+        },
+        {
+          "op": "js_publish",
+          "subject": "state.clientes.cliente.v1.acme.k",
+          "data": "{\"v\":1}",
+          "expectedLastSubjectSeq": 0,
+          "expect": {
+            "outcome": "ok"
+          }
+        },
+        {
+          "op": "js_publish",
+          "subject": "state.clientes.cliente.v1.acme.k",
+          "data": "{\"v\":2}",
+          "expectedLastSubjectSeq": 0,
+          "title": "secuencial, sin carrera: 10071 con número",
+          "expect": {
+            "outcome": "error",
+            "errCode": 10071,
+            "text": {
+              "match": "^wrong last sequence: [0-9]+$"
+            }
+          }
+        },
+        {
+          "op": "cas_race",
+          "stream": "STATE_CLIENTES",
+          "subject": "state.clientes.cliente.v1.acme.carrera",
+          "writers": 8,
+          "rounds": 15,
+          "title": "bajo carrera: 10164",
+          "expect": {
+            "accepted": 15,
+            "perRound": [
+              1
+            ],
+            "errCodes": {
+              "includes": 10164
+            }
+          }
+        },
+        {
+          "op": "consumer_add",
+          "stream": "STATE_CLIENTES",
+          "durable": "svc__state_clientes_cliente_v1__acme",
+          "filter": "state.clientes.cliente.v1.acme.*",
+          "deliver": "last_per_subject",
+          "replicas": 3,
+          "title": "un durable last_per_subject sobre R3",
+          "expect": {
+            "outcome": "ok",
+            "deliverPolicy": "last_per_subject",
+            "numReplicas": 3
+          }
+        }
+      ]
+    }
+  ]
+}

@@ -128,12 +128,12 @@ protocolo a v2.
 
 | SDK | Nivel | Tests | Verificado | Capacidades |
 |---|---|---|---|---|
-| [Node / TypeScript](sdk-node/) | **L3** | 105 | ✅ | `signing` `security` |
+| [Node / TypeScript](sdk-node/) | **L3** | 105 | ✅ | `signing` `security` `state` |
 | [Python](sdk-python/) | **L3** | 205 | ✅ | `signing` |
 | [Go](sdk-go/) | **L3** | 162 | ✅ (también con `-race`) | `signing` |
 | [Java](sdk-java/) | **L3** | 144 | ✅ (Maven en el runner) | `signing` |
 | [.NET](sdk-dotnet/) | **L3** | 189 | ✅ | `signing` |
-| [Rust](sdk-rust/) | L2 | 175 | ✅ (incl. 14 contra NATS real) | `signing` `security` |
+| [Rust](sdk-rust/) | L2 | 175 | ✅ (incl. 14 contra NATS real) | `signing` `security` `state` |
 | [PHP](sdk-php/) | **L3** | 304 | ✅ incl. 3 de integración contra NATS real | `signing` |
 | [PHP](sdk-php/) | L2 | 201 | ✅ (transporte no — ver abajo) | `signing` |
 
@@ -154,8 +154,9 @@ aparte, contra un NATS real: **14/14**.
 |---|---|---|
 | `signing` | Firma Ed25519 del evento — [`07-signing.md`](specification/07-signing.md) | No firma ni verifica; sigue siendo conforme |
 | `security` | Inbox privado `_INBOX.<servicio>`, TLS con CA propia, credenciales `.creds`/nkey, `NOT_PROVISIONED`/`PERMISSION_DENIED`, primera conexión que falla rápido y denegaciones visibles — [`06-security.md`](specification/06-security.md) | **No es compatible con la configuración segura**: con el inbox por defecto el broker le deniega su propio inbox y su primera petición falla |
+| `state` | Estado replicado: `put`/`get`/`delete`/`watch` de un valor por clave, con CAS, lápidas y DLQ de estado — [`10-state.md`](specification/10-state.md) | No replica estado; sigue siendo conforme |
 
-Hoy solo Node y Rust declaran `security`. Un SDK no anuncia una capacidad hasta que la ha
+Hoy solo Node y Rust declaran `security` y `state`. Un SDK no anuncia una capacidad hasta que la ha
 ejecutado contra un broker real.
 
 ---

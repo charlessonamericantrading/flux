@@ -114,7 +114,7 @@ export interface ContextoConfig {
   dir: string;
 }
 
-function rangoDePuertos(): [number, number] {
+export function rangoDePuertos(): [number, number] {
   const m = /^(\d+)-(\d+)$/.exec(process.env.FLUX_TEST_PORTS ?? "4400-4449");
   if (!m) throw new Error("FLUX_TEST_PORTS debe ser `desde-hasta`, por ejemplo 4400-4449");
   return [Number(m[1]), Number(m[2])];

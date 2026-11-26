@@ -98,7 +98,18 @@ pub struct SchemaBundle {
     #[serde(default)]
     pub subjects: HashMap<String, String>,
 
-    /// URI (`$id`) → JSON Schema.
+    /// Contrato de **estado** (`clientes.cliente.v1`) → URI del esquema con el MINOR más alto de
+    /// su mayor — 10-state.md §10. Es el índice que `subjects` es para los eventos, y por eso
+    /// el SDK resuelve el `dataschema` de un `put` aquí y no por red.
+    ///
+    /// `#[serde(default)]`: un bundle anterior a la fase 2 no lo tiene, y un servicio que solo usa
+    /// eventos no debe dejar de arrancar por ello.
+    #[serde(default)]
+    pub state: HashMap<String, String>,
+
+    /// URI (`$id`) → JSON Schema. Incluye los de estado y el de la lápida
+    /// (`https://schemas.internal/system/state/eliminado/1.0.0.json`), que **no** está en ningún
+    /// índice porque su URI es constante.
     #[serde(default)]
     pub schemas: HashMap<String, Value>,
 }
@@ -140,6 +151,12 @@ impl SchemaBundle {
     #[must_use]
     pub fn uri_for(&self, subject: &str) -> Option<&str> {
         self.subjects.get(subject).map(String::as_str)
+    }
+
+    /// El `dataschema` exacto de un contrato de estado, si el bundle lo conoce.
+    #[must_use]
+    pub fn state_uri_for(&self, contract: &str) -> Option<&str> {
+        self.state.get(contract).map(String::as_str)
     }
 
     /// Cuántos esquemas trae. Útil para un log de arranque: un bundle vacío es un fallo de
@@ -282,6 +299,27 @@ impl Validator {
     /// y [`FluxError::SchemaNotFound`] si el `dataschema` no está en el bundle. En modo
     /// `warn` ninguna de las dos: se registran y se devuelve `Ok`.
     pub fn validate(&self, event: &Event, subject: &str) -> Result<(), FluxError> {
+        self.run(event, subject, false)
+    }
+
+    /// Como [`Validator::validate`], para una **entrada de estado**: el mensaje de cada error
+    /// cita la **ruta** del campo y la **regla** que incumple, **nunca su valor**.
+    ///
+    /// En un evento el valor es inofensivo; en un estado `data` es dato personal. Un error como
+    /// `"ana@example.com" no cumple el formato` acabaría en logs, en la excepción del llamante
+    /// y, si es al consumir, en `dlqerror` durante 90 días —el derecho de supresión no se
+    /// cumpliría—, así que el mensaje dice `/email incumple «pattern»` — 10-state.md §3.6.
+    ///
+    /// Reporta **todos** los incumplimientos, no el primero, igual que `validate`.
+    ///
+    /// # Errores
+    ///
+    /// Los de [`Validator::validate`].
+    pub(crate) fn validate_state(&self, event: &Event, contract: &str) -> Result<(), FluxError> {
+        self.run(event, &format!("state.{contract}"), true)
+    }
+
+    fn run(&self, event: &Event, subject: &str, redact: bool) -> Result<(), FluxError> {
         let Some(validator) = self.compiled.get(&event.dataschema) else {
             return self.report(FluxError::SchemaNotFound(SchemaNotFoundError {
                 subject: subject.to_string(),
@@ -313,7 +351,11 @@ impl Validator {
             .map(|e| {
                 let path = e.instance_path().to_string();
                 let donde = if path.is_empty() { "(raíz)" } else { &path };
-                format!("{donde} {e}")
+                if redact {
+                    redacted(donde, e.kind())
+                } else {
+                    format!("{donde} {e}")
+                }
             })
             .collect();
 
@@ -337,6 +379,25 @@ impl Validator {
             log(LogLevel::Warn, &format!("[flux] {error}"));
         }
         Ok(())
+    }
+}
+
+/// El mensaje de un incumplimiento **sin el valor que lo causó**: ruta y regla.
+///
+/// `required` es la excepción razonable: nombra la propiedad que falta, que sale del *esquema*
+/// y no del dato. `additionalProperties` y `unevaluatedProperties` NO nombran las sobrantes:
+/// esas sí salen del dato.
+fn redacted(donde: &str, kind: &jsonschema::error::ValidationErrorKind) -> String {
+    use jsonschema::error::ValidationErrorKind as K;
+    match kind {
+        K::Required { property } => {
+            let nombre = property.as_str().unwrap_or("?");
+            format!("{donde} no tiene la propiedad obligatoria `{nombre}`")
+        }
+        K::AdditionalProperties { .. } | K::UnevaluatedProperties { .. } => {
+            format!("{donde} lleva propiedades que el esquema no declara")
+        }
+        otro => format!("{donde} incumple la regla `{}`", otro.keyword()),
     }
 }
 
@@ -592,6 +653,7 @@ mod tests {
     fn un_ref_remoto_no_se_resuelve_por_red() {
         let bundle = SchemaBundle {
             subjects: HashMap::new(),
+            state: HashMap::new(),
             schemas: HashMap::from([(
                 "https://schemas.internal/x/1.0.0.json".to_string(),
                 json!({
@@ -612,6 +674,7 @@ mod tests {
         let uri = "https://schemas.internal/x/1.0.0.json".to_string();
         let bundle = SchemaBundle {
             subjects: HashMap::from([(SUBJECT.to_string(), uri.clone())]),
+            state: HashMap::new(),
             schemas: HashMap::from([(
                 uri.clone(),
                 json!({
@@ -630,5 +693,98 @@ mod tests {
         e.dataschema = uri;
         let err = v.validate(&e, SUBJECT).unwrap_err();
         assert!(matches!(err, FluxError::SchemaValidation(_)), "{err:?}");
+    }
+
+    // ── estado — 10-state.md §3.6, §10 ───────────────────────────────────────
+
+    const CONTRATO: &str = "clientes.cliente.v1";
+
+    /// El bundle real indexa los contratos de estado, y la lápida va en `schemas` pero **no**
+    /// en el índice: su URI es constante.
+    #[test]
+    fn el_bundle_indexa_el_contrato_de_estado_y_trae_la_lapida() {
+        let b = bundle();
+        let uri = b.state_uri_for(CONTRATO).expect("índice `state`");
+        assert_eq!(
+            uri,
+            "https://schemas.internal/state/clientes/cliente/1.0.0.json"
+        );
+        assert!(b.schemas.contains_key(uri));
+        assert!(b
+            .schemas
+            .contains_key("https://schemas.internal/system/state/eliminado/1.0.0.json"));
+        assert!(!b.state.values().any(|u| u.contains("/system/")));
+        assert_eq!(b.state_uri_for("clientes.nadie.v1"), None);
+    }
+
+    fn evento_de_estado(data: &Value) -> Event {
+        let mut e = evento(data);
+        e.dataschema = bundle().state_uri_for(CONTRATO).unwrap().to_string();
+        e
+    }
+
+    /// **El mensaje no copia valores.** Un `email` mal formado es dato personal: si el error lo
+    /// citara acabaría en logs, en la excepción y en `dlqerror` durante 90 días.
+    #[test]
+    fn el_error_de_estado_cita_la_ruta_y_la_regla_nunca_el_valor() {
+        let secreto = "ana-no-es-un-email";
+        let e = evento_de_estado(&json!({
+            "clienteId": "cli-1", "nombre": "Ana Secreta", "email": secreto, "aggregateVersion": 1
+        }));
+        let err = strict().validate_state(&e, CONTRATO).unwrap_err();
+        let texto = format!("{err}");
+        assert!(
+            texto.contains("/email incumple la regla `pattern`"),
+            "{texto}"
+        );
+        for valor in [secreto, "Ana Secreta"] {
+            assert!(
+                !texto.contains(valor),
+                "el mensaje filtra un valor: {texto}"
+            );
+        }
+        assert_eq!(err.code(), Some("INVALID_SCHEMA"));
+
+        // Y el de un evento, que no es estado, sí cita el valor: es la diferencia que se defiende.
+        let normal = strict().validate(&e, CONTRATO).unwrap_err().to_string();
+        assert!(normal.contains(secreto), "{normal}");
+    }
+
+    /// Reporta **todos** los incumplimientos, no solo el primero, y `required` nombra la
+    /// propiedad que falta (sale del esquema, no del dato).
+    #[test]
+    fn el_error_de_estado_lista_todos_los_incumplimientos() {
+        let e =
+            evento_de_estado(&json!({ "clienteId": "cli-1", "aggregateVersion": 1, "pais": "es" }));
+        let err = strict().validate_state(&e, CONTRATO).unwrap_err();
+        let texto = format!("{err}");
+        assert!(texto.contains("`nombre`"), "{texto}");
+        assert!(texto.contains("`email`"), "{texto}");
+        assert!(
+            texto.contains("/pais incumple la regla `pattern`"),
+            "{texto}"
+        );
+        assert!(!texto.contains("\"es\""), "{texto}");
+    }
+
+    /// Un dato válido pasa, y la lápida valida contra su esquema fijo.
+    #[test]
+    fn un_estado_valido_y_su_lapida_pasan() {
+        let e = evento_de_estado(&json!({
+            "clienteId": "cli-1", "nombre": "Ana", "email": "ana@example.com", "aggregateVersion": 7
+        }));
+        strict().validate_state(&e, CONTRATO).expect("válido");
+
+        let mut lapida = evento(&json!({ "aggregateVersion": 8 }));
+        lapida.dataschema =
+            "https://schemas.internal/system/state/eliminado/1.0.0.json".to_string();
+        strict()
+            .validate_state(&lapida, CONTRATO)
+            .expect("lápida válida");
+
+        let mut rota = evento(&json!({ "aggregateVersion": 0, "dato": "x" }));
+        rota.dataschema = lapida.dataschema.clone();
+        let err = strict().validate_state(&rota, CONTRATO).unwrap_err();
+        assert_eq!(err.code(), Some("INVALID_SCHEMA"), "{err}");
     }
 }

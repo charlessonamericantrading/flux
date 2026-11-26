@@ -73,12 +73,15 @@ export {
   dlqSubject,
   isDlqSubject,
   sourceUri,
+  RESERVED_DOMAINS,
+  assertNotReservedDomain,
 } from "./protocol.js";
 export type { ParsedSubject } from "./protocol.js";
 
 export {
   createValidator,
   schemaUriFor,
+  stateSchemaUriFor,
   SchemaValidationError,
   SchemaNotFoundError,
 } from "./validation.js";
@@ -98,7 +101,79 @@ export type {
   PublishOutcome,
   ConsumeOutcome,
   ConnectionState,
+  StateWriteOutcome,
 } from "./metrics.js";
 
 export { currentContext } from "./context.js";
 export type { EventContext } from "./context.js";
+
+// ─── Estado replicado — la capacidad `state` (specification/10-state.md) ─────────────────
+// `bus.state.put | delete | get | watch`; los seis códigos de 04-errors.md §6; y las funciones
+// PURAS y deterministas que construyen los bytes (el arnés cruzado las usa: sin reloj ni UUID).
+
+export {
+  InvalidStateContractError,
+  // funciones puras
+  stateSubject,
+  stateStreamName,
+  stateDurableName,
+  stateFilterSubject,
+  stateDlqSubject,
+  stateType,
+  stateTombstoneType,
+  stateDataschema,
+  parseStateContract,
+  buildStateEvent,
+  buildStateTombstone,
+  toStateDlqEvent,
+  buildStateDlqEvent,
+  buildUnreadableStateDlqEvent,
+  // validación
+  assertStateKey,
+  assertStateTenant,
+  assertStateClassification,
+  aggregateVersionOf,
+  isValidAggregateVersion,
+  isSequenceConflict,
+  // constantes
+  STATE_KEY_PATTERN,
+  STATE_TENANT_PATTERN,
+  STATE_TENANT_MAX_LENGTH,
+  STATE_CONTRACT_PATTERN,
+  STATE_CONFLICT_CODES,
+  STATE_MAX_ATTEMPTS,
+  STATE_SCHEMA_BASE,
+  STATE_CLASSIFICATIONS,
+  STATE_DEFAULT_CLASSIFICATION,
+  AGGREGATE_VERSION_MAX,
+  TOMBSTONE_DATASCHEMA,
+} from "./state.js";
+export type {
+  // Solo como TIPO: su constructor recibe una conexión de NATS, y la API pública no expone ninguno.
+  StateClient,
+  StateEntry,
+  StateEventInput,
+  StateTombstoneInput,
+  StateDlqInfo,
+  StateDlqBuildInput,
+  ParsedStateContract,
+  StatePutOptions,
+  StateDeleteOptions,
+  StateGetOptions,
+  StateWatchOptions,
+  StateWriteResult,
+  StateHandler,
+  StateHandlerContext,
+  StateSubscription,
+} from "./state.js";
+
+export {
+  InvalidTenantForStateError,
+  InvalidStateKeyError,
+  MissingAggregateVersionError,
+  StateSubjectMismatchError,
+  StateConflictError,
+  ReservedDomainError,
+  InvalidDataClassificationError,
+  RestrictedStateEntryError,
+} from "./state-errors.js";

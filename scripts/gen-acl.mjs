@@ -40,8 +40,11 @@
  *                cuatro con --dev, que añade CREATE), más `dlq.<subject>`.
  *   · subscribe: solo su inbox privado `_INBOX.<servicio>.>`. Ningún subject de dominio:
  *                los SDKs consumen por pull, y lo que confina es `$JS.API`.
- *   · nunca:     `CONSUMER.DURABLE.CREATE.*`, `STREAM.MSG.GET.*`, ni crear, modificar,
- *                borrar o purgar streams. Se deniegan por omisión.
+ *   · estado:    el dueño, `state.<dom>.>` y DIRECT.GET de su dominio; el observador, los
+ *                permisos de su durable de estado y DIRECT.GET con el tenant fijado. Ninguno
+ *                recibe `STREAM.INFO.STATE_<DOM>` (lista claves y tenants: A-39).
+ *   · nunca:     `CONSUMER.DURABLE.CREATE.*`, `STREAM.MSG.GET.*`, la forma de cuerpo de
+ *                DIRECT.GET, ni crear, modificar, borrar o purgar streams. Se deniegan por omisión.
  *   · CONSUMER.CREATE no se concede por defecto: en producción los durables los crea
  *                `flux provision`. Un durable borrado lo recrearía el propio servicio con
  *                deliver_policy `all`, reentregando hasta 30 días de eventos sin que nadie lo
@@ -61,9 +64,28 @@
  *       { "name": "pedidos-api",     "owns": ["pedidos"],
  *         "consumes": ["inventario.stock.v1.>"] },
  *       { "name": "facturacion-api", "owns": ["facturacion"],
- *         "consumes": ["pedidos.pedido.v1.creado"] }
+ *         "consumes": ["pedidos.pedido.v1.creado"] },
+ *       { "name": "crm-api",         "owns": ["clientes"] },
+ *       { "name": "tienda-web",      "watches": [
+ *           { "contract": "clientes.cliente.v1", "tenants": ["acme"] } ] },
+ *       { "name": "informes-api",    "watches": ["clientes.cliente.v1"] }
  *     ]
  *   }
+ *
+ * Estado replicado (specification/10-state.md; permisos en 06-security.md §3.8):
+ *   · DUEÑO. No hace falta declarar nada más que `owns`: un dominio TIENE estado si el bundle
+ *     tiene algún contrato suyo (`schemas/state/<dominio>/…`), y entonces su dueño recibe
+ *     `state.<dom>.>` y `DIRECT.GET` de su dominio, más los permisos de su durable de DLQ de estado.
+ *   · OBSERVADOR. `watches` es una lista de contratos de estado (`<dominio>.<agregado>.v<major>`,
+ *     sin evento: `clientes.cliente.v1`). Cada entrada es el contrato a secas —observa TODOS los
+ *     tenants— o `{ "contract": …, "tenants": ["acme"] }`, que CONFINA al servicio a esos tenants:
+ *     el filtro de su durable y su DIRECT.GET llevan el tenant, y el que lo aplica es el broker.
+ *     `tenants` nunca puede ser una lista vacía (sería «ninguno» escrito como «todos»).
+ *   · Un servicio no observa su propio dominio, y el estado NO va en `consumes`.
+ *   · Una clave desconocida en un servicio (`watch` por `watches`) es un error: una errata no puede
+ *     ser «un servicio sin permisos».
+ *   · Los dominios `dlq`, `state`, `rpc` y `system` no pueden ser de nadie (RESERVED_DOMAIN): el
+ *     «dueño» de `state` recibiría `state.>` y escribiría el estado de todos los dominios.
  */
 
 import { readFile } from "node:fs/promises";
@@ -74,7 +96,7 @@ import {
   DOMAIN_RE,
   NKEY_USER_RE,
   analizarManifiesto,
-  loadBundleSubjects,
+  loadBundle,
   permisosDe,
 } from "./lib/manifest.mjs";
 
@@ -134,15 +156,15 @@ function informar(titulo, problemas) {
 const args = leerArgumentos(process.argv.slice(2));
 const manifiesto = await leerJson(args.manifiesto, "el manifiesto");
 
-let subjectsDelBundle;
+let bundle;
 try {
-  subjectsDelBundle = await loadBundleSubjects(args.bundle);
+  bundle = await loadBundle(args.bundle);
 } catch (e) {
   console.error(`✗ ${e.message}`);
   process.exit(2);
 }
 
-const { problemas, servicios, dueñoDe } = analizarManifiesto(manifiesto, subjectsDelBundle);
+const { problemas, servicios, dueñoDe } = analizarManifiesto(manifiesto, bundle);
 if (problemas.length) informar("en el manifiesto", problemas);
 
 const env = manifiesto.environment ?? "produccion";
@@ -217,9 +239,12 @@ async function cargarClaves(ruta, necesarias) {
 
 if (args.check) {
   const durables = servicios.reduce((n, s) => n + permisosDe(s, { dev: !!args.dev }).durables.length, 0);
+  const conEstado = new Set(servicios.flatMap((s) => s.stateOwns));
+  const observaciones = servicios.reduce((n, s) => n + s.watches.length, 0);
   console.log(
     `✓ manifiesto válido: ${servicios.length} servicio(s), ${dueñoDe.size} dominio(s), ` +
       `${durables} durable(s) a aprovisionar` +
+      (conEstado.size ? `, ${conEstado.size} dominio(s) con estado y ${observaciones} observación(es) de estado` : "") +
       (args.tenants ? `, ${tenants.length} tenant(s)` : "") +
       (claves ? `, ${identidades.length} clave(s) públicas` : ""),
   );
@@ -240,6 +265,8 @@ if (args.json) {
         subscribe: perm.subscribe,
         owns: s.owns,
         consumes: s.subjects,
+        stateOwns: s.stateOwns,
+        watches: s.watches,
         durables: perm.durables,
       });
     }
@@ -270,6 +297,13 @@ function renderUsuario(svc, { id, placeholder, titulo }) {
       l.push(`      #     → ${svc.subjects.join(", ")}`);
     }
   }
+  if (svc.stateOwns.length) l.push(`      #   estado de: ${svc.stateOwns.join(", ")} (escribe state.<dominio>.>)`);
+  if (svc.watches.length) {
+    l.push(
+      `      #   observa estado: ` +
+        svc.watches.map((w) => `${w.contract} (${w.tenants ? `tenant ${w.tenants.join(", ")}` : "todos los tenants"})`).join("; "),
+    );
+  }
   l.push(`      {`);
   l.push(lineaNkey(id, placeholder));
   l.push(`        permissions: {`);
@@ -295,8 +329,11 @@ function cabeceraComun() {
     `#     de sus durables, ni uno más. Los permisos de subject no gobiernan JetStream.`,
     `#   · Inbox PRIVADO por servicio, _INBOX.<servicio>.>. Un _INBOX.> común permite a`,
     `#     cualquiera leer las entregas de otro: las de un pull consumer viajan por el inbox.`,
-    `#   · Nunca se concede CONSUMER.DURABLE.CREATE.*, STREAM.MSG.GET.* ni crear, modificar,`,
-    `#     borrar o purgar streams. Se deniegan por omisión.`,
+    `#   · Nunca se concede CONSUMER.DURABLE.CREATE.*, STREAM.MSG.GET.*, la forma de cuerpo de`,
+    `#     DIRECT.GET, STREAM.INFO.STATE_<DOM> ni crear, modificar, borrar o purgar streams. Se`,
+    `#     deniegan por omisión.`,
+    `#   · Estado (06-security.md §3.8): el dueño escribe state.<dom>.> y lee lo suyo; el observador`,
+    `#     lee con DIRECT.GET por subject CON EL TENANT FIJADO si el manifiesto lo confina.`,
     ...(args.dev
       ? [
           `#   · MODO --dev: se concede además CONSUMER.CREATE de cada durable PROPIO, con su filtro`,

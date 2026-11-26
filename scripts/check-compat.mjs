@@ -8,11 +8,20 @@
  *
  * "Sin (1) y (2) automatizados, el resto de 05-compatibility.md es una sugerencia
  * amable." Esto es (1) y (2).
+ *
+ * Recorre los tres árboles de scripts/schema-rules.mjs: eventos
+ * (`schemas/<dominio>/<agregado>/<evento>/…`), estado (`schemas/state/<dominio>/<agregado>/…`) y
+ * plataforma (`schemas/system/…`). Las reglas de compatibilidad (05-compatibility.md §2) valen igual
+ * en los tres. Un esquema de estado debe además declarar `aggregateVersion` como entero `required`
+ * (≥ 1) y llevar un objeto en la raíz — 10-state.md §3.4, §10 —, y un dominio reservado (`dlq`,
+ * `rpc`, y el propio `state` o `system` como dominio de evento) es un error.
  */
 
 import { readFile, readdir } from "node:fs/promises";
 import { join, dirname, relative } from "node:path";
 import { fileURLToPath } from "node:url";
+
+import { clasifica, nombresDeEstadoValidos, problemasDeEstado, LAPIDA } from "./schema-rules.mjs";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 const SCHEMAS = join(ROOT, "schemas");
@@ -34,27 +43,12 @@ async function walk(dir) {
   return out;
 }
 
-const SEMVER = /^(\d+)\.(\d+)\.(\d+)\.json$/;
-
-/** `schemas/<dominio>/<agregado>/<evento>/<semver>.json` */
+/** La ruta, clasificada por scripts/schema-rules.mjs (evento, estado o plataforma). `null` si no
+ *  sigue ninguna convención. */
 function parsePath(abs) {
   const rel = relative(SCHEMAS, abs).replace(/\\/g, "/");
-  const parts = rel.split("/");
-  if (parts.length !== 4) return null;
-  const [domain, aggregate, event, file] = parts;
-  const m = SEMVER.exec(file);
-  if (!m) return null;
-  return {
-    rel,
-    domain,
-    aggregate,
-    event,
-    major: +m[1],
-    minor: +m[2],
-    patch: +m[3],
-    expectedId: `https://schemas.internal/${rel}`,
-    key: `${domain}/${aggregate}/${event}/${m[1]}`,
-  };
+  const meta = clasifica(rel);
+  return meta.tipo === "fuera" ? null : meta;
 }
 
 // ─── Comparación de compatibilidad ───────────────────────────────────────────
@@ -162,7 +156,13 @@ for (const abs of files) {
   const meta = parsePath(abs);
   if (!meta) {
     err(relative(ROOT, abs).replace(/\\/g, "/"), "ruta fuera de convención",
-      "Formato: schemas/<dominio>/<agregado>/<evento>/<major>.<minor>.<patch>.json");
+      "Formato: schemas/<dominio>/<agregado>/<evento>/<major>.<minor>.<patch>.json (evento) o " +
+      "schemas/state/<dominio>/<agregado>/<major>.<minor>.<patch>.json (estado)");
+    continue;
+  }
+  if (meta.tipo === "reservado") {
+    err(meta.rel, meta.motivo,
+      "Un dominio reservado colisiona con un espacio de nombres del protocolo en el broker (subjects overlap, A-43). Nombra el bounded context real");
     continue;
   }
 
@@ -172,6 +172,13 @@ for (const abs of files) {
   } catch (e) {
     err(meta.rel, `JSON inválido: ${e.message}`, null);
     continue;
+  }
+
+  // Un esquema de ESTADO: los nombres van en un subject y `data` lleva la versión (10-state.md §10).
+  if (meta.tipo === "estado") {
+    for (const p of [...nombresDeEstadoValidos(meta), ...problemasDeEstado(schema)]) err(meta.rel, p.msg, p.hint);
+  } else if (meta.rel === LAPIDA.ruta) {
+    for (const p of problemasDeEstado(schema)) err(meta.rel, `la lápida: ${p.msg}`, p.hint);
   }
 
   if (schema.$id !== meta.expectedId) {
@@ -203,6 +210,14 @@ for (const abs of files) {
   const lista = porMajor.get(meta.key) ?? [];
   lista.push({ meta, schema });
   porMajor.set(meta.key, lista);
+}
+
+// Con algún contrato de estado, la lápida es obligatoria: `delete` valida contra su URI fija
+// (10-state.md §4). `bundle-schemas.mjs` lo comprueba también, pero este paso corre antes en CI.
+const hayEstado = [...porMajor.values()].some((l) => l[0].meta.tipo === "estado");
+if (hayEstado && !files.some((f) => relative(SCHEMAS, f).replace(/\\/g, "/") === LAPIDA.ruta)) {
+  err(`schemas/${LAPIDA.ruta}`, "falta el esquema de la lápida",
+    "Hay contratos de estado y `delete` valida contra esta URI fija — 10-state.md §4");
 }
 
 // Compatibilidad entre versiones consecutivas del mismo mayor.
