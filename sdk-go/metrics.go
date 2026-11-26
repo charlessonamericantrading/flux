@@ -34,6 +34,14 @@ const (
 	MetricConnectionState = "flux_connection_state"
 )
 
+// Nombres de las métricas de la capacidad `rpc` (08-observability.md §2.5). No van entre las siete obligatorias: como las de
+// estado, van en su bloque (`protocol.json` → `rpc.metrics`).
+const (
+	MetricRPCClientRequests = "flux_rpc_client_requests_total"
+	MetricRPCServerRequests = "flux_rpc_server_requests_total"
+	MetricRPCDuration       = "flux_rpc_duration_seconds"
+)
+
 // PublishOutcome es el valor de la etiqueta `outcome` al publicar.
 type PublishOutcome string
 
@@ -226,6 +234,22 @@ func (m *InMemoryMetrics) StateWrite(contract, outcome string) {
 	m.inc(MetricStateWrites, []label{{"contract", contract}, {"outcome", outcome}})
 }
 
+// RPCClientRequest implementa RPCMetricsSink: `flux_rpc_client_requests_total{operation, outcome}`. Nunca el tenant, el `id`, el
+// `correlationid` ni quién llama: una serie por cada uno.
+func (m *InMemoryMetrics) RPCClientRequest(operation, outcome string) {
+	m.inc(MetricRPCClientRequests, []label{{"operation", operation}, {"outcome", outcome}})
+}
+
+// RPCServerRequest implementa RPCMetricsSink: `flux_rpc_server_requests_total{operation, outcome}`.
+func (m *InMemoryMetrics) RPCServerRequest(operation, outcome string) {
+	m.inc(MetricRPCServerRequests, []label{{"operation", operation}, {"outcome", outcome}})
+}
+
+// RPCDuration implementa RPCMetricsSink: `flux_rpc_duration_seconds{operation, role}`, con `role` = `client` o `server`.
+func (m *InMemoryMetrics) RPCDuration(operation, role string, seconds float64) {
+	m.observe(MetricRPCDuration, []label{{"operation", operation}, {"role", role}}, seconds)
+}
+
 // EventPublished implementa MetricsSink.
 func (m *InMemoryMetrics) EventPublished(subject string, outcome PublishOutcome) {
 	m.inc(MetricEventsPublished, []label{{"subject", subject}, {"outcome", string(outcome)}})
@@ -298,21 +322,27 @@ func (m *InMemoryMetrics) Render() string {
 	}
 	familia("counter", []string{
 		MetricEventsPublished, MetricEventsConsumed, MetricEventsDLQ, MetricEventsRetried, MetricStateWrites,
+		MetricRPCClientRequests, MetricRPCServerRequests,
 	}, counters)
 	familia("gauge", []string{MetricConsumerPending, MetricConnectionState}, gauges)
 
-	if len(histos) > 0 {
-		out = append(out, "# TYPE "+MetricHandlerDuration+" histogram")
+	for _, name := range []string{MetricHandlerDuration, MetricRPCDuration} {
 		keys := make([]string, 0, len(histos))
 		for k := range histos {
-			keys = append(keys, k)
+			if k == name || strings.HasPrefix(k, name+"{") {
+				keys = append(keys, k)
+			}
 		}
+		if len(keys) == 0 {
+			continue
+		}
+		out = append(out, "# TYPE "+name+" histogram")
 		sort.Strings(keys)
 		buckets := DurationBuckets()
 		for _, k := range keys {
 			h := histos[k]
-			labels := strings.TrimSuffix(strings.TrimPrefix(k, MetricHandlerDuration+"{"), "}")
-			if labels == MetricHandlerDuration { // sin etiquetas: TrimPrefix no cortó nada
+			labels := strings.TrimSuffix(strings.TrimPrefix(k, name+"{"), "}")
+			if labels == name { // sin etiquetas: TrimPrefix no cortó nada
 				labels = ""
 			}
 			sep := ""
@@ -320,17 +350,17 @@ func (m *InMemoryMetrics) Render() string {
 				sep = ","
 			}
 			for i, limit := range buckets {
-				out = append(out, MetricHandlerDuration+`_bucket{`+labels+sep+
+				out = append(out, name+`_bucket{`+labels+sep+
 					`le="`+formatValue(limit)+`"} `+strconv.Itoa(h.buckets[i]))
 			}
-			out = append(out, MetricHandlerDuration+`_bucket{`+labels+sep+`le="+Inf"} `+
+			out = append(out, name+`_bucket{`+labels+sep+`le="+Inf"} `+
 				strconv.Itoa(h.count))
 			suffix := ""
 			if labels != "" {
 				suffix = "{" + labels + "}"
 			}
-			out = append(out, MetricHandlerDuration+"_sum"+suffix+" "+formatValue(h.sum))
-			out = append(out, MetricHandlerDuration+"_count"+suffix+" "+strconv.Itoa(h.count))
+			out = append(out, name+"_sum"+suffix+" "+formatValue(h.sum))
+			out = append(out, name+"_count"+suffix+" "+strconv.Itoa(h.count))
 		}
 	}
 

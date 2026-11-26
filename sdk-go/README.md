@@ -452,6 +452,59 @@ rechazos con 8 escritores sobre una clave); un `DIRECT.GET` de una clave ausente
 error, y el de un stream que no existe da `ErrNoResponders`; y un durable borrado bajo un `Consume` vivo entrega
 `jetstream.ErrConsumerDeleted` y la librería **para ella misma** el consumo en ~1 ms (en Node son 43 s). PLAN.md, A-196 y A-197.
 
+## Petición/respuesta: `Request` y `Respond` — capacidad `rpc`
+
+Una **orden** o un **cálculo** que necesita respuesta ya, a otro servicio ([`11-request-reply.md`](../specification/11-request-reply.md)).
+Core NATS, sin stream ni DLQ: si nadie escucha, quien llama lo sabe en milisegundos. **No** es para publicar un hecho (eso es un evento)
+ni para leer un dato que otro posee (eso es el estado).
+
+```go
+// QUIEN RESPONDE (el dueño del dominio `clientes`): una suscripción al subject EXACTO, con el nombre del servicio como grupo de cola.
+r, err := bus.Respond(ctx, "clientes.cliente.v1.calcular-descuento",
+    func(ctx context.Context, req flux.RPCRequest) (any, error) {
+        entrada, err := flux.UnmarshalRPCData[PeticionDescuento](req)
+        if err != nil { return nil, err }
+        if entrada.ClienteID == "" {
+            return nil, flux.NewPermanentError("falta clienteId", flux.WithCode("CLIENTE_REQUERIDO")) // viaja con su clase y su código
+        }
+        return map[string]any{"descuentoCents": 500, "moneda": "EUR"}, nil // la respuesta es un OBJETO
+    })
+defer r.Stop(ctx) // parada ordenada: deja de escuchar, espera a lo que está en vuelo
+
+// QUIEN LLAMA: UN intento, con un timeout (5 s por defecto, de 1 ms a 25 s).
+data, err := bus.Request(ctx, "clientes.cliente.v1.calcular-descuento",
+    map[string]any{"clienteId": "cli-1", "totalCents": 9990, "moneda": "EUR"},
+    flux.WithRPCTimeout(2*time.Second), flux.WithRPCAggregateID("cli-1"))
+descuento, err := flux.RequestAs[Descuento](ctx, bus, "clientes.cliente.v1.calcular-descuento", peticion) // tipada
+```
+
+| Qué | Cómo lo cumple el SDK de Go |
+|---|---|
+| **El sobre** | Un CloudEvent normal (`type` `com.flux.rpc.<dominio>.<agregado>.<operacion>.request.v<M>`, `dataschema` `…/rpc/…/request/<M>.0.0.json` o el del bundle), **sin cabeceras de NATS**. La respuesta **hereda** `correlationid`, `tenantid` y `subject` de la petición y su `causationid` es el `id` de la petición. Los cuatro ejemplos de §3.5 salen **byte a byte** (668, 703, 677 y 791 bytes). |
+| **Antes de la red** | RESERVED_DOMAIN → INVALID_RPC_CALL (operación, timeout, `data` que no es un objeto, reintentos) → INVALID_DATACLASSIFICATION → L3 → tamaño (RPC_MESSAGE_TOO_LARGE). El primero que falla gana, y **ninguno abre una petición**. |
+| **`no responders`** | RPC_UNAVAILABLE en **milisegundos**, RETRYABLE, también con un `Subscribe` de eventos vivo en la misma conexión: el SDK usa **una sola** suscripción de respuestas por conexión (la de `nats.go`) y no abre una segunda a su propio inbox. |
+| **Permisos** | Un `publish` a una operación no concedida, o una suscripción denegada a su inbox, es **PERMISSION_DENIED** en milisegundos con el subject completo —`nats.go` no entrega la denegación a la petición, que esperaría su timeout—. `Respond` **falla al arrancar** si falta la suscripción del dueño (`rpc.<dominio>.>`); sin `allow_responses` el handler se ejecuta pero no puede contestar: quien llama ve RPC_TIMEOUT y el dueño lo dice **una vez** en su `Logger`. |
+| **Quien llama verifica** | Las cinco comprobaciones de §4.3: ¿es un CloudEvent?, ¿su `type`?, ¿su `causationid`?, ¿`correlationid` y `tenantid`?, ¿el `data` del error cumple su esquema? Si no, **RPC_INVALID_REPLY** (PERMANENT: es un incidente, no un dato). La única excepción es el error de una petición que quien responde no pudo leer. |
+| **Errores del handler** | `NewPermanentError` / `NewRetryableError` viajan con su clase, **su código y su mensaje**; un error que el clasificador reconoce (un 503), con un mensaje **genérico**; cualquier otro, `permanent` `UNKNOWN` «error interno del servicio» —su texto puede llevar `data`—, y su detalle va al `Logger`. `retryAfterMs` es una sugerencia para el primer reintento. Un pánico es una respuesta, no un timeout. |
+| **Reintentos** | `WithRPCRetries(n)`, solo ante RPC_UNAVAILABLE y RPC_TIMEOUT, **con el mismo `id` y los mismos bytes**: quien responde puede reconocer la orden repetida (RPC_TIMEOUT **no** dice que no se ejecutó). Hay que deduplicar por `req.ID`. |
+| **Parada ordenada** | `Responder.Stop` y `Bus.Close` hacen `Drain` **de cada suscripción** —no `nc.Drain()` de la conexión, que pierde las respuestas de lo que está en vuelo—, esperan a los handlers (hasta 25 s) y dejan un margen de 25 ms para la propagación del interés en un cluster. |
+| **Concurrencia** | Cada petición corre en su goroutine, con un **semáforo de 256 handlers** por operación (`WithMaxConcurrent`); el exceso espera en la cola de la suscripción. |
+| **Firma** | Con `Verify: VerifyRequire` a los dos lados: la ida y la vuelta van firmadas, y quien responde rechaza una petición con `time` fuera de ±300 s (**STALE_REQUEST**). |
+| **L3** | La petición se valida **antes de salir** y la respuesta al recibirla (con el índice `rpc` del bundle, sin red); quien responde valida lo que recibe y lo que devuelve. El mensaje cita **ruta y regla, nunca el valor**, y dice de quién es el fallo. |
+| **Tenant** | Opción (`WithRPCTenant`) > el del evento en curso > el de `ConnectOptions` > `system` (a diferencia del estado, una petición no es un dato guardado). **Es del handler autorizar el tenant**: quien responde no filtra por el suyo. |
+
+Los códigos de §7 de [`04-errors.md`](../specification/04-errors.md): `RPC_UNAVAILABLE`, `RPC_TIMEOUT`, `RPC_INVALID_REPLY`,
+`RPC_MESSAGE_TOO_LARGE`, `STALE_REQUEST`, `INVALID_RPC_CALL` (más `RESERVED_DOMAIN`, `INVALID_SCHEMA`, `PERMISSION_DENIED`). Un error que
+manda quien responde es un `*RPCRemoteError`, con **su** clase y **su** código, y se reconoce con `errors.As` como cualquier otro.
+Las métricas `flux_rpc_client_requests_total`, `flux_rpc_server_requests_total` y `flux_rpc_duration_seconds` son una extensión opcional
+de `MetricsSink` (`RPCMetricsSink`), que `InMemoryMetrics` implementa.
+
+### Lo que se midió de `nats.go` para la petición/respuesta
+
+`nc.Request` a un subject denegado da `ErrTimeout`: la denegación llega por el `ErrorHandler` ~1 ms después y por nada más, así que el SDK
+la **compite** con la respuesta. `no responders` llega en 0 ms (la librería lo anuncia en CONNECT sin opción para quitarlo). Con
+`sub.Drain()` las 3 respuestas en vuelo llegan; con `nc.Drain()` se pierden las 3. PLAN.md, A-192, A-193, A-194 y A-198.
+
 ## Métricas
 
 Siete métricas con nombres y etiquetas fijados por el protocolo
@@ -735,6 +788,7 @@ servidor**, no solo sobre la solicitada.
 | `text.go`, `canonical.go` | UTF-8 literal y la forma canónica de `data` (`01-envelope.md §4.1`) |
 | `state.go`, `state_pure.go` | `State()`: `Put`, `Delete`, `Get`, `Watch` (`10-state.md`); la parte pura —subject, contrato, clave, `aggregateVersion`, sobre de estado y de DLQ— es lo que ejerce el arnés cruzado |
 | `validation.go` | también el mensaje de L3 **sin valores** de un estado |
+| `rpc.go`, `rpc_pure.go`, `errors_rpc.go` | `Bus.Request`, `Bus.Respond`, `Responder.Stop` (`11-request-reply.md`); la parte pura —operación, timeout, sobre de la petición, de la respuesta y del error— es lo que ejerce el arnés cruzado |
 | `external_id.go` | `WithExternalKey`: el `id` determinista de un hecho importado (`01-envelope.md §2.6.1`) |
 
 ## Desarrollo

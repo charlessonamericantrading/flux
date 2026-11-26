@@ -345,6 +345,9 @@ type variant struct {
 	DropAllowResponses bool
 	// Dev concede CONSUMER.CREATE (gen-acl.mjs --dev).
 	Dev bool
+	// Subscribe, si no es nil, REEMPLAZA los permisos de suscripción: para quitar el único que tiene un servicio (una lista
+	// vacía no deniega nada, así que se pone otro que no sirve de nada).
+	Subscribe []string
 }
 
 type envOptions struct {
@@ -416,6 +419,9 @@ func startEnv(t *testing.T, opts envOptions) *testEnv {
 		env.Keys[v.Name] = key
 		env.service[v.Name] = v.Base
 		p := *base
+		if v.Subscribe != nil {
+			p.Subscribe = v.Subscribe
+		}
 		if v.DropAllowResponses {
 			p.AllowResponses = nil
 		}

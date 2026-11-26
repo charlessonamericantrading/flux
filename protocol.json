@@ -1183,7 +1183,8 @@
         "capabilities": [
           "signing",
           "security",
-          "state"
+          "state",
+          "rpc"
         ],
         "evidence": {
           "security": [
@@ -1194,6 +1195,10 @@
           "state": [
             "sdk-go/state_integration_test.go",
             "sdk-go/state_test.go"
+          ],
+          "rpc": [
+            "sdk-go/rpc_integration_test.go",
+            "sdk-go/rpc_test.go"
           ]
         }
       },
