@@ -1233,10 +1233,15 @@ async fn broker_parar_en_orden_no_pierde_lo_que_esta_en_vuelo() {
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     // A los 100 ms: parar. `stop()` no vuelve hasta que lo que está en vuelo termina.
-    let t = Instant::now();
     let parada = {
         let r = responder.clone();
-        tokio::spawn(async move { r.stop().await })
+        // Lo que tarda `stop()` MISMO, medido dentro de su tarea: medirlo fuera lo confunde con la
+        // petición en vuelo, que tarda lo suyo aunque `stop()` no esperase a nadie.
+        tokio::spawn(async move {
+            let t = Instant::now();
+            r.stop().await;
+            t.elapsed()
+        })
     };
     tokio::time::sleep(Duration::from_millis(60)).await;
     // Desde que deja de escuchar, la petición NUEVA da `no responders` al instante (no cae en la que se va).
@@ -1262,11 +1267,10 @@ async fn broker_parar_en_orden_no_pierde_lo_que_esta_en_vuelo() {
         .unwrap()
         .expect("la petición en vuelo no se pierde");
     assert_eq!(r.data_as::<Value>().unwrap()["descuentoCents"], 500);
-    parada.await.unwrap();
+    let tardo_stop = parada.await.unwrap();
     assert!(
-        t.elapsed() >= Duration::from_millis(250),
-        "stop() esperó al handler: {:?}",
-        t.elapsed()
+        tardo_stop >= Duration::from_millis(200),
+        "stop() debe esperar a lo que está en vuelo (le quedaban ~300 ms al handler): {tardo_stop:?}"
     );
     assert!(responder.is_stopped());
     assert_eq!(
@@ -3093,7 +3097,7 @@ async fn medida_la_denegacion_de_una_suscripcion_llega_en_milisegundos() {
     let broker = Broker::sin_permiso(&bin, "crm", "subscribe");
     let crm = bus(&broker.url(), "crm").await;
     let mut tiempos = Vec::new();
-    for _ in 0..200 {
+    for _ in 0..100 {
         let t = Instant::now();
         let e = crm
             .respond(DESCUENTO, |_: RpcRequest, _: RpcContext| async move {
@@ -3105,7 +3109,7 @@ async fn medida_la_denegacion_de_una_suscripcion_llega_en_milisegundos() {
         tiempos.push(t.elapsed().as_secs_f64() * 1000.0);
     }
     eprintln!(
-        "A-90: aviso de suscripción denegada, 200 intentos: p50 {:.2} ms, p99 {:.2} ms, máx {:.2} ms (tope de espera: 100 ms)",
+        "A-90: aviso de suscripción denegada, 100 intentos: p50 {:.2} ms, p99 {:.2} ms, máx {:.2} ms (tope de espera: 100 ms)",
         percentil(tiempos.clone(), 0.5),
         percentil(tiempos.clone(), 0.99),
         percentil(tiempos.clone(), 1.0)

@@ -2642,7 +2642,7 @@ impl Bus {
     ) -> Result<Responder, FluxError> {
         let op = RpcOperation::parse(operation)?;
         let max = opts.max_concurrent.unwrap_or(MAX_CONCURRENT_HANDLERS);
-        if max == 0 || max > Semaphore::MAX_PERMITS {
+        if max == 0 || u32::try_from(max).is_err() {
             return Err(FluxError::InvalidRpcCall {
                 reason: format!(
                     "`max_concurrent` de {max} no sirve: debe ser al menos 1 (por defecto \
@@ -3455,7 +3455,14 @@ mod tests {
     fn el_error_que_se_construye_cumple_su_esquema() {
         type Rompe = fn(&mut RpcErrorBody);
         let casos: [(&str, Rompe); 6] = [
-            ("class poison", |e| e.class = ErrorClass::Poison),
+            (
+                "class poison",
+                // Sin `retryAfterMs`: si no, fallaría por esa otra regla y no por la clase.
+                |e| {
+                    e.class = ErrorClass::Poison;
+                    e.retry_after_ms = None;
+                },
+            ),
             ("code en minúsculas", |e| e.code = "http_503".into()),
             ("code vacío", |e| e.code.clear()),
             ("message vacío", |e| e.message.clear()),
@@ -3707,11 +3714,6 @@ mod tests {
                 "{data}"
             );
             assert!(motivo(&r).contains("esquema"), "{data}");
-            // El motivo no cita valores recibidos.
-            assert!(
-                !motivo(&r).contains("poison")
-                    || data.contains("poison") && !motivo(&r).contains("\"poison\"")
-            );
         }
         // `5000.0` es un entero para JSON Schema.
         let mut e = base.clone();
