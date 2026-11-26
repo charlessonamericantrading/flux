@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.internal/system/state/eliminado/1.0.0.json",
+  "title": "system.state.eliminado",
+  "description": "La lápida de una entrada de estado: lo que `state.delete` publica en el subject de la clave, sustituyendo al valor anterior, que sale del stream. Es el `dataschema` FIJO de toda lápida, de cualquier contrato. `data` lleva SOLO la versión: ningún dato que borrar. Va con `type: com.flux.state.<dominio>.<agregado>.deleted.v<major>` y `dataclassification: internal`. La versión existe porque `put` lee la lápida para decidir si una escritura nueva es `stale`; una clave borrada solo se recrea con una versión estrictamente mayor — 10-state.md §4.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["aggregateVersion"],
+  "properties": {
+    "aggregateVersion": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "La versión de la lápida: DEBE superar la del valor que borra. Una lápida con versión menor o igual a la actual es `stale` y no se escribe."
+    }
+  }
+}

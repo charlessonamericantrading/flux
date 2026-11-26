@@ -1,0 +1,41 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.internal/state/clientes/cliente/1.0.0.json",
+  "title": "state clientes.cliente.v1",
+  "description": "El valor ACTUAL de un cliente, publicado por crm-api, dueño del agregado, en el subject `state.clientes.cliente.v1.<tenant>.<clienteId>`. A diferencia de los eventos del dominio —que llevan solo la referencia `clienteId`—, el estado SÍ lleva el dato personal: va clasificado `confidential`, los campos con PII llevan `x-pii`, y se puede borrar con `state.delete`, que lo sustituye por una lápida. Ver 10-state.md.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["clienteId", "nombre", "email", "aggregateVersion"],
+  "properties": {
+    "clienteId": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$",
+      "description": "Identificador del agregado. Coincide con la CLAVE del estado y con el atributo `subject` del CloudEvent: es un identificador opaco, nunca PII."
+    },
+    "aggregateVersion": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Contador monotónico del agregado, el mismo que llevan sus eventos. OBLIGATORIO en todo estado: `put` lo compara con el del valor actual y no escribe una versión que no avanza (resultado `stale`). Sobrevive a los borrados: una clave borrada y recreada continúa desde la versión de su lápida — 10-state.md §3.4, §4."
+    },
+    "nombre": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 200,
+      "x-pii": true,
+      "description": "Nombre completo del cliente. Dato personal: el SDK lo redacta en logs, y desaparece con la lápida."
+    },
+    "email": {
+      "type": "string",
+      "minLength": 3,
+      "maxLength": 254,
+      "pattern": "^[^@\\s]+@[^@\\s]+$",
+      "x-pii": true,
+      "description": "Correo electrónico del cliente. Dato personal: el SDK lo redacta en logs, y desaparece con la lápida."
+    },
+    "pais": {
+      "type": "string",
+      "pattern": "^[A-Z]{2}$",
+      "description": "País de residencia, ISO 3166-1 alfa-2. Opcional."
+    }
+  }
+}

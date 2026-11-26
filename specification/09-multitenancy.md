@@ -78,6 +78,15 @@ formato.
 
 Se documenta porque es la propuesta que surge sola, y merece un "no, y por esto".
 
+> **El estado es otra cosa.** El estado replicado ([10-state.md §2.2](10-state.md)) **sí** lleva
+> el tenant en su subject —`state.<dominio>.<agregado>.v<major>.<tenant>.<clave>`—, y no
+> contradice este rechazo: es otro espacio de nombres, con su propio stream y sus seis tokens,
+> que no toca la regla de 4 tokens de los eventos. Allí el tenant **tiene** que estar en el
+> subject, porque un stream de estado guarda un valor por subject y dos tenants con la misma
+> clave se pisarían; y de paso el broker puede confinar a un observador a su tenant (A-38). Lo
+> que **no** consigue es ocultar los nombres de los tenants y de las claves a quien pueda
+> consultar el stream ([10-state.md §8](10-state.md)).
+
 ## 3. Obligaciones del SDK — Modelo A
 
 Un SDK **DEBE**:

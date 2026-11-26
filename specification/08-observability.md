@@ -19,7 +19,8 @@ mismo, agrupar deja de funcionar en cuanto el ecosistema es polyglot — que es 
 ## 2. Métricas obligatorias
 
 Un SDK L2 **DEBE** exponer estas siete. Nombres en formato Prometheus; un SDK con otro
-backend **DEBE** conservar los nombres y las etiquetas.
+backend **DEBE** conservar los nombres y las etiquetas. Un SDK que declara la capacidad `state`
+([10-state.md](10-state.md)) **DEBE** exponer además la de [§2.4](#24-flux_state_writes_total--la-capacidad-state).
 
 | Métrica | Tipo | Etiquetas |
 |---|---|---|
@@ -119,6 +120,47 @@ entregados** a ese consumidor. No son los entregados y sin confirmar.
   esperando ack. Se ve en `flux_event_handler_duration_seconds`.
 - Un consumidor **muerto** sí: deja de recoger mensajes y `num_pending` sube sin
   techo. Es la señal, y la conexión sigue reportándose sana mientras tanto.
+
+### 2.4 `flux_state_writes_total` — la capacidad `state`
+
+| Métrica | Tipo | Etiquetas |
+|---|---|---|
+| `flux_state_writes_total` | Counter | `contract`, `outcome` |
+
+```
+contract = <dominio>.<agregado>.v<major>      ("clientes.cliente.v1")
+outcome  = ok | stale | conflict | invalid_schema
+```
+
+Cuenta cada `put` y cada `delete` ([10-state.md §3](10-state.md)), sin distinguirlos: una lápida
+es un valor más.
+
+| `outcome` | Cuándo |
+|---|---|
+| `ok` | Se escribió: `applied: true` |
+| `stale` | La versión no avanzaba: `applied: false`, `outcome: "stale"`. **No es un error** |
+| `conflict` | El chequeo de secuencia agotó sus 3 intentos: `STATE_CONFLICT` |
+| `invalid_schema` | `MISSING_AGGREGATE_VERSION`, o `data` no cumple su esquema (L3): `INVALID_SCHEMA` |
+
+**`invalid_schema` se emite también cuando la llamada lanza**, por la misma razón que en
+[§2.1](#21-valores-de-las-etiquetas): una excepción sirve a quien la provoca, y la métrica a quien
+opera el ecosistema. Los demás errores de la llamada —`INVALID_STATE_KEY`,
+`INVALID_TENANT_FOR_STATE`, `RESERVED_DOMAIN`— son errores de programación y **no** se cuentan;
+tampoco un fallo de transporte, que es RETRYABLE y ya lo cuenta la conexión.
+
+**Cardinalidad.** `contract` está acotado —hay tantos como contratos de estado declarados— y sirve
+como etiqueta. **Nunca** la clave ni el tenant: la clave tiene una serie por cada agregado del
+dominio, y el tenant, una por cada cliente de la plataforma. Es la regla de
+§2.2, aplicada a lo único que el estado añade.
+
+**Lo que se reutiliza.** Un `watch` se mide con las métricas de consumo de §2 sin cambiar ninguna:
+
+- `subject` = **`state.<contrato>`** (`state.clientes.cliente.v1`), acotado como cualquier otro;
+- `consumer` = el durable **sin el sufijo de tenant** (`tienda-web__state_clientes_cliente_v1`),
+  aunque el servicio tenga un durable por tenant ([10-state.md §5.2](10-state.md)): con el
+  sufijo, cada tenant nuevo crearía series nuevas;
+- `flux_consumer_pending` es la **suma** de los durables del servicio para ese contrato, no el
+  valor del último sondeado: varios durables con las mismas etiquetas se pisarían entre sí.
 
 ## 3. Histograma de duración
 

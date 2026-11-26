@@ -1,0 +1,1010 @@
+{
+  "suite": "state-semantics",
+  "title": "Estado replicado: el algoritmo de put/delete/get y la foto de watch, sobre NATS crudo",
+  "spec": "specification/10-state.md §3 a §5",
+  "plan": "docs/plan-v1.1/PLAN.md, Fase 2",
+  "runner": "conformance/state-broker.mjs",
+  "verifiedAgainst": "nats-server 2.14.5",
+  "verifiedOn": "2026-11-26",
+  "$comment": "Escenarios del PROTOCOLO, no del broker: los ejecuta conformance/state-broker.mjs con la implementación de REFERENCIA de 10-state.md §3.2 escrita sobre NATS crudo, y los SDKs de Node y Rust DEBEN ejecutar los mismos con su API (`bus.state.put`, `delete`, `get`, `watch`): lo esperado es lo de aquí. Usan el mismo vocabulario que state-broker.json (`state_put`, `state_delete`, `state_get`, `state_watch`, `state_race` y las demás). `outcome` es `ok`, `stale` o `error`; con `error`, `errCode` es el código estable de 04-errors.md §6. `hook`: `beforePublish` hace escribir a un rival entre la lectura y la publicación de un intento; `lostAckOnce` hace que el primer publish se aplique pero quien lo hizo vea un error de secuencia.",
+  "vocabulary": "state-broker.json → vocabulary",
+  "cases": [
+    {
+      "id": "put-and-delete-versions",
+      "title": "put y delete son el mismo algoritmo: una versión que no avanza es `stale`, y una clave borrada se recrea con una versión mayor",
+      "spec": "10-state.md §3.2, §3.4, §4",
+      "covers": [
+        "A-50"
+      ],
+      "rationale": "Es la tabla de verdad de §3.2 y §4 que Node y Rust deben reproducir con su API. Cada fila es una decisión: una versión IGUAL tampoco avanza; la lápida lleva versión y `put` la lee; una clave borrada se recrea solo con una versión estrictamente mayor que la de la lápida (el contador sobrevive al borrado); borrar una clave que nunca existió escribe la lápida; y `get` de una lápida es `null`, igual que de una clave inexistente.",
+      "observed": {
+        "server": "nats-server 2.14.5",
+        "date": "2026-11-26",
+        "result": "Ejecutado con la implementación de referencia sobre NATS crudo: v1 ok, v2 ok, v2 otra vez stale, v1 stale; delete v3 ok, put v3 stale, put v2 stale, put v4 ok (recrea), delete v4 stale, delete v5 ok, delete v5 otra vez stale; delete de una clave inexistente v1 ok y deja una lápida."
+      },
+      "steps": [
+        {
+          "op": "stream_add",
+          "name": "STATE_CLIENTES",
+          "subjects": [
+            "state.clientes.>"
+          ],
+          "state": true,
+          "expect": {
+            "outcome": "ok"
+          }
+        },
+        {
+          "op": "state_put",
+          "contract": "clientes.cliente.v1",
+          "tenant": "acme",
+          "key": "k1",
+          "version": 1,
+          "expect": {
+            "outcome": "ok",
+            "applied": true,
+            "result": "ok"
+          }
+        },
+        {
+          "op": "state_put",
+          "contract": "clientes.cliente.v1",
+          "tenant": "acme",
+          "key": "k1",
+          "version": 2,
+          "expect": {
+            "outcome": "ok",
+            "applied": true
+          }
+        },
+        {
+          "op": "state_put",
+          "contract": "clientes.cliente.v1",
+          "tenant": "acme",
+          "key": "k1",
+          "version": 2,
+          "title": "la misma versión con otro id: no avanza",
+          "expect": {
+            "outcome": "stale",
+            "applied": false,
+            "result": "stale"
+          }
+        },
+        {
+          "op": "state_put",
+          "contract": "clientes.cliente.v1",
+          "tenant": "acme",
+          "key": "k1",
+          "version": 1,
+          "title": "una versión vieja",
+          "expect": {
+            "outcome": "stale",
+            "applied": false
+          }
+        },
+        {
+          "op": "state_get",
+          "contract": "clientes.cliente.v1",
+          "tenant": "acme",
+          "key": "k1",
+          "expect": {
+            "isNull": false,
+            "aggregateVersion": 2,
+            "deleted": false,
+            "entry.tenantId": "acme",
+            "entry.key": "k1"
+          }
+        },
+        {
+          "op": "state_delete",
+          "contract": "clientes.cliente.v1",
+          "tenant": "acme",
+          "key": "k1",
+          "version": 3,
+          "expect": {
+            "outcome": "ok",
+            "applied": true
+          }
+        },
+        {
+          "op": "state_get",
+          "contract": "clientes.cliente.v1",
+          "tenant": "acme",
+          "key": "k1",
+          "title": "get de una lápida",
+          "expect": {
+            "isNull": true,
+            "deleted": true,
+            "aggregateVersion": 3
+          }
+        },
+        {
+          "op": "state_put",
+          "contract": "clientes.cliente.v1",
+          "tenant": "acme",
+          "key": "k1",
+          "version": 3,
+          "title": "put con la versión de la lápida",
+          "expect": {
+            "outcome": "stale"
+          }
+        },
+        {
+          "op": "state_put",
+          "contract": "clientes.cliente.v1",
+          "tenant": "acme",
+          "key": "k1",
+          "version": 2,
+          "title": "put con una versión menor que la de la lápida",
+          "expect": {
+            "outcome": "stale"
+          }
+        },
+        {
+          "op": "state_put",
+          "contract": "clientes.cliente.v1",
+          "tenant": "acme",
+          "key": "k1",
+          "version": 4,
+          "title": "recrear con una versión mayor que la de la lápida",
+          "expect": {
+            "outcome": "ok",
+            "applied": true
+          }
+        },
+        {
+          "op": "state_get",
+          "contract": "clientes.cliente.v1",
+          "tenant": "acme",
+          "key": "k1",
+          "expect": {
+            "isNull": false,
+            "aggregateVersion": 4
+          }
+        },
+        {
+          "op": "state_delete",
+          "contract": "clientes.cliente.v1",
+          "tenant": "acme",
+          "key": "k1",
+          "version": 4,
+          "title": "delete con la versión actual: no avanza",
+          "expect": {
+            "outcome": "stale"
+          }
+        },
+        {
+          "op": "state_delete",
+          "contract": "clientes.cliente.v1",
+          "tenant": "acme",
+          "key": "k1",
+          "version": 5,
+          "expect": {
+            "outcome": "ok"
+          }
+        },
+        {
+          "op": "state_delete",
+          "contract": "clientes.cliente.v1",
+          "tenant": "acme",
+          "key": "k1",
+          "version": 5,
+          "title": "delete repetido",
+          "expect": {
+            "outcome": "stale"
+          }
+        },
+        {
+          "op": "state_delete",
+          "contract": "clientes.cliente.v1",
+          "tenant": "acme",
+          "key": "fantasma",
+          "version": 1,
+          "title": "delete de una clave que NUNCA existió",
+          "expect": {
+            "outcome": "ok",
+            "applied": true
+          }
+        },
+        {
+          "op": "state_get",
+          "contract": "clientes.cliente.v1",
+          "tenant": "acme",
+          "key": "fantasma",
+          "title": "…deja una lápida",
+          "expect": {
+            "isNull": true,
+            "deleted": true
+          }
+        },
+        {
+          "op": "state_get",
+          "contract": "clientes.cliente.v1",
+          "tenant": "acme",
+          "key": "nadie",
+          "title": "get de una clave inexistente",
+          "expect": {
+            "isNull": true
+          }
+        }
+      ]
+    },
+    {
+      "id": "put-validates-before-the-network",
+      "title": "Una clave o una versión inválidas fallan ANTES de abrir ninguna petición",
+      "spec": "10-state.md §2.3, §3.4, §3.6",
+      "covers": [
+        "A-41"
+      ],
+      "rationale": "El broker acepta casi cualquier clave (A-41) y el esquema solo valida con L3: la comprobación es del protocolo y va siempre. Los casos de versión cubren lo que el nombre MISSING_AGGREGATE_VERSION no sugiere: un decimal, el 0 o un valor mayor que 2^53 − 1 también lo son. La clave `cli-1\\n` es la de la trampa de `$` en Python y PHP.",
+      "observed": {
+        "server": "nats-server 2.14.5",
+        "date": "2026-11-26",
+        "result": "La implementación de referencia rechaza la clave con punto, con espacio, con `_` inicial, con un salto de línea final, vacía y de 129 caracteres con INVALID_STATE_KEY; y una versión 0, negativa, 7.5 o mayor que 2^53 − 1 con MISSING_AGGREGATE_VERSION. Una clave de 128 caracteres y la versión 2^53 − 1 se aceptan."
+      },
+      "steps": [
+        {
+          "op": "stream_add",
+          "name": "STATE_CLIENTES",
+          "subjects": [
+            "state.clientes.>"
+          ],
+          "state": true,
+          "expect": {
+            "outcome": "ok"
+          }
+        },
+        {
+          "op": "state_put",
+          "contract": "clientes.cliente.v1",
+          "tenant": "acme",
+          "key": "a.b",
+          "version": 1,
+          "title": "clave con punto",
+          "expect": {
+            "outcome": "error",
+            "errCode": "INVALID_STATE_KEY"
+          }
+        },
+        {
+          "op": "state_put",
+          "contract": "clientes.cliente.v1",
+          "tenant": "acme",
+          "key": "a b",
+          "version": 1,
+          "title": "clave con espacio",
+          "expect": {
+            "outcome": "error",
+            "errCode": "INVALID_STATE_KEY"
+          }
+        },
+        {
+          "op": "state_put",
+          "contract": "clientes.cliente.v1",
+          "tenant": "acme",
+          "key": "_reservada",
+          "version": 1,
+          "title": "prefijo reservado",
+          "expect": {
+            "outcome": "error",
+            "errCode": "INVALID_STATE_KEY"
+          }
+        },
+        {
+          "op": "state_put",
+          "contract": "clientes.cliente.v1",
+          "tenant": "acme",
+          "key": "cli-1\n",
+          "version": 1,
+          "title": "salto de línea final (trampa de `$`)",
+          "expect": {
+            "outcome": "error",
+            "errCode": "INVALID_STATE_KEY"
+          }
+        },
+        {
+          "op": "state_put",
+          "contract": "clientes.cliente.v1",
+          "tenant": "acme",
+          "key": "",
+          "version": 1,
+          "title": "vacía",
+          "expect": {
+            "outcome": "error",
+            "errCode": "INVALID_STATE_KEY"
+          }
+        },
+        {
+          "op": "state_put",
+          "contract": "clientes.cliente.v1",
+          "tenant": "acme",
+          "key": "{repeat:a:129}",
+          "version": 1,
+          "title": "129 caracteres",
+          "expect": {
+            "outcome": "error",
+            "errCode": "INVALID_STATE_KEY"
+          }
+        },
+        {
+          "op": "state_put",
+          "contract": "clientes.cliente.v1",
+          "tenant": "acme",
+          "key": "{repeat:a:128}",
+          "version": 1,
+          "title": "128 caracteres",
+          "expect": {
+            "outcome": "ok"
+          }
+        },
+        {
+          "op": "state_put",
+          "contract": "clientes.cliente.v1",
+          "tenant": "acme",
+          "key": "v0",
+          "version": 0,
+          "title": "versión 0",
+          "expect": {
+            "outcome": "error",
+            "errCode": "MISSING_AGGREGATE_VERSION"
+          }
+        },
+        {
+          "op": "state_put",
+          "contract": "clientes.cliente.v1",
+          "tenant": "acme",
+          "key": "v-1",
+          "version": -1,
+          "title": "versión negativa",
+          "expect": {
+            "outcome": "error",
+            "errCode": "MISSING_AGGREGATE_VERSION"
+          }
+        },
+        {
+          "op": "state_put",
+          "contract": "clientes.cliente.v1",
+          "tenant": "acme",
+          "key": "v75",
+          "version": 7.5,
+          "title": "versión decimal",
+          "expect": {
+            "outcome": "error",
+            "errCode": "MISSING_AGGREGATE_VERSION"
+          }
+        },
+        {
+          "op": "state_put",
+          "contract": "clientes.cliente.v1",
+          "tenant": "acme",
+          "key": "vmax",
+          "version": 9007199254740992,
+          "title": "versión mayor que 2^53 − 1",
+          "expect": {
+            "outcome": "error",
+            "errCode": "MISSING_AGGREGATE_VERSION"
+          }
+        },
+        {
+          "op": "state_put",
+          "contract": "clientes.cliente.v1",
+          "tenant": "acme",
+          "key": "vmax",
+          "version": 9007199254740991,
+          "title": "versión 2^53 − 1",
+          "expect": {
+            "outcome": "ok"
+          }
+        }
+      ]
+    },
+    {
+      "id": "put-recognizes-its-own-write",
+      "title": "Si el publish se aplicó pero quien lo hizo ve un error de secuencia, el reintento reconoce su propia escritura por el id",
+      "spec": "10-state.md §3.2 (paso 1b), §3.3",
+      "covers": [
+        "A-33",
+        "A-50"
+      ],
+      "rationale": "Sin el paso 1b, una librería de NATS que reenvía el publish tras una reconexión convierte una escritura buena en `stale`: el reenvío da «wrong last sequence» porque el mensaje que cambió la secuencia es el propio. Reconocerlo exige el MISMO id en todos los intentos y que el broker conserve las cabeceras del mensaje (A-32).",
+      "observed": {
+        "server": "nats-server 2.14.5",
+        "date": "2026-11-26",
+        "result": "El primer intento se aplica y el SDK ve un 10071 simulado; el reintento relee, ve su propio id y devuelve ok con ownWrite true y la secuencia de su mensaje, sin publicar de nuevo. El stream queda con un solo mensaje."
+      },
+      "steps": [
+        {
+          "op": "stream_add",
+          "name": "STATE_CLIENTES",
+          "subjects": [
+            "state.clientes.>"
+          ],
+          "state": true,
+          "expect": {
+            "outcome": "ok"
+          }
+        },
+        {
+          "op": "state_put",
+          "contract": "clientes.cliente.v1",
+          "tenant": "acme",
+          "key": "k1",
+          "version": 1,
+          "id": "01924f8e-7c3a-7b2d-9e14-aaaaaaaaaaaa",
+          "hook": {
+            "lostAckOnce": true
+          },
+          "expect": {
+            "outcome": "ok",
+            "applied": true,
+            "ownWrite": true,
+            "attempts": 2
+          }
+        },
+        {
+          "op": "stream_state",
+          "name": "STATE_CLIENTES",
+          "expect": {
+            "messages": 1,
+            "lastSeq": 1
+          }
+        },
+        {
+          "op": "state_get",
+          "contract": "clientes.cliente.v1",
+          "tenant": "acme",
+          "key": "k1",
+          "expect": {
+            "aggregateVersion": 1,
+            "revision": 1
+          }
+        }
+      ]
+    },
+    {
+      "id": "put-conflict-is-retryable-after-three-attempts",
+      "title": "Tres conflictos seguidos agotan el `put`: STATE_CONFLICT; una versión MÁS ALTA del competidor no es un conflicto, es `stale`",
+      "spec": "10-state.md §3.2, §3.3",
+      "covers": [
+        "A-50",
+        "A-33"
+      ],
+      "rationale": "Fija el máximo de 3 intentos y distingue dos cosas que se parecen: un competidor que escribe una versión MENOR entre mi lectura y mi publicación me deja sin la S correcta pero mi versión sigue siendo válida (conflicto, se reintenta); uno que escribe una MAYOR hace que mi escritura sea obsoleta (stale, no se reintenta).",
+      "observed": {
+        "server": "nats-server 2.14.5",
+        "date": "2026-11-26",
+        "result": "Con un competidor que escribe las versiones 1, 2 y 3 entre la lectura y la publicación de cada intento, un put de la versión 100 agota los 3 intentos con STATE_CONFLICT y la clave queda en la versión 3. Con un competidor que escribe la versión 11 antes del primer publish, un put de la versión 10 da stale en el segundo intento."
+      },
+      "steps": [
+        {
+          "op": "stream_add",
+          "name": "STATE_CLIENTES",
+          "subjects": [
+            "state.clientes.>"
+          ],
+          "state": true,
+          "expect": {
+            "outcome": "ok"
+          }
+        },
+        {
+          "op": "state_put",
+          "contract": "clientes.cliente.v1",
+          "tenant": "acme",
+          "key": "c1",
+          "version": 100,
+          "hook": {
+            "beforePublish": [
+              {
+                "attempt": 1,
+                "fromVersion": 1
+              },
+              {
+                "attempt": 2,
+                "fromVersion": 2
+              },
+              {
+                "attempt": 3,
+                "fromVersion": 3
+              }
+            ]
+          },
+          "title": "tres rivales con versiones menores",
+          "expect": {
+            "outcome": "error",
+            "errCode": "STATE_CONFLICT"
+          }
+        },
+        {
+          "op": "state_get",
+          "contract": "clientes.cliente.v1",
+          "tenant": "acme",
+          "key": "c1",
+          "title": "la clave quedó en la del rival",
+          "expect": {
+            "aggregateVersion": 3
+          }
+        },
+        {
+          "op": "state_put",
+          "contract": "clientes.cliente.v1",
+          "tenant": "acme",
+          "key": "c2",
+          "version": 10,
+          "hook": {
+            "beforePublish": [
+              {
+                "attempt": 1,
+                "fromVersion": 11
+              }
+            ]
+          },
+          "title": "un rival con una versión MÁS ALTA",
+          "expect": {
+            "outcome": "stale",
+            "applied": false,
+            "attempts": 2
+          }
+        }
+      ]
+    },
+    {
+      "id": "three-owner-instances-converge",
+      "title": "Tres instancias del dueño escribiendo versiones 1..40 de una clave la dejan en la 40",
+      "spec": "10-state.md §3.1",
+      "covers": [
+        "A-50"
+      ],
+      "rationale": "Es la propiedad que justifica que `put` sea condicional: da igual el orden en que lleguen las escrituras, la versión vigente es la más alta. Los conflictos que agotan los 3 intentos son RETRYABLE y la aplicación los reintenta; el caso los reintenta hasta converger.",
+      "observed": {
+        "server": "nats-server 2.14.5",
+        "date": "2026-11-26",
+        "result": "3 instancias, versiones 1..40 repartidas al azar con pausas de 0 a 4 ms: la clave termina en la versión 40 (varias ejecuciones). En un cluster de 3 nodos, con carga artificial de 3 escritores sin pausa sobre la misma clave: de 90 put, 49 ok, 27 stale y 14 STATE_CONFLICT."
+      },
+      "steps": [
+        {
+          "op": "stream_add",
+          "name": "STATE_CLIENTES",
+          "subjects": [
+            "state.clientes.>"
+          ],
+          "state": true,
+          "expect": {
+            "outcome": "ok"
+          }
+        },
+        {
+          "op": "state_race",
+          "contract": "clientes.cliente.v1",
+          "tenant": "acme",
+          "key": "carrera",
+          "instances": 3,
+          "from": 1,
+          "to": 40,
+          "expect": {
+            "finalVersion": 40,
+            "other": 0
+          }
+        }
+      ]
+    },
+    {
+      "id": "cluster-three-owner-instances-converge",
+      "title": "Lo mismo sobre un stream R3: bajo carrera el conflicto es 10164, y la clave converge igualmente en la 40",
+      "spec": "10-state.md §3.2",
+      "covers": [
+        "A-49",
+        "A-50"
+      ],
+      "topology": "cluster3",
+      "rationale": "Es el caso que detecta a un SDK que solo reconoce el 10071: en un nodo suelto nunca ve un 10164, y pasa; en un cluster, cada conflicto de carrera sería un error desconocido que NO se reintenta (`other` > 0) y la clave no convergería.",
+      "observed": {
+        "server": "nats-server 2.14.5",
+        "date": "2026-11-26",
+        "result": "Cluster de 3 nodos locales, 3 instancias, versiones 1..40 repartidas al azar con pausas: la clave termina en la 40 y ningún error es distinto de STATE_CONFLICT. Con una referencia que solo reconozca el 10071 el caso falla (mutante only-10071)."
+      },
+      "steps": [
+        {
+          "op": "stream_add",
+          "name": "STATE_CLIENTES",
+          "subjects": [
+            "state.clientes.>"
+          ],
+          "state": true,
+          "config": {
+            "num_replicas": 3
+          },
+          "expect": {
+            "outcome": "ok",
+            "config.num_replicas": 3
+          }
+        },
+        {
+          "op": "state_race",
+          "contract": "clientes.cliente.v1",
+          "tenant": "acme",
+          "key": "carrera",
+          "instances": 3,
+          "from": 1,
+          "to": 40,
+          "expect": {
+            "finalVersion": 40,
+            "other": 0
+          }
+        }
+      ]
+    },
+    {
+      "id": "same-key-two-tenants-do-not-overwrite",
+      "title": "La misma clave en dos tenants son dos valores: el tenant está en el subject",
+      "spec": "10-state.md §2.2",
+      "covers": [
+        "A-50",
+        "A-14"
+      ],
+      "rationale": "Es el motivo de que el tenant vaya en el subject y no solo en el sobre: con el tenant solo en el sobre, `cli-1` de globex pisaría a `cli-1` de acme sin ningún error. Las versiones son por clave Y tenant: la de uno no condiciona la del otro.",
+      "observed": {
+        "server": "nats-server 2.14.5",
+        "date": "2026-11-26",
+        "result": "put de cli-1 en acme (v1) y en globex (v5): dos mensajes; get de cada uno devuelve el suyo. Un put de v2 en acme no es stale por la v5 de globex."
+      },
+      "steps": [
+        {
+          "op": "stream_add",
+          "name": "STATE_CLIENTES",
+          "subjects": [
+            "state.clientes.>"
+          ],
+          "state": true,
+          "expect": {
+            "outcome": "ok"
+          }
+        },
+        {
+          "op": "state_put",
+          "contract": "clientes.cliente.v1",
+          "tenant": "acme",
+          "key": "cli-1",
+          "version": 1,
+          "expect": {
+            "outcome": "ok"
+          }
+        },
+        {
+          "op": "state_put",
+          "contract": "clientes.cliente.v1",
+          "tenant": "globex",
+          "key": "cli-1",
+          "version": 5,
+          "expect": {
+            "outcome": "ok"
+          }
+        },
+        {
+          "op": "stream_state",
+          "name": "STATE_CLIENTES",
+          "expect": {
+            "messages": 2
+          }
+        },
+        {
+          "op": "state_get",
+          "contract": "clientes.cliente.v1",
+          "tenant": "acme",
+          "key": "cli-1",
+          "expect": {
+            "aggregateVersion": 1
+          }
+        },
+        {
+          "op": "state_get",
+          "contract": "clientes.cliente.v1",
+          "tenant": "globex",
+          "key": "cli-1",
+          "expect": {
+            "aggregateVersion": 5
+          }
+        },
+        {
+          "op": "state_put",
+          "contract": "clientes.cliente.v1",
+          "tenant": "acme",
+          "key": "cli-1",
+          "version": 2,
+          "title": "la versión de acme no depende de la de globex",
+          "expect": {
+            "outcome": "ok"
+          }
+        }
+      ]
+    },
+    {
+      "id": "watch-snapshot-and-synced",
+      "title": "`watch` entrega la foto con la lápida como `deleted`, y `onSynced` se dispara en la última entrada",
+      "spec": "10-state.md §5.2, §5.3, §5.5",
+      "covers": [
+        "A-35",
+        "A-50"
+      ],
+      "rationale": "Fija la forma de la entrada ({key, tenantId, deleted, data, aggregateVersion, revision}) y el momento de `onSynced`: cuando llega la entrega con `pending == 0`. Una lápida llega como `deleted: true` con `data: null` y su versión, y una clave de OTRO tenant no llega a un watch con tenant.",
+      "observed": {
+        "server": "nats-server 2.14.5",
+        "date": "2026-11-26",
+        "result": "3 claves de acme (una borrada después) y una de globex: el watch de acme entrega 3 entradas; la lápida con deleted true y data null; la señal de sincronizado se da en la tercera (pending 0) y no inmediatamente."
+      },
+      "steps": [
+        {
+          "op": "stream_add",
+          "name": "STATE_CLIENTES",
+          "subjects": [
+            "state.clientes.>"
+          ],
+          "state": true,
+          "expect": {
+            "outcome": "ok"
+          }
+        },
+        {
+          "op": "state_put",
+          "contract": "clientes.cliente.v1",
+          "tenant": "acme",
+          "key": "cli-1",
+          "version": 1,
+          "expect": {
+            "outcome": "ok"
+          }
+        },
+        {
+          "op": "state_put",
+          "contract": "clientes.cliente.v1",
+          "tenant": "acme",
+          "key": "cli-2",
+          "version": 1,
+          "expect": {
+            "outcome": "ok"
+          }
+        },
+        {
+          "op": "state_put",
+          "contract": "clientes.cliente.v1",
+          "tenant": "acme",
+          "key": "cli-3",
+          "version": 1,
+          "expect": {
+            "outcome": "ok"
+          }
+        },
+        {
+          "op": "state_delete",
+          "contract": "clientes.cliente.v1",
+          "tenant": "acme",
+          "key": "cli-3",
+          "version": 2,
+          "expect": {
+            "outcome": "ok"
+          }
+        },
+        {
+          "op": "state_put",
+          "contract": "clientes.cliente.v1",
+          "tenant": "globex",
+          "key": "cli-1",
+          "version": 1,
+          "expect": {
+            "outcome": "ok"
+          }
+        },
+        {
+          "op": "state_watch",
+          "contract": "clientes.cliente.v1",
+          "tenant": "acme",
+          "durable": "tienda__state_clientes_cliente_v1__acme",
+          "expect": {
+            "count": 3,
+            "keys": [
+              "cli-1",
+              "cli-2",
+              "cli-3"
+            ],
+            "syncedImmediately": false,
+            "syncedAtIndex": 2,
+            "entries.0.tenantId": "acme",
+            "entries.0.deleted": false,
+            "entries.0.aggregateVersion": 1,
+            "entries.0.data.clienteId": "cli-1",
+            "entries.2.deleted": true,
+            "entries.2.data": null,
+            "entries.2.aggregateVersion": 2
+          }
+        }
+      ]
+    },
+    {
+      "id": "watch-of-an-empty-contract-is-synced-immediately",
+      "title": "Con el contrato vacío, `onSynced` se invoca nada más abrir el `watch`, antes de ninguna entrada",
+      "spec": "10-state.md §5.5",
+      "covers": [
+        "A-35",
+        "A-50"
+      ],
+      "rationale": "Si `onSynced` esperase a una entrada, un servicio que observa un contrato todavía vacío no arrancaría nunca.",
+      "observed": {
+        "server": "nats-server 2.14.5",
+        "date": "2026-11-26",
+        "result": "Con el stream vacío, el consumidor informa num_pending 0 y num_ack_pending 0 al crearse: sincronizado de inmediato, sin entradas."
+      },
+      "steps": [
+        {
+          "op": "stream_add",
+          "name": "STATE_CLIENTES",
+          "subjects": [
+            "state.clientes.>"
+          ],
+          "state": true,
+          "expect": {
+            "outcome": "ok"
+          }
+        },
+        {
+          "op": "state_watch",
+          "contract": "clientes.cliente.v1",
+          "tenant": "acme",
+          "durable": "tienda__state_clientes_cliente_v1__acme",
+          "expect": {
+            "count": 0,
+            "syncedImmediately": true,
+            "syncedAtIndex": -1
+          }
+        }
+      ]
+    },
+    {
+      "id": "watch-with-writes-during-sync",
+      "title": "Lo escrito mientras se sincroniza llega en la misma foto: lo reescrito, con su versión nueva, y `onSynced` espera a la última",
+      "spec": "10-state.md §5.5",
+      "covers": [
+        "A-35",
+        "A-50"
+      ],
+      "rationale": "`onSynced` promete que ya se vio lo que había al abrir, no que no lleguen entradas después; y con un dueño que escribe durante la sincronización se retrasa hasta alcanzar `pending == 0`. Una clave reescrita aparece una vez con su versión más reciente.",
+      "observed": {
+        "server": "nats-server 2.14.5",
+        "date": "2026-11-26",
+        "result": "3 claves escritas, watch abierto, y después cli-1 reescrita (v2) y cli-9 nueva: se entregan cli-2, cli-3, cli-1 (v2) y cli-9, y la señal de sincronizado se da en la cuarta."
+      },
+      "steps": [
+        {
+          "op": "stream_add",
+          "name": "STATE_CLIENTES",
+          "subjects": [
+            "state.clientes.>"
+          ],
+          "state": true,
+          "expect": {
+            "outcome": "ok"
+          }
+        },
+        {
+          "op": "state_put",
+          "contract": "clientes.cliente.v1",
+          "tenant": "acme",
+          "key": "cli-1",
+          "version": 1
+        },
+        {
+          "op": "state_put",
+          "contract": "clientes.cliente.v1",
+          "tenant": "acme",
+          "key": "cli-2",
+          "version": 1
+        },
+        {
+          "op": "state_put",
+          "contract": "clientes.cliente.v1",
+          "tenant": "acme",
+          "key": "cli-3",
+          "version": 1
+        },
+        {
+          "op": "state_watch",
+          "contract": "clientes.cliente.v1",
+          "tenant": "acme",
+          "durable": "tienda__state_clientes_cliente_v1__acme",
+          "afterCreate": [
+            {
+              "key": "cli-1",
+              "version": 2
+            },
+            {
+              "key": "cli-9",
+              "version": 1
+            }
+          ],
+          "expect": {
+            "count": 4,
+            "keys": [
+              "cli-2",
+              "cli-3",
+              "cli-1",
+              "cli-9"
+            ],
+            "entries.2.aggregateVersion": 2,
+            "syncedAtIndex": 3,
+            "syncedImmediately": false
+          }
+        }
+      ]
+    },
+    {
+      "id": "watch-without-tenant-needs-the-tenant-in-the-entry",
+      "title": "Un `watch` sin tenant recibe `cli-1` de dos tenants: la entrada lleva `tenantId` o la copia local los mezclaría",
+      "spec": "10-state.md §5.3",
+      "covers": [
+        "A-50",
+        "A-14"
+      ],
+      "rationale": "Justifica el campo `tenantId` de la entrada, que no estaba en el plan: con solo la clave, un handler que guarda por clave sobrescribiría el cliente de un tenant con el de otro, en silencio.",
+      "observed": {
+        "server": "nats-server 2.14.5",
+        "date": "2026-11-26",
+        "result": "Dos escrituras de la clave cli-1 (acme v1, globex v5) y un watch sin tenant: dos entradas con la misma key y tenantId distinto. Con el tenant acme: una."
+      },
+      "steps": [
+        {
+          "op": "stream_add",
+          "name": "STATE_CLIENTES",
+          "subjects": [
+            "state.clientes.>"
+          ],
+          "state": true,
+          "expect": {
+            "outcome": "ok"
+          }
+        },
+        {
+          "op": "state_put",
+          "contract": "clientes.cliente.v1",
+          "tenant": "acme",
+          "key": "cli-1",
+          "version": 1
+        },
+        {
+          "op": "state_put",
+          "contract": "clientes.cliente.v1",
+          "tenant": "globex",
+          "key": "cli-1",
+          "version": 5,
+          "expect": {
+            "outcome": "ok"
+          }
+        },
+        {
+          "op": "state_watch",
+          "contract": "clientes.cliente.v1",
+          "durable": "svc__state_clientes_cliente_v1",
+          "expect": {
+            "count": 2,
+            "keys": [
+              "cli-1",
+              "cli-1"
+            ],
+            "entries.0.tenantId": "acme",
+            "entries.1.tenantId": "globex",
+            "entries.1.aggregateVersion": 5
+          }
+        },
+        {
+          "op": "state_watch",
+          "contract": "clientes.cliente.v1",
+          "tenant": "acme",
+          "durable": "svc__state_clientes_cliente_v1__acme",
+          "title": "con tenant",
+          "expect": {
+            "count": 1,
+            "entries.0.tenantId": "acme"
+          }
+        }
+      ]
+    }
+  ]
+}

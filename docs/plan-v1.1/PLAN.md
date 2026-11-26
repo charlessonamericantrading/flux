@@ -161,8 +161,10 @@ El sobre es **el mismo CloudEvent** en las tres. Así `tenantid`, `correlationid
 ### 4.3 Nombres de dominio reservados
 
 `dlq`, `state`, `rpc`, `system`. Un dominio llamado así colisionaría con un espacio de
-nombres del protocolo. **Hoy `dlq` no está reservado y debería**: se arregla en la Fase 2
-(`02-naming.md`, `protocol.json`, `gen-acl.mjs`, `flux validate`).
+nombres del protocolo, **y en el broker** (`subjects overlap with an existing stream`, A-43).
+**Hoy `dlq` no está reservado y debería**: se arregla en la Fase 2. **Hecho** en `02-naming.md` §1.3,
+`protocol.json` (`naming.reservedDomains`) y `bundle-schemas.mjs`/`check-compat.mjs`; la API de los
+SDKs responde con `RESERVED_DOMAIN`. Pendiente: `gen-acl.mjs` y `flux validate`.
 
 ### 4.4 Datos personales: la contradicción se resuelve con el estado
 
@@ -456,34 +458,70 @@ parte 3 de `diseno-candidato.mjs`). *(Hecho.)*
 **Objetivo:** «el dato llega solo». Sustituye `GET /recurso/123`, la carga inicial y el
 polling de datos. Filas 3 y 4 del mapa. Cierra H5.
 
-Documento nuevo: `specification/10-state.md`.
+Documento nuevo: [`specification/10-state.md`](../../specification/10-state.md), **normativo**. Lo que
+sigue es el plan tal como quedó **tras medir y escribir la spec**: la fase se hizo en un frente de
+spec e infraestructura de esquemas, y los de SDKs, permisos y CLI los implementan sobre ese
+contrato. Donde esto y la spec discrepen, manda la spec.
+
+> **Corregido tras medir.** Lo que la ejecución contra nats-server 2.14.5 (Apéndice A, A-31 … A-50)
+> cambió respecto al plan original, y por qué:
+>
+> - **El conflicto de secuencia tiene DOS códigos, no uno.** El plan decía «wrong last sequence»
+>   (10071). En un cluster de 3 nodos, una carrera da **10164** y sin número; el 10071 solo sale
+>   sin carrera. Un SDK que reconozca solo el 10071 pasa todas las pruebas contra un nodo y, en
+>   producción, no reintenta. *(A-33, A-49; el mutante `only-10071` solo lo detecta el caso de
+>   cluster.)*
+> - **El chequeo de secuencia va ANTES que el de duplicados.** Un reenvío con el mismo
+>   `Nats-Msg-Id` y la `S` vieja da el error de secuencia, no `duplicate`: `duplicate_window` no
+>   protege a `put`, y un acuse perdido convertiría una escritura buena en `stale`. Se añade el
+>   **paso 1b** (reconocer la propia escritura por el `id`, que el broker conserva en las
+>   cabeceras) y la regla de **mismo `id` y mismos bytes en todos los intentos**. *(A-32, A-33)*
+> - **`STREAM.INFO` con `subjects_filter` lista todas las claves y todos los tenants.** Se **deja de
+>   conceder `STREAM.INFO.STATE_<DOM>` a los observadores** y el SDK no lo usa: `watch` y `get`
+>   funcionan sin él (`CONSUMER.INFO` distingue stream y consumidor ausentes). Eso obliga a una
+>   excepción acotada a «`DIRECT.GET` nunca» de [06-security.md §3.5](../../specification/06-security.md): la forma **por subject** de
+>   un contrato y un tenant; la forma de cuerpo sigue denegada, y el broker rechaza un cuerpo en la
+>   forma por subject (408). *(A-38, A-39, A-48)*
+> - **El broker no valida las claves**: acepta `*`, `a.b` (dos tokens: la entrada queda fuera de
+>   todo filtro) y 2000 caracteres. La validación es del SDK, con coincidencia **completa** (en Python
+>   y PHP el `$` acepta un `\n` final). La clave no puede empezar por `_` (reservado). *(A-41)*
+> - **El tenant de estado** tiene un máximo de 64 caracteres (los nombres de consumidor admiten 255,
+>   A-42) y **no tiene valor por defecto**: ni `system` implícito.
+> - **La entrada lleva `tenantId`** además de `{ key, deleted, data, aggregateVersion, revision }`: un
+>   `watch` sin tenant recibe `cli-1` de varios y la clave sola mezclaría los tenants en la copia local.
+> - **`onSynced`** se define con precisión (§2.4): `num_pending` solo no basta.
+> - **Dominios reservados**: también `system` (el plan lo daba por reservado solo en §4.3), y la API
+>   rechaza con `RESERVED_DOMAIN`, no con «subject inválido». *(A-43)*
+> - **`DLQ_<DOM>` captura `dlq.state.<dom>.>` solo si el dominio tiene estado**: 1.1 sigue siendo
+>   aditiva. *(A-44)*
 
 #### 2.1 Modelo
 
-- **Stream** `STATE_<DOMINIO>`, subjects `state.<dominio>.>`:
+- **Stream** `STATE_<DOMINIO>`, subjects `state.<dominio>.>`, **un valor por clave**:
 
   ```
   max_msgs_per_subject: 1     # un valor por clave: el stream ES el estado actual
   allow_direct:         true  # lecturas puntuales sin consumidor
   max_age:              0     # sin caducidad: el estado vive hasta que se borra
-  discard:              old
-  duplicate_window:     2m
+  discard:              old   # NO `new`: con discard_new_per_subject sería un create-only (A-46)
+  duplicate_window:     2m    # no interviene en las escrituras: el chequeo de secuencia va antes
   replicas:             3 (producción) / 1 (SDK en desarrollo)
   ```
 
-  *(A-9, A-10)*
-- **Subject** `state.<dominio>.<agregado>.v<major>.<tenantid>.<clave>` — 6 tokens fijos.
-  - El tenant va en el subject para que **el broker** filtre y confine *(A-14)*. Con el
-    tenant solo en el sobre, dos tenants con el mismo id de agregado se pisarían en
-    silencio.
-  - `tenantid` **DEBE** cumplir `^[a-z0-9]+(-[a-z0-9]+)*$`. Si no, `INVALID_TENANT_FOR_STATE`.
-  - `clave` **DEBE** cumplir `^[A-Za-z0-9_-]{1,128}$`. Si no, `INVALID_STATE_KEY`. Sin
-    codificación automática: una clave que no cabe en un token es un error, no algo que
-    cada SDK escape a su manera.
-- **Sobre:** un CloudEvent normal. `subject` (el atributo) = la clave, obligatorio.
+  *(A-31, A-32, A-46, A-49)*. `flux doctor` audita las cuatro líneas que, mal puestas, no dan error.
+- **Subject** `state.<dominio>.<agregado>.v<major>.<tenant>.<clave>` — 6 tokens fijos.
+  - El tenant va en el subject para que **el broker** filtre y confine *(A-38)*. Con el tenant
+    solo en el sobre, dos tenants con el mismo id de agregado se pisarían en silencio.
+  - `tenant`: `^[a-z0-9]+(-[a-z0-9]+)*$`, **64 caracteres como máximo**. Si no,
+    `INVALID_TENANT_FOR_STATE`. Sin valor por defecto.
+  - `clave`: `^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$` (**no empieza por `_`**). Si no, `INVALID_STATE_KEY`.
+    Sin codificación automática, con coincidencia completa *(A-41)*.
+- **Sobre:** un CloudEvent normal. `subject` (el atributo) = la clave y `tenantid` = el token de
+  tenant del subject de NATS: si discrepan, POISON `STATE_SUBJECT_MISMATCH`.
   `dataclassification` ∈ `public | internal | confidential`.
-- **`data` DEBE incluir `aggregateVersion`** (entero ≥ 1, creciente). El esquema lo
-  declara `required`; `bundle-schemas.mjs` rechaza un esquema de estado que no lo haga.
+- **`data` DEBE incluir `aggregateVersion`** (entero ≥ 1 y ≤ 2^53 − 1). El esquema lo declara
+  `required`; `bundle-schemas.mjs` y `check-compat.mjs` rechazan un esquema de estado que no lo
+  haga. **Hecho.**
 
 #### 2.2 Escribir — solo el dueño
 
@@ -491,23 +529,32 @@ Documento nuevo: `specification/10-state.md`.
 «actual», y un consumidor nuevo lo recibiría como verdad.
 
 ```
+0. Validar sin red y construir el evento UNA vez (mismo id y bytes en todos los intentos).
 1. Leer el último mensaje de la clave (direct get) → secuencia S, versión V. Sin valor: S = 0.
+1b. Si el id leído es el de ESTE put → ya se aplicó (acuse perdido): resultado «ok».
 2. Si nueva.aggregateVersion <= V → no escribir. Resultado `stale`. No es un error.
-3. Publicar con  Nats-Expected-Last-Subject-Sequence: S   y   Nats-Msg-Id: <id>.
-4. Si el broker responde «wrong last sequence» → volver a 1. Máximo 3 intentos.
+3. Publicar por JetStream con  Nats-Expected-Last-Subject-Sequence: S   y   Nats-Msg-Id: <id>.
+4. Error 10071 o 10164 («wrong last sequence») → volver a 1. Máximo 3 intentos: STATE_CONFLICT.
 ```
 
-*(A-11)*. El SDK **PUEDE** recordar en memoria la última secuencia de cada clave que él
-mismo escribió, para ahorrarse el paso 1.
+*(A-32, A-33, A-49)*. El SDK **PUEDE** recordar en memoria la última secuencia de cada clave que él
+mismo escribió, para ahorrarse el paso 1. Un `publish` de **core** a un subject de estado
+sobrescribe **sin chequeo**: siempre por JetStream *(A-45)*. Resultado:
+`{ applied, outcome: "ok" | "stale", revision }`. Detalle y porqués: `10-state.md` §3.
 
 #### 2.3 Borrar
 
-`delete` publica una **lápida** en el mismo subject: un CloudEvent con
+`delete` publica una **lápida** en el mismo subject con **el mismo algoritmo**: un CloudEvent con
 `type: com.flux.state.<dom>.<agr>.deleted.v<M>`, `data: { "aggregateVersion": n }`,
 `dataclassification: internal` y `dataschema` fijo
 `https://schemas.internal/system/state/eliminado/1.0.0.json`. Al entrar, el valor anterior
-sale del stream *(A-13)*.
+sale del stream *(A-34)*.
 
+- La lápida lleva versión porque `put` la lee para decidir si una escritura es `stale`.
+- **Una clave borrada se recrea con una versión estrictamente mayor que la de la lápida** *(A-34)*.
+  La trampa: un dueño que borra su fila y la recrea con `aggregateVersion: 1` recibe `stale` y la
+  clave sigue borrada, sin error.
+- Borrar una clave que nunca existió escribe la lápida. `get` de una lápida devuelve `null`.
 - La lápida es permanente en 1.1. Compactarlas queda fuera — §6.
 - Un consumidor **DEBE** borrar o anonimizar su copia local al recibir una lápida. Es lo
   que hace real el derecho de supresión aguas abajo.
@@ -515,26 +562,40 @@ sale del stream *(A-13)*.
 #### 2.4 Leer
 
 - **`watch`** — foto completa y después los cambios, por el mismo canal:
-  - durable `<servicio>__state_<dom>_<agr>_v<M>`, con sufijo `__<tenant>` si filtra;
+  - durable `<servicio>__state_<dom>_<agr>_v<M>`, con sufijo `__<tenant>` si filtra (los guiones del
+    tenant pasan a `_`): **un durable compartido reparte los mensajes** entre quienes lo usan
+    *(A-47)*;
   - `deliver_policy: last_per_subject`; el resto, la config canónica de `03-delivery.md` §2;
-  - filtro `state.<dom>.<agr>.v<M>.<tenant>.*` (o `*.*` sin tenant; `tenantIsolation:
-    "strict"` lo prohíbe).
+  - filtro `state.<dom>.<agr>.v<M>.<tenant>.*` (o `*.*` sin tenant; `tenantIsolation: "strict"`
+    lo prohíbe). Con tenant en `connect()`, **siempre** filtra, también si es `system`.
 
-  *(A-12)*. Un consumidor que estuvo caído recibe **solo el último valor** de cada clave
-  que cambió, no los intermedios.
+  *(A-35)*. Un consumidor que estuvo caído recibe **solo el último valor** de cada clave que
+  cambió, no los intermedios; un valor reemplazado mientras estaba en vuelo **no se reentrega**
+  *(A-36)*. La recuperación es borrar y recrear el durable *(A-37)*.
 - **`get`** — una clave, pedida al broker por subject:
-  `$JS.API.DIRECT.GET.STATE_<DOM>.<subject>`. Clave inexistente → `404`. *(A-14)*
-- La entrada que recibe el handler: `{ key, deleted, data, aggregateVersion, revision }`,
-  donde `revision` es la secuencia del stream.
-- `onSynced`: se invoca una vez, cuando `num_pending` llega a 0 por primera vez.
+  `$JS.API.DIRECT.GET.STATE_<DOM>.<subject>`. Clave inexistente → `404`; stream inexistente o sin
+  `allow_direct` → **sin respuesta** (se ven igual). *(A-32)*
+- La entrada que recibe el handler: `{ key, tenantId, deleted, data, aggregateVersion, revision }`,
+  donde `revision` es la secuencia del stream y `data` es `null` si `deleted`.
+- `onSynced`: se invoca **una vez por `watch`**. Si al abrir el consumidor no tiene nada pendiente
+  (`num_pending` y `num_ack_pending` a 0: el stream está vacío), **de inmediato**, antes de
+  entregar nada. Si no, cuando llega una entrega con `pending == 0` en sus metadatos **y** todos los
+  handlers lanzados hasta ahí han terminado. Las escrituras durante la sincronización llegan en la
+  misma foto (lo reescrito, una vez y con su valor más reciente) y retrasan `onSynced`.
+  *(A-35)*
 
 #### 2.5 Errores y DLQ
 
-- Misma taxonomía que los eventos (`04-errors.md`).
-- Subject de DLQ: `dlq.state.<dom>.<agr>.v<M>` — sin tenant ni clave, para que no se
-  multiplique. El stream `DLQ_<DOM>` pasa a capturar `dlq.<dom>.>` **y** `dlq.state.<dom>.>`.
+- Misma taxonomía que los eventos (`04-errors.md`), con los **seis códigos de estado** de §6 de ese
+  documento: `INVALID_TENANT_FOR_STATE`, `INVALID_STATE_KEY`, `MISSING_AGGREGATE_VERSION`,
+  `RESERVED_DOMAIN` (PERMANENT), `STATE_SUBJECT_MISMATCH` (POISON) y `STATE_CONFLICT` (RETRYABLE).
+- Subject de DLQ: `dlq.state.<dom>.<agr>.v<M>` — sin tenant ni clave, para que no se multiplique. El
+  stream `DLQ_<DOM>` de un dominio **con estado** captura `dlq.<dom>.>` **y** `dlq.state.<dom>.>`;
+  uno sin estado no cambia. El dueño lee la DLQ de estado con `<servicio>__dlq_state_<dom>`.
 - **El evento de DLQ de estado no lleva el dato**: `data` se sustituye por
-  `{ "key": "…", "revision": n }`. Si no, un dato personal borrado seguiría 90 días en la DLQ.
+  `{ "key": "…", "revision": n }`. Si no, un dato personal borrado seguiría 90 días en la DLQ. Por lo
+  mismo: `dlqerror` no cita valores, un mensaje ilegible no se copia, y la firma original no se
+  conserva (firma un `data` que ya no está).
 - **El estado no se reproduce desde la DLQ.** Republicar un valor viejo pisaría uno nuevo.
   `flux dlq replay` **DEBE** rechazar `dlq.state.>`. La recuperación es `flux state resync`.
 
@@ -543,42 +604,44 @@ sale del stream *(A-13)*.
 ```ts
 await bus.state.put("clientes.cliente.v1", "cli-1",
   { clienteId: "cli-1", nombre: "Ana", email: "ana@example.com", aggregateVersion: 7 },
-  { classification: "confidential" });                       // → { applied: true, revision }
+  { classification: "confidential" });        // → { applied: true, outcome: "ok", revision }
 
 await bus.state.delete("clientes.cliente.v1", "cli-1", { aggregateVersion: 8 });
 
 const actual = await bus.state.get("clientes.cliente.v1", "cli-1");   // entrada | null
 
 await bus.state.watch("clientes.cliente.v1", async (entrada, ctx) => {
-  if (entrada.deleted) return borrarLocal(entrada.key);
+  if (entrada.deleted) return borrarLocal(entrada.tenantId, entrada.key);
   await guardarLocal(entrada);        // UPDATE … WHERE aggregate_version < $n
 }, { onSynced: () => listo() });
 ```
 
-`publish()` **DEBE** rechazar subjects que empiecen por `state.`, `rpc.` o `dlq.`.
+`publish()` **DEBE** rechazar los dominios reservados `dlq`, `state`, `rpc` y `system` con
+`RESERVED_DOMAIN`. Sin `classification`, `put` usa `confidential`; `restricted` se rechaza.
 
 #### 2.7 Entregables
 
-| Dónde | Qué |
-|---|---|
-| `specification/10-state.md` | Todo lo anterior, con el porqué de cada regla |
-| `specification/06-security.md` §5.1 | Reescribir según §4.4 de este plan |
-| `specification/02-naming.md` | Nombres reservados; stream `STATE_`; durable de estado |
-| `specification/08-observability.md` | `flux_state_writes_total{contract,outcome}` con `outcome = ok \| stale \| conflict \| invalid_schema`. Las métricas de consumo existentes se reutilizan con `subject="state.<contrato>"`. **Nunca** la clave ni el tenant como etiqueta. |
-| `protocol.json` | `version: "1.1.0"`; bloque `state`; patrones nuevos; `security.piiInPayload` por primitiva |
-| `scripts/check-protocol-json.mjs` | Casos que deben pasar y fallar para cada patrón nuevo |
-| `scripts/bundle-schemas.mjs`, `check-compat.mjs` | Recorrer `schemas/state/`; índice `state` en el bundle |
-| `scripts/gen-acl.mjs` | Clave `watches`. Dueño: publica en `state.<dom>.>`. Observador: los cuatro permisos de 1.1 sobre `STATE_<DOM>`, `DIRECT.GET` acotado a su tenant y `dlq.state.<contrato>` |
-| `cli/` | `flux state ls \| get \| resync`; `provision` crea `STATE_`; `doctor` audita su config; `tail` entiende `state.` |
-| `sdk-node/`, `sdk-rust/` | La API de 2.6, con tests contra NATS real |
-| `conformance/cases/` | Un caso por cada observación A-9 … A-14 |
-| `conformance/harness/` | Operaciones `state-build`, `state-tombstone`, `state-subject`, `state-dlq`, con vectores |
-| `conformance/security.mjs` | Otro servicio no escribe estado ajeno; un tenant no lee el de otro |
-| `schemas/state/clientes/cliente/1.0.0.json` | Esquema de ejemplo, con `x-pii` |
+| Dónde | Qué | Estado |
+|---|---|---|
+| `specification/10-state.md` | Todo lo anterior, con el porqué de cada regla | **Hecho** |
+| `specification/06-security.md` §5.1 | Reescribir según §4.4 de este plan | **Hecho** (§2, §3, §4 y §7: de la fase 1) |
+| `specification/02-naming.md` | Nombres reservados; stream `STATE_`; durable de estado | **Hecho** |
+| `specification/04-errors.md` §6 | Los seis códigos de estado | **Hecho** |
+| `specification/08-observability.md` | `flux_state_writes_total{contract,outcome}` con `outcome = ok \| stale \| conflict \| invalid_schema`. Las métricas de consumo existentes se reutilizan con `subject="state.<contrato>"` y el `consumer` **sin el sufijo de tenant**. **Nunca** la clave ni el tenant como etiqueta | **Hecho** |
+| `protocol.json` | `version: "1.1.0"`; bloque `state`; `errors.codes`; definición de la capacidad `state` (sin ningún SDK que la declare); `security.piiInPayload` por primitiva | **Hecho** |
+| `scripts/check-protocol-json.mjs` | Casos que deben pasar y fallar para cada patrón nuevo, invariantes de estado y 56 mutaciones | **Hecho** |
+| `scripts/bundle-schemas.mjs`, `check-compat.mjs` | Recorrer `schemas/state/`; índice `state` en el bundle; error con pista si falta `aggregateVersion` | **Hecho** (reglas en `scripts/schema-rules.mjs`) |
+| `schemas/state/clientes/cliente/1.0.0.json`, `schemas/system/state/eliminado/1.0.0.json` | Esquema de ejemplo con `x-pii`, y la lápida | **Hecho** |
+| `conformance/cases/` | `state-broker.json` (A-31 … A-49), `state-semantics.json` (A-50) y `cross-sdk-state-envelope.json`; los ejecuta `conformance/state-broker.mjs` | **Hecho** |
+| `scripts/gen-acl.mjs` | Clave `watches`. Dueño: publica en `state.<dom>.>` y `DIRECT.GET` de su dominio. Observador: `CONSUMER.INFO`, `MSG.NEXT` y `ACK` de su durable, `DIRECT.GET` acotado a su tenant, `dlq.state.<contrato>` y `STREAM.INFO.DLQ_<DOM>`; **sin** `STREAM.INFO.STATE_<DOM>`. Patrones en `protocol.json` → `state.acl` | Pendiente (agente de permisos) |
+| `cli/` | `flux state ls \| get \| resync`; `provision` crea `STATE_` y amplía `DLQ_<DOM>`; `doctor` audita su config; `dlq replay` rechaza `dlq.state.>`; `tail` entiende `state.` | Pendiente (agente de CLI) |
+| `sdk-node/`, `sdk-rust/` | La API de 2.6, con tests contra NATS real y los escenarios de `state-semantics.json` | Pendiente |
+| `conformance/harness/` | Operaciones `state-build`, `state-tombstone`, `state-subject`, `state-dlq`, con los vectores de `cross-sdk-state-envelope.json` | Pendiente (integración) |
+| `conformance/security.mjs` | Otro servicio no escribe estado ajeno; un tenant no lee el de otro. Los casos de datos de `state-broker.json` (`acls.estado`) ya lo miden contra una ACL a mano | Pendiente (integración) |
 
 **Aceptación:** la definición de hecho, más un test de extremo a extremo: el dueño escribe
-100 claves, un observador nuevo las recibe todas, se borra una, el observador recibe la
-lápida, y `get` de esa clave devuelve `null`.
+100 claves, un observador nuevo las recibe todas y recibe `onSynced`, se borra una, el observador
+recibe la lápida, y `get` de esa clave devuelve `null`.
 
 ---
 
@@ -863,7 +926,7 @@ Documento `specification/13-encryption.md`. Diseño de partida:
 | El formato de `$JS.ACK.…` cambia con dominios JetStream o entre versiones | Caso de conformidad que fije el formato observado (A-3). Si cambia, la ACL se rompe en alto, no en silencio. |
 | Algún cliente NATS no permite fijar el prefijo de inbox, o usa la API antigua de creación | Verificar librería por librería en 1.4. Si una no puede, ese SDK exige consumidores preaprovisionados y se documenta. |
 | Un `durable` personalizado en `subscribe()` no coincide con la ACL | Falla con violación de permisos. Decláralo en el manifiesto o no lo uses. |
-| Dos instancias del mismo servicio con distinto `tenantId` comparten durable de **eventos** y cada una descarta los del otro | Existe hoy. Evalúalo en la Fase 2 al definir el sufijo de tenant del durable de estado; si se confirma, abre un caso. |
+| Dos instancias del mismo servicio con distinto `tenantId` comparten durable de **eventos** y cada una descarta los del otro | **Confirmado en la Fase 2.** El broker reparte los mensajes de un durable compartido entre quienes lo usan (A-47, caso `shared-durable-splits-messages`); el SDK de Node confirma y descarta lo que no es de su tenant (`sdk-node/src/client.ts`, `#dispatch`), y el durable de eventos no lleva tenant: cada instancia pierde la mitad, en silencio. **El de estado lo evita** con el sufijo `__<tenant>`. El de eventos sigue igual: arreglarlo es cambiar el nombre del durable de eventos (decisión del dueño; ver el informe de la fase). |
 | `flux provision` y el auto-aprovisionado del SDK divergen | Una sola fuente de la config canónica: `protocol.json`. |
 | El alcance es grande: siete SDKs por tres primitivas | Por eso Node y Rust primero. Las fases 1–5 ya dan un sistema completo; la 6 es paridad. |
 
@@ -912,9 +975,32 @@ Reproducible: [`evidencia/ejecutar.sh`](evidencia/ejecutar.sh).
 | A-28 | SDK de Rust (`async-nats` 0.50) con una publicación denegada por la ACL: ¿qué ve quien la hizo? | **Nada**: el servidor descarta el mensaje y manda `-ERR 'Permissions Violation for Publish to "…"'` por la conexión; la petición espera a su timeout. Solo es observable como `Event::ServerError(ServerError::Other(texto))`. El log **del servidor** dice otra cosa: `Publish Violation - Subject "…"`. Fuente: `sdk-rust/tests/security.rs` |
 | A-29 | SDK de Rust bajo permisos exactos: subjects que publica un consumidor y un dueño en un flujo completo (publicar, consumir, ack, WIP, nak, term, DLQ, sondeo) | `STREAM.INFO.EVT_<D>`, `STREAM.INFO.DLQ_<D>` (¡no estaba en la candidata!), `CONSUMER.CREATE.<S>.<d>.<subject>`, `CONSUMER.INFO.<S>.<d>`, `CONSUMER.MSG.NEXT.<S>.<d>`, `$JS.ACK.<S>.<d>.<…>`, `dlq.<subject>`; ninguno de `$JS.API.INFO`. Toda petición responde bajo `_INBOX.<servicio>.` incluida la del pull (`MSG.NEXT`) |
 | A-30 | Fallos de conexión inicial en `async-nats`: credencial rechazada, CA que no firmó, TLS exigido sin TLS en el broker, mTLS sin certificado de cliente | `AuthorizationViolation` el primero; **los tres de TLS llegan como `ConnectErrorKind::Io`** con un `io::Error InvalidData` dentro (`UnknownIssuer`, `InvalidContentType`, `CertificateRequired`), no como `Tls` |
+| A-31 | Stream de estado: `max_msgs_per_subject: 1`, `allow_direct`, `max_age: 0`, `discard: old`; 3 escrituras sobre 2 claves. Reproduce A-9 | **2 mensajes.** El servidor devuelve la configuración pedida, sin sobrescribirla (también con 3 réplicas). Sin `max_msgs_per_subject`, las mismas 3 escrituras dejan 3. Caso `one-value-per-key` |
+| A-32 | `DIRECT.GET` por subject. Reproduce A-10 | Devuelve el cuerpo y las cabeceras `Nats-Stream`, `Nats-Subject`, `Nats-Sequence`, `Nats-Time-Stamp` **y las que se publicaron** (`Nats-Msg-Id`). Clave inexistente: `404 Message Not Found`. **Stream inexistente, o sin `allow_direct`: nadie contesta (`no responders`), y se ven igual.** Con comodín devuelve el último mensaje escrito que lo cumple. Caso `direct-get-by-subject` |
+| A-33 | `Nats-Expected-Last-Subject-Sequence`: crear con `0`, S vieja, mismo `Nats-Msg-Id` reenviado. Reproduce A-11 | `0` crea si el subject no tiene mensaje; si lo tiene, err **10071** «wrong last sequence: N» (N = la real). **El chequeo de secuencia se evalúa ANTES que el de duplicados**: el mismo id con la S vieja da 10071, no `duplicate`. **Un publish rechazado por secuencia no gasta el `Nats-Msg-Id`.** Sin cabecera de secuencia el mismo id sí es `duplicate`. Caso `conditional-write` |
+| A-34 | Lápida sobre una clave; recrearla. Reproduce A-13 | El valor anterior **sale del stream** (un mensaje por clave) y `DIRECT.GET` devuelve la lápida. Recrear con `expected=0`: 10071 con la secuencia de la lápida; con la secuencia de la lápida: se aplica. Caso `tombstone-replaces-and-recreates` |
+| A-35 | Consumidor `last_per_subject` sobre estado: tamaño, orden, `pending`, stream vacío, escrituras durante la sincronización, igualdad con `all`. Reproduce A-12 | `num_pending` = número de **claves** del filtro, lápidas incluidas. Entrega en orden de secuencia con el `pending` de los metadatos bajando hasta **0** en la última. Stream vacío: `num_pending 0` y no entrega nada. Una clave reescrita durante la sincronización aparece **una vez**, con su secuencia nueva; una nueva, al final. En este stream `deliver_policy: all` entrega lo mismo. Casos `snapshot-*`, `writes-during-the-snapshot` |
+| A-36 | Revisión 1 entregada y `nak`; entra la revisión 2 que la sustituye | **La 1 no se reentrega**: el siguiente pull entrega solo la 2; `num_redelivered 0`. Caso `replaced-message-is-not-redelivered` |
+| A-37 | Borrar y recrear el durable (`flux state resync`) | Vuelve a entregar el último valor de cada clave. Caso `resync-by-recreating-the-durable` |
+| A-38 | ACL por tenant sobre el estado, escrita a mano: dueño y observador de `acme`. Reproduce A-14 | El dueño escribe en todos sus tenants y lee; no escribe en otro dominio. El observador **no escribe**; lee `acme.*`; se le **deniega** `globex`, `v1.*.*`, `state.<dom>.>`, la forma de **cuerpo** de `DIRECT.GET` y `STREAM.MSG.GET`; el comodín en la clave pasa (es su tenant). Su `CONSUMER.INFO`, `MSG.NEXT` y `ACK` funcionan; los del durable de otro servicio, no. **`DIRECT.GET` por subject con un cuerpo `{seq}` da `408 Bad Request`**: no se puede colar un cuerpo por un permiso de subject. Casos `acl-owner-writes-observer-reads-only-its-tenant`, `subject-form-direct-get-rejects-a-body` |
+| A-39 | `STREAM.INFO` con `subjects_filter` en el cuerpo, con y sin permiso | **Lista TODOS los subjects del stream con su recuento: todas las claves y todos los tenants.** Sin ese permiso, `put`, `get` y `watch` funcionan igual. Casos `stream-info-lists-keys-and-tenants`, `acl-stream-info-needs-its-own-permission` |
+| A-40 | `CONSUMER.CREATE` por subject con un filtro más ancho en el cuerpo: `filter_subject`, `filter_subjects` o ninguno | 10131 «did not match filtered subject» para el primero y para ninguno (no hereda el del subject); **10137** «consumer with multiple subject filters cannot use subject based API» para el array. Caso `acl-consumer-create-filter-cannot-be-widened` |
+| A-41 | Publicar a un subject de estado con claves `*`, `a>b`, `a.b`, `café`, 2000 caracteres y `a b` | **El broker acepta todas salvo la que lleva un espacio** (`illegal subject`). `a.b` son dos tokens: queda fuera del filtro `…acme.*`, sin error. Casos `broker-does-not-validate-keys`, `put-validates-before-the-network` |
+| A-42 | Longitud de nombres | Consumidor: **255** como máximo (256 → err 10102): caso `name-length-limits`. Medido a mano, sin caso: un stream de 255 caracteres se acepta, y un subject de 3,9 KiB se publica pero uno de 5 KiB no recibe respuesta |
+| A-43 | `EVT_STATE` (`state.>`) con `STATE_CLIENTES` existente; `EVT_DLQ` (`dlq.>`) con `DLQ_PEDIDOS` | Err **10065** «subjects overlap with an existing stream» en los dos. `state-clientes` no está reservado y convive. Caso `reserved-domains-collide-in-the-broker` |
+| A-44 | Ampliar `DLQ_CLIENTES` con `dlq.state.clientes.>` teniendo mensajes; publicar antes y después; publicar a un subject sin stream | Se amplía sin perder mensajes. Publicar por JetStream a un subject que nadie captura **falla** (a diferencia de core). El `DLQ` de otro dominio no captura `dlq.state.clientes.>`. Caso `dlq-stream-can-be-widened` |
+| A-45 | Publicar por **core** a un subject de estado | **Lo captura el stream sin acuse y sin chequeo de secuencia**: sobrescribe. Caso `core-publish-bypasses-the-conditional-write` |
+| A-46 | Stream con `discard: new` y `discard_new_per_subject` | La segunda escritura en una clave da err **10077** «maximum messages per subject exceeded»: sería un create-only. Descartado. Caso `discard-new-per-subject-is-create-only` |
+| A-47 | Dos clientes pidiendo del MISMO durable | **Reparten los mensajes** (3 y 3, disjuntos). Por eso el durable de estado lleva el tenant, y por eso el riesgo de §7 sobre eventos es real. Caso `shared-durable-splits-messages` |
+| A-48 | `CONSUMER.INFO` de un consumidor inexistente y de un stream inexistente | 404 con err **10014** «consumer not found» y **10059** «stream not found»: se distinguen sin `STREAM.INFO`. Caso `consumer-info-distinguishes-missing-stream-and-consumer` |
+| A-49 | Cluster de 3 nodos locales: stream R3 con la config de estado; carrera de 8 escritores con la misma S; lectura directa tras un `put`; 3 instancias del dueño | Config devuelta tal cual. **Bajo carrera: 210 de 210 rechazos con err 10164 «wrong last sequence», SIN número**; sin carrera sigue siendo 10071 con número. 400 `put` seguidos de su lectura inmediata: 0 lecturas obsoletas (**no** demuestra que no ocurra con latencia real). 3 instancias sobre la misma clave sin pausa: de 90 `put`, 49 ok, 27 `stale`, 14 `STATE_CONFLICT`. Casos `cluster-r3-cas-conflict-code`, `cluster-three-owner-instances-converge` |
+| A-50 | El algoritmo de `put`/`delete`/`get` y la foto de `watch` (10-state.md §3.2, §5.5), como implementación de referencia sobre NATS crudo | Los escenarios de `state-semantics.json`: versiones y `stale`; recrear tras la lápida; clave inexistente; versión 0, decimal o > 2^53 − 1; propia escritura tras un acuse perdido; 3 conflictos → `STATE_CONFLICT`, un rival con versión mayor → `stale`; 3 instancias convergen; mismo `cli-1` en dos tenants; foto con lápida, vacía y con escrituras. Nueve mutantes de la referencia (`--mutant`) los hacen fallar todos |
 A-19 a A-27 los reproduce `sdk-node/test/integration/` (`acl.test.ts`, `auth.test.ts`,
 `tls.test.ts`), contra nats-server 2.14.5 y `@nats-io/*` 3.4.0. A-28 a A-30 los reproduce
 `sdk-rust/tests/security.rs`, contra nats-server 2.14.5 y `async-nats` 0.50.
+A-31 a A-50 los ejecuta [`conformance/state-broker.mjs`](../../conformance/state-broker.mjs) contra
+nats-server 2.14.5 y `@nats-io/*` 3.4.0 (`NATS_SERVER=… node conformance/state-broker.mjs`: 35 casos más 5 comprobaciones de los
+ejemplos byte a byte; un nodo, una ACL escrita a mano y un cluster de tres nodos).
 
 **Qué caso cubre cada una.** Las observaciones **del broker** ya son casos de
 [`conformance/cases/security-acl.json`](../../conformance/cases/security-acl.json) (el mapa
@@ -922,8 +1008,11 @@ completo es su bloque `brokerObservations`): A-1 → S9 · A-2 → S6, S9 · A-3
 A-5 → S3 · A-6 → S4 · A-7 → S6 · A-8 → S5 · A-8a → S1, S2 · A-8c → S10 · A-8f → S6, S13 ·
 A-19, A-20 → S12 · A-21 → S13 · A-22 → S6 · A-24 → S8 (la parte del broker) · A-25 → S14 ·
 A-27 → S10, S11 · A-29 → S11.
+Las del **estado** (A-9 … A-14 y A-31 … A-50) son casos de
+[`conformance/cases/state-broker.json`](../../conformance/cases/state-broker.json) y
+[`state-semantics.json`](../../conformance/cases/state-semantics.json): cada caso lleva su lista `covers`.
 **No tienen caso** porque son del SDK o de la librería (A-8b, A-26, A-28, A-30; los cubren
-`verify-acl.mjs` y los tests de los SDKs), de las Fases 2 y 3 (A-9 … A-18, aún en `evidencia/`) o
+`verify-acl.mjs` y los tests de los SDKs), de la Fase 3 (A-15 … A-18, aún en `evidencia/`) o
 necesitan otra forma de arrancar el servidor (A-8d, la misma nkey en dos accounts: no arranca;
 A-23, el modo operador/JWT; A-8e y A-24, la parte de `connect()` que se cuelga: son de la
 librería y de la CLI).
