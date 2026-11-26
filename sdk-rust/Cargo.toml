@@ -127,3 +127,7 @@ async-nats = "0.50"
 # commitear una clave privada de prueba —que caduca y que un escáner de secretos marca— o
 # depender de que `openssl` esté instalado.
 rcgen = "0.13"
+# `tests/state.rs` comprueba que cada permiso de su configuración de broker, escrita a mano, encaja
+# en los patrones de `protocol.json` → `state.acl`: las expresiones de ahí son regex puras (sin
+# lookahead, que el crate `regex` no admite). Ya está en el árbol de dependencias: la trae `async-nats`.
+regex = "1"

@@ -1,8 +1,12 @@
 # flux — Event Protocol v1
 
 > **Estado:** Draft normativo
-> **Versión:** 1.0.0
+> **Versión:** 1.1.0
 > **Última revisión:** 2026-11-26
+
+> **1.1 es aditiva.** Las decisiones de v1.0 no cambian; el estado replicado
+> ([10-state.md](10-state.md)) entra como **extensión opcional**, igual que la firma: un servicio
+> que solo use eventos sigue siendo conforme.
 
 ---
 
@@ -55,7 +59,9 @@ dato.**
   request/reply, usa NATS Core request/reply — está fuera del alcance de v1.
 - **Transporte de blobs.** Si el payload supera **1 MiB**, publica una referencia
   (URI + checksum), no el contenido. Ver [01-envelope.md §7](01-envelope.md).
-- **Sustituto de una tabla.** Un evento no es una fila. Un evento es un cambio.
+- **Sustituto de una tabla.** Un evento no es una fila. Un evento es un cambio. Si lo que
+  necesitas es la fila —el valor actual de un agregado—, es **estado**
+  ([10-state.md](10-state.md)).
 
 ## 5. Niveles de conformidad
 
@@ -141,6 +147,7 @@ conforme; lo que no es, es compatible con aquello que la capacidad habilita.
 |---|---|---|
 | `signing` | [07-signing.md](07-signing.md) | No firma ni verifica. Un evento sin firma sigue siendo válido: el modo por defecto es `off` |
 | `security` | Esta sección, y lo que cita | **No es compatible con la configuración segura** de [06-security.md](06-security.md): con el inbox por defecto el broker le deniega la suscripción a su propio inbox y su primera petición falla |
+| `state` | [10-state.md](10-state.md) | No escribe ni lee **estado replicado** (`put`, `delete`, `get`, `watch`): para leer un dato que guarda otro sistema tiene que llamarle por HTTP. Sigue siendo conforme |
 
 El registro de qué SDK declara qué capacidad es [`protocol.json`](../protocol.json) →
 `capabilities`, y la tabla «Estado de los SDKs» del [`README.md`](../README.md) lo muestra.
@@ -176,12 +183,25 @@ SDK contiene los códigos de error de las capacidades que declara y que existen 
 evidencia que cita. Es necesario y **no suficiente**: que un código esté escrito no prueba que
 se emita.
 
+#### `state`
+
+Un SDK **declara** `state` solo si cumple **todo** lo de [10-state.md §10](10-state.md): las
+cuatro operaciones, **los mismos bytes** que los ejemplos de [10-state.md §2.6](10-state.md), el
+reconocimiento de **los dos** códigos de conflicto de secuencia, los **siete** códigos de
+[04-errors.md §6](04-errors.md), el rechazo de los dominios reservados en `publish()` y un ciclo
+completo contra un broker real con los permisos exactos de estado, en los dos sentidos.
+`security` no es requisito, pero **sin ella el SDK no puede ejecutar** el ciclo bajo la
+configuración segura.
+
 Una capacidad nueva se añade aquí con su nombre, su documento normativo y la evidencia que la
 acredita, y ningún SDK la declara hasta que pasa esa evidencia.
 
 ## 6. Fuera del alcance de v1
 
 Declarado explícitamente para evitar scope creep:
+
+> El **estado replicado** no está en esta lista: entra en 1.1 como extensión opcional
+> ([10-state.md](10-state.md)).
 
 - Request/reply y RPC.
 - Sagas y orquestación de procesos de larga duración.
@@ -202,3 +222,4 @@ Declarado explícitamente para evitar scope creep:
 | [07-signing.md](07-signing.md) | Firma Ed25519 — extensión **opcional** |
 | [08-observability.md](08-observability.md) | Métricas, trazas y alertas — normativo para L2 |
 | [09-multitenancy.md](09-multitenancy.md) | Modelos de aislamiento entre tenants |
+| [10-state.md](10-state.md) | Estado replicado — extensión **opcional**: `put`, `delete`, `get`, `watch` |

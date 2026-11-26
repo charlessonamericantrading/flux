@@ -323,5 +323,1472 @@
       "why": "Un SDK que escape los no-ASCII firma sobre bytes distintos: su firma no verificaria en ningun otro, y al reves tampoco."
     }
   ],
-  "$commentVerify": "Los vectores de verify cruzan de verdad: el runner FIRMA con el SDK de referencia y pide a cada uno de los demas que VERIFIQUE esa firma. Es la unica prueba que demuestra interoperabilidad; que cada SDK verifique su propia firma solo demuestra consistencia consigo mismo."
+  "$commentVerify": "Los vectores de verify cruzan de verdad: el runner FIRMA con el SDK de referencia y pide a cada uno de los demas que VERIFIQUE esa firma. Es la unica prueba que demuestra interoperabilidad; que cada SDK verifique su propia firma solo demuestra consistencia consigo mismo.",
+  "stateVectors": [
+    {
+      "id": "state-put-minimo",
+      "spec": "10-state.md §2.5",
+      "why": "El caso base del estado. Si dos SDKs difieren aquí, difieren en todo lo demás: type, dataschema derivado, `subject` = la clave, `partitionkey` y `tenantid` salen de ESTA entrada.",
+      "op": "state-build",
+      "input": {
+        "contract": "clientes.cliente.v1",
+        "tenantId": "acme",
+        "key": "cli-1",
+        "id": "01924f8e-7c3a-7b2d-9e14-3f8a1c9d0e55",
+        "source": "/produccion/crm-api",
+        "time": "2026-08-20T10:25:39.412Z",
+        "correlationid": "01924f8e-7c3a-7b2d-9e14-3f8a1c9d0e55",
+        "producerversion": "2.1.0",
+        "classification": "internal",
+        "data": {
+          "clienteId": "cli-1",
+          "aggregateVersion": 1
+        }
+      }
+    },
+    {
+      "id": "state-put-spec-2-6",
+      "spec": "10-state.md §2.6",
+      "why": "El `put` de la spec, con UTF-8 literal (`María`) y su SHA-256: es lo que hace que el resultado no sea «lo que dice Node» sino lo que dice la spec. Es el fixture `state-put` de cross-sdk-state-envelope.json.",
+      "op": "state-build",
+      "input": {
+        "contract": "clientes.cliente.v1",
+        "tenantId": "acme",
+        "key": "cli-1",
+        "id": "01924f8e-7c3a-7b2d-9e14-3f8a1c9d0e55",
+        "source": "/produccion/crm-api",
+        "time": "2026-08-20T10:25:39.412Z",
+        "correlationid": "01924f8e-7c3a-7b2d-9e14-3f8a1c9d0e55",
+        "producerversion": "2.1.0",
+        "classification": "confidential",
+        "data": {
+          "clienteId": "cli-1",
+          "nombre": "María Peña",
+          "email": "maria@example.com",
+          "aggregateVersion": 7
+        }
+      },
+      "caseFixture": "state-put",
+      "sha256": "fa6b20beb64f90c06b0cfb2c82d809a8fd2672b365681d2cd9d1a99f29b13b40"
+    },
+    {
+      "id": "state-put-utf8-literal",
+      "spec": "01-envelope.md §1.1, 10-state.md §2.6",
+      "why": "Acentos, eñes, euro, emoji (par sustituto) y <>&'+ LITERALES. Un serializador que escape el no-ASCII (`json_encode` de PHP, System.Text.Json, un `ensure_ascii` olvidado) da otros bytes, y con ellos otra firma, otro hash de deduplicación y un replay que no es verbatim.",
+      "op": "state-build",
+      "input": {
+        "contract": "clientes.cliente.v1",
+        "tenantId": "acme",
+        "key": "cli-2",
+        "id": "01924f8e-7c3a-7b2d-9e14-3f8a1c9d0e55",
+        "source": "/produccion/crm-api",
+        "time": "2026-08-20T10:25:39.412Z",
+        "correlationid": "01924f8e-7c3a-7b2d-9e14-3f8a1c9d0e55",
+        "producerversion": "2.1.0",
+        "classification": "confidential",
+        "data": {
+          "clienteId": "cli-2",
+          "nota": "Café con leche & pan <tostado>, para el señor Muñoz — 5€",
+          "emoji": "✅ 🚀",
+          "pais": "España",
+          "ruta": "https://ejemplo.test/a/b?x=1&y=2",
+          "aggregateVersion": 4
+        }
+      }
+    },
+    {
+      "id": "state-put-escapes-obligatorios",
+      "spec": "01-envelope.md §1.1",
+      "why": "Solo se escapa lo que JSON OBLIGA a escapar: comillas, barra, \\n, \\t y los de control. U+007F y U+2028 van LITERALES (`json_encode` de PHP escapa U+2028 aunque se le pida UTF-8 sin escapes). Es el reverso del vector `utf8-literal`: allí nada se escapa, aquí se escapa exactamente lo debido.",
+      "op": "state-build",
+      "input": {
+        "contract": "clientes.cliente.v1",
+        "tenantId": "acme",
+        "key": "cli-3",
+        "id": "01924f8e-7c3a-7b2d-9e14-3f8a1c9d0e55",
+        "source": "/produccion/crm-api",
+        "time": "2026-08-20T10:25:39.412Z",
+        "correlationid": "01924f8e-7c3a-7b2d-9e14-3f8a1c9d0e55",
+        "producerversion": "2.1.0",
+        "classification": "internal",
+        "data": {
+          "clienteId": "cli-3",
+          "cita": "dijo \"hola\"",
+          "ruta": "C:\\temp\\x",
+          "lineas": "a\nb\tc",
+          "control": "\u0001",
+          "del": "\u007f",
+          "separador": "a\u2028b",
+          "aggregateVersion": 2
+        }
+      }
+    },
+    {
+      "id": "state-put-limites-minimos",
+      "spec": "10-state.md §2.3, §2.4",
+      "why": "Tenant de 1 carácter y clave `0` (empieza por dígito): el extremo corto de los dos patrones.",
+      "op": "state-build",
+      "input": {
+        "contract": "clientes.cliente.v1",
+        "tenantId": "a",
+        "key": "0",
+        "id": "01924f8e-7c3a-7b2d-9e14-3f8a1c9d0e55",
+        "source": "/produccion/crm-api",
+        "time": "2026-08-20T10:25:39.412Z",
+        "correlationid": "01924f8e-7c3a-7b2d-9e14-3f8a1c9d0e55",
+        "producerversion": "2.1.0",
+        "classification": "internal",
+        "data": {
+          "clienteId": "0",
+          "aggregateVersion": 1
+        }
+      }
+    },
+    {
+      "id": "state-put-limites-maximos",
+      "spec": "10-state.md §2.3, §2.4",
+      "why": "Tenant de 64 caracteres (con guiones) y clave de 128 (mayúscula, `_` y `-` dentro): el extremo largo de los dos patrones. Un SDK que cuente bytes donde otro cuenta caracteres, o que se pase en uno, falla aquí.",
+      "op": "state-build",
+      "input": {
+        "contract": "clientes.cliente.v1",
+        "tenantId": "a-a-a-a-a-a-a-a-a-a-a-a-a-a-a-a-a-a-a-a-a-a-a-a-a-a-a-a-a-a-a-a1",
+        "key": "Za9_-a9_-a9_-a9_-a9_-a9_-a9_-a9_-a9_-a9_-a9_-a9_-a9_-a9_-a9_-a9_-a9_-a9_-a9_-a9_-a9_-a9_-a9_-a9_-a9_-a9_-a9_-a9_-a9_-a9_-a9_-a9_",
+        "id": "01924f8e-7c3a-7b2d-9e14-3f8a1c9d0e55",
+        "source": "/produccion/crm-api",
+        "time": "2026-08-20T10:25:39.412Z",
+        "correlationid": "01924f8e-7c3a-7b2d-9e14-3f8a1c9d0e55",
+        "producerversion": "2.1.0",
+        "classification": "internal",
+        "data": {
+          "clienteId": "k",
+          "aggregateVersion": 1
+        }
+      }
+    },
+    {
+      "id": "state-put-version-maxima",
+      "spec": "10-state.md §3.4",
+      "why": "`aggregateVersion` = 2^53 − 1, el mayor entero que Node representa sin perder precisión. Un SDK con un tipo más estrecho (u32, i32) o que lo pase por `double` con un formato distinto lo imprime de otra forma.",
+      "op": "state-build",
+      "input": {
+        "contract": "clientes.cliente.v1",
+        "tenantId": "acme",
+        "key": "cli-1",
+        "id": "01924f8e-7c3a-7b2d-9e14-3f8a1c9d0e55",
+        "source": "/produccion/crm-api",
+        "time": "2026-08-20T10:25:39.412Z",
+        "correlationid": "01924f8e-7c3a-7b2d-9e14-3f8a1c9d0e55",
+        "producerversion": "2.1.0",
+        "classification": "internal",
+        "data": {
+          "clienteId": "cli-1",
+          "aggregateVersion": 9007199254740991
+        }
+      }
+    },
+    {
+      "id": "state-put-public-y-system",
+      "spec": "10-state.md §2.4, §3.6",
+      "why": "`public` y el tenant `system`: un tenant válido, que no es un comodín ni un valor por defecto.",
+      "op": "state-build",
+      "input": {
+        "contract": "clientes.cliente.v1",
+        "tenantId": "system",
+        "key": "pais-es",
+        "id": "01924f8e-7c3a-7b2d-9e14-3f8a1c9d0e55",
+        "source": "/produccion/crm-api",
+        "time": "2026-08-20T10:25:39.412Z",
+        "correlationid": "01924f8e-7c3a-7b2d-9e14-3f8a1c9d0e55",
+        "producerversion": "2.1.0",
+        "classification": "public",
+        "data": {
+          "codigo": "ES",
+          "aggregateVersion": 5
+        }
+      }
+    },
+    {
+      "id": "state-put-extensiones-opcionales",
+      "spec": "01-envelope.md §6, 10-state.md §2.5",
+      "why": "`causationid`, `traceparent` y `tracestate` presentes: fija su POSICIÓN respecto a `partitionkey` (causationid va ANTES, traceparent y tracestate DESPUÉS). Ningún test de un solo SDK lo ve.",
+      "op": "state-build",
+      "input": {
+        "contract": "clientes.cliente.v1",
+        "tenantId": "acme",
+        "key": "cli-1",
+        "id": "01924f8e-7c3a-7b2d-9e14-3f8a1c9d0e55",
+        "source": "/produccion/crm-api",
+        "time": "2026-08-20T10:25:39.412Z",
+        "correlationid": "01924f8e-7c3a-7b2d-9e14-3f8a1c9d0e55",
+        "producerversion": "2.1.0",
+        "classification": "confidential",
+        "causationid": "01924f8d-1a2b-7c3d-8e4f-5a6b7c8d9e01",
+        "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+        "tracestate": "flux=1",
+        "data": {
+          "clienteId": "cli-1",
+          "aggregateVersion": 2
+        }
+      }
+    },
+    {
+      "id": "state-put-contrato-v2-kebab",
+      "spec": "10-state.md §2.2, 02-naming.md §1",
+      "why": "Un contrato con kebab-case y v2: el `type` es `com.flux.state.logistica.linea-envio.v2` y el `dataschema` derivado es `…/state/logistica/linea-envio/2.0.0.json`. La derivación es del SDK, no del vector.",
+      "op": "state-build",
+      "input": {
+        "contract": "logistica.linea-envio.v2",
+        "tenantId": "acme-corp",
+        "key": "Env_00-9",
+        "id": "01924f8e-7c3a-7b2d-9e14-3f8a1c9d0e55",
+        "source": "/produccion/crm-api",
+        "time": "2026-08-20T10:25:39.412Z",
+        "correlationid": "01924f8e-7c3a-7b2d-9e14-3f8a1c9d0e55",
+        "producerversion": "2.1.0",
+        "classification": "confidential",
+        "data": {
+          "envioId": "Env_00-9",
+          "aggregateVersion": 3,
+          "motivo": "ausente"
+        }
+      }
+    },
+    {
+      "id": "state-put-orden-de-claves-de-data",
+      "spec": "01-envelope.md §6",
+      "why": "`data` viaja con el orden de claves del vector (no alfabético, con `aggregateVersion` en medio, objetos y arrays anidados). El orden es normativo: de él dependen el replay verbatim, la firma y el hash.",
+      "op": "state-build",
+      "input": {
+        "contract": "clientes.cliente.v1",
+        "tenantId": "acme",
+        "key": "cli-1",
+        "id": "01924f8e-7c3a-7b2d-9e14-3f8a1c9d0e55",
+        "source": "/produccion/crm-api",
+        "time": "2026-08-20T10:25:39.412Z",
+        "correlationid": "01924f8e-7c3a-7b2d-9e14-3f8a1c9d0e55",
+        "producerversion": "2.1.0",
+        "classification": "internal",
+        "data": {
+          "z": {
+            "b": 1,
+            "a": [
+              1,
+              {
+                "y": 2,
+                "x": 3
+              }
+            ]
+          },
+          "aggregateVersion": 2,
+          "a": "último"
+        }
+      }
+    },
+    {
+      "id": "state-put-control-tenant",
+      "spec": "10-state.md §2.4, §2.5",
+      "why": "CONTROL del arnés: es `state-put-minimo` con OTRO tenant y sus bytes DEBEN ser distintos. Si no lo fueran, la comparación byte a byte no vería un SDK que intercambia el tenant, que es el fallo más caro de este protocolo (un dato guardado en otro sitio, sin error).",
+      "op": "state-build",
+      "input": {
+        "contract": "clientes.cliente.v1",
+        "tenantId": "globex",
+        "key": "cli-1",
+        "id": "01924f8e-7c3a-7b2d-9e14-3f8a1c9d0e55",
+        "source": "/produccion/crm-api",
+        "time": "2026-08-20T10:25:39.412Z",
+        "correlationid": "01924f8e-7c3a-7b2d-9e14-3f8a1c9d0e55",
+        "producerversion": "2.1.0",
+        "classification": "internal",
+        "data": {
+          "clienteId": "cli-1",
+          "aggregateVersion": 1
+        }
+      },
+      "differsFrom": "state-put-minimo"
+    },
+    {
+      "id": "state-put-rechaza-sin-aggregate-version",
+      "spec": "10-state.md §3.4",
+      "why": "Ausente. El nombre del código cubre TODO lo que no sea un entero ≥ 1, no solo la ausencia.",
+      "op": "state-build",
+      "input": {
+        "contract": "clientes.cliente.v1",
+        "tenantId": "acme",
+        "key": "cli-1",
+        "id": "01924f8e-7c3a-7b2d-9e14-3f8a1c9d0e55",
+        "source": "/produccion/crm-api",
+        "time": "2026-08-20T10:25:39.412Z",
+        "correlationid": "01924f8e-7c3a-7b2d-9e14-3f8a1c9d0e55",
+        "producerversion": "2.1.0",
+        "classification": "internal",
+        "data": {
+          "clienteId": "cli-1"
+        }
+      },
+      "expect": "MISSING_AGGREGATE_VERSION"
+    },
+    {
+      "id": "state-put-rechaza-version-cero",
+      "spec": "10-state.md §3.4",
+      "why": "0: el mínimo es 1.",
+      "op": "state-build",
+      "input": {
+        "contract": "clientes.cliente.v1",
+        "tenantId": "acme",
+        "key": "cli-1",
+        "id": "01924f8e-7c3a-7b2d-9e14-3f8a1c9d0e55",
+        "source": "/produccion/crm-api",
+        "time": "2026-08-20T10:25:39.412Z",
+        "correlationid": "01924f8e-7c3a-7b2d-9e14-3f8a1c9d0e55",
+        "producerversion": "2.1.0",
+        "classification": "internal",
+        "data": {
+          "clienteId": "cli-1",
+          "aggregateVersion": 0
+        }
+      },
+      "expect": "MISSING_AGGREGATE_VERSION"
+    },
+    {
+      "id": "state-put-rechaza-version-cadena",
+      "spec": "10-state.md §3.4",
+      "why": "\"7\": una cadena no es el entero 7 (01-envelope.md §2.4: los tipos no se coaccionan).",
+      "op": "state-build",
+      "input": {
+        "contract": "clientes.cliente.v1",
+        "tenantId": "acme",
+        "key": "cli-1",
+        "id": "01924f8e-7c3a-7b2d-9e14-3f8a1c9d0e55",
+        "source": "/produccion/crm-api",
+        "time": "2026-08-20T10:25:39.412Z",
+        "correlationid": "01924f8e-7c3a-7b2d-9e14-3f8a1c9d0e55",
+        "producerversion": "2.1.0",
+        "classification": "internal",
+        "data": {
+          "clienteId": "cli-1",
+          "aggregateVersion": "7"
+        }
+      },
+      "expect": "MISSING_AGGREGATE_VERSION"
+    },
+    {
+      "id": "state-put-rechaza-version-decimal",
+      "spec": "10-state.md §3.4",
+      "why": "7.5: un contador es un entero.",
+      "op": "state-build",
+      "input": {
+        "contract": "clientes.cliente.v1",
+        "tenantId": "acme",
+        "key": "cli-1",
+        "id": "01924f8e-7c3a-7b2d-9e14-3f8a1c9d0e55",
+        "source": "/produccion/crm-api",
+        "time": "2026-08-20T10:25:39.412Z",
+        "correlationid": "01924f8e-7c3a-7b2d-9e14-3f8a1c9d0e55",
+        "producerversion": "2.1.0",
+        "classification": "internal",
+        "data": {
+          "clienteId": "cli-1",
+          "aggregateVersion": 7.5
+        }
+      },
+      "expect": "MISSING_AGGREGATE_VERSION"
+    },
+    {
+      "id": "state-put-rechaza-version-negativa",
+      "spec": "10-state.md §3.4",
+      "why": "-1.",
+      "op": "state-build",
+      "input": {
+        "contract": "clientes.cliente.v1",
+        "tenantId": "acme",
+        "key": "cli-1",
+        "id": "01924f8e-7c3a-7b2d-9e14-3f8a1c9d0e55",
+        "source": "/produccion/crm-api",
+        "time": "2026-08-20T10:25:39.412Z",
+        "correlationid": "01924f8e-7c3a-7b2d-9e14-3f8a1c9d0e55",
+        "producerversion": "2.1.0",
+        "classification": "internal",
+        "data": {
+          "clienteId": "cli-1",
+          "aggregateVersion": -1
+        }
+      },
+      "expect": "MISSING_AGGREGATE_VERSION"
+    },
+    {
+      "id": "state-put-rechaza-version-null",
+      "spec": "10-state.md §3.4",
+      "why": "`null` no es «ausente» ni 0: es un tipo equivocado.",
+      "op": "state-build",
+      "input": {
+        "contract": "clientes.cliente.v1",
+        "tenantId": "acme",
+        "key": "cli-1",
+        "id": "01924f8e-7c3a-7b2d-9e14-3f8a1c9d0e55",
+        "source": "/produccion/crm-api",
+        "time": "2026-08-20T10:25:39.412Z",
+        "correlationid": "01924f8e-7c3a-7b2d-9e14-3f8a1c9d0e55",
+        "producerversion": "2.1.0",
+        "classification": "internal",
+        "data": {
+          "clienteId": "cli-1",
+          "aggregateVersion": null
+        }
+      },
+      "expect": "MISSING_AGGREGATE_VERSION"
+    },
+    {
+      "id": "state-put-rechaza-version-mayor-que-2-53",
+      "spec": "10-state.md §3.4",
+      "why": "2^53: el primer entero que un `double` ya no distingue de su vecino.",
+      "op": "state-build",
+      "input": {
+        "contract": "clientes.cliente.v1",
+        "tenantId": "acme",
+        "key": "cli-1",
+        "id": "01924f8e-7c3a-7b2d-9e14-3f8a1c9d0e55",
+        "source": "/produccion/crm-api",
+        "time": "2026-08-20T10:25:39.412Z",
+        "correlationid": "01924f8e-7c3a-7b2d-9e14-3f8a1c9d0e55",
+        "producerversion": "2.1.0",
+        "classification": "internal",
+        "data": {
+          "clienteId": "cli-1",
+          "aggregateVersion": 9007199254740992
+        }
+      },
+      "expect": "MISSING_AGGREGATE_VERSION"
+    },
+    {
+      "id": "state-put-rechaza-data-no-objeto",
+      "spec": "10-state.md §3.4, 01-envelope.md §2",
+      "why": "`data` debe ser un objeto con `aggregateVersion`; un array no lo es.",
+      "op": "state-build",
+      "input": {
+        "contract": "clientes.cliente.v1",
+        "tenantId": "acme",
+        "key": "cli-1",
+        "id": "01924f8e-7c3a-7b2d-9e14-3f8a1c9d0e55",
+        "source": "/produccion/crm-api",
+        "time": "2026-08-20T10:25:39.412Z",
+        "correlationid": "01924f8e-7c3a-7b2d-9e14-3f8a1c9d0e55",
+        "producerversion": "2.1.0",
+        "classification": "internal",
+        "data": [
+          1,
+          2
+        ]
+      },
+      "expect": "MISSING_AGGREGATE_VERSION"
+    },
+    {
+      "id": "state-put-rechaza-restricted",
+      "spec": "10-state.md §3.6, §7",
+      "why": "`restricted` no se admite en estado: 24 h de retención no caben en un almacén sin caducidad.",
+      "op": "state-build",
+      "input": {
+        "contract": "clientes.cliente.v1",
+        "tenantId": "acme",
+        "key": "cli-1",
+        "id": "01924f8e-7c3a-7b2d-9e14-3f8a1c9d0e55",
+        "source": "/produccion/crm-api",
+        "time": "2026-08-20T10:25:39.412Z",
+        "correlationid": "01924f8e-7c3a-7b2d-9e14-3f8a1c9d0e55",
+        "producerversion": "2.1.0",
+        "classification": "restricted",
+        "data": {
+          "clienteId": "cli-1",
+          "aggregateVersion": 1
+        }
+      },
+      "expect": "INVALID_DATACLASSIFICATION"
+    },
+    {
+      "id": "state-put-rechaza-clasificacion-desconocida",
+      "spec": "01-envelope.md §3.1, 10-state.md §3.6",
+      "why": "Una clasificación fuera del enum no se «corrige» a un valor por defecto: asumir `internal` haría circular PII con 30 días de retención en vez de 7.",
+      "op": "state-build",
+      "input": {
+        "contract": "clientes.cliente.v1",
+        "tenantId": "acme",
+        "key": "cli-1",
+        "id": "01924f8e-7c3a-7b2d-9e14-3f8a1c9d0e55",
+        "source": "/produccion/crm-api",
+        "time": "2026-08-20T10:25:39.412Z",
+        "correlationid": "01924f8e-7c3a-7b2d-9e14-3f8a1c9d0e55",
+        "producerversion": "2.1.0",
+        "classification": "secreto",
+        "data": {
+          "clienteId": "cli-1",
+          "aggregateVersion": 1
+        }
+      },
+      "expect": "INVALID_DATACLASSIFICATION"
+    },
+    {
+      "id": "state-put-rechaza-clave-invalida",
+      "spec": "10-state.md §2.3",
+      "why": "`cli.1` son DOS tokens de NATS: la entrada quedaría fuera de todo filtro, sin error.",
+      "op": "state-build",
+      "input": {
+        "contract": "clientes.cliente.v1",
+        "tenantId": "acme",
+        "key": "cli.1",
+        "id": "01924f8e-7c3a-7b2d-9e14-3f8a1c9d0e55",
+        "source": "/produccion/crm-api",
+        "time": "2026-08-20T10:25:39.412Z",
+        "correlationid": "01924f8e-7c3a-7b2d-9e14-3f8a1c9d0e55",
+        "producerversion": "2.1.0",
+        "classification": "internal",
+        "data": {
+          "clienteId": "cli.1",
+          "aggregateVersion": 1
+        }
+      },
+      "expect": "INVALID_STATE_KEY"
+    },
+    {
+      "id": "state-put-rechaza-tenant-invalido",
+      "spec": "10-state.md §2.4",
+      "why": "El tenant de un evento es cualquier cadena; el de un estado, no: va dentro del subject.",
+      "op": "state-build",
+      "input": {
+        "contract": "clientes.cliente.v1",
+        "tenantId": "ACME",
+        "key": "cli-1",
+        "id": "01924f8e-7c3a-7b2d-9e14-3f8a1c9d0e55",
+        "source": "/produccion/crm-api",
+        "time": "2026-08-20T10:25:39.412Z",
+        "correlationid": "01924f8e-7c3a-7b2d-9e14-3f8a1c9d0e55",
+        "producerversion": "2.1.0",
+        "classification": "internal",
+        "data": {
+          "clienteId": "cli-1",
+          "aggregateVersion": 1
+        }
+      },
+      "expect": "INVALID_TENANT_FOR_STATE"
+    },
+    {
+      "id": "state-put-rechaza-dominio-reservado",
+      "spec": "10-state.md §2.7",
+      "why": "`state` no es un dominio: un `state.state.…` colisionaría con el espacio de nombres del protocolo.",
+      "op": "state-build",
+      "input": {
+        "contract": "state.cliente.v1",
+        "tenantId": "acme",
+        "key": "cli-1",
+        "id": "01924f8e-7c3a-7b2d-9e14-3f8a1c9d0e55",
+        "source": "/produccion/crm-api",
+        "time": "2026-08-20T10:25:39.412Z",
+        "correlationid": "01924f8e-7c3a-7b2d-9e14-3f8a1c9d0e55",
+        "producerversion": "2.1.0",
+        "classification": "internal",
+        "data": {
+          "clienteId": "cli-1",
+          "aggregateVersion": 1
+        }
+      },
+      "expect": "RESERVED_DOMAIN"
+    },
+    {
+      "id": "state-put-orden-reservado-antes-que-clave",
+      "spec": "10-state.md §3.6",
+      "why": "Dominio reservado Y clave inválida: gana el dominio.",
+      "op": "state-build",
+      "input": {
+        "contract": "state.cliente.v1",
+        "tenantId": "acme",
+        "key": "a.b",
+        "id": "01924f8e-7c3a-7b2d-9e14-3f8a1c9d0e55",
+        "source": "/produccion/crm-api",
+        "time": "2026-08-20T10:25:39.412Z",
+        "correlationid": "01924f8e-7c3a-7b2d-9e14-3f8a1c9d0e55",
+        "producerversion": "2.1.0",
+        "classification": "internal",
+        "data": {
+          "clienteId": "a.b",
+          "aggregateVersion": 1
+        }
+      },
+      "expect": "RESERVED_DOMAIN"
+    },
+    {
+      "id": "state-put-orden-clave-antes-que-tenant",
+      "spec": "10-state.md §3.6",
+      "why": "Clave inválida Y tenant inválido: gana la clave.",
+      "op": "state-build",
+      "input": {
+        "contract": "clientes.cliente.v1",
+        "tenantId": "ACME",
+        "key": "a.b",
+        "id": "01924f8e-7c3a-7b2d-9e14-3f8a1c9d0e55",
+        "source": "/produccion/crm-api",
+        "time": "2026-08-20T10:25:39.412Z",
+        "correlationid": "01924f8e-7c3a-7b2d-9e14-3f8a1c9d0e55",
+        "producerversion": "2.1.0",
+        "classification": "internal",
+        "data": {
+          "clienteId": "a.b",
+          "aggregateVersion": 1
+        }
+      },
+      "expect": "INVALID_STATE_KEY"
+    },
+    {
+      "id": "state-put-orden-tenant-antes-que-version",
+      "spec": "10-state.md §3.6",
+      "why": "Tenant inválido Y sin `aggregateVersion`: gana el tenant.",
+      "op": "state-build",
+      "input": {
+        "contract": "clientes.cliente.v1",
+        "tenantId": "ACME",
+        "key": "cli-1",
+        "id": "01924f8e-7c3a-7b2d-9e14-3f8a1c9d0e55",
+        "source": "/produccion/crm-api",
+        "time": "2026-08-20T10:25:39.412Z",
+        "correlationid": "01924f8e-7c3a-7b2d-9e14-3f8a1c9d0e55",
+        "producerversion": "2.1.0",
+        "classification": "internal",
+        "data": {
+          "clienteId": "cli-1"
+        }
+      },
+      "expect": "INVALID_TENANT_FOR_STATE"
+    },
+    {
+      "id": "state-put-orden-version-antes-que-clasificacion",
+      "spec": "10-state.md §3.6",
+      "why": "Sin `aggregateVersion` Y `restricted`: gana la versión.",
+      "op": "state-build",
+      "input": {
+        "contract": "clientes.cliente.v1",
+        "tenantId": "acme",
+        "key": "cli-1",
+        "id": "01924f8e-7c3a-7b2d-9e14-3f8a1c9d0e55",
+        "source": "/produccion/crm-api",
+        "time": "2026-08-20T10:25:39.412Z",
+        "correlationid": "01924f8e-7c3a-7b2d-9e14-3f8a1c9d0e55",
+        "producerversion": "2.1.0",
+        "classification": "restricted",
+        "data": {
+          "clienteId": "cli-1"
+        }
+      },
+      "expect": "MISSING_AGGREGATE_VERSION"
+    },
+    {
+      "id": "state-tombstone-spec-2-6",
+      "spec": "10-state.md §2.6, §4",
+      "why": "La lápida de la spec con su SHA-256: `type` con `.deleted.`, `dataschema` fijo, `internal` y `data` con SOLO la versión. Es el fixture `state-tombstone`.",
+      "op": "state-tombstone",
+      "input": {
+        "contract": "clientes.cliente.v1",
+        "tenantId": "acme",
+        "key": "cli-1",
+        "id": "01924f90-2b11-7a40-8c3d-6d5e4f3a2b10",
+        "source": "/produccion/crm-api",
+        "time": "2026-08-20T10:31:02.057Z",
+        "correlationid": "01924f90-2b11-7a40-8c3d-6d5e4f3a2b10",
+        "producerversion": "2.1.0",
+        "aggregateVersion": 8
+      },
+      "caseFixture": "state-tombstone",
+      "sha256": "7a7868d2f643ccd584a354bce87c26d8d7f20826f23da26e99dbed78269bed3d"
+    },
+    {
+      "id": "state-tombstone-version-maxima",
+      "spec": "10-state.md §3.4, §4",
+      "why": "La lápida con `aggregateVersion` 2^53 − 1.",
+      "op": "state-tombstone",
+      "input": {
+        "contract": "clientes.cliente.v1",
+        "tenantId": "acme",
+        "key": "cli-1",
+        "id": "01924f90-2b11-7a40-8c3d-6d5e4f3a2b10",
+        "source": "/produccion/crm-api",
+        "time": "2026-08-20T10:31:02.057Z",
+        "correlationid": "01924f90-2b11-7a40-8c3d-6d5e4f3a2b10",
+        "producerversion": "2.1.0",
+        "aggregateVersion": 9007199254740991
+      }
+    },
+    {
+      "id": "state-tombstone-extensiones-opcionales",
+      "spec": "01-envelope.md §6, 10-state.md §4",
+      "why": "Lápida con `causationid`, `traceparent` y `tracestate`: la misma posición que en un `put`.",
+      "op": "state-tombstone",
+      "input": {
+        "contract": "clientes.cliente.v1",
+        "tenantId": "acme",
+        "key": "cli-1",
+        "id": "01924f90-2b11-7a40-8c3d-6d5e4f3a2b10",
+        "source": "/produccion/crm-api",
+        "time": "2026-08-20T10:31:02.057Z",
+        "correlationid": "01924f90-2b11-7a40-8c3d-6d5e4f3a2b10",
+        "producerversion": "2.1.0",
+        "aggregateVersion": 8,
+        "causationid": "01924f8e-7c3a-7b2d-9e14-3f8a1c9d0e55",
+        "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+        "tracestate": "flux=1"
+      }
+    },
+    {
+      "id": "state-tombstone-rechaza-version-cero",
+      "spec": "10-state.md §3.4, §4",
+      "why": "Una lápida sin versión no sirve: `put` la lee.",
+      "op": "state-tombstone",
+      "input": {
+        "contract": "clientes.cliente.v1",
+        "tenantId": "acme",
+        "key": "cli-1",
+        "id": "01924f90-2b11-7a40-8c3d-6d5e4f3a2b10",
+        "source": "/produccion/crm-api",
+        "time": "2026-08-20T10:31:02.057Z",
+        "correlationid": "01924f90-2b11-7a40-8c3d-6d5e4f3a2b10",
+        "producerversion": "2.1.0",
+        "aggregateVersion": 0
+      },
+      "expect": "MISSING_AGGREGATE_VERSION"
+    },
+    {
+      "id": "state-tombstone-rechaza-version-mayor-que-2-53",
+      "spec": "10-state.md §3.4, §4",
+      "why": "2^53.",
+      "op": "state-tombstone",
+      "input": {
+        "contract": "clientes.cliente.v1",
+        "tenantId": "acme",
+        "key": "cli-1",
+        "id": "01924f90-2b11-7a40-8c3d-6d5e4f3a2b10",
+        "source": "/produccion/crm-api",
+        "time": "2026-08-20T10:31:02.057Z",
+        "correlationid": "01924f90-2b11-7a40-8c3d-6d5e4f3a2b10",
+        "producerversion": "2.1.0",
+        "aggregateVersion": 9007199254740992
+      },
+      "expect": "MISSING_AGGREGATE_VERSION"
+    },
+    {
+      "id": "state-tombstone-rechaza-clave-invalida",
+      "spec": "10-state.md §2.3",
+      "why": "La lápida valida la clave como un `put`.",
+      "op": "state-tombstone",
+      "input": {
+        "contract": "clientes.cliente.v1",
+        "tenantId": "acme",
+        "key": "a b",
+        "id": "01924f90-2b11-7a40-8c3d-6d5e4f3a2b10",
+        "source": "/produccion/crm-api",
+        "time": "2026-08-20T10:31:02.057Z",
+        "correlationid": "01924f90-2b11-7a40-8c3d-6d5e4f3a2b10",
+        "producerversion": "2.1.0",
+        "aggregateVersion": 8
+      },
+      "expect": "INVALID_STATE_KEY"
+    },
+    {
+      "id": "state-tombstone-rechaza-tenant-invalido",
+      "spec": "10-state.md §2.4",
+      "why": "La lápida valida el tenant como un `put`.",
+      "op": "state-tombstone",
+      "input": {
+        "contract": "clientes.cliente.v1",
+        "tenantId": "A",
+        "key": "cli-1",
+        "id": "01924f90-2b11-7a40-8c3d-6d5e4f3a2b10",
+        "source": "/produccion/crm-api",
+        "time": "2026-08-20T10:31:02.057Z",
+        "correlationid": "01924f90-2b11-7a40-8c3d-6d5e4f3a2b10",
+        "producerversion": "2.1.0",
+        "aggregateVersion": 8
+      },
+      "expect": "INVALID_TENANT_FOR_STATE"
+    },
+    {
+      "id": "state-tombstone-rechaza-dominio-reservado",
+      "spec": "10-state.md §2.7",
+      "why": "La lápida rechaza `rpc`.",
+      "op": "state-tombstone",
+      "input": {
+        "contract": "rpc.cliente.v1",
+        "tenantId": "acme",
+        "key": "cli-1",
+        "id": "01924f90-2b11-7a40-8c3d-6d5e4f3a2b10",
+        "source": "/produccion/crm-api",
+        "time": "2026-08-20T10:31:02.057Z",
+        "correlationid": "01924f90-2b11-7a40-8c3d-6d5e4f3a2b10",
+        "producerversion": "2.1.0",
+        "aggregateVersion": 8
+      },
+      "expect": "RESERVED_DOMAIN"
+    },
+    {
+      "id": "state-dlq-spec-2-6",
+      "spec": "10-state.md §2.6, §6",
+      "why": "El evento de DLQ de estado de la spec con su SHA-256: el sobre original con las `dlq*` y `data` sustituido por `{ key, revision }`. Si `data` conservara el dato, un dato personal borrado seguiría 90 días en la DLQ. Es el fixture `state-dlq`.",
+      "op": "state-dlq",
+      "input": {
+        "original": {
+          "contract": "clientes.cliente.v1",
+          "tenantId": "acme",
+          "key": "cli-1",
+          "id": "01924f8e-7c3a-7b2d-9e14-3f8a1c9d0e55",
+          "source": "/produccion/crm-api",
+          "time": "2026-08-20T10:25:39.412Z",
+          "correlationid": "01924f8e-7c3a-7b2d-9e14-3f8a1c9d0e55",
+          "producerversion": "2.1.0",
+          "classification": "confidential",
+          "data": {
+            "clienteId": "cli-1",
+            "nombre": "María Peña",
+            "email": "maria@example.com",
+            "aggregateVersion": 7
+          }
+        },
+        "revision": 41,
+        "dlq": {
+          "reason": "permanent",
+          "attempts": 1,
+          "consumer": "tienda-web__state_clientes_cliente_v1__acme",
+          "error": "PAIS_NO_SOPORTADO: el cliente cli-1 tiene un país fuera del catálogo",
+          "dlqtime": "2026-08-20T10:25:40.117Z"
+        }
+      },
+      "caseFixture": "state-dlq",
+      "sha256": "dbb6d882f7df49e4b88026f17fb7b83e9e6c2226aa731ad25d71fc41c8b8f6d9"
+    },
+    {
+      "id": "state-dlq-retryable-agotado",
+      "spec": "10-state.md §6, 01-envelope.md §6",
+      "why": "Otro motivo (`retryable`, 6 intentos), otro contrato y un original con `causationid`, `traceparent` y `tracestate`: fija que las `dlq*` van DESPUÉS de todas las opcionales y justo antes de `data`.",
+      "op": "state-dlq",
+      "input": {
+        "original": {
+          "contract": "logistica.linea-envio.v2",
+          "tenantId": "globex",
+          "key": "Env_00-9",
+          "id": "01924f8e-7c3a-7b2d-9e14-3f8a1c9d0e55",
+          "source": "/produccion/crm-api",
+          "time": "2026-08-20T10:25:39.412Z",
+          "correlationid": "01924f8e-7c3a-7b2d-9e14-3f8a1c9d0e55",
+          "producerversion": "2.1.0",
+          "classification": "confidential",
+          "causationid": "01924f8d-1a2b-7c3d-8e4f-5a6b7c8d9e01",
+          "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+          "tracestate": "flux=1",
+          "data": {
+            "envioId": "Env_00-9",
+            "aggregateVersion": 3,
+            "motivo": "ausente"
+          }
+        },
+        "revision": 1042,
+        "dlq": {
+          "reason": "retryable",
+          "attempts": 6,
+          "consumer": "tienda-web__state_logistica_linea_envio_v2__globex",
+          "error": "INVALID_SCHEMA: /motivo no cumple el formato",
+          "dlqtime": "2026-08-20T11:17:09.000Z"
+        }
+      }
+    },
+    {
+      "id": "state-dlq-rechaza-original-invalido",
+      "spec": "10-state.md §2.3, §6",
+      "why": "El evento de DLQ se construye del original: si este no era una entrada legal, no hay DLQ que construir.",
+      "op": "state-dlq",
+      "input": {
+        "original": {
+          "contract": "clientes.cliente.v1",
+          "tenantId": "acme",
+          "key": "a.b",
+          "id": "01924f8e-7c3a-7b2d-9e14-3f8a1c9d0e55",
+          "source": "/produccion/crm-api",
+          "time": "2026-08-20T10:25:39.412Z",
+          "correlationid": "01924f8e-7c3a-7b2d-9e14-3f8a1c9d0e55",
+          "producerversion": "2.1.0",
+          "classification": "internal",
+          "data": {
+            "clienteId": "a.b",
+            "aggregateVersion": 1
+          }
+        },
+        "revision": 41,
+        "dlq": {
+          "reason": "permanent",
+          "attempts": 1,
+          "consumer": "tienda-web__state_clientes_cliente_v1__acme",
+          "error": "PAIS_NO_SOPORTADO: /pais",
+          "dlqtime": "2026-08-20T10:25:40.117Z"
+        }
+      },
+      "expect": "INVALID_STATE_KEY"
+    },
+    {
+      "id": "state-subject-basico",
+      "spec": "10-state.md §2.2, §2.3, §2.4",
+      "why": "Seis tokens: `state.` + contrato + tenant + clave.",
+      "op": "state-subject",
+      "input": {
+        "contract": "clientes.cliente.v1",
+        "tenantId": "acme",
+        "key": "cli-1"
+      },
+      "expectSubject": "state.clientes.cliente.v1.acme.cli-1"
+    },
+    {
+      "id": "state-subject-kebab-v2",
+      "spec": "10-state.md §2.2, §2.3, §2.4",
+      "why": "kebab-case en dominio, agregado y tenant; `_` y `-` en la clave; mayúsculas conservadas.",
+      "op": "state-subject",
+      "input": {
+        "contract": "logistica.linea-envio.v2",
+        "tenantId": "acme-corp",
+        "key": "Env_00-9"
+      },
+      "expectSubject": "state.logistica.linea-envio.v2.acme-corp.Env_00-9"
+    },
+    {
+      "id": "state-subject-tenant-system-clave-cero",
+      "spec": "10-state.md §2.2, §2.3, §2.4",
+      "why": "`system` es un tenant válido y `0`, una clave válida.",
+      "op": "state-subject",
+      "input": {
+        "contract": "clientes.cliente.v1",
+        "tenantId": "system",
+        "key": "0"
+      },
+      "expectSubject": "state.clientes.cliente.v1.system.0"
+    },
+    {
+      "id": "state-subject-clave-128",
+      "spec": "10-state.md §2.2, §2.3, §2.4",
+      "why": "128 caracteres: el máximo de la clave.",
+      "op": "state-subject",
+      "input": {
+        "contract": "clientes.cliente.v1",
+        "tenantId": "acme",
+        "key": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      },
+      "expectSubject": "state.clientes.cliente.v1.acme.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    },
+    {
+      "id": "state-subject-tenant-64",
+      "spec": "10-state.md §2.2, §2.3, §2.4",
+      "why": "64 caracteres: el máximo del tenant.",
+      "op": "state-subject",
+      "input": {
+        "contract": "clientes.cliente.v1",
+        "tenantId": "tttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttt",
+        "key": "k"
+      },
+      "expectSubject": "state.clientes.cliente.v1.tttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttt.k"
+    },
+    {
+      "id": "state-subject-clave-con-punto",
+      "spec": "10-state.md §2.2, §2.3, §2.4",
+      "why": "Son DOS tokens de NATS: la entrada quedaría fuera de todo filtro, sin error.",
+      "op": "state-subject",
+      "input": {
+        "contract": "clientes.cliente.v1",
+        "tenantId": "acme",
+        "key": "cli.1"
+      },
+      "expect": "INVALID_STATE_KEY"
+    },
+    {
+      "id": "state-subject-clave-con-espacio",
+      "spec": "10-state.md §2.2, §2.3, §2.4",
+      "why": "El único carácter que el broker sí rechaza.",
+      "op": "state-subject",
+      "input": {
+        "contract": "clientes.cliente.v1",
+        "tenantId": "acme",
+        "key": "cli 1"
+      },
+      "expect": "INVALID_STATE_KEY"
+    },
+    {
+      "id": "state-subject-clave-comodin-asterisco",
+      "spec": "10-state.md §2.2, §2.3, §2.4",
+      "why": "El broker acepta `*` como clave (A-41): lo valida el SDK.",
+      "op": "state-subject",
+      "input": {
+        "contract": "clientes.cliente.v1",
+        "tenantId": "acme",
+        "key": "*"
+      },
+      "expect": "INVALID_STATE_KEY"
+    },
+    {
+      "id": "state-subject-clave-comodin-mayor",
+      "spec": "10-state.md §2.2, §2.3, §2.4",
+      "why": "El broker acepta `>` como clave (A-41): lo valida el SDK.",
+      "op": "state-subject",
+      "input": {
+        "contract": "clientes.cliente.v1",
+        "tenantId": "acme",
+        "key": ">"
+      },
+      "expect": "INVALID_STATE_KEY"
+    },
+    {
+      "id": "state-subject-clave-con-acento",
+      "spec": "10-state.md §2.2, §2.3, §2.4",
+      "why": "Sin codificación automática: dos escapes serían dos claves para el mismo agregado.",
+      "op": "state-subject",
+      "input": {
+        "contract": "clientes.cliente.v1",
+        "tenantId": "acme",
+        "key": "café"
+      },
+      "expect": "INVALID_STATE_KEY"
+    },
+    {
+      "id": "state-subject-clave-reservada",
+      "spec": "10-state.md §2.2, §2.3, §2.4",
+      "why": "El prefijo `_` está reservado al protocolo.",
+      "op": "state-subject",
+      "input": {
+        "contract": "clientes.cliente.v1",
+        "tenantId": "acme",
+        "key": "_reservada"
+      },
+      "expect": "INVALID_STATE_KEY"
+    },
+    {
+      "id": "state-subject-clave-con-salto-final",
+      "spec": "10-state.md §2.2, §2.3, §2.4",
+      "why": "Coincidencia COMPLETA: en Python y PHP el `$` acepta un `\\n` final y `cli-1\\n` pasaría el patrón.",
+      "op": "state-subject",
+      "input": {
+        "contract": "clientes.cliente.v1",
+        "tenantId": "acme",
+        "key": "cli-1\n"
+      },
+      "expect": "INVALID_STATE_KEY"
+    },
+    {
+      "id": "state-subject-clave-vacia",
+      "spec": "10-state.md §2.2, §2.3, §2.4",
+      "why": "Un token vacío no es un token.",
+      "op": "state-subject",
+      "input": {
+        "contract": "clientes.cliente.v1",
+        "tenantId": "acme",
+        "key": ""
+      },
+      "expect": "INVALID_STATE_KEY"
+    },
+    {
+      "id": "state-subject-clave-129",
+      "spec": "10-state.md §2.2, §2.3, §2.4",
+      "why": "Un carácter más que el máximo.",
+      "op": "state-subject",
+      "input": {
+        "contract": "clientes.cliente.v1",
+        "tenantId": "acme",
+        "key": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      },
+      "expect": "INVALID_STATE_KEY"
+    },
+    {
+      "id": "state-subject-tenant-mayusculas",
+      "spec": "10-state.md §2.2, §2.3, §2.4",
+      "why": "El tenant de estado es kebab-case en minúsculas.",
+      "op": "state-subject",
+      "input": {
+        "contract": "clientes.cliente.v1",
+        "tenantId": "ACME",
+        "key": "cli-1"
+      },
+      "expect": "INVALID_TENANT_FOR_STATE"
+    },
+    {
+      "id": "state-subject-tenant-guion-bajo",
+      "spec": "10-state.md §2.2, §2.3, §2.4",
+      "why": "`_` no es del patrón del tenant (sí lo es de la clave).",
+      "op": "state-subject",
+      "input": {
+        "contract": "clientes.cliente.v1",
+        "tenantId": "acme_corp",
+        "key": "cli-1"
+      },
+      "expect": "INVALID_TENANT_FOR_STATE"
+    },
+    {
+      "id": "state-subject-tenant-con-punto",
+      "spec": "10-state.md §2.2, §2.3, §2.4",
+      "why": "Un punto en el tenant partiría el subject en siete tokens.",
+      "op": "state-subject",
+      "input": {
+        "contract": "clientes.cliente.v1",
+        "tenantId": "acme.corp",
+        "key": "cli-1"
+      },
+      "expect": "INVALID_TENANT_FOR_STATE"
+    },
+    {
+      "id": "state-subject-tenant-vacio",
+      "spec": "10-state.md §2.2, §2.3, §2.4",
+      "why": "Sin valor por defecto: un tenant vacío no se convierte en `system`.",
+      "op": "state-subject",
+      "input": {
+        "contract": "clientes.cliente.v1",
+        "tenantId": "",
+        "key": "cli-1"
+      },
+      "expect": "INVALID_TENANT_FOR_STATE"
+    },
+    {
+      "id": "state-subject-tenant-65",
+      "spec": "10-state.md §2.2, §2.3, §2.4",
+      "why": "Un carácter más que el máximo: el durable de un observador lleva el tenant (A-42).",
+      "op": "state-subject",
+      "input": {
+        "contract": "clientes.cliente.v1",
+        "tenantId": "ttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttt",
+        "key": "cli-1"
+      },
+      "expect": "INVALID_TENANT_FOR_STATE"
+    },
+    {
+      "id": "state-subject-dominio-state",
+      "spec": "10-state.md §2.2, §2.3, §2.4",
+      "why": "`state` no es un dominio.",
+      "op": "state-subject",
+      "input": {
+        "contract": "state.cliente.v1",
+        "tenantId": "acme",
+        "key": "cli-1"
+      },
+      "expect": "RESERVED_DOMAIN"
+    },
+    {
+      "id": "state-subject-dominio-dlq",
+      "spec": "10-state.md §2.2, §2.3, §2.4",
+      "why": "`dlq` no es un dominio.",
+      "op": "state-subject",
+      "input": {
+        "contract": "dlq.cliente.v1",
+        "tenantId": "acme",
+        "key": "cli-1"
+      },
+      "expect": "RESERVED_DOMAIN"
+    },
+    {
+      "id": "state-subject-dominio-rpc",
+      "spec": "10-state.md §2.2, §2.3, §2.4",
+      "why": "`rpc` no es un dominio.",
+      "op": "state-subject",
+      "input": {
+        "contract": "rpc.cliente.v1",
+        "tenantId": "acme",
+        "key": "cli-1"
+      },
+      "expect": "RESERVED_DOMAIN"
+    },
+    {
+      "id": "state-subject-dominio-system",
+      "spec": "10-state.md §2.2, §2.3, §2.4",
+      "why": "`system` no es un dominio.",
+      "op": "state-subject",
+      "input": {
+        "contract": "system.cliente.v1",
+        "tenantId": "acme",
+        "key": "cli-1"
+      },
+      "expect": "RESERVED_DOMAIN"
+    },
+    {
+      "id": "state-subject-clave-termina-en-guion",
+      "spec": "10-state.md §2.2, §2.3, §2.4",
+      "why": "`-` y `_` valen al final de una clave, no al principio.",
+      "op": "state-subject",
+      "input": {
+        "contract": "clientes.cliente.v1",
+        "tenantId": "acme",
+        "key": "a-"
+      },
+      "expectSubject": "state.clientes.cliente.v1.acme.a-"
+    },
+    {
+      "id": "state-subject-clave-termina-en-guion-bajo",
+      "spec": "10-state.md §2.2, §2.3, §2.4",
+      "why": "Idem para `_`.",
+      "op": "state-subject",
+      "input": {
+        "contract": "clientes.cliente.v1",
+        "tenantId": "acme",
+        "key": "a_"
+      },
+      "expectSubject": "state.clientes.cliente.v1.acme.a_"
+    },
+    {
+      "id": "state-subject-clave-distingue-mayusculas",
+      "spec": "10-state.md §2.2, §2.3, §2.4",
+      "why": "Los subjects de NATS son case-sensitive: `Cli-1` no es `cli-1`.",
+      "op": "state-subject",
+      "input": {
+        "contract": "clientes.cliente.v1",
+        "tenantId": "acme",
+        "key": "Cli-1"
+      },
+      "expectSubject": "state.clientes.cliente.v1.acme.Cli-1"
+    },
+    {
+      "id": "state-subject-major-10-y-tenant-con-digitos",
+      "spec": "10-state.md §2.2, §2.3, §2.4",
+      "why": "`v10` no es `v1`; el tenant admite dígitos y guiones.",
+      "op": "state-subject",
+      "input": {
+        "contract": "clientes.cliente.v10",
+        "tenantId": "t-1-2",
+        "key": "k"
+      },
+      "expectSubject": "state.clientes.cliente.v10.t-1-2.k"
+    },
+    {
+      "id": "state-subject-clave-empieza-por-guion",
+      "spec": "10-state.md §2.2, §2.3, §2.4",
+      "why": "Debe empezar por letra o dígito.",
+      "op": "state-subject",
+      "input": {
+        "contract": "clientes.cliente.v1",
+        "tenantId": "acme",
+        "key": "-a"
+      },
+      "expect": "INVALID_STATE_KEY"
+    },
+    {
+      "id": "state-subject-clave-digito-no-ascii",
+      "spec": "10-state.md §2.2, §2.3, §2.4",
+      "why": "`[0-9]` es ASCII: un dígito árabe-índico (`٣`) no vale, aunque `\\d` de algunos motores sí lo aceptaría.",
+      "op": "state-subject",
+      "input": {
+        "contract": "clientes.cliente.v1",
+        "tenantId": "acme",
+        "key": "٣"
+      },
+      "expect": "INVALID_STATE_KEY"
+    },
+    {
+      "id": "state-subject-clave-espacio-duro",
+      "spec": "10-state.md §2.2, §2.3, §2.4",
+      "why": "U+00A0 no es un espacio ASCII, y tampoco es de la clave.",
+      "op": "state-subject",
+      "input": {
+        "contract": "clientes.cliente.v1",
+        "tenantId": "acme",
+        "key": "a\u00a0b"
+      },
+      "expect": "INVALID_STATE_KEY"
+    },
+    {
+      "id": "state-subject-clave-con-barra",
+      "spec": "10-state.md §2.2, §2.3, §2.4",
+      "why": "`/` no es de la clave.",
+      "op": "state-subject",
+      "input": {
+        "contract": "clientes.cliente.v1",
+        "tenantId": "acme",
+        "key": "a/b"
+      },
+      "expect": "INVALID_STATE_KEY"
+    },
+    {
+      "id": "state-subject-clave-emoji",
+      "spec": "10-state.md §2.2, §2.3, §2.4",
+      "why": "Un carácter fuera del BMP (par sustituto en UTF-16, 4 bytes en UTF-8).",
+      "op": "state-subject",
+      "input": {
+        "contract": "clientes.cliente.v1",
+        "tenantId": "acme",
+        "key": "🚀"
+      },
+      "expect": "INVALID_STATE_KEY"
+    },
+    {
+      "id": "state-subject-tenant-empieza-por-guion",
+      "spec": "10-state.md §2.2, §2.3, §2.4",
+      "why": "kebab-case: sin guion al principio.",
+      "op": "state-subject",
+      "input": {
+        "contract": "clientes.cliente.v1",
+        "tenantId": "-a",
+        "key": "k"
+      },
+      "expect": "INVALID_TENANT_FOR_STATE"
+    },
+    {
+      "id": "state-subject-tenant-termina-en-guion",
+      "spec": "10-state.md §2.2, §2.3, §2.4",
+      "why": "kebab-case: sin guion al final.",
+      "op": "state-subject",
+      "input": {
+        "contract": "clientes.cliente.v1",
+        "tenantId": "a-",
+        "key": "k"
+      },
+      "expect": "INVALID_TENANT_FOR_STATE"
+    },
+    {
+      "id": "state-subject-tenant-guion-doble",
+      "spec": "10-state.md §2.2, §2.3, §2.4",
+      "why": "kebab-case: un solo guion entre grupos.",
+      "op": "state-subject",
+      "input": {
+        "contract": "clientes.cliente.v1",
+        "tenantId": "a--b",
+        "key": "k"
+      },
+      "expect": "INVALID_TENANT_FOR_STATE"
+    },
+    {
+      "id": "state-subject-tenant-con-enie",
+      "spec": "10-state.md §2.2, §2.3, §2.4",
+      "why": "Fuera de `[a-z0-9]`.",
+      "op": "state-subject",
+      "input": {
+        "contract": "clientes.cliente.v1",
+        "tenantId": "españa",
+        "key": "k"
+      },
+      "expect": "INVALID_TENANT_FOR_STATE"
+    },
+    {
+      "id": "state-subject-orden-reservado-antes-que-todo",
+      "spec": "10-state.md §2.2, §2.3, §2.4",
+      "why": "§3.6: dominio reservado, clave inválida Y tenant inválido: gana el dominio.",
+      "op": "state-subject",
+      "input": {
+        "contract": "state.cliente.v1",
+        "tenantId": "T",
+        "key": "a.b"
+      },
+      "expect": "RESERVED_DOMAIN"
+    },
+    {
+      "id": "state-subject-orden-clave-antes-que-tenant",
+      "spec": "10-state.md §2.2, §2.3, §2.4",
+      "why": "§3.6: clave inválida Y tenant inválido: gana la clave.",
+      "op": "state-subject",
+      "input": {
+        "contract": "clientes.cliente.v1",
+        "tenantId": "T",
+        "key": "a.b"
+      },
+      "expect": "INVALID_STATE_KEY"
+    },
+    {
+      "id": "state-subject-contrato-malformado-1",
+      "spec": "10-state.md §2.2, §2.3, §3.6",
+      "why": "04-errors.md §6: un contrato mal formado tiene su código estable `INVALID_STATE_CONTRACT`.",
+      "op": "state-subject",
+      "input": {
+        "contract": "clientes.cliente",
+        "tenantId": "acme",
+        "key": "cli-1"
+      },
+      "expect": "INVALID_STATE_CONTRACT"
+    },
+    {
+      "id": "state-subject-contrato-malformado-2",
+      "spec": "10-state.md §2.2, §2.3, §3.6",
+      "why": "04-errors.md §6: un contrato mal formado tiene su código estable `INVALID_STATE_CONTRACT`.",
+      "op": "state-subject",
+      "input": {
+        "contract": "clientes.cliente.v1.creado",
+        "tenantId": "acme",
+        "key": "cli-1"
+      },
+      "expect": "INVALID_STATE_CONTRACT"
+    },
+    {
+      "id": "state-subject-contrato-malformado-3",
+      "spec": "10-state.md §2.2, §2.3, §3.6",
+      "why": "04-errors.md §6: un contrato mal formado tiene su código estable `INVALID_STATE_CONTRACT`.",
+      "op": "state-subject",
+      "input": {
+        "contract": "clientes.cliente.1",
+        "tenantId": "acme",
+        "key": "cli-1"
+      },
+      "expect": "INVALID_STATE_CONTRACT"
+    },
+    {
+      "id": "state-subject-contrato-malformado-4",
+      "spec": "10-state.md §2.2, §2.3, §3.6",
+      "why": "04-errors.md §6: un contrato mal formado tiene su código estable `INVALID_STATE_CONTRACT`.",
+      "op": "state-subject",
+      "input": {
+        "contract": "clientes.cliente.v0",
+        "tenantId": "acme",
+        "key": "cli-1"
+      },
+      "expect": "INVALID_STATE_CONTRACT"
+    },
+    {
+      "id": "state-subject-contrato-malformado-5",
+      "spec": "10-state.md §2.2, §2.3, §3.6",
+      "why": "04-errors.md §6: un contrato mal formado tiene su código estable `INVALID_STATE_CONTRACT`.",
+      "op": "state-subject",
+      "input": {
+        "contract": "Clientes.cliente.v1",
+        "tenantId": "acme",
+        "key": "cli-1"
+      },
+      "expect": "INVALID_STATE_CONTRACT"
+    },
+    {
+      "id": "state-subject-contrato-malformado-6",
+      "spec": "10-state.md §2.2, §2.3, §3.6",
+      "why": "04-errors.md §6: un contrato mal formado tiene su código estable `INVALID_STATE_CONTRACT`.",
+      "op": "state-subject",
+      "input": {
+        "contract": "clientes.Cliente.v1",
+        "tenantId": "acme",
+        "key": "cli-1"
+      },
+      "expect": "INVALID_STATE_CONTRACT"
+    },
+    {
+      "id": "state-subject-contrato-malformado-7",
+      "spec": "10-state.md §2.2, §2.3, §3.6",
+      "why": "04-errors.md §6: un contrato mal formado tiene su código estable `INVALID_STATE_CONTRACT`.",
+      "op": "state-subject",
+      "input": {
+        "contract": "",
+        "tenantId": "acme",
+        "key": "cli-1"
+      },
+      "expect": "INVALID_STATE_CONTRACT"
+    },
+    {
+      "id": "state-subject-contrato-malformado-8",
+      "spec": "10-state.md §2.2, §2.3, §3.6",
+      "why": "04-errors.md §6: un contrato mal formado tiene su código estable `INVALID_STATE_CONTRACT`; se valida antes que el tenant y la clave.",
+      "op": "state-subject",
+      "input": {
+        "contract": "clientes.cliente",
+        "tenantId": "ACME",
+        "key": "a.b"
+      },
+      "expect": "INVALID_STATE_CONTRACT"
+    },
+    {
+      "id": "state-subject-dominio-reservado-state",
+      "spec": "10-state.md §2.2, §2.3, §3.6",
+      "why": "§2.1: el dominio `state` está reservado; gana sobre cualquier otra validación.",
+      "op": "state-subject",
+      "input": {
+        "contract": "state.cliente",
+        "tenantId": "acme",
+        "key": "cli-1"
+      },
+      "expect": "RESERVED_DOMAIN"
+    }
+  ],
+  "$commentState": "Los vectores de `stateVectors` los ejecutan SOLO los SDKs que declaran la capacidad `state` en protocol.json → capabilities; para los demás el runner imprime «N/A: no declara state». `input` es la entrada del arnés SIN el `op` (que va aparte), plana como el `input` de los fixtures de cross-sdk-state-envelope.json. Cada vector dice QUÉ espera: `sha256` (los bytes son los de la spec), `expectSubject` (el subject de NATS), `expect` (el código estable del rechazo) o nada (los bytes los fija el SDK de referencia). `differsFrom` es un control: los bytes DEBEN ser distintos de los de ese otro vector. `caseFixture` enlaza con un fixture del caso, y el runner comprueba que siguen coincidiendo."
 }

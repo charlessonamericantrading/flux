@@ -1,0 +1,410 @@
+{
+  "case": "cross-sdk-state-envelope",
+  "title": "Todos los SDKs construyen la misma entrada de estado, la misma lápida y el mismo evento de DLQ de estado, byte a byte",
+  "spec": "specification/10-state.md §2.5, §2.6, §4, §6; specification/01-envelope.md §6",
+  "verifiedAgainst": "conformance/state-broker.mjs (reconstruye los bytes desde `event` y compara el SHA-256), JSON.stringify de Node y json.dumps(ensure_ascii=False, separators) de Python",
+  "verifiedOn": "2026-11-26",
+  "rationale": "Es la parte de la fase 2 que se compara byte a byte entre lenguajes, como cross-sdk-envelope.json y cross-sdk-dlq-envelope.json: la entrada de estado (con `subject` = la clave y `tenantid` = el del subject de NATS, y `partitionkey` = la clave), la lápida (con su `type` `.deleted.`, su `dataschema` fijo, `internal` y `data` solo con la versión) y el evento de DLQ de estado (el sobre original con las `dlq*` y `data` = {key, revision}). Un SDK que reordene claves, escape el no-ASCII (`María`, `país`: UTF-8 literal, 01-envelope.md §1.1) o ponga `data` en otro sitio rompe el replay verbatim, la firma y la deduplicación por hash. Los vectores del subject fijan qué es una clave y un tenant válidos, y el CÓDIGO estable de cada rechazo.",
+  "attributeOrder": [
+    "specversion",
+    "id",
+    "source",
+    "type",
+    "time",
+    "datacontenttype",
+    "dataschema",
+    "subject",
+    "correlationid",
+    "tenantid",
+    "producerversion",
+    "dataclassification",
+    "causationid",
+    "partitionkey",
+    "traceparent",
+    "tracestate",
+    "signkeyid",
+    "signature",
+    "dlqreason",
+    "dlqattempts",
+    "dlqconsumer",
+    "dlqerror",
+    "dlqtime",
+    "data"
+  ],
+  "harness": {
+    "$comment": "Las operaciones del arnés cruzado (conformance/harness/README.md), implementadas en los arneses de Node (referencia) y de Rust. El runner (conformance/cross-sdk.mjs) las ejecuta con los vectores `stateVectors` de conformance/harness/vectors.json, que repiten los fixtures y los subjectVectors de este caso —y aborta si dejan de coincidir—, y solo en los SDKs que declaran `state` en protocol.json: para los demás imprime «N/A: no declara state». Todas son deterministas: id, time y dlqtime vienen dados; `dataschema` no, lo deriva el SDK. La entrada de cada op es la de `input` más el `op`, PLANA. `state-build` da `bytes` (base64) igual que `build`; `state-subject` da `{ok, subject}` o `{ok:false, code}`.",
+    "ops": {
+      "state-build": "entrada: { contract, tenantId, key, id, source, time, correlationid, producerversion, classification, data } → bytes del evento de estado",
+      "state-tombstone": "entrada: { contract, tenantId, key, id, source, time, correlationid, producerversion, aggregateVersion } → bytes de la lápida",
+      "state-subject": "entrada: { contract, tenantId, key } → el subject de NATS, o el código estable del rechazo",
+      "state-dlq": "entrada: { original: <entrada de state-build>, revision, dlq: { reason, attempts, consumer, error, dlqtime } } → bytes del evento de DLQ de estado"
+    }
+  },
+  "fixtures": [
+    {
+      "id": "state-put",
+      "title": "put de clientes.cliente.v1, tenant acme, clave cli-1, aggregateVersion 7",
+      "harnessOp": "state-build",
+      "input": {
+        "contract": "clientes.cliente.v1",
+        "tenantId": "acme",
+        "key": "cli-1",
+        "id": "01924f8e-7c3a-7b2d-9e14-3f8a1c9d0e55",
+        "source": "/produccion/crm-api",
+        "time": "2026-08-20T10:25:39.412Z",
+        "correlationid": "01924f8e-7c3a-7b2d-9e14-3f8a1c9d0e55",
+        "producerversion": "2.1.0",
+        "classification": "confidential",
+        "data": {
+          "clienteId": "cli-1",
+          "nombre": "María Peña",
+          "email": "maria@example.com",
+          "aggregateVersion": 7
+        }
+      },
+      "natsSubject": "state.clientes.cliente.v1.acme.cli-1",
+      "event": {
+        "specversion": "1.0",
+        "id": "01924f8e-7c3a-7b2d-9e14-3f8a1c9d0e55",
+        "source": "/produccion/crm-api",
+        "type": "com.flux.state.clientes.cliente.v1",
+        "time": "2026-08-20T10:25:39.412Z",
+        "datacontenttype": "application/json",
+        "dataschema": "https://schemas.internal/state/clientes/cliente/1.0.0.json",
+        "subject": "cli-1",
+        "correlationid": "01924f8e-7c3a-7b2d-9e14-3f8a1c9d0e55",
+        "tenantid": "acme",
+        "producerversion": "2.1.0",
+        "dataclassification": "confidential",
+        "partitionkey": "cli-1",
+        "data": {
+          "clienteId": "cli-1",
+          "nombre": "María Peña",
+          "email": "maria@example.com",
+          "aggregateVersion": 7
+        }
+      },
+      "bytes": 563,
+      "sha256": "fa6b20beb64f90c06b0cfb2c82d809a8fd2672b365681d2cd9d1a99f29b13b40",
+      "base64": "eyJzcGVjdmVyc2lvbiI6IjEuMCIsImlkIjoiMDE5MjRmOGUtN2MzYS03YjJkLTllMTQtM2Y4YTFjOWQwZTU1Iiwic291cmNlIjoiL3Byb2R1Y2Npb24vY3JtLWFwaSIsInR5cGUiOiJjb20uZmx1eC5zdGF0ZS5jbGllbnRlcy5jbGllbnRlLnYxIiwidGltZSI6IjIwMjYtMDgtMjBUMTA6MjU6MzkuNDEyWiIsImRhdGFjb250ZW50dHlwZSI6ImFwcGxpY2F0aW9uL2pzb24iLCJkYXRhc2NoZW1hIjoiaHR0cHM6Ly9zY2hlbWFzLmludGVybmFsL3N0YXRlL2NsaWVudGVzL2NsaWVudGUvMS4wLjAuanNvbiIsInN1YmplY3QiOiJjbGktMSIsImNvcnJlbGF0aW9uaWQiOiIwMTkyNGY4ZS03YzNhLTdiMmQtOWUxNC0zZjhhMWM5ZDBlNTUiLCJ0ZW5hbnRpZCI6ImFjbWUiLCJwcm9kdWNlcnZlcnNpb24iOiIyLjEuMCIsImRhdGFjbGFzc2lmaWNhdGlvbiI6ImNvbmZpZGVudGlhbCIsInBhcnRpdGlvbmtleSI6ImNsaS0xIiwiZGF0YSI6eyJjbGllbnRlSWQiOiJjbGktMSIsIm5vbWJyZSI6Ik1hcsOtYSBQZcOxYSIsImVtYWlsIjoibWFyaWFAZXhhbXBsZS5jb20iLCJhZ2dyZWdhdGVWZXJzaW9uIjo3fX0="
+    },
+    {
+      "id": "state-tombstone",
+      "title": "delete de esa clave, aggregateVersion 8",
+      "harnessOp": "state-tombstone",
+      "input": {
+        "contract": "clientes.cliente.v1",
+        "tenantId": "acme",
+        "key": "cli-1",
+        "id": "01924f90-2b11-7a40-8c3d-6d5e4f3a2b10",
+        "source": "/produccion/crm-api",
+        "time": "2026-08-20T10:31:02.057Z",
+        "correlationid": "01924f90-2b11-7a40-8c3d-6d5e4f3a2b10",
+        "producerversion": "2.1.0",
+        "aggregateVersion": 8
+      },
+      "natsSubject": "state.clientes.cliente.v1.acme.cli-1",
+      "event": {
+        "specversion": "1.0",
+        "id": "01924f90-2b11-7a40-8c3d-6d5e4f3a2b10",
+        "source": "/produccion/crm-api",
+        "type": "com.flux.state.clientes.cliente.deleted.v1",
+        "time": "2026-08-20T10:31:02.057Z",
+        "datacontenttype": "application/json",
+        "dataschema": "https://schemas.internal/system/state/eliminado/1.0.0.json",
+        "subject": "cli-1",
+        "correlationid": "01924f90-2b11-7a40-8c3d-6d5e4f3a2b10",
+        "tenantid": "acme",
+        "producerversion": "2.1.0",
+        "dataclassification": "internal",
+        "partitionkey": "cli-1",
+        "data": {
+          "aggregateVersion": 8
+        }
+      },
+      "bytes": 495,
+      "sha256": "7a7868d2f643ccd584a354bce87c26d8d7f20826f23da26e99dbed78269bed3d",
+      "base64": "eyJzcGVjdmVyc2lvbiI6IjEuMCIsImlkIjoiMDE5MjRmOTAtMmIxMS03YTQwLThjM2QtNmQ1ZTRmM2EyYjEwIiwic291cmNlIjoiL3Byb2R1Y2Npb24vY3JtLWFwaSIsInR5cGUiOiJjb20uZmx1eC5zdGF0ZS5jbGllbnRlcy5jbGllbnRlLmRlbGV0ZWQudjEiLCJ0aW1lIjoiMjAyNi0wOC0yMFQxMDozMTowMi4wNTdaIiwiZGF0YWNvbnRlbnR0eXBlIjoiYXBwbGljYXRpb24vanNvbiIsImRhdGFzY2hlbWEiOiJodHRwczovL3NjaGVtYXMuaW50ZXJuYWwvc3lzdGVtL3N0YXRlL2VsaW1pbmFkby8xLjAuMC5qc29uIiwic3ViamVjdCI6ImNsaS0xIiwiY29ycmVsYXRpb25pZCI6IjAxOTI0ZjkwLTJiMTEtN2E0MC04YzNkLTZkNWU0ZjNhMmIxMCIsInRlbmFudGlkIjoiYWNtZSIsInByb2R1Y2VydmVyc2lvbiI6IjIuMS4wIiwiZGF0YWNsYXNzaWZpY2F0aW9uIjoiaW50ZXJuYWwiLCJwYXJ0aXRpb25rZXkiOiJjbGktMSIsImRhdGEiOnsiYWdncmVnYXRlVmVyc2lvbiI6OH19"
+    },
+    {
+      "id": "state-dlq",
+      "title": "evento de DLQ de estado: el sobre original sin su data, con la clave y la revisión",
+      "harnessOp": "state-dlq",
+      "input": {
+        "original": {
+          "contract": "clientes.cliente.v1",
+          "tenantId": "acme",
+          "key": "cli-1",
+          "id": "01924f8e-7c3a-7b2d-9e14-3f8a1c9d0e55",
+          "source": "/produccion/crm-api",
+          "time": "2026-08-20T10:25:39.412Z",
+          "correlationid": "01924f8e-7c3a-7b2d-9e14-3f8a1c9d0e55",
+          "producerversion": "2.1.0",
+          "classification": "confidential",
+          "data": {
+            "clienteId": "cli-1",
+            "nombre": "María Peña",
+            "email": "maria@example.com",
+            "aggregateVersion": 7
+          }
+        },
+        "revision": 41,
+        "dlq": {
+          "reason": "permanent",
+          "attempts": 1,
+          "consumer": "tienda-web__state_clientes_cliente_v1__acme",
+          "error": "PAIS_NO_SOPORTADO: el cliente cli-1 tiene un país fuera del catálogo",
+          "dlqtime": "2026-08-20T10:25:40.117Z"
+        }
+      },
+      "natsSubject": "dlq.state.clientes.cliente.v1",
+      "event": {
+        "specversion": "1.0",
+        "id": "01924f8e-7c3a-7b2d-9e14-3f8a1c9d0e55",
+        "source": "/produccion/crm-api",
+        "type": "com.flux.state.clientes.cliente.v1",
+        "time": "2026-08-20T10:25:39.412Z",
+        "datacontenttype": "application/json",
+        "dataschema": "https://schemas.internal/state/clientes/cliente/1.0.0.json",
+        "subject": "cli-1",
+        "correlationid": "01924f8e-7c3a-7b2d-9e14-3f8a1c9d0e55",
+        "tenantid": "acme",
+        "producerversion": "2.1.0",
+        "dataclassification": "confidential",
+        "partitionkey": "cli-1",
+        "dlqreason": "permanent",
+        "dlqattempts": 1,
+        "dlqconsumer": "tienda-web__state_clientes_cliente_v1__acme",
+        "dlqerror": "PAIS_NO_SOPORTADO: el cliente cli-1 tiene un país fuera del catálogo",
+        "dlqtime": "2026-08-20T10:25:40.117Z",
+        "data": {
+          "key": "cli-1",
+          "revision": 41
+        }
+      },
+      "bytes": 719,
+      "sha256": "dbb6d882f7df49e4b88026f17fb7b83e9e6c2226aa731ad25d71fc41c8b8f6d9",
+      "base64": "eyJzcGVjdmVyc2lvbiI6IjEuMCIsImlkIjoiMDE5MjRmOGUtN2MzYS03YjJkLTllMTQtM2Y4YTFjOWQwZTU1Iiwic291cmNlIjoiL3Byb2R1Y2Npb24vY3JtLWFwaSIsInR5cGUiOiJjb20uZmx1eC5zdGF0ZS5jbGllbnRlcy5jbGllbnRlLnYxIiwidGltZSI6IjIwMjYtMDgtMjBUMTA6MjU6MzkuNDEyWiIsImRhdGFjb250ZW50dHlwZSI6ImFwcGxpY2F0aW9uL2pzb24iLCJkYXRhc2NoZW1hIjoiaHR0cHM6Ly9zY2hlbWFzLmludGVybmFsL3N0YXRlL2NsaWVudGVzL2NsaWVudGUvMS4wLjAuanNvbiIsInN1YmplY3QiOiJjbGktMSIsImNvcnJlbGF0aW9uaWQiOiIwMTkyNGY4ZS03YzNhLTdiMmQtOWUxNC0zZjhhMWM5ZDBlNTUiLCJ0ZW5hbnRpZCI6ImFjbWUiLCJwcm9kdWNlcnZlcnNpb24iOiIyLjEuMCIsImRhdGFjbGFzc2lmaWNhdGlvbiI6ImNvbmZpZGVudGlhbCIsInBhcnRpdGlvbmtleSI6ImNsaS0xIiwiZGxxcmVhc29uIjoicGVybWFuZW50IiwiZGxxYXR0ZW1wdHMiOjEsImRscWNvbnN1bWVyIjoidGllbmRhLXdlYl9fc3RhdGVfY2xpZW50ZXNfY2xpZW50ZV92MV9fYWNtZSIsImRscWVycm9yIjoiUEFJU19OT19TT1BPUlRBRE86IGVsIGNsaWVudGUgY2xpLTEgdGllbmUgdW4gcGHDrXMgZnVlcmEgZGVsIGNhdMOhbG9nbyIsImRscXRpbWUiOiIyMDI2LTA4LTIwVDEwOjI1OjQwLjExN1oiLCJkYXRhIjp7ImtleSI6ImNsaS0xIiwicmV2aXNpb24iOjQxfX0="
+    }
+  ],
+  "assertions": [
+    {
+      "id": "data-is-last",
+      "expr": "Object.keys(event).at(-1) === 'data'"
+    },
+    {
+      "id": "subject-attribute-is-the-key",
+      "expr": "event.subject === natsSubject.split('.').at(-1)"
+    },
+    {
+      "id": "tenantid-is-the-subject-tenant-token",
+      "expr": "event.tenantid === natsSubject.split('.').at(-2)"
+    },
+    {
+      "id": "utf8-literal-no-u-escapes",
+      "expr": "!/\\\\u[0-9a-fA-F]{4}/.test(JSON.stringify(event))"
+    },
+    {
+      "id": "dlq-state-data-is-key-and-revision-only",
+      "expr": "Object.keys(dlqEvent.data).join() === 'key,revision'"
+    },
+    {
+      "id": "dlq-state-has-no-signature",
+      "expr": "!('signature' in dlqEvent) && !('signkeyid' in dlqEvent)"
+    }
+  ],
+  "subjectVectors": [
+    {
+      "contract": "clientes.cliente.v1",
+      "tenantId": "acme",
+      "key": "cli-1",
+      "natsSubject": "state.clientes.cliente.v1.acme.cli-1"
+    },
+    {
+      "contract": "logistica.linea-envio.v2",
+      "tenantId": "acme-corp",
+      "key": "Env_00-9",
+      "natsSubject": "state.logistica.linea-envio.v2.acme-corp.Env_00-9"
+    },
+    {
+      "contract": "clientes.cliente.v1",
+      "tenantId": "system",
+      "key": "0",
+      "natsSubject": "state.clientes.cliente.v1.system.0"
+    },
+    {
+      "contract": "clientes.cliente.v1",
+      "tenantId": "acme",
+      "key": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "natsSubject": "state.clientes.cliente.v1.acme.aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    },
+    {
+      "contract": "clientes.cliente.v1",
+      "tenantId": "tttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttt",
+      "key": "k",
+      "natsSubject": "state.clientes.cliente.v1.tttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttt.k"
+    },
+    {
+      "contract": "clientes.cliente.v1",
+      "tenantId": "acme",
+      "key": "cli.1",
+      "errorCode": "INVALID_STATE_KEY"
+    },
+    {
+      "contract": "clientes.cliente.v1",
+      "tenantId": "acme",
+      "key": "cli 1",
+      "errorCode": "INVALID_STATE_KEY"
+    },
+    {
+      "contract": "clientes.cliente.v1",
+      "tenantId": "acme",
+      "key": "*",
+      "errorCode": "INVALID_STATE_KEY"
+    },
+    {
+      "contract": "clientes.cliente.v1",
+      "tenantId": "acme",
+      "key": ">",
+      "errorCode": "INVALID_STATE_KEY"
+    },
+    {
+      "contract": "clientes.cliente.v1",
+      "tenantId": "acme",
+      "key": "café",
+      "errorCode": "INVALID_STATE_KEY"
+    },
+    {
+      "contract": "clientes.cliente.v1",
+      "tenantId": "acme",
+      "key": "_reservada",
+      "errorCode": "INVALID_STATE_KEY"
+    },
+    {
+      "contract": "clientes.cliente.v1",
+      "tenantId": "acme",
+      "key": "cli-1\n",
+      "errorCode": "INVALID_STATE_KEY"
+    },
+    {
+      "contract": "clientes.cliente.v1",
+      "tenantId": "acme",
+      "key": "",
+      "errorCode": "INVALID_STATE_KEY"
+    },
+    {
+      "contract": "clientes.cliente.v1",
+      "tenantId": "acme",
+      "key": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "errorCode": "INVALID_STATE_KEY"
+    },
+    {
+      "contract": "clientes.cliente.v1",
+      "tenantId": "ACME",
+      "key": "cli-1",
+      "errorCode": "INVALID_TENANT_FOR_STATE"
+    },
+    {
+      "contract": "clientes.cliente.v1",
+      "tenantId": "acme_corp",
+      "key": "cli-1",
+      "errorCode": "INVALID_TENANT_FOR_STATE"
+    },
+    {
+      "contract": "clientes.cliente.v1",
+      "tenantId": "acme.corp",
+      "key": "cli-1",
+      "errorCode": "INVALID_TENANT_FOR_STATE"
+    },
+    {
+      "contract": "clientes.cliente.v1",
+      "tenantId": "",
+      "key": "cli-1",
+      "errorCode": "INVALID_TENANT_FOR_STATE"
+    },
+    {
+      "contract": "clientes.cliente.v1",
+      "tenantId": "ttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttttt",
+      "key": "cli-1",
+      "errorCode": "INVALID_TENANT_FOR_STATE"
+    },
+    {
+      "contract": "state.cliente.v1",
+      "tenantId": "acme",
+      "key": "cli-1",
+      "errorCode": "RESERVED_DOMAIN"
+    },
+    {
+      "contract": "dlq.cliente.v1",
+      "tenantId": "acme",
+      "key": "cli-1",
+      "errorCode": "RESERVED_DOMAIN"
+    },
+    {
+      "contract": "rpc.cliente.v1",
+      "tenantId": "acme",
+      "key": "cli-1",
+      "errorCode": "RESERVED_DOMAIN"
+    },
+    {
+      "contract": "system.cliente.v1",
+      "tenantId": "acme",
+      "key": "cli-1",
+      "errorCode": "RESERVED_DOMAIN"
+    },
+    {
+      "contract": "clientes.cliente",
+      "tenantId": "acme",
+      "key": "cli-1",
+      "errorCode": "INVALID_STATE_CONTRACT"
+    },
+    {
+      "contract": "clientes.cliente.v1.creado",
+      "tenantId": "acme",
+      "key": "cli-1",
+      "errorCode": "INVALID_STATE_CONTRACT"
+    },
+    {
+      "contract": "clientes.cliente.1",
+      "tenantId": "acme",
+      "key": "cli-1",
+      "errorCode": "INVALID_STATE_CONTRACT"
+    },
+    {
+      "contract": "clientes.cliente.v0",
+      "tenantId": "acme",
+      "key": "cli-1",
+      "errorCode": "INVALID_STATE_CONTRACT"
+    },
+    {
+      "contract": "Clientes.cliente.v1",
+      "tenantId": "acme",
+      "key": "cli-1",
+      "errorCode": "INVALID_STATE_CONTRACT"
+    },
+    {
+      "contract": "clientes.Cliente.v1",
+      "tenantId": "acme",
+      "key": "cli-1",
+      "errorCode": "INVALID_STATE_CONTRACT"
+    },
+    {
+      "contract": "",
+      "tenantId": "acme",
+      "key": "cli-1",
+      "errorCode": "INVALID_STATE_CONTRACT"
+    },
+    {
+      "contract": "clientes.cliente",
+      "tenantId": "ACME",
+      "key": "a.b",
+      "errorCode": "INVALID_STATE_CONTRACT"
+    },
+    {
+      "contract": "state.cliente",
+      "tenantId": "acme",
+      "key": "cli-1",
+      "errorCode": "RESERVED_DOMAIN"
+    }
+  ]
+}

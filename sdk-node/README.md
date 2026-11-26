@@ -1,7 +1,9 @@
 # @flux/sdk — Node.js / TypeScript
 
 Cliente delgado del [flux Event Protocol v1](../README.md).
-**Nivel de conformidad: L3** (gobernado).
+**Nivel de conformidad: L3** (gobernado). Capacidades opcionales: `signing`, `security` y el
+[estado replicado](#estado-replicado) (`bus.state`), que **todavía no está declarado** en
+`protocol.json` → `capabilities`: se declara cuando el arnés cruzado reproduzca los vectores de estado.
 
 El SDK resuelve infraestructura, no negocio. Si te encuentras metiendo lógica de
 dominio aquí, va en tu servicio.
@@ -215,6 +217,163 @@ fallo, no es para nosotros.
 > esa garantía, es account de NATS por tenant — ver
 > [09-multitenancy.md §2](../specification/09-multitenancy.md), que lista el coste real.
 
+## Estado replicado
+
+Un evento dice **qué pasó**; el **estado** es el **valor actual** de un agregado, que su dueño
+publica y los demás observan. Sustituye a `GET /clientes/123`, a la carga inicial
+(`GET /clientes?page=`) y al polling de datos. Contrato normativo:
+[10-state.md](../specification/10-state.md). Es una extensión **opcional**: un servicio que solo use
+eventos no la toca.
+
+```ts
+// El DUEÑO escribe. aggregateVersion es suyo (su contador), el SDK no lo inventa.
+await bus.state.put("clientes.cliente.v1", "cli-1",
+  { clienteId: "cli-1", nombre: "Ana", email: "ana@example.com", aggregateVersion: 7 },
+  { tenantId: "acme" });                       // → { applied: true, outcome: "ok", revision: 41 }
+
+await bus.state.delete("clientes.cliente.v1", "cli-1", { aggregateVersion: 8, tenantId: "acme" });
+
+// Un OBSERVADOR lee: una clave…
+const actual = await bus.state.get("clientes.cliente.v1", "cli-1", { tenantId: "acme" });  // entrada | null
+
+// …o todo el contrato: una foto completa y después los cambios, por el mismo canal.
+await bus.state.watch("clientes.cliente.v1", async (entrada) => {
+  if (entrada.deleted) return borrarLocal(entrada.tenantId, entrada.key);  // OBLIGATORIO: la lápida
+  await guardarLocal(entrada);                  // UPDATE … WHERE aggregate_version < $n
+}, { tenantId: "acme", onSynced: () => listo() });
+```
+
+`entrada` es `{ key, tenantId, deleted, data, aggregateVersion, revision }`: `data` es `null` si es
+una lápida, y `tenantId` existe porque un `watch` sin tenant recibe `cli-1` de varios y la clave
+sola mezclaría los tenants en tu copia local.
+
+**Lo que hace `put`, y por qué** ([10-state.md §3](../specification/10-state.md)):
+
+- Es **condicional**. Lee la clave con `DIRECT.GET`, no escribe si `aggregateVersion` no avanza y
+  publica con `Nats-Expected-Last-Subject-Sequence`: dos instancias del dueño, o una lenta, no
+  pisan un valor nuevo con uno viejo (y un consumidor nuevo no recibe el viejo como la verdad).
+- Una versión que no avanza —**también una igual**— es **`stale`, y no es un error**
+  (`{ applied: false, outcome: "stale", revision }`). Lo que sí puede ser un error es ignorarlo.
+- **Reconoce su propia escritura** (paso 1b): si el acuse se pierde, el reintento relee, ve su propio
+  `id` y devuelve `ok`; sin eso, una escritura buena se convertiría en un `stale`.
+- Reconoce **los dos códigos** de conflicto de secuencia, `10071` y `10164` (el segundo, sin número,
+  es el de un cluster bajo carrera; un SDK que solo conozca el primero pasa sus pruebas contra un nodo
+  y no reintenta en producción). Tres intentos y, agotados, `STATE_CONFLICT` (**RETRYABLE**).
+- **Valida antes de la red**, en este orden: dominio reservado, forma del contrato, clave, tenant,
+  `aggregateVersion`, clasificación y —con L3— el esquema. Sin `classification`, usa **`confidential`** (no el default de
+  la conexión); `restricted` se rechaza.
+- **Nunca por core NATS.** Un `publish` de core a un subject de estado sobrescribe sin acuse ni chequeo.
+
+**Borrar** es `put` de una **lápida** (`data: { aggregateVersion }` y nada más) en el mismo subject:
+el valor anterior **sale del stream**. La versión de la lápida debe superar la del valor. Y la
+trampa: un dueño que borra su fila y la recrea con `aggregateVersion: 1` recibe `stale` y **la clave
+sigue borrada, sin error**; su contador tiene que sobrevivir al borrado (`deleted_at` en vez de `DELETE`).
+`get` de una lápida da `null`, igual que de una clave que nunca existió.
+
+**Reglas que el SDK aplica por ti**
+
+| | |
+|---|---|
+| Subject | `state.<dom>.<agr>.v<M>.<tenant>.<clave>` — 6 tokens. La clave y el tenant van **dentro**: el tenant lo confina el **broker** |
+| Clave | `^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$`, coincidencia completa, sin codificar. El broker **no** la valida (acepta `*`, `a.b` y 2000 caracteres): `INVALID_STATE_KEY` |
+| Tenant | `^[a-z0-9]+(-[a-z0-9]+)*$`, máximo 64, **sin valor por defecto** (ni `system` implícito). `put`, `delete` y `get`: la opción, el evento en curso o `connect()`; si no, `INVALID_TENANT_FOR_STATE`. **`watch`: solo la opción y `connect()`, nunca el evento en curso** (no corre dentro de un handler) |
+| `aggregateVersion` | Entero ≥ 1 y ≤ 2^53 − 1, **siempre** (con o sin L3). **En Node `7.0` es el entero 7**: `JSON.parse("7.0")` y `7` son el mismo `number`, así que no se puede rechazar. Es un límite conocido del lenguaje (10-state.md §3.4), no un fallo: un SDK cuyo parser distingue entero de flotante (Rust) sí lo rechaza |
+| Dominios | `dlq`, `state`, `rpc` y `system` no son dominios: `publish()`, `subscribe()` y todo `bus.state.*` lanzan `RESERVED_DOMAIN` |
+| `watch` | Durable `<servicio>__state_<dom>_<agr>_v<M>` (+ `__<tenant>`), `deliver_policy: last_per_subject`; con `tenantIsolation: "strict"` exige tenant |
+| `onSynced` | **Una vez** por `watch()` (ni por reconexión ni tras un `resync`): con el contrato vacío, de inmediato y antes de entregar nada; si no, cuando llega una entrega con `pending == 0` **y** el handler ha terminado. No promete que no lleguen entradas después. **`watch` toma un tenant**: un servicio que observa N tenants hace N llamadas y recibe N `onSynced`; combinarlas es de la aplicación |
+| `watch` y `flux state resync` | Si el durable se **borra** con el `watch` abierto, el SDK reabre el consumo (`CONSUMER.INFO` por nombre, sin `CONSUMER.CREATE`, comprobando la configuración) y la foto vuelve a entregarse. Medido con `nats.js` 3.4.0 (tres veces): **43 s** hasta la primera entrada sin esto, 0,1 s con ello |
+
+**Los siete códigos** ([04-errors.md §6](../specification/04-errors.md)) — `code` fijo, clase fija:
+
+| Código | Clase | Cuándo |
+|---|---|---|
+| `INVALID_STATE_CONTRACT` | PERMANENT | Un contrato que no es `<dominio>.<agregado>.v<major>` (`clientes.cliente`); un dominio reservado es `RESERVED_DOMAIN` |
+| `INVALID_TENANT_FOR_STATE` | PERMANENT | Tenant que no cumple el patrón, o ninguno |
+| `INVALID_STATE_KEY` | PERMANENT | Clave que no cabe en un token de NATS |
+| `MISSING_AGGREGATE_VERSION` | PERMANENT | Falta, o no es un entero ≥ 1 (también al consumir) |
+| `STATE_SUBJECT_MISMATCH` | **POISON** | El `tenantid`, el `subject` o el `type` del sobre no coinciden con el subject de NATS: nunca se aplica ni llega al handler |
+| `STATE_CONFLICT` | RETRYABLE | Tres conflictos de secuencia seguidos |
+| `RESERVED_DOMAIN` | PERMANENT | Un dominio reservado en un subject o contrato |
+
+Un contrato mal formado (`clientes.cliente`) lanza `InvalidStateContractError`, con su código
+`INVALID_STATE_CONTRACT` (el séptimo: antes no tenía ninguno). Reutiliza, sin código nuevo, `INVALID_DATACLASSIFICATION`
+(`restricted` en un `put`; POISON si llega en un mensaje), `INVALID_SCHEMA` (L3), `NOT_PROVISIONED` y
+`PERMISSION_DENIED`. Ningún mensaje cita valores de `data`: una clave o un tenant sí, una versión por su tipo.
+
+**`NOT_PROVISIONED` en estado.** El SDK no consulta ni crea el stream `STATE_<DOM>` (`STREAM.INFO` lista
+todas las claves y todos los tenants). Su señal es otra: **nadie contesta** a `DIRECT.GET` —y un stream sin
+`allow_direct` se ve igual que uno que no existe—, o `CONSUMER.INFO` dice «stream not found». El mensaje
+nombra las dos causas y apunta a `flux provision` y `flux doctor`.
+
+**La DLQ de estado** (`dlq.state.<dom>.<agr>.v<M>`, sin tenant ni clave) guarda el sobre original **sin el
+dato**: `data` pasa a `{ key, revision }`, sin `signkeyid` ni `signature`; un mensaje ilegible no se copia
+en ninguna forma, y el `dlqerror` de un error que no es de flux se reduce a su código y a una frase fija
+(`UNKNOWN: error sin clasificar de la aplicación; el mensaje se omite…`: el de un driver puede citar la fila
+entera). `onPoison` recibe `raw` **vacío**. El estado **no se reproduce** desde la DLQ (`flux dlq replay` lo
+rechaza): se resincroniza con `flux state resync`. `watch` avisa al abrir si `DLQ_<DOM>` no captura
+`dlq.state.<dom>.>`.
+
+**L3.** `put` valida `data` contra el esquema que resuelve el índice `state` del bundle
+(`validation.bundle.state`), sin red; la lápida, contra `schemas/system/state/eliminado/1.0.0.json`.
+El mensaje reporta **todos** los errores y cita la **ruta** (`/email`), nunca el valor.
+
+**Métrica.** `flux_state_writes_total{contract,outcome}` (`ok | stale | conflict | invalid_schema`) por el
+`MetricsSink` (`stateWrite`, opcional: un sink anterior sigue funcionando). `invalid_schema` es todo fallo de
+L3 —también `SCHEMA_NOT_FOUND` en modo estricto— y `MISSING_AGGREGATE_VERSION`, como en un evento. **Nunca** la clave ni el tenant
+como etiqueta. Un `watch` reutiliza las métricas de consumo con `subject="state.<contrato>"` y el `consumer`
+**sin** el sufijo de tenant; `flux_consumer_pending` es la **suma** de sus durables.
+
+### Permisos que el estado necesita
+
+Medidos contra un `nats-server` real y con la matriz «quita uno y falla» de
+`test/integration/state.test.ts`. Coinciden con `protocol.json` → `state.acl`:
+
+| Rol | `publish` | Sin él |
+|---|---|---|
+| Todo servicio | `$JS.API.INFO`; `subscribe`: `_INBOX.<servicio>.>` | — |
+| **Dueño** del dominio `<dom>` | `state.<dom>.>` · `$JS.API.DIRECT.GET.STATE_<DOM>.state.<dom>.>` | `PermissionDeniedError` al `put`/`delete`/`get` |
+| **Observador** del contrato `<dom>.<agr>.v<M>`, tenant `<t>` | `$JS.API.CONSUMER.INFO.STATE_<DOM>.<durable>` · `…MSG.NEXT.STATE_<DOM>.<durable>` · `$JS.ACK.STATE_<DOM>.<durable>.>` · `dlq.state.<dom>.<agr>.v<M>` · `$JS.API.STREAM.INFO.DLQ_<DOM>` | `watch` lanza `PermissionDeniedError` (info, pull, DLQ); **ack** y **DLQ** no lanzan (ver abajo) |
+| …y su `get` | `$JS.API.DIRECT.GET.STATE_<DOM>.state.<dom>.<agr>.v<M>.<t>.*` (`….*.*` sin tenant) | `get` lanza `PermissionDeniedError`; `watch` no lo necesita |
+| Quien **lee** la DLQ de estado de su dominio | `…CONSUMER.INFO`, `…MSG.NEXT` y `$JS.ACK…` de `DLQ_<DOM>.<servicio>__dlq_state_<dom>` | (no es del SDK: un pull consumer propio) |
+| Solo en **desarrollo** | `$JS.API.CONSUMER.CREATE.STATE_<DOM>.<durable>.state.<dom>.<agr>.v<M>.<t>.*` | `NotProvisionedError` si el durable no existe |
+
+- **Nunca** `$JS.API.STREAM.INFO.STATE_<DOM>` a un observador (lista claves y tenants), ni la forma de
+  **cuerpo** de `DIRECT.GET` (`$JS.API.DIRECT.GET.<stream>` + `{"seq": n}` lee cualquier mensaje). El
+  broker rechaza un cuerpo en la forma por subject (`408`).
+- El tenant va **fijado** en el permiso de lectura y en el nombre del durable: un observador de `acme`
+  no lee `globex` (`get` y `watch` lanzan `PermissionDeniedError`), y no escribe.
+- Como con los eventos, un `ack` o un pull denegados **no lanzan**: el pull lo detecta `watch()` al abrir
+  (lanza), el `ack` solo lo registra `logger.error` —la entrada se reentrega cada `ack_wait`, sin fin—, y una
+  DLQ no escribible deja la entrada **sin terminar** (se reentrega y se avisa). **Configura un `logger`.**
+
+### Funciones puras (para el arnés cruzado y para tus tests)
+
+Construyen los **bytes exactos** de [10-state.md §2.6](../specification/10-state.md), sin reloj ni UUID por
+dentro: `id` y `time` los das tú. Producen lo mismo en todos los SDKs.
+
+```ts
+import { stateSubject, buildStateEvent, buildStateTombstone, buildStateDlqEvent, serialize } from "@flux/sdk";
+
+stateSubject("clientes.cliente.v1", "acme", "cli-1");   // "state.clientes.cliente.v1.acme.cli-1"
+serialize(buildStateEvent({ contract, tenantId, key, id, source, time, correlationid, producerversion, classification, data }));
+serialize(buildStateTombstone({ contract, tenantId, key, id, source, time, correlationid, producerversion, aggregateVersion }));
+serialize(buildStateDlqEvent({ original, revision, dlq: { reason, attempts, consumer, error, dlqtime } }));
+```
+
+`test/state.test.ts` fija que coinciden con `conformance/cases/cross-sdk-state-envelope.json` y con el texto
+de la spec (y que cambiar el `tenantid` cambia el hash).
+
+### Lo que NO hace
+
+- **No crea ni consulta `STATE_<DOM>`** (lo aprovisiona `flux provision`), ni ofrece una opción de desarrollo
+  para crearlo. Sí crea `DLQ_<DOM>` (con los dos subjects) si no existe, como con los eventos.
+- **No recuerda en memoria** la última secuencia escrita para ahorrarse la lectura (la spec lo permite): cada
+  `put` lee primero.
+- **`get` es una lectura de réplica.** Con `replicas: 3`, justo después de un `put` puede devolver el valor
+  anterior (no medido con red real, [10-state.md §3.7](../specification/10-state.md)); quien necesite su
+  propia escritura usa `revision`.
+- **No resincroniza**: borrar y recrear el durable es `flux state resync`, con credenciales de operación.
+
 ## Seguridad: permisos, inbox, TLS y credenciales
 
 Lo que [06-security.md](../specification/06-security.md) §2 y §3 exigen del SDK, y lo que
@@ -365,6 +524,10 @@ NATS_SERVER=$PWD/bin/nats-server npm test
 # FLUX_REQUIRE_BROKER=1 hace que la ausencia del binario sea un FALLO y no un salto con aviso.
 # Es lo que usa el CI: sin ella un binario que no compilara daría verde sin ejecutar nada.
 # Puertos: 4400-4449 por defecto (FLUX_TEST_PORTS=desde-hasta). TLS necesita `openssl`.
+# El estado replicado añade un cluster de TRES nodos (seis puertos: A-49, el conflicto 10164).
+#   test/state.test.ts                         unitarios: bytes exactos, validación, algoritmo, métricas
+#   test/integration/state.test.ts             permisos exactos: el ciclo de 100 claves y «quita un permiso y se nota»
+#   test/integration/state-semantics.test.ts   conformance/cases/state-semantics.json ejecutado con esta API
 
 # Suite de conformidad contra NATS real
 docker compose up -d          # desde la raíz del repo

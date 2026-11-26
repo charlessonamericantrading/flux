@@ -95,6 +95,19 @@ https://raw.githubusercontent.com/charlessonamericantrading/flux/main/protocol.j
 11. **UTF-8 literal, sin escapes `\u`.** `café`, no `café`. Ambos son JSON válido
     y **no son los mismos bytes**.
 
+**Estado replicado** (extensión opcional, [10-state.md](specification/10-state.md)):
+
+12. **Un dato que guarda otro sistema es estado, no una llamada.** `state.watch` / `state.get`,
+    nunca un `GET` por HTTP ni polling. Solo el **dueño** escribe (`put`, `delete`).
+13. **`put` exige `aggregateVersion` (entero ≥ 1) y es condicional.** Una versión que no avanza da
+    `stale`, que **no** es un error. Una clave borrada solo se recrea con una versión mayor que la
+    de su lápida.
+14. **El dato personal solo vive en estado**: clasificado `confidential`, con `x-pii` en el
+    esquema, y borrable con `delete`. `restricted` no se admite. En un **evento**, la regla 5
+    sigue intacta. Un consumidor **DEBE** borrar su copia local al recibir una lápida.
+15. **`dlq`, `state`, `rpc` y `system` no son dominios.** `publish()` los rechaza
+    (`RESERVED_DOMAIN`).
+
 ---
 
 ## 2. Publicar un evento
@@ -216,6 +229,10 @@ Estas no dan error: dan comportamiento incorrecto. Un agente las comete casi sie
 | `_INBOX.>` común a todos los servicios | **Cualquiera lo lee todo.** Las entregas de un pull consumer viajan por el inbox: con `_INBOX.>` compartido, un servicio sin concesión sobre `inventario` leyó un evento completo de `inventario` (medido en NATS 2.14.5). Cada servicio usa **`_INBOX.<servicio>.>`**, fijado por el SDK a partir del nombre de servicio. |
 | Una credencial o un TLS mal puestos fallan con un error | **No siempre.** `waitOnFirstConnect` (Node) y `retry_on_initial_connect` (Rust) reintentan **cualquier** error: un certificado que no verifica deja `connect()` colgado, o el servicio arrancado y mudo. `connect()` espera a un broker caído pero **falla al instante** ante lo que esperar no arregla ([03-delivery.md §6.1](specification/03-delivery.md)). Un `ack` o un pull denegados tampoco lanzan: el evento se reentrega para siempre ([06-security.md §3.7](specification/06-security.md)). |
 | Los formateadores ISO por defecto sirven para `time` | No. Go recorta ceros (`.41Z`), Python da microsegundos y `+00:00`. Formatea explícitamente: **exactamente 3 decimales y sufijo `Z`**. |
+| La clave y el tenant de un estado van en el sobre | **Van en el subject**: `state.<dom>.<agr>.v<M>.<tenant>.<clave>`, y `tenantid` y `subject` del sobre **DEBEN** coincidir (si no, POISON `STATE_SUBJECT_MISMATCH`). El broker **no valida la clave**: acepta `*`, `a.b` (dos tokens: la entrada queda fuera de todo filtro, sin error) y 2000 caracteres. Valídala tú: `^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$`, con coincidencia **completa**: en Python y PHP el `$` acepta un `\n` final (medido). |
+| `put` solo publica | **Es condicional**: lee la secuencia (`DIRECT.GET`), no escribe si la versión no avanza y publica con `Nats-Expected-Last-Subject-Sequence`. Un `publish` de core a un subject de estado sobrescribe **sin chequeo ni acuse**. El conflicto de secuencia tiene **dos** códigos: `10071` (un nodo) y `10164` (cluster, bajo carrera): reconoce los dos o no reintentarás en producción. Reintenta con **el mismo `id`**. |
+| El estado se recupera desde la DLQ | **No se reproduce**: `dlq.state.>` no lleva el dato (`data` es `{ key, revision }`) y republicar un valor viejo pisaría uno nuevo. `flux dlq replay` lo rechaza; la recuperación es `flux state resync`. |
+| Un estado con PII es «lo mismo que un evento con PII» | No: el estado va `confidential` con `x-pii` y **se puede borrar** (`delete` sustituye el valor por una lápida). Pero el borrado **físico** en disco y las **claves** y **tenants** (visibles en `STREAM.INFO`) no los cubre: la clave es un id opaco, nunca un email. |
 
 > Las tres primeras trampas de JetStream comparten forma: **el servidor acepta la
 > petición, no devuelve error, y aplica otra cosa.** Ninguna se detecta leyendo código;
@@ -226,7 +243,7 @@ Estas no dan error: dan comportamiento incorrecto. Un agente las comete casi sie
 Opt-in. Un servicio que no las use sigue siendo conforme, pero si el proyecto ya las
 tiene activas, tu código debe respetarlas.
 
-**Capacidades por SDK:** cada SDK declara las que tiene (`signing`, `security`: columna *Capacidades* del [`README.md`](README.md)), y uno sin `security` no es compatible con las ACLs de `gen-acl.mjs` ([00-protocol.md §5](specification/00-protocol.md)).
+**Capacidades por SDK:** cada SDK declara las que tiene (`signing`, `security`, `state`: columna *Capacidades* del [`README.md`](README.md)), y uno sin `security` no es compatible con las ACLs de `gen-acl.mjs` ([00-protocol.md §5](specification/00-protocol.md)). Uno sin `state` no puede escribir ni leer estado replicado.
 
 ### Validación L3 — [00-protocol.md §5](specification/00-protocol.md)
 
@@ -246,6 +263,38 @@ equipo la semana que viene.
 - Un fallo al **consumir** se clasifica **PERMANENT**, y en Python/Go lo declara el propio
   error en vez de dejarlo en manos de la política de errores desconocidos.
 
+### Estado replicado — [10-state.md](specification/10-state.md)
+
+El **valor actual** de un agregado, que el dueño publica y los demás observan: sustituye a
+`GET /clientes/123`, a la carga inicial y al polling de datos. Un evento dice *qué pasó*; el
+estado lleva *el dato*.
+
+```ts
+await bus.state.put("clientes.cliente.v1", "cli-1",
+  { clienteId: "cli-1", nombre: "Ana", email: "ana@example.com", aggregateVersion: 7 });
+await bus.state.delete("clientes.cliente.v1", "cli-1", { aggregateVersion: 8 });
+const actual = await bus.state.get("clientes.cliente.v1", "cli-1");       // entrada | null
+await bus.state.watch("clientes.cliente.v1", async (entrada) => {         // foto + cambios
+  if (entrada.deleted) return borrarLocal(entrada.tenantId, entrada.key);
+  await guardarLocal(entrada);                  // UPDATE … WHERE aggregate_version < $n
+}, { onSynced: () => listo() });
+```
+
+- Subject `state.<dom>.<agr>.v<M>.<tenant>.<clave>`: **6 tokens**, tenant y clave **dentro**. Un
+  stream `STATE_<DOM>` guarda **un valor por clave**; `delete` publica una **lápida** (con su
+  versión) que lo sustituye.
+- **Tenant explícito**: sin valor por defecto (ni `system` implícito). Una clave que no cumple el
+  patrón es `INVALID_STATE_KEY`, no algo que se escape. El tenant de `put`/`get`/`delete` sale de la
+  opción, del evento en curso y de `connect()`; el de `watch`, solo de la opción y de `connect()`.
+- `onSynced` se invoca **una vez** por `watch`: al terminar la foto inicial, o de inmediato si no hay nada.
+- **Siete códigos**: `INVALID_STATE_CONTRACT`, `INVALID_TENANT_FOR_STATE`, `INVALID_STATE_KEY`,
+  `MISSING_AGGREGATE_VERSION`, `RESERVED_DOMAIN` (PERMANENT), `STATE_SUBJECT_MISMATCH` (POISON) y
+  `STATE_CONFLICT` (RETRYABLE) — [04-errors.md §6](specification/04-errors.md).
+- La DLQ de estado (`dlq.state.<dom>.<agr>.v<M>`) **no lleva el dato**, y el estado **no se
+  reproduce** desde ella.
+- Métrica `flux_state_writes_total{contract,outcome}`; **nunca** la clave ni el tenant como
+  etiqueta. Esquemas en `schemas/state/…`, con `aggregateVersion` obligatoria.
+
 ### Firma Ed25519 — [07-signing.md](specification/07-signing.md)
 
 - Se firma `serialize(evento sin `signature` y sin extensiones `dlq*`)`. **No hay
@@ -260,7 +309,7 @@ equipo la semana que viene.
 ### Métricas — [08-observability.md](specification/08-observability.md)
 
 Los nombres y etiquetas son **contrato**, no decisión de cada servicio. Siete métricas
-`flux_*`.
+`flux_*` (más `flux_state_writes_total` en un SDK con la capacidad `state`).
 
 - **Nunca** etiquetes por `tenantid`, `id` ni `correlationid`: un tenant nuevo no debe
   crear series temporales nuevas. En **trazas** sí.
@@ -291,6 +340,8 @@ Los nombres y etiquetas son **contrato**, no decisión de cada servicio. Siete m
 | Metadatos en la raíz del envelope | Las extensiones CloudEvents solo admiten escalares. Acabarás con JSON dentro de un string. Va todo en `data`. |
 | `core.entidad.v1.cambiado` | Dominio genérico = ningún dominio. |
 | Credenciales `.creds`/`.nk` en el repo | Están en `.gitignore` por algo. Van en el gestor de secretos. |
+| Meter el dato personal en un evento «porque el consumidor lo necesita» | Es lo que el **estado** resuelve: el evento lleva `clienteId`, el estado lleva el dato, clasificado y borrable. |
+| Leer un dato de otro servicio con `GET` por HTTP | Es **estado** (`state.get` / `state.watch`), no petición/respuesta. |
 
 ## 11. Antes de dar por terminado
 
@@ -309,6 +360,9 @@ Los nombres y etiquetas son **contrato**, no decisión de cada servicio. Siete m
       `node scripts/check-compat.mjs`
 - [ ] Si tocaste `AGENTS.md` o `specification/`: `node scripts/build-llms.mjs`
 - [ ] Ninguna métrica etiquetada por `tenantid`, `id` ni `correlationid`
+- [ ] Si escribes **estado**: `aggregateVersion` ≥ 1 en `data` y en el esquema (`schemas/state/…`);
+      el dato personal con `x-pii` y `confidential`; el consumidor borra su copia al recibir una lápida
+- [ ] Ningún dominio llamado `dlq`, `state`, `rpc` ni `system`; ninguna clave o tenant como etiqueta de métrica
 
 ---
 
@@ -324,8 +378,12 @@ Los nombres y etiquetas son **contrato**, no decisión de cada servicio. Siete m
 # flux — Event Protocol v1
 
 > **Estado:** Draft normativo
-> **Versión:** 1.0.0
+> **Versión:** 1.1.0
 > **Última revisión:** 2026-11-26
+
+> **1.1 es aditiva.** Las decisiones de v1.0 no cambian; el estado replicado
+> ([10-state.md](10-state.md)) entra como **extensión opcional**, igual que la firma: un servicio
+> que solo use eventos sigue siendo conforme.
 
 ---
 
@@ -378,7 +436,9 @@ dato.**
   request/reply, usa NATS Core request/reply — está fuera del alcance de v1.
 - **Transporte de blobs.** Si el payload supera **1 MiB**, publica una referencia
   (URI + checksum), no el contenido. Ver [01-envelope.md §7](01-envelope.md).
-- **Sustituto de una tabla.** Un evento no es una fila. Un evento es un cambio.
+- **Sustituto de una tabla.** Un evento no es una fila. Un evento es un cambio. Si lo que
+  necesitas es la fila —el valor actual de un agregado—, es **estado**
+  ([10-state.md](10-state.md)).
 
 ## 5. Niveles de conformidad
 
@@ -464,6 +524,7 @@ conforme; lo que no es, es compatible con aquello que la capacidad habilita.
 |---|---|---|
 | `signing` | [07-signing.md](07-signing.md) | No firma ni verifica. Un evento sin firma sigue siendo válido: el modo por defecto es `off` |
 | `security` | Esta sección, y lo que cita | **No es compatible con la configuración segura** de [06-security.md](06-security.md): con el inbox por defecto el broker le deniega la suscripción a su propio inbox y su primera petición falla |
+| `state` | [10-state.md](10-state.md) | No escribe ni lee **estado replicado** (`put`, `delete`, `get`, `watch`): para leer un dato que guarda otro sistema tiene que llamarle por HTTP. Sigue siendo conforme |
 
 El registro de qué SDK declara qué capacidad es [`protocol.json`](../protocol.json) →
 `capabilities`, y la tabla «Estado de los SDKs» del [`README.md`](../README.md) lo muestra.
@@ -499,12 +560,25 @@ SDK contiene los códigos de error de las capacidades que declara y que existen 
 evidencia que cita. Es necesario y **no suficiente**: que un código esté escrito no prueba que
 se emita.
 
+#### `state`
+
+Un SDK **declara** `state` solo si cumple **todo** lo de [10-state.md §10](10-state.md): las
+cuatro operaciones, **los mismos bytes** que los ejemplos de [10-state.md §2.6](10-state.md), el
+reconocimiento de **los dos** códigos de conflicto de secuencia, los **siete** códigos de
+[04-errors.md §6](04-errors.md), el rechazo de los dominios reservados en `publish()` y un ciclo
+completo contra un broker real con los permisos exactos de estado, en los dos sentidos.
+`security` no es requisito, pero **sin ella el SDK no puede ejecutar** el ciclo bajo la
+configuración segura.
+
 Una capacidad nueva se añade aquí con su nombre, su documento normativo y la evidencia que la
 acredita, y ningún SDK la declara hasta que pasa esa evidencia.
 
 ## 6. Fuera del alcance de v1
 
 Declarado explícitamente para evitar scope creep:
+
+> El **estado replicado** no está en esta lista: entra en 1.1 como extensión opcional
+> ([10-state.md](10-state.md)).
 
 - Request/reply y RPC.
 - Sagas y orquestación de procesos de larga duración.
@@ -525,6 +599,7 @@ Declarado explícitamente para evitar scope creep:
 | [07-signing.md](07-signing.md) | Firma Ed25519 — extensión **opcional** |
 | [08-observability.md](08-observability.md) | Métricas, trazas y alertas — normativo para L2 |
 | [09-multitenancy.md](09-multitenancy.md) | Modelos de aislamiento entre tenants |
+| [10-state.md](10-state.md) | Estado replicado — extensión **opcional**: `put`, `delete`, `get`, `watch` |
 
 
 ==============================================================================
@@ -941,6 +1016,28 @@ El orden de los tokens está elegido para que los filtros útiles sean expresabl
 > nombres de dos tokens. Fijando la versión en la posición 3, la forma del subject es
 > invariante y `>` siempre significa "de aquí hacia abajo".
 
+### 1.3 Dominios reservados
+
+`dlq`, `state`, `rpc` y `system` **NO DEBEN** usarse como dominio: cada uno es un espacio de
+nombres del protocolo, y un dominio con su nombre colisionaría con él.
+
+| Nombre | Qué ocupa |
+|---|---|
+| `dlq` | Los subjects de la DLQ: `dlq.<subject original>` (§3.1) y `dlq.state.<dominio>.…` |
+| `state` | El estado replicado: `state.<dominio>.<agregado>.v<major>.<tenant>.<clave>` ([10-state.md](10-state.md)), y `schemas/state/` |
+| `rpc` | La petición/respuesta (`rpc.<dominio>.…`, fase 3), y `schemas/rpc/` |
+| `system` | Lo de la plataforma: `schemas/system/…` y el tenant `"system"` ([09-multitenancy.md §5](09-multitenancy.md)) |
+
+**La colisión es del broker, no solo de estilo.** Medido contra NATS 2.14.5 (A-43): con
+`STATE_CLIENTES` (`state.clientes.>`) creado, `EVT_STATE` (`state.>`) falla con `subjects overlap
+with an existing stream` (err 10065), y lo mismo `EVT_DLQ` (`dlq.>`) junto a `DLQ_PEDIDOS`
+(`dlq.pedidos.>`). O el dominio no se puede crear, o —si se crea primero— es el estado el que no
+puede existir. `dlq` no estaba reservado en v1.0 y debería.
+
+Un SDK **DEBE** rechazar un subject o un contrato en un dominio reservado con **`RESERVED_DOMAIN`**
+([04-errors.md §6](04-errors.md)); `gen-acl.mjs` y `flux validate` rechazan el manifiesto que lo
+declare como dominio, y `bundle-schemas.mjs`, un esquema de evento en `schemas/<reservado>/`.
+
 ## 2. `type` de CloudEvents
 
 Reverse-DNS, derivado **determinísticamente** del subject:
@@ -960,17 +1057,35 @@ consumidores distintos: el subject enruta (y necesita la versión en posición f
 para los wildcards), el `type` identifica el contrato en un catálogo (y ahí lee mejor
 con la versión al final, como un sufijo SemVer).
 
+El estado tiene el suyo, con el mismo prefijo que su subject y su ruta de esquema
+([10-state.md §2.5](10-state.md)):
+
+```
+subject (NATS):  state.clientes.cliente.v1.acme.cli-1
+type:            com.flux.state.clientes.cliente.v1
+lápida:          com.flux.state.clientes.cliente.deleted.v1
+```
+
 ## 3. Streams de JetStream
 
 ```
 EVT_<DOMINIO>        subjects: <dominio>.>
 DLQ_<DOMINIO>        subjects: dlq.<dominio>.>
+STATE_<DOMINIO>      subjects: state.<dominio>.>          (solo si el dominio tiene estado)
 ```
 
 ```
 EVT_PEDIDOS          pedidos.>
 DLQ_PEDIDOS          dlq.pedidos.>
+STATE_CLIENTES       state.clientes.>
+DLQ_CLIENTES         dlq.clientes.>  y  dlq.state.clientes.>
 ```
+
+- `STATE_<DOMINIO>` guarda **un valor por clave** y no caduca; su configuración está en
+  [10-state.md §2.1](10-state.md). Solo existe si el dominio tiene contratos de estado.
+- **El stream `DLQ_<DOMINIO>` de un dominio con estado captura además `dlq.state.<dominio>.>`**:
+  la DLQ de estado ([10-state.md §6](10-state.md)). Un dominio sin estado conserva el
+  `DLQ_<DOMINIO>` de siempre, sin tocarlo.
 
 - Un stream **por dominio**, no por evento. Un stream por evento multiplica ficheros
   y consumidores sin ganar aislamiento real.
@@ -1025,7 +1140,7 @@ DLQ_PEDIDOS
 ## 4. Durable consumers
 
 ```
-<servicio>__<subject con los puntos sustituidos por guiones bajos>
+<servicio>__<subject con los puntos y los guiones sustituidos por guiones bajos>
 ```
 
 ```
@@ -1035,13 +1150,43 @@ durable:  facturacion-api__pedidos_pedido_v1_creado
 ```
 
 **Los nombres de durable consumer de NATS tampoco admiten `.`** — sustituirlos por
-`_` y separar el servicio con `__` mantiene la reversibilidad: partiendo por `__`
-recuperas servicio y subject exactos. Un nombre de consumidor que no dice qué servicio
-lo tiene abierto es inútil en `nats consumer ls` cuando hay que decidir a las 3 de la
-mañana si se puede borrar.
+`_` y separar el servicio con `__` permite recuperar el servicio partiendo por `__`. Un
+nombre de consumidor que no dice qué servicio lo tiene abierto es inútil en `nats consumer
+ls` cuando hay que decidir a las 3 de la mañana si se puede borrar.
+
+Los **guiones** del subject (`linea-envio`) pasan también a `_`, como hacen `durableName()` de
+los SDKs y `scripts/lib/manifest.mjs`; esta sección solo decía los puntos. Como consecuencia
+`a-b.c…` y `a.b-c…` dan el mismo durable, y el generador de ACLs rechaza un manifiesto que
+consuma los dos ([06-security.md §3.0](06-security.md)).
 
 Un SDK L1 **DEBE** derivar este nombre automáticamente a partir del nombre de servicio
 de `connect()` y del subject de `subscribe()`.
+
+### 4.1 Durables de estado
+
+```
+<servicio>__state_<dominio>_<agregado>_v<major>[__<tenant>]
+```
+
+```
+contrato: clientes.cliente.v1     servicio: tienda-web      tenant: acme
+durable:  tienda-web__state_clientes_cliente_v1__acme        (sin tenant: …_v1)
+```
+
+Es el de un `watch` ([10-state.md §5.2](10-state.md)), sobre `STATE_<DOMINIO>`. El contrato se
+escribe como en un subject —`state.clientes.cliente.v1`— y se transforma igual: puntos y
+guiones a `_`. **El tenant va al final, tras otro `__`, y con sus guiones también a `_`**: un
+durable compartido reparte los mensajes entre quienes lo usan (A-47), así que dos instancias del
+mismo servicio con tenants distintos **necesitan** durables distintos. Con `__` como separador
+caben tres partes sin ambigüedad: ni el servicio (`[a-z0-9-]`) ni los tokens del contrato pueden
+contener `__`.
+
+El dueño de un dominio con estado lee su DLQ de estado con
+`<servicio>__dlq_state_<dominio>` sobre `DLQ_<DOMINIO>` (filtro `dlq.state.<dominio>.>`), el
+paralelo del `<servicio>__dlq_<dominio>` de [06-security.md §3.1](06-security.md).
+
+Un nombre de consumidor admite **255 caracteres** como máximo (A-42); por eso el tenant de un
+estado se limita a 64.
 
 ## 5. Antipatrones
 
@@ -1053,8 +1198,9 @@ de `connect()` y del subject de `subscribe()`.
 | `pedidos.pedido.v1.creado.retry` | Un 5º token rompe todos los wildcards. | Los reintentos son de JetStream, no del subject |
 | `pedidos.pedido.v1.OrderCreated` | Mayúsculas + idioma mezclado. | `pedidos.pedido.v1.creado` |
 | `core.entidad.v1.cambiado` | Dominio genérico = ningún dominio. | Nombra el bounded context real |
+| `state.cliente.v1.creado`, `dlq.pedido.v1.creado` | Un dominio reservado: choca con un stream del protocolo, y el SDK lo rechaza (`RESERVED_DOMAIN`). | Nombra el bounded context real — [§1.3](#13-dominios-reservados) |
 
-> **Sobre `actualizado`:** es el antipatrón más caro de los seis. Obliga a cada
+> **Sobre `actualizado`:** es el antipatrón más caro de los siete. Obliga a cada
 > consumidor a comparar contra su propia copia para averiguar qué pasó, lo que
 > significa que cada consumidor implementa —y equivoca— su propia lógica de diff.
 > Un evento debe declarar el hecho, no delegar su descubrimiento.
@@ -1446,6 +1592,8 @@ El SDK no logra siquiera construir un evento a partir del mensaje.
 - Falta un atributo obligatorio de CloudEvents
 - `specversion` desconocida
 - `datacontenttype` no soportado
+- Una entrada de estado cuyo sobre **miente sobre su identidad**: su `tenantid`, su `subject` o su
+  `type` no coinciden con el subject de NATS en el que llegó ([§6](#6-errores-de-la-capacidad-state))
 
 → `term()` + DLQ + **alerta inmediata**. Un POISON casi siempre significa que un
 productor está roto o que alguien publicó a mano en el subject equivocado. Es el único
@@ -1584,6 +1732,11 @@ nats stream get DLQ_PEDIDOS --last-for 'dlq.pedidos.pedido.v1.creado' --json \
 > todos los consumidores aguas abajo y convierte una recuperación en un incidente
 > nuevo.
 
+> **El estado no se reproduce.** Un evento de `dlq.state.>` no lleva el dato (su `data` es
+> `{ key, revision }`) y, aunque lo llevara, republicar un valor viejo pisaría uno nuevo.
+> `flux dlq replay` **DEBE** rechazar `dlq.state.>`; la recuperación es `flux state resync`
+> ([10-state.md §6](10-state.md)).
+
 ## 5. Errores de la capacidad `security`
 
 Un SDK que declara la capacidad `security` ([00-protocol.md §5](00-protocol.md)) **DEBE**
@@ -1709,6 +1862,75 @@ estos códigos: son estables.
 > **Alcance.** Esto cubre la **primera** conexión. Qué debe hacer un SDK si el broker rechaza
 > las credenciales durante una *re*conexión (una credencial que caduca o se rota) **no está
 > medido**, y esta spec no lo fija: ninguno de estos códigos se define para ese caso.
+
+## 6. Errores de la capacidad `state`
+
+Un SDK que declara la capacidad `state` ([00-protocol.md §5](00-protocol.md),
+[10-state.md](10-state.md)) **DEBE** emitir estos **siete** códigos estables. La lista es
+**cerrada**: un caso que no encaje en ninguno es un hueco de la spec, no un código nuevo que cada
+SDK inventa. (Nació con seis; el séptimo, `INVALID_STATE_CONTRACT`, es justo el hueco que dejó
+abierto: un contrato mal formado —`clientes.cliente`, sin versión— no cabía en ninguno, y Node
+lanzaba un error sin código mientras Rust lanzaba `InvalidSubject`, que no es de estado.)
+
+| Código | Clase | Se lanza en | Se emite cuando |
+|---|---|---|---|
+| `INVALID_TENANT_FOR_STATE` | **PERMANENT** | `put`, `get`, `delete`, `watch` | El tenant no cumple `^[a-z0-9]+(-[a-z0-9]+)*$` con 64 caracteres como máximo, o no se puede resolver ninguno: el estado **no** cae en `system` por defecto ([10-state.md §2.4](10-state.md)) |
+| `INVALID_STATE_CONTRACT` | **PERMANENT** | `put`, `get`, `delete`, `watch` | El contrato no es `<dominio>.<agregado>.v<major>` —el subject sin `state.`, sin tenant y sin clave—: no son tres tokens, un token no es `kebab-case` en minúsculas o la versión no es `v` y un entero ≥ 1 (`clientes.cliente`, `clientes.cliente.v1.creado`, `Clientes.cliente.v1`). Un dominio reservado **no** es este código: es `RESERVED_DOMAIN`, que se evalúa antes ([10-state.md §2.2](10-state.md)) |
+| `INVALID_STATE_KEY` | **PERMANENT** | `put`, `get`, `delete` | La clave no cumple `^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$`: un punto, un comodín, un espacio, vacía, de más de 128 caracteres, o que empieza por `_` ([10-state.md §2.3](10-state.md)) |
+| `MISSING_AGGREGATE_VERSION` | **PERMANENT** | `put`, `delete` (y al consumir) | `data` no tiene `aggregateVersion`, o no es un entero ≥ 1 y ≤ 2^53 − 1 ([10-state.md §3.4](10-state.md)) |
+| `STATE_SUBJECT_MISMATCH` | **POISON** | Al consumir: `watch` y `get` | El `tenantid`, el `subject` o el `type` del sobre no coinciden con el subject de NATS en el que llegó la entrada ([10-state.md §5.4](10-state.md)) |
+| `STATE_CONFLICT` | **RETRYABLE** | `put`, `delete` | El chequeo de secuencia agotó sus 3 intentos: alguien escribió la misma clave entre la lectura y la publicación, las tres veces ([10-state.md §3.2](10-state.md)) |
+| `RESERVED_DOMAIN` | **PERMANENT** | `publish`, `subscribe`, `put`, `get`, `delete`, `watch` | Un subject o un contrato usa un dominio reservado: `dlq`, `state`, `rpc` o `system` ([10-state.md §2.7](10-state.md)) |
+
+**Por qué estas clases.**
+
+- Los cinco que se lanzan al **llamar** (`INVALID_STATE_CONTRACT`, `INVALID_TENANT_FOR_STATE`,
+  `INVALID_STATE_KEY`, `MISSING_AGGREGATE_VERSION`, `RESERVED_DOMAIN`) son **PERMANENT**: la llamada está mal y
+  repetirla da el mismo error ([§5.1](#51-son-permanent)). Un `put` dentro de un handler que los
+  provoque va a la DLQ en la **primera** entrega.
+- **`STATE_SUBJECT_MISMATCH` es POISON**, no PERMANENT: el mensaje es legible, pero **miente sobre
+  su identidad** —su tenant o su clave—, y un productor que lo hace está roto o es hostil. Es
+  lo que [§1.3](#13-poison) pide despertar a alguien por: **alerta inmediata**.
+- **`STATE_CONFLICT` es RETRYABLE**: el conflicto es del entorno —otra instancia escribe la misma
+  clave—, no de la llamada. Un reintento relee y suele resolverlo, o termina en `stale`.
+- `MISSING_AGGREGATE_VERSION` también se aplica **al consumir**: una entrada sin versión
+  válida no se puede aplicar de forma condicional. Es PERMANENT y va a la DLQ de estado.
+
+**Qué DEBE decir el mensaje.** Lo mismo que [§5.2](#52-qué-debe-decir-el-mensaje): el código es
+fijo y la aplicación no puede sustituirlo; el mensaje nombra **qué** está mal y **cómo se
+arregla** (la clave que no encaja, con el patrón; el tenant que falta y que `connect()` o la
+opción `tenantId` lo dan); y **NO DEBE** incluir valores de `data`, por la misma razón que en
+[§5.2](#52-qué-debe-decir-el-mensaje): acaba en logs y en `dlqerror`, y en estado `data` es dato
+personal. Una **clave y un tenant sí pueden citarse**: son identificadores opacos, no PII.
+
+**Lo que no es un código nuevo.** Estos ya existen y se reutilizan tal cual:
+
+| Situación | Código |
+|---|---|
+| `classification: "restricted"` (o una fuera del enum) en un `put`; un mensaje de estado que la lleve | `INVALID_DATACLASSIFICATION` ([01-envelope.md §3.1](01-envelope.md)) |
+| `data` no cumple el esquema del contrato, o el de la lápida | `INVALID_SCHEMA` |
+| En modo estricto, el esquema del contrato (o el de la lápida) no está en el bundle | `SCHEMA_NOT_FOUND` (lo emiten los SDKs con L3; [00-protocol.md §5](00-protocol.md) todavía no lo nombra) |
+| El stream de estado (o el consumidor) no existe o no responde, y el servicio no puede crearlo | `NOT_PROVISIONED` — [§5](#5-errores-de-la-capacidad-security) |
+| El broker deniega la operación por permisos | `PERMISSION_DENIED` — [§5](#5-errores-de-la-capacidad-security) |
+
+**`NOT_PROVISIONED` en estado, un matiz.** [§5](#5-errores-de-la-capacidad-security) lo define
+por una **pareja** de señales: crear → denegado e info → no existe. Un SDK de estado no consulta
+ni crea el stream de estado ([10-state.md §8](10-state.md)), así que su señal es otra, medida
+(A-32, A-48): `CONSUMER.INFO` contesta «stream not found» (10059), o `DIRECT.GET` y la publicación
+**no contestan nadie** (`no responders`). Un stream sin `allow_direct` se ve exactamente igual que
+uno que no existe, y el mensaje **DEBE** nombrar las dos causas, y apuntar a `flux provision`
+(lo crea) y a `flux doctor` (lo audita). Se mantiene la frontera de siempre con
+`PERMISSION_DENIED`: si el broker **deniega** la operación, es un permiso, no un recurso.
+
+**Métricas.** Un handler cuyo error es uno de estos acaba contado por las que ya existen
+(`flux_events_dlq_total{code=…}`, [08-observability.md §2.1](08-observability.md)); un
+`STATE_SUBJECT_MISMATCH` cuenta además como `outcome="poison"`. De los errores de la llamada de
+`put` y `delete`, `flux_state_writes_total` solo cuenta `MISSING_AGGREGATE_VERSION`,
+`INVALID_SCHEMA` y `SCHEMA_NOT_FOUND`, los tres como `invalid_schema`
+([08-observability.md §2.4](08-observability.md)); el resto son errores de quien llama y quedan en
+su excepción. `INVALID_STATE_CONTRACT` tampoco puede contarse por una razón añadida: la etiqueta
+`contract` es el contrato, y uno mal formado es una cadena arbitraria que crearía una serie por
+cada error de tipeo.
 
 
 ==============================================================================
@@ -1988,7 +2210,9 @@ servicio, un grupo por cada subject consumido y ni un comodín donde no toca—,
 justo lo que un humano no mantiene.
 
 El manifiesto de ownership ([`examples/services.json`](../examples/services.json)) es
-la fuente, y [`scripts/gen-acl.mjs`](../scripts/gen-acl.mjs) deriva la configuración.
+la fuente, y [`scripts/gen-acl.mjs`](../scripts/gen-acl.mjs) deriva la configuración. Cada servicio
+declara `name`, `owns`, `consumes` y, si observa estado replicado, `watches`
+([§3.8](#38-estado-replicado-watches-y-sus-permisos)).
 
 ```bash
 node scripts/gen-acl.mjs examples/services.json                       # genera (bloque `accounts`, incluible con `include`)
@@ -2016,6 +2240,7 @@ El generador rechaza los manifiestos que rompen el modelo, no solo los mal forma
 | Un servicio suscrito a su propio dominio | Suele indicar que ese flujo debería ser una llamada interna, no un evento |
 | Nombre de servicio fuera de `[a-z0-9-]`, o repetido | Alimenta los nombres de durable consumer y el prefijo del inbox — [02-naming.md §4](02-naming.md) |
 | Dos subjects que dan el mismo durable | Los puntos y los guiones del subject pasan a `_`: el segundo `consumers.add` reutilizaría el durable del primero con otro filtro, sin error |
+| Una clave desconocida en un servicio, o ser dueño (o consumir, u observar) un dominio reservado (`dlq`, `state`, `rpc`, `system`) | Una errata no puede ser «un servicio sin permisos», y el «dueño» de `state` recibiría `state.>` — y las reglas de `watches`, en [§3.8](#38-estado-replicado-watches-y-sus-permisos) |
 | Con `--nkeys`: un servicio sin clave, una clave repetida, o una semilla | Sin clave no hay identidad; repetida es una credencial compartida (§2); una semilla es un secreto y nunca va a una config |
 
 Con `--tenants` (Modelo B, [09-multitenancy.md](09-multitenancy.md)) los permisos de cada
@@ -2147,7 +2372,7 @@ Por omisión, y verificado uno a uno contra el broker:
 | Nunca a un servicio | Por qué |
 |---|---|
 | `$JS.API.CONSUMER.DURABLE.CREATE.*` | La API antigua: el filtro va solo en el cuerpo y **ninguna ACL lo ve**. Concederla permite crear un consumidor sobre cualquier cosa (A-5) |
-| `$JS.API.STREAM.MSG.GET.*` y `$JS.API.DIRECT.GET.*` | Leen cualquier mensaje del stream por secuencia, sin consumidor ni filtro: saltan todo lo anterior (A-6) |
+| `$JS.API.STREAM.MSG.GET.*` y `$JS.API.DIRECT.GET.*` | Leen cualquier mensaje del stream por secuencia, sin consumidor ni filtro: saltan todo lo anterior (A-6). **Una única excepción acotada**: la forma *por subject* de un contrato de estado y un tenant fijado, o de su dominio para el dueño ([§3.8](#38-estado-replicado-watches-y-sus-permisos)); la forma de cuerpo sigue denegada |
 | Crear, modificar, borrar o purgar streams; borrar consumidores; listar | Un stream es un recurso compartido de todo el dominio ([02-naming.md §3.2](02-naming.md)) |
 | `$JS.API.>`, `$JS.API.*.>`, `>` | Es la forma de «arreglar» una denegación y la que anula el modelo entero: con `$JS.API.>` un servicio crea un consumidor sobre el stream de otro dominio, lee con `STREAM.MSG.GET` y pide mensajes de durables ajenos (reproducido en `verify-acl` con un usuario mutante) |
 
@@ -2161,7 +2386,9 @@ cuenta. Un servicio ve eso de los streams que consume; de ningún otro.
 ([02-naming.md §3.2](02-naming.md)), con [`flux provision`](../cli/README.md) y credenciales
 de **operación**, que no son las de ningún servicio. `flux provision <services.json>` lee el
 mismo manifiesto que el generador de ACL y crea, de forma idempotente, lo que esas ACLs
-presuponen: `EVT_<DOM>` y `DLQ_<DOM>` por dominio y un durable por subject consumido. Si algo
+presuponen: `EVT_<DOM>` y `DLQ_<DOM>` por dominio y un durable por subject consumido; y, para
+los dominios con estado, `STATE_<DOM>`, la DLQ de estado y los durables de cada `watches`
+([§3.8](#38-estado-replicado-watches-y-sus-permisos)). Si algo
 existe con otra configuración, informa de la diferencia y **no lo sobrescribe**; no borra
 nunca.
 
@@ -2231,6 +2458,141 @@ cada operación, medido contra nats-server 2.14.5, y lo que el SDK **DEBE** hace
 Se comprueba **de extremo a extremo** y **en los dos sentidos** ([§3.4](#34-permisos-exactos-por-consumidor-durable)):
 con el permiso quitado, la denegación se *nota* por el canal que corresponde a su fila.
 
+### 3.8 Estado replicado: `watches` y sus permisos
+
+El estado ([10-state.md](10-state.md)) añade dos roles al manifiesto: el **dueño** de un dominio que tiene
+estado y el **observador** de un contrato. Los permisos de cada uno los fija `protocol.json` → `state.acl`
+(derivados de A-38 a A-40 y A-48, medidos a mano contra un broker) y los **genera**
+[`gen-acl.mjs`](../scripts/gen-acl.mjs); [`verify-acl.mjs`](../scripts/verify-acl.mjs) y los casos S15 a S20 de
+la suite de seguridad los **ejecutan** contra un nats-server real —con los dos sentidos: lo concedido
+funciona, y lo no concedido se deniega—. Todo lo de [§3.1 a §3.7](#31-dlq) rige igual: ningún permiso de
+suscripción, inbox privado, `CONSUMER.CREATE` solo con `--dev`, y las denegaciones se ven.
+
+#### El manifiesto
+
+```jsonc
+{ "services": [
+  { "name": "crm-api",      "owns": ["clientes"] },                       // dueño: del estado de clientes también
+  { "name": "tienda-web",   "watches": [ { "contract": "clientes.cliente.v1", "tenants": ["acme"] } ] },
+  { "name": "informes-api", "watches": ["clientes.cliente.v1"] }          // todos los tenants
+] }
+```
+
+- **Un dominio *tiene* estado si el bundle de esquemas tiene un contrato suyo**
+  (`schemas/state/<dominio>/…`, índice `state` de `schemas/bundle.json`: [10-state.md §10](10-state.md)).
+  El dueño no declara nada más que `owns`; sin contratos de estado en el bundle, no recibe ningún permiso de
+  estado.
+- **`watches`** es una lista de **contratos** (`<dominio>.<agregado>.v<major>`, sin evento ni tenant ni clave:
+  `clientes.cliente.v1`). Cada entrada es el contrato a secas —observa **todos** los tenants— o un objeto
+  `{ "contract": …, "tenants": ["acme", …] }`, que **confina** al servicio a esos tenants. Un contrato
+  observado necesita dueño declarado y esquema en el bundle.
+- **El confinamiento lo aplica el broker, no el SDK.** Con `tenants`, el generador concede un durable y un
+  `DIRECT.GET` **por tenant**, con el tenant fijado en el subject del permiso; sin `tenants`, el tenant es
+  `*`. Con el tenant solo en el sobre, ningún permiso podría confinar a nadie ([10-state.md §2.2](10-state.md)).
+- **El durable lleva el tenant en el nombre si confina, y solo entonces**:
+  `tienda-web__state_clientes_cliente_v1__acme` frente a `informes-api__state_clientes_cliente_v1`. Un durable
+  compartido reparte los mensajes entre quienes lo usan (A-47): sin el tenant, dos instancias de un servicio
+  —una por tenant— se quitarían la mitad de la foto.
+
+| El generador rechaza | Por qué |
+|---|---|
+| `tenants` vacío (`[]`) | Leído como «ninguno» y aplicado como «todos» es la trampa de `allow: []` (A-25): para todos los tenants, el contrato a secas |
+| Un `tenant` en singular, o cualquier clave desconocida en una entrada o en un servicio (`watch` por `watches`) | Una errata no puede degradarse a «todos los tenants» ni a «un servicio sin permisos» |
+| Un tenant que no cumple `state.tenant.pattern` (mayúsculas, `*`, más de 64 caracteres) | El de un estado es más estricto que el de un evento ([10-state.md §2.4](10-state.md)); un comodín ampliaría el permiso |
+| Un contrato que no existe en el bundle, o un subject de **evento** en `watches` | Sin esquema de estado no hay stream ni durable; un evento va en `consumes` |
+| El estado en `consumes` (`state.clientes.cliente.v1.acme`) | `state` es un dominio reservado: el estado no se consume como un evento |
+| Observar un dominio sin dueño, o el **propio** | Como con los eventos ([§3.0](#30-las-acls-se-generan-no-se-escriben)): el dueño ya lo escribe y lo lee con `get` |
+| El mismo contrato dos veces en un servicio, o dos contratos que dan el mismo durable | Los puntos y los guiones pasan a `_`: el segundo `consumers.add` reutilizaría el durable del primero con otro filtro |
+| Ser dueño de un dominio **reservado** (`dlq`, `state`, `rpc`, `system`: [02-naming.md §1.3](02-naming.md)) | `ownDomain` casa con `state.>`: el «dueño» de `state` recibiría permiso para escribir el estado de **todos** los dominios (`RESERVED_DOMAIN`) |
+
+#### Qué recibe cada rol
+
+Con el ejemplo de arriba (`gen-acl.mjs examples/services.json`), y solo los permisos **de estado**; el resto
+—`$JS.API.INFO`, el inbox, los permisos de eventos— es el de §3.4:
+
+```jsonc
+// crm-api — dueño del estado de clientes
+"state.clientes.>",                                                                   // escribe CUALQUIER clave de CUALQUIER tenant
+"$JS.API.DIRECT.GET.STATE_CLIENTES.state.clientes.>",                                 // el paso 1 de `put` y su `get`
+"$JS.API.CONSUMER.INFO.DLQ_CLIENTES.crm-api__dlq_state_clientes",                     // lee su DLQ de estado con un pull consumer
+"$JS.API.CONSUMER.MSG.NEXT.DLQ_CLIENTES.crm-api__dlq_state_clientes",
+"$JS.ACK.DLQ_CLIENTES.crm-api__dlq_state_clientes.>",
+
+// tienda-web — observa clientes.cliente.v1 confinada a acme
+"$JS.API.CONSUMER.INFO.STATE_CLIENTES.tienda-web__state_clientes_cliente_v1__acme",   // los permisos de SU durable
+"$JS.API.CONSUMER.MSG.NEXT.STATE_CLIENTES.tienda-web__state_clientes_cliente_v1__acme",
+"$JS.ACK.STATE_CLIENTES.tienda-web__state_clientes_cliente_v1__acme.>",
+"$JS.API.DIRECT.GET.STATE_CLIENTES.state.clientes.cliente.v1.acme.*",                 // `get`, con el tenant FIJADO
+"$JS.API.STREAM.INFO.DLQ_CLIENTES",                                                   // el SDK comprueba la DLQ al abrir…
+"dlq.state.clientes.cliente.v1",                                                      // …y manda ahí lo que no puede aplicar
+
+// informes-api — observa clientes.cliente.v1 sin confinar: mismo patrón, tenant `*`
+"$JS.API.CONSUMER.INFO.STATE_CLIENTES.informes-api__state_clientes_cliente_v1", …
+"$JS.API.DIRECT.GET.STATE_CLIENTES.state.clientes.cliente.v1.*.*",
+```
+
+y, **solo con `--dev`**, `CONSUMER.CREATE.STATE_CLIENTES.<durable>.state.clientes.cliente.v1.<tenant|*>.*`
+sobre el durable propio (con el filtro exacto) y `CONSUMER.CREATE.DLQ_CLIENTES.<durable>.dlq.state.clientes.>` el
+dueño, por la misma razón que en §3.4.
+
+**Cada permiso, y por qué es esa forma exacta** (lo medido, en la suite como S15 a S20):
+
+| Permiso | Para qué | Lo que impide la forma |
+|---|---|---|
+| `state.<dom>.>` (solo el dueño) | `put` y `delete`, que son publicaciones condicionales por JetStream ([10-state.md §3](10-state.md)) | Un observador, un servicio sin estado y el dueño de **otro** dominio no escriben estado ajeno. Un `publish` de **core** a un subject de estado lo captura el stream **sin acuse y sin chequeo de secuencia** y sobrescribe (A-45): la ACL es lo único que lo impide (S16) |
+| `DIRECT.GET.STATE_<DOM>.state.<dom>.>` (dueño) | El paso 1 de `put` (leer la secuencia y la versión) y su `get` | Solo su stream y solo su dominio |
+| `DIRECT.GET.STATE_<DOM>.<contrato>.<tenant\|*>.*` (observador) | `get` de lo que observa | **El tenant fijado**: con el permiso de `…acme.*`, una clave de `acme` se lee; `…globex.*`, `…v1.*.*` y `state.<dom>.>` se deniegan (A-14, A-38; S17). Un comodín **en la clave** (`…acme.>`) sí pasa: sigue siendo su tenant |
+| `CONSUMER.INFO`, `MSG.NEXT` y `$JS.ACK…>` de **su** durable | `watch`: lo primero que pregunta, pedir la foto y confirmar | Los del durable de **otro** servicio (A-8); quitar uno rompe el `watch` de la forma de siempre (§3.7: S20) |
+| `STREAM.INFO.DLQ_<DOM>` y `dlq.state.<contrato>` (observador) | El SDK comprueba la DLQ al abrir y le manda lo que no puede aplicar | Un solo subject de DLQ **por contrato** (cinco tokens, sin tenant ni clave): no `dlq.state.>`, ni la de otro contrato, ni la forma con clave (S19) |
+| Durable `<servicio>__dlq_state_<dom>` (dueño) | Leer su DLQ de estado como la de eventos (§3.1) | Un observador no la lee, aunque no lleve el dato: sí lleva claves y errores |
+
+**Nunca, a ningún rol, ni siquiera al dueño:**
+
+- **`STREAM.INFO.STATE_<DOM>`.** Con `subjects_filter` en el cuerpo devuelve **todas las claves y todos los
+  tenants** del stream con su recuento (A-39): con ese único permiso un servicio confinado a `acme` conoce los
+  clientes de `globex`. El SDK no lo usa —`put`, `get` y `watch` funcionan sin él, porque `CONSUMER.INFO`
+  distingue «no existe el consumidor» de «no existe el stream» (A-48)— y ningún patrón de `protocol.json` lo
+  casa. [10-state.md §8](10-state.md) lo dice igual: **el dueño tampoco lo recibe**. Si un día
+  hace falta, es un permiso más del dueño y nunca del observador (S18).
+- **La forma de cuerpo de `DIRECT.GET`** (`$JS.API.DIRECT.GET.<stream>` + `{"seq": n}` o `{"last_by_subj": …}`)
+  lee cualquier mensaje, y ninguna ACL ve el cuerpo. No casa con el permiso por subject, y el broker rechaza un
+  cuerpo en la forma por subject (`408`, A-38): no se puede colar la lectura de otro mensaje por un permiso de
+  contrato y tenant (S18).
+- **Gestionar el stream ni sus durables** (`STREAM.CREATE|UPDATE|DELETE|PURGE`, `CONSUMER.DELETE|NAMES`,
+  `CONSUMER.DURABLE.CREATE`): son de quien aprovisiona. Un durable de estado se recrea con `flux state resync`,
+  con credenciales de operación.
+
+#### La excepción a §3.5
+
+[§3.5](#35-lo-que-nunca-se-concede) niega a un servicio `$JS.API.DIRECT.GET.*`. Este apartado la **acota**, no la
+levanta: lo que se concede es la **forma por subject** de un contrato y un tenant concretos —o, para el dueño,
+de su dominio—, y es lo único. En `protocol.json` la lista de lo denegable sigue siendo
+`security.acl.neverGrantedPattern`, que caza todo `DIRECT.GET`; las dos formas concedibles figuran en
+`security.acl.neverGrantedExceptions`, que **refiere** su patrón en `state.acl` (una sola fuente). Es una lista
+aparte y no un `(?!…)` dentro del patrón porque los motores sin lookahead (Rust `regex`, Go `RE2`) tienen que
+poder compilarlo; quien aplique el patrón ignorando las excepciones se equivoca hacia lo seguro. La forma de
+cuerpo, cualquier comodín por encima del tenant y `DIRECT.GET.>` siguen denegados. `check-protocol-json.mjs` lo
+prueba en los dos sentidos.
+
+#### Aprovisionamiento
+
+`flux provision` ([§3.6](#36-aprovisionamiento-los-streams-no-los-crea-el-servicio)) lee el mismo manifiesto y,
+para cada dominio con estado:
+
+- crea **`STATE_<DOM>`** con la configuración de `protocol.json` → `state.stream`
+  (`max_msgs_per_subject: 1`, `allow_direct`, `max_age: 0`, `discard: old`, `duplicate_window: 2m`; réplicas con
+  `--replicas`);
+- hace que **`DLQ_<DOM>`** capture también `dlq.state.<dom>.>`. Si ya existía con solo `dlq.<dom>.>` —lo creó un
+  `flux provision` de la 1.0—, **lo amplía**: es lo único que la herramienta cambia en un recurso existente, no
+  pierde mensajes (A-44) y `--dry-run` lo muestra como `se ampliaría`. Cualquier otra diferencia se informa y no
+  se toca;
+- crea el durable de cada `watches` (uno por tenant si confina) con `deliver_policy: last_per_subject` y el resto
+  de la configuración canónica ([03-delivery.md §2](03-delivery.md)), y el durable con el que el dueño lee su
+  DLQ de estado.
+
+Un dominio **sin** contratos de estado conserva su `DLQ_<DOM>` de la 1.0 y no recibe ningún permiso de estado:
+1.1 es aditiva.
+
 ## 4. Multi-tenant
 
 `tenantid` es obligatorio en el envelope, pero **el envelope no es un mecanismo de
@@ -2267,14 +2629,34 @@ cada handler se acuerde.
 ### 5.1 Derecho de supresión
 
 Los eventos son inmutables; el RGPD exige poder borrar. La contradicción se resuelve
-**no metiendo PII en el evento**:
+**separando lo que pasó de lo que se sabe**: el evento lleva referencias y el dato vive en el
+**estado**, que sí se puede borrar ([10-state.md](10-state.md)).
 
-- El evento lleva **referencias** (`clienteId`), no PII (`email`, `nombre`, `dni`).
-- La PII vive en el servicio dueño, donde se puede borrar de verdad.
-- Un consumidor que necesite la PII la pide al dueño y aplica su propia retención.
+| | Evento | Estado |
+|---|---|---|
+| ¿Datos personales? | **No.** Solo referencias (`clienteId`). La regla dura 5 de `AGENTS.md` no cambia | **Sí**, con `dataclassification: "confidential"` y `"x-pii": true` en los campos del esquema |
+| ¿Se puede borrar? | No: es un log inmutable | **Sí**: `state.delete` sustituye el valor por una lápida |
 
-Un subject cuyo `data` contenga PII directa **DEBE** documentarlo y **DEBERÍA**
-rediseñarse. La alternativa —cripto-borrado con clave por sujeto— queda fuera de v1.
+- El evento dice **qué pasó**: `clienteId`, no `email` ni `nombre`.
+- El estado lleva **el dato**: `put` guarda el valor actual de cada agregado y `delete` lo
+  sustituye por una lápida, con lo que el valor anterior **sale del stream**. El consumidor
+  ya no pide el dato al dueño —que es justo la llamada que flux quiere eliminar—: lo tiene
+  porque le llegó, y lo mantiene al día con `state.watch`.
+- Un consumidor **DEBE** borrar o anonimizar su copia local al recibir una lápida. Es lo que
+  hace real el derecho de supresión **aguas abajo**.
+- **`restricted` no se admite en estado** en 1.1 (credenciales, salud, financiero): su retención
+  de 24 h no cabe en un almacén que no caduca, y no debe tomarse esa decisión por omisión.
+- **La DLQ de estado no conserva el dato** (`data` pasa a `{ key, revision }`), para que un dato
+  borrado no siga 90 días en la DLQ ([10-state.md §6](10-state.md)).
+- Lo que el estado **no** garantiza: el borrado **físico** en disco —depende de la compactación
+  de JetStream—, las copias fuera del broker (backups, réplicas locales que ignoren la lápida) y
+  la privacidad de las **claves** y los **tenants**, visibles en los metadatos del stream
+  ([10-state.md §7 y §8](10-state.md)). Por eso no son PII. La garantía fuerte es el cifrado del
+  payload (fase 7).
+
+Un subject de **evento** cuyo `data` contenga PII directa **DEBE** documentarlo y **DEBERÍA**
+rediseñarse: pasar el dato al estado y dejar la referencia en el evento. La alternativa
+—cripto-borrado con clave por sujeto— queda fuera de v1.
 
 ## 6. Superficie operativa
 
@@ -2546,7 +2928,8 @@ mismo, agrupar deja de funcionar en cuanto el ecosistema es polyglot — que es 
 ## 2. Métricas obligatorias
 
 Un SDK L2 **DEBE** exponer estas siete. Nombres en formato Prometheus; un SDK con otro
-backend **DEBE** conservar los nombres y las etiquetas.
+backend **DEBE** conservar los nombres y las etiquetas. Un SDK que declara la capacidad `state`
+([10-state.md](10-state.md)) **DEBE** exponer además la de [§2.4](#24-flux_state_writes_total--la-capacidad-state).
 
 | Métrica | Tipo | Etiquetas |
 |---|---|---|
@@ -2646,6 +3029,50 @@ entregados** a ese consumidor. No son los entregados y sin confirmar.
   esperando ack. Se ve en `flux_event_handler_duration_seconds`.
 - Un consumidor **muerto** sí: deja de recoger mensajes y `num_pending` sube sin
   techo. Es la señal, y la conexión sigue reportándose sana mientras tanto.
+
+### 2.4 `flux_state_writes_total` — la capacidad `state`
+
+| Métrica | Tipo | Etiquetas |
+|---|---|---|
+| `flux_state_writes_total` | Counter | `contract`, `outcome` |
+
+```
+contract = <dominio>.<agregado>.v<major>      ("clientes.cliente.v1")
+outcome  = ok | stale | conflict | invalid_schema
+```
+
+Cuenta cada `put` y cada `delete` ([10-state.md §3](10-state.md)), sin distinguirlos: una lápida
+es un valor más.
+
+| `outcome` | Cuándo |
+|---|---|
+| `ok` | Se escribió: `applied: true` |
+| `stale` | La versión no avanzaba: `applied: false`, `outcome: "stale"`. **No es un error** |
+| `conflict` | El chequeo de secuencia agotó sus 3 intentos: `STATE_CONFLICT` |
+| `invalid_schema` | `MISSING_AGGREGATE_VERSION`, o la validación L3 de `data` falla: `INVALID_SCHEMA` (no cumple su esquema) **o `SCHEMA_NOT_FOUND`** (modo estricto: el esquema del contrato, o el de la lápida, no está en el bundle) |
+
+**`invalid_schema` se emite también cuando la llamada lanza**, por la misma razón que en
+[§2.1](#21-valores-de-las-etiquetas): una excepción sirve a quien la provoca, y la métrica a quien
+opera el ecosistema. Es lo mismo que hace `publish()` con un evento: **cualquier** fallo de L3 es
+`invalid_schema`, también el esquema ausente del bundle en modo estricto. Los demás errores de la
+llamada —`INVALID_STATE_CONTRACT`, `INVALID_STATE_KEY`, `INVALID_TENANT_FOR_STATE`,
+`RESERVED_DOMAIN`— son errores de programación y **no** se cuentan (el primero, además, porque su
+valor es el de la etiqueta `contract`: uno mal formado crearía una serie por cada error de tipeo);
+tampoco un fallo de transporte, que es RETRYABLE y ya lo cuenta la conexión.
+
+**Cardinalidad.** `contract` está acotado —hay tantos como contratos de estado declarados— y sirve
+como etiqueta. **Nunca** la clave ni el tenant: la clave tiene una serie por cada agregado del
+dominio, y el tenant, una por cada cliente de la plataforma. Es la regla de
+§2.2, aplicada a lo único que el estado añade.
+
+**Lo que se reutiliza.** Un `watch` se mide con las métricas de consumo de §2 sin cambiar ninguna:
+
+- `subject` = **`state.<contrato>`** (`state.clientes.cliente.v1`), acotado como cualquier otro;
+- `consumer` = el durable **sin el sufijo de tenant** (`tienda-web__state_clientes_cliente_v1`),
+  aunque el servicio tenga un durable por tenant ([10-state.md §5.2](10-state.md)): con el
+  sufijo, cada tenant nuevo crearía series nuevas;
+- `flux_consumer_pending` es la **suma** de los durables del servicio para ese contrato, no el
+  valor del último sondeado: varios durables con las mismas etiquetas se pisarían entre sí.
 
 ## 3. Histograma de duración
 
@@ -2790,6 +3217,15 @@ formato.
 
 Se documenta porque es la propuesta que surge sola, y merece un "no, y por esto".
 
+> **El estado es otra cosa.** El estado replicado ([10-state.md §2.2](10-state.md)) **sí** lleva
+> el tenant en su subject —`state.<dominio>.<agregado>.v<major>.<tenant>.<clave>`—, y no
+> contradice este rechazo: es otro espacio de nombres, con su propio stream y sus seis tokens,
+> que no toca la regla de 4 tokens de los eventos. Allí el tenant **tiene** que estar en el
+> subject, porque un stream de estado guarda un valor por subject y dos tenants con la misma
+> clave se pisarían; y de paso el broker puede confinar a un observador a su tenant (A-38). Lo
+> que **no** consigue es ocultar los nombres de los tenants y de las claves a quien pueda
+> consultar el stream ([10-state.md §8](10-state.md)).
+
 ## 3. Obligaciones del SDK — Modelo A
 
 Un SDK **DEBE**:
@@ -2866,5 +3302,928 @@ evita descubrirlo a mitad.
 
 
 ==============================================================================
-== FIN — 11 documentos
+== specification/10-state.md
+==============================================================================
+
+# 10 — Estado replicado
+
+> **Estado:** extensión **opcional** de v1.1 (capacidad `state`, [00-protocol.md §5](00-protocol.md)).
+> Un SDK L1/L2/L3 conforme no necesita implementarla; un servicio que solo use eventos sigue
+> siendo conforme.
+>
+> Cada observación citada como `A-n` está medida contra **nats-server 2.14.5** y descrita en el
+> [Apéndice A del plan v1.1](../docs/plan-v1.1/PLAN.md#apéndice-a--evidencia). Las que son del
+> broker son casos ejecutables de [`conformance/cases/state-broker.json`](../conformance/cases/state-broker.json).
+> Las observaciones A-9 a A-14 del plan original se **reprodujeron** (A-31 a A-38: cada fila del
+> Apéndice dice cuál reproduce) y la fase añadió A-39 a A-50, entre ellas dos que cambian el
+> diseño: **el conflicto de secuencia tiene dos códigos** (A-33, A-49) y **`STREAM.INFO` lista
+> las claves y los tenants** (A-39).
+
+---
+
+## 1. Qué problema resuelve
+
+Un evento dice **qué pasó**. Quien llega tarde, o quien necesita *el dato* y no *el hecho*, no
+tiene nada que hacer con él: ha de llamar al dueño (`GET /clientes/123`) o pedirle una carga
+inicial (`GET /clientes?page=`). Es justo lo que flux quiere eliminar, y es el hueco que dejaba
+la regla «los eventos no llevan datos personales; pídelos al dueño»
+([06-security.md §5.1](06-security.md)).
+
+El **estado** es el valor **actual** de un agregado, publicado por su dueño y replicado a quien
+lo observa:
+
+| Hoy (HTTP) | Con estado |
+|---|---|
+| `GET /clientes/123` — leer un dato que guarda otro sistema | `state.get` |
+| `GET /clientes?page=…` — carga inicial | `state.watch` entrega **una foto completa** y después los cambios, por el mismo canal |
+| Polling de `GET /cambios?desde=` para mantener una copia local | `state.watch`: el dato llega solo, cuando cambia |
+
+**La regla que evita recrear el problema.** Si lo que necesitas es *un dato que otro sistema
+guarda*, es estado. La petición/respuesta (fase 3) queda para órdenes que necesitan respuesta ya
+y para cálculos; usarla para leer datos es volver a tener una API con otro transporte.
+
+**Qué no es.** No es un evento: no tiene historia, solo el último valor. No es una base de datos:
+no hay consultas, ni índices, ni transacciones entre claves. Es una copia clave → valor con una
+sola regla de escritura (§3) y una sola de lectura (§5). Y no sustituye al evento: el dueño
+sigue publicando **eventos** para que los demás *reaccionen*; el estado sirve para que
+*conozcan*. Lo normal es publicar los dos — el evento lleva la referencia (`clienteId`) y el
+estado lleva el dato.
+
+## 2. Modelo
+
+### 2.1 Un stream por dominio, un valor por clave
+
+```
+STATE_<DOMINIO>           subjects: state.<dominio>.>
+
+  storage:               file
+  retention:             limits
+  max_msgs_per_subject:  1        # un valor por clave: el stream ES el estado actual
+  allow_direct:          true     # lecturas puntuales sin consumidor
+  max_age:               0        # sin caducidad: el estado vive hasta que se borra
+  discard:               old
+  duplicate_window:      2m
+  replicas:              3        # producción; 1 en desarrollo
+```
+
+Por qué cada línea:
+
+- **`max_msgs_per_subject: 1` + `discard: old`** es lo que convierte un log en un mapa: al entrar
+  un mensaje nuevo en un subject, el anterior **sale** del stream. Tres escrituras sobre dos
+  claves dejan dos mensajes (A-31). Con `discard: new` y `discard_new_per_subject` el broker
+  **rechazaría** la segunda escritura (`maximum messages per subject exceeded`, err 10077):
+  sería un «crear solo si no existe», no un estado (A-46).
+- **`allow_direct: true`** habilita `$JS.API.DIRECT.GET.…`, la lectura puntual por subject sin
+  crear un consumidor (§5.1). Sin él, `get` y el paso 1 de `put` reciben «sin respuesta» (A-32).
+- **`max_age: 0`**: el estado no caduca. Un valor que desapareciera a los 30 días sería una
+  copia que miente. Se borra con una lápida (§4).
+- **`duplicate_window: 2m`**: igual que los eventos ([03-delivery.md §3](03-delivery.md)). Para
+  las escrituras no interviene: el chequeo de secuencia se evalúa **antes** que el de duplicados
+  (A-33), y la defensa contra el acuse perdido es otra (§3.2, paso 1b).
+- **`replicas: 3`** en producción y **1** si el SDK lo crea en desarrollo, por la misma razón
+  que en [02-naming.md §3.2](02-naming.md). Medido con 3 nodos (A-49): el servidor devuelve la
+  configuración pedida, sin sobrescribirla.
+
+> El servidor devolvió en todas las pruebas la configuración que se le pidió (A-31, A-49). Aun
+> así, `flux doctor` **DEBE** auditar `max_msgs_per_subject`, `allow_direct`, `max_age` y
+> `discard` de cada `STATE_<DOM>`: son los cuatro que, mal puestos, no dan error y rompen la
+> semántica.
+
+Un dominio **tiene estado** si el bundle de esquemas tiene algún contrato de estado suyo
+(`schemas/state/<dominio>/…`, [§10](#10-qué-debe-un-sdk-state)). El stream **se aprovisiona fuera
+del SDK** ([06-security.md §3.6](06-security.md)): `flux provision` lo crea para cada dominio que
+tenga estado. Los SDKs **NO DEBEN** consultar el stream de estado con `STREAM.INFO` ni crearlo
+por defecto (§8 explica por qué). Un SDK **PUEDE** ofrecer, solo como opción explícita de
+desarrollo, crearlo con esta configuración.
+
+### 2.2 El subject
+
+```
+state.<dominio>.<agregado>.v<major>.<tenant>.<clave>
+```
+
+Seis tokens, siempre. Es el subject de NATS de la entrada; **no** es el atributo `subject` de
+CloudEvents ([01-envelope.md §2.1](01-envelope.md)), que aquí vale la clave.
+
+| Token | Regla |
+|---|---|
+| `state` | Literal. Espacio de nombres del protocolo, como `dlq.` ([§2.7](#27-dominios-reservados)) |
+| `dominio`, `agregado`, `v<major>` | Los del contrato, como en [02-naming.md §1](02-naming.md) |
+| `tenant` | §2.4 |
+| `clave` | §2.3 |
+
+El **nombre de contrato** de un estado es `<dominio>.<agregado>.v<major>` (`clientes.cliente.v1`):
+el subject sin `state.`, sin tenant y sin clave. Es lo que recibe `state.watch` y lo que figura
+en las métricas. Una cadena que no tiene esa forma —`clientes.cliente` sin versión,
+`clientes.cliente.v1.creado` con cuatro tokens, `Clientes.cliente.v1` con mayúsculas— es
+**`INVALID_STATE_CONTRACT`** (PERMANENT); un dominio reservado ([§2.7](#27-dominios-reservados)),
+`RESERVED_DOMAIN`, que se evalúa antes (§3.6).
+
+**Por qué el tenant va en el subject y no solo en el sobre.** Con el tenant solo en el sobre, dos
+tenants con la misma clave (`cli-1`) escribirían **el mismo mensaje**: el segundo pisaría al
+primero sin ningún error, porque un stream de estado guarda *un valor por subject*. Y el broker
+no podría confinar a nadie por tenant: no ve el sobre. En el subject, el aislamiento por tenant lo
+**aplica el broker** (A-38): un observador con permiso sobre `…v1.acme.*` no puede crear un
+consumidor con otro filtro ni leer una clave de `globex`.
+
+> Esto **no contradice** el rechazo del Modelo C en [09-multitenancy.md §2](09-multitenancy.md).
+> El Modelo C ponía el tenant *delante de los eventos*, lo que rompía la regla de 4 tokens de
+> la que dependen los wildcards, los nombres de stream y la derivación del `type`. El estado es
+> otro espacio de nombres —`state.`, con su propio stream y su propia forma de seis tokens— y no
+> toca nada de lo anterior. El coste es el que el Modelo C ya tenía: el aislamiento por tenant
+> de un estado está en la **ACL**, y una ACL por tenant es más larga.
+
+### 2.3 La clave
+
+```
+^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$
+```
+
+Un único token de NATS: sin puntos, sin comodines, sin espacios, de 1 a 128 caracteres. **Se
+distinguen mayúsculas** (los subjects de NATS son case-sensitive: `Cli-1` y `cli-1` son dos
+claves distintas, no la misma).
+
+- **Sin codificación automática.** Una clave que no cabe en un token es un error
+  (`INVALID_STATE_KEY`), no algo que cada SDK escape a su manera: dos escapes distintos serían
+  dos claves distintas para el mismo agregado.
+- **El broker no valida nada de esto, y por eso lo valida el SDK.** Medido (A-41): NATS acepta
+  como clave `*`, `>`, `a.b` (que son *dos* tokens: la entrada quedaría fuera del filtro de
+  todos los observadores, sin error), `café` y una cadena de 2000 caracteres. Solo rechaza los
+  espacios. Una clave sin validar es un subject fantasma, la misma familia de trampas que las
+  mayúsculas de [02-naming.md §1.1](02-naming.md).
+- **Coincidencia completa, no `$`.** En Python (`re.match`) y en PHP (`preg_match` sin `D`) el
+  `$` acepta **un `\n` final**: `"cli-1\n"` pasaría el patrón y llegaría con su salto de línea a
+  la librería de NATS, que según cuál lo rechaza con un error poco claro o no. Se valida con
+  `fullmatch`, `\z` o el modificador `D`; JavaScript, Go y Rust no tienen el problema. Los
+  vectores incluyen esa clave.
+- **No empieza por `_`.** El prefijo `_` queda **reservado al protocolo** (*decidido
+  provisionalmente*, §12): endurecer la regla más tarde sería un cambio incompatible, relajarla
+  no. Hoy ninguna clave reservada tiene uso.
+- **La clave es un identificador opaco, no un dato.** Nunca PII ni secretos: es visible en los
+  metadatos del stream ([§8](#8-permisos)) y en los logs. `cli-1`, no `ana@example.com`.
+
+### 2.4 El tenant
+
+```
+^[a-z0-9]+(-[a-z0-9]+)*$        longitud máxima: 64
+```
+
+`kebab-case` en minúsculas, como los demás tokens del protocolo. `"system"` es un tenant válido.
+Dos matices que importan:
+
+- **El tenant de un evento es cualquier cadena** ([01-envelope.md §3.1](01-envelope.md)); el de
+  un estado, no. Un servicio con `tenantId: "ACME_Corp"` publica eventos sin problema y no puede
+  escribir estado: `INVALID_TENANT_FOR_STATE`. El límite de 64 sale de que el durable de un
+  observador (§5.2) lleva el tenant en el nombre y NATS limita los nombres de consumidor a **255**
+  (A-42).
+- **No hay valor por defecto.** Un evento sin tenant explícito cae en `system`; un estado **no**:
+  el tenant está en el subject, y un tenant equivocado no es una etiqueta mal puesta sino un dato
+  guardado en otro sitio ([09-multitenancy.md §5](09-multitenancy.md) ya dice que `system` no es
+  un comodín). Quien quiera `system` lo dice (*decidido provisionalmente*).
+- **Cómo se resuelve, por operación.** No es el mismo orden para todas, y esa diferencia es
+  deliberada:
+
+  | Operación | Orden de resolución | Si no sale ninguno |
+  |---|---|---|
+  | `put`, `delete`, `get` | la opción de la llamada → el **evento en curso** → el `tenantId` de `connect()` | `INVALID_TENANT_FOR_STATE` |
+  | `watch` | la opción de la llamada → el `tenantId` de `connect()`. **Nunca el evento en curso** | se observan **todos** los tenants (con `tenantIsolation: "strict"`, un error de configuración: [§5.2](#52-watch)) |
+
+  Un `put` o un `get` **dentro de un handler** derivan de un evento, y un estado derivado
+  pertenece al tenant del evento que lo causó. Un `watch` **no corre dentro de un handler**: se
+  abre al arrancar y vive tanto como el servicio, y heredar el tenant de «el evento que se esté
+  procesando» haría que su filtro dependiera de qué evento llegó primero, o de si alguien lo abrió
+  desde un handler por descuido. Lo que un `watch` observa lo decide quien lo escribe o quien
+  configura la conexión, nunca el tráfico.
+
+### 2.5 El sobre
+
+Un CloudEvent normal ([01-envelope.md](01-envelope.md)): las mismas extensiones obligatorias, la
+misma validación L3, la misma firma. Lo que cambia:
+
+| Atributo | Valor en una entrada de estado |
+|---|---|
+| `type` | `com.flux.state.<dominio>.<agregado>.v<major>`; el de una lápida, `com.flux.state.<dominio>.<agregado>.deleted.v<major>` (§4) |
+| `subject` | **La clave.** Obligatorio, e **idéntico** al último token del subject de NATS |
+| `tenantid` | **Idéntico** al token de tenant del subject de NATS |
+| `dataschema` | El esquema del contrato (`schemas/state/<dominio>/<agregado>/<semver>.json`); el de una lápida, fijo (§4) |
+| `dataclassification` | `public`, `internal` o `confidential`. **`restricted` no se admite** en estado (§7) |
+| `partitionkey` | La clave, como en todo evento ([01-envelope.md §3.2](01-envelope.md)) |
+| `data` | Un objeto con **`aggregateVersion`** (entero ≥ 1), §3.4 |
+
+**`tenantid` y `subject` DEBEN coincidir con el subject de NATS.** La identidad de una entrada
+está en el subject; el sobre la repite para quien lo lea fuera del broker (un backup, un fichero).
+Si discrepan, uno de los dos miente, y quien consume no puede saber cuál: es un mensaje roto, no
+un dato con un tenant raro (§5.4: **POISON**, `STATE_SUBJECT_MISMATCH`). Es la versión de estado
+de [01-envelope.md §2.4](01-envelope.md): un tipo equivocado no se coacciona, se rechaza.
+
+El orden de los atributos es el de siempre ([01-envelope.md §6](01-envelope.md)) y `data` va el
+último. No hay ningún atributo nuevo en el sobre: todo lo propio del estado está en el subject, en
+el `type` y en `data`.
+
+### 2.6 Ejemplos byte a byte
+
+Tres líneas, sin espacios ni saltos entre atributos, UTF-8 literal (`María`, `país`: sin
+escapes `\u`, [01-envelope.md §1.1](01-envelope.md)). Lo que está entre los bytes es el contrato:
+si un SDK produce otra secuencia para la misma entrada, está mal. Las reproduce el caso
+[`cross-sdk-state-envelope`](../conformance/cases/cross-sdk-state-envelope.json) con su SHA-256.
+
+**`put`** de `clientes.cliente.v1`, tenant `acme`, clave `cli-1`, `aggregateVersion` 7
+(subject de NATS: `state.clientes.cliente.v1.acme.cli-1`; 563 bytes):
+
+```
+{"specversion":"1.0","id":"01924f8e-7c3a-7b2d-9e14-3f8a1c9d0e55","source":"/produccion/crm-api","type":"com.flux.state.clientes.cliente.v1","time":"2026-08-20T10:25:39.412Z","datacontenttype":"application/json","dataschema":"https://schemas.internal/state/clientes/cliente/1.0.0.json","subject":"cli-1","correlationid":"01924f8e-7c3a-7b2d-9e14-3f8a1c9d0e55","tenantid":"acme","producerversion":"2.1.0","dataclassification":"confidential","partitionkey":"cli-1","data":{"clienteId":"cli-1","nombre":"María Peña","email":"maria@example.com","aggregateVersion":7}}
+```
+
+SHA-256: `fa6b20beb64f90c06b0cfb2c82d809a8fd2672b365681d2cd9d1a99f29b13b40`.
+
+**Lápida** (`delete` de esa clave, `aggregateVersion` 8; 495 bytes). Mismo subject de NATS:
+
+```
+{"specversion":"1.0","id":"01924f90-2b11-7a40-8c3d-6d5e4f3a2b10","source":"/produccion/crm-api","type":"com.flux.state.clientes.cliente.deleted.v1","time":"2026-08-20T10:31:02.057Z","datacontenttype":"application/json","dataschema":"https://schemas.internal/system/state/eliminado/1.0.0.json","subject":"cli-1","correlationid":"01924f90-2b11-7a40-8c3d-6d5e4f3a2b10","tenantid":"acme","producerversion":"2.1.0","dataclassification":"internal","partitionkey":"cli-1","data":{"aggregateVersion":8}}
+```
+
+SHA-256: `7a7868d2f643ccd584a354bce87c26d8d7f20826f23da26e99dbed78269bed3d`.
+
+**Evento de DLQ de estado** (un observador, `tienda-web`, no pudo aplicar la revisión 41 del
+`put` de arriba; subject de NATS: `dlq.state.clientes.cliente.v1`; 719 bytes). Es el sobre
+**original** con las extensiones `dlq*` y **sin su `data`**: §6.
+
+```
+{"specversion":"1.0","id":"01924f8e-7c3a-7b2d-9e14-3f8a1c9d0e55","source":"/produccion/crm-api","type":"com.flux.state.clientes.cliente.v1","time":"2026-08-20T10:25:39.412Z","datacontenttype":"application/json","dataschema":"https://schemas.internal/state/clientes/cliente/1.0.0.json","subject":"cli-1","correlationid":"01924f8e-7c3a-7b2d-9e14-3f8a1c9d0e55","tenantid":"acme","producerversion":"2.1.0","dataclassification":"confidential","partitionkey":"cli-1","dlqreason":"permanent","dlqattempts":1,"dlqconsumer":"tienda-web__state_clientes_cliente_v1__acme","dlqerror":"PAIS_NO_SOPORTADO: el cliente cli-1 tiene un país fuera del catálogo","dlqtime":"2026-08-20T10:25:40.117Z","data":{"key":"cli-1","revision":41}}
+```
+
+SHA-256: `dbb6d882f7df49e4b88026f17fb7b83e9e6c2226aa731ad25d71fc41c8b8f6d9`.
+
+Se comprueban con `JSON.stringify` (Node) y con `json.dumps(ensure_ascii=False,
+separators=(",", ":"))` (Python): los mismos bytes.
+
+### 2.7 Dominios reservados
+
+`dlq`, `state`, `rpc` y `system` **NO DEBEN** usarse como dominio ([02-naming.md §1.3](02-naming.md)).
+Cada uno es un espacio de nombres del protocolo, y un dominio con ese nombre colisionaría con él
+**en el broker**: un `EVT_STATE` (`state.>`) no puede crearse si existe `STATE_CLIENTES`
+(`state.clientes.>`), ni un `EVT_DLQ` (`dlq.>`) junto a `DLQ_PEDIDOS` (`dlq.pedidos.>`):
+`subjects overlap with an existing stream`, err 10065 (A-43). `dlq` no estaba reservado en v1
+y debería.
+
+Toda API que reciba un subject o un contrato —`publish`, `subscribe`, `put`, `get`, `delete`,
+`watch`— **DEBE** rechazar un dominio reservado con **`RESERVED_DOMAIN`** (PERMANENT) antes de
+tocar la red. En particular, **`publish()` no puede escribir en `state.`, `rpc.` ni `dlq.`**: un
+evento publicado ahí no pasaría por el chequeo de secuencia del estado (A-45). Los validan además
+`gen-acl.mjs` y `flux validate` sobre el manifiesto, y `bundle-schemas.mjs` sobre `schemas/`.
+
+## 3. Escribir
+
+Solo el **dueño** del dominio escribe estado: la ACL del broker lo aplica igual que con los
+eventos ([06-security.md §3](06-security.md)), y un servicio no puede escribir en un dominio
+ajeno aunque su código lo intente.
+
+### 3.1 `put` es condicional
+
+```ts
+await bus.state.put("clientes.cliente.v1", "cli-1",
+  { clienteId: "cli-1", nombre: "Ana", email: "ana@example.com", aggregateVersion: 7 },
+  { classification: "confidential" });      // → { applied: true, outcome: "ok", revision: 41 }
+```
+
+Un `put` que solo publicara dejaría que dos instancias del dueño, o una instancia lenta, pisaran
+un valor nuevo con uno viejo: la última escritura en llegar al broker gana, no la de versión más
+alta. Y **un consumidor nuevo recibiría ese valor viejo como la verdad**, porque en un stream de
+estado no hay historia de la que corregirlo. Por eso `put` compara versiones y, además, hace la
+escritura **condicional** en el broker.
+
+### 3.2 El algoritmo
+
+```
+0. Validar sin red y construir el evento UNA vez (§3.3): id, time, bytes. (§3.6)
+1. Leer el último mensaje de la clave con DIRECT.GET por subject.
+     · 404 → no hay valor: S = 0, y no hay versión V.
+     · si no → S = su secuencia (cabecera Nats-Sequence); V = data.aggregateVersion del cuerpo.
+1b. Si el id del mensaje leído es el id de ESTE put → ya se aplicó (acuse perdido): outcome
+     "ok", revision S. No se publica nada más.
+2. Si hay V y nueva.aggregateVersion <= V → no escribir. Resultado "stale". No es un error.
+3. Publicar por JetStream con
+     Nats-Expected-Last-Subject-Sequence: S      Nats-Msg-Id: <id del evento>
+4. Acuse → resultado "ok", revision = la secuencia del acuse.
+   Error 10071 ("wrong last sequence: N") o 10164 ("wrong last sequence") → alguien escribió
+   entre el 1 y el 3: volver a 1. Como máximo 3 intentos; agotados, STATE_CONFLICT.
+```
+
+`delete` ([§4](#4-borrar)) es **el mismo algoritmo**: una lápida es un valor más, con su versión.
+
+Por qué cada paso, con lo medido:
+
+- **Paso 1: `S = 0` significa «la clave no existe».** `Nats-Expected-Last-Subject-Sequence: 0`
+  crea la clave si el subject no tiene ningún mensaje, y falla si ya lo tiene (A-33). Es lo que
+  hace que dos escritores concurrentes sobre una clave nueva no se pisen: uno gana y el otro
+  recibe el error del paso 4.
+- **Paso 1b: sin él, un acuse perdido convierte una escritura buena en un `stale`.** El primer
+  intento se aplica, el acuse se pierde, el SDK reintenta con la misma `S`: el broker contesta
+  `wrong last sequence` porque el mensaje que cambió la secuencia es **el propio** (A-33), el SDK
+  relee, ve su propia versión, y concluiría `stale` con su propio dato. Reconocerlo por el `id`
+  es posible porque el broker **conserva las cabeceras** del mensaje almacenado, `Nats-Msg-Id`
+  incluida (A-32), y porque el evento lleva el mismo `id` en todos los intentos (§3.3).
+- **Paso 3: el chequeo de secuencia se evalúa antes que el de duplicados.** Un reenvío con el
+  mismo `Nats-Msg-Id` y la misma `S` **no** devuelve `duplicate: true`: devuelve el error de
+  secuencia (A-33). Por eso `duplicate_window` no protege a `put`, y por eso existe el paso 1b.
+- **Paso 4: dos códigos, no uno.** Un nodo suelto, o un cluster sin carrera, responde
+  **10071** con el número (`wrong last sequence: 402`). Un stream replicado, cuando el conflicto
+  se detecta al aplicar la entrada, responde **10164** y **sin número** (A-49: 210 de 210 errores
+  de una carrera de 8 escritores sobre un cluster de 3 nodos). Un SDK que solo reconozca el 10071
+  trata un conflicto corriente como un error desconocido y **no reintenta**: pasa sus pruebas
+  contra un NATS de un nodo y falla en producción. Los dos son «alguien escribió antes»; el
+  número, cuando viene, no hace falta: se relee.
+- **Un rechazo por secuencia no gasta el `Nats-Msg-Id`.** Reintentar con el mismo `id` y la
+  `S` corregida se aplica, no cae como duplicado (A-33).
+
+### 3.3 Lo que el algoritmo exige a quien lo implementa
+
+- **El evento se construye una sola vez.** `id`, `time` y los bytes son **los mismos en todos los
+  intentos** de un `put`. Con un `id` nuevo por intento, el paso 1b no reconocería nunca la propia
+  escritura.
+- **Siempre por JetStream y siempre con la cabecera de secuencia.** Un `publish` de **core** a un
+  subject de estado sí lo captura el stream, pero **sin acuse y sin chequeo**: sobrescribe sin
+  condición (A-45). Es el atajo que anula §3.1.
+- **`Nats-Msg-Id` = `id` del evento**, como siempre ([03-delivery.md §3](03-delivery.md)).
+- **3 intentos, sin espera obligatoria.** El SDK **PUEDE** esperar un poco (con jitter) entre
+  intentos. Medido con 3 instancias escribiendo la **misma** clave sin pausa (A-49): de 90 `put`,
+  49 se aplicaron, 27 fueron `stale` y 14 agotaron los 3 intentos. Es una carga artificial
+  —ninguna aplicación escribe una clave en un bucle desde tres sitios—, pero dice qué pasa si la
+  carga existe: `STATE_CONFLICT` es **RETRYABLE** y se reintenta con el backoff de siempre.
+- **El SDK PUEDE recordar en memoria** la última secuencia de cada clave que él mismo escribió,
+  para ahorrarse el paso 1 en el primer intento. Si el publish falla, relee.
+- **Un valor ilegible no bloquea la clave.** Si el mensaje leído en el paso 1 no es JSON, o no
+  tiene un `aggregateVersion` válido, se trata como «sin versión»: se sobrescribe, con el
+  chequeo de secuencia sobre **su** `S`. De lo contrario una entrada rota dejaría la clave
+  inescribible para siempre, porque ningún servicio puede purgar el stream
+  ([06-security.md §3.5](06-security.md)). *Decidido provisionalmente.*
+
+### 3.4 La versión
+
+`aggregateVersion` **lo pone el dueño**: es el contador monotónico de su agregado, el mismo que
+va en los eventos ([03-delivery.md §5.1](03-delivery.md)). El SDK no lo inventa ni lo incrementa.
+
+- **DEBE** ser un **entero ≥ 1** y **≤ 2^53 − 1** (9007199254740991: el mayor que Node, y todo
+  lo que use `double`, representa sin perder precisión). Ausente, `null`, una cadena (`"7"`), un
+  decimal (`7.5`, y `7.0` donde el lenguaje lo distinga: véase el punto siguiente), `0`, un
+  negativo o uno mayor: `MISSING_AGGREGATE_VERSION` (PERMANENT). El nombre cubre todo lo que no
+  sea un entero ≥ 1, no solo la ausencia. Se comprueba **siempre**, con o sin validación L3: es
+  una regla del protocolo, no del esquema.
+- **`7.0` depende del lenguaje, y la spec lo dice en vez de fingir que no.** El contador es un
+  entero, y `7.0` no lo es *para quien lo distingue*: un SDK cuyo parser de JSON separa el entero
+  del flotante (Rust con `serde_json`, donde `7.0` es un `f64`) **DEBE** rechazarlo con
+  `MISSING_AGGREGATE_VERSION`. En un lenguaje de **número JSON único** —Node: `JSON.parse("7.0")`
+  y `7` son el mismo `number`— es **indistinguible** de `7`, y el SDK no puede saber qué escribió
+  quien lo llamó: ahí se acepta como `7`. Es un **límite conocido del lenguaje**, no un fallo del
+  SDK, y no hay nada que corregir en él. Por eso `7.0` **no** figura en
+  `conformance/cases/state-semantics.json` (ese fichero es JSON, y lo leen los dos): lo comprueba
+  el test de cada SDK que sí distingue, y el de Node documenta que no puede.
+- **Una versión que no avanza es `stale`, y una igual tampoco avanza**: dos escrituras con la
+  misma versión son, por contrato, el mismo dato, y la segunda no se aplica. Corregir un valor
+  exige subir la versión.
+- **`stale` no es un error.** Es la respuesta normal de un dueño que reproduce un evento viejo o
+  de dos instancias que compiten. Lo que sí puede ser un error es *ignorarlo*: un dueño que
+  necesita su valor en el estado y recibe `stale` tiene un contador de versión que retrocede.
+- **El contador sobrevive a los borrados** (§4): una clave borrada y vuelta a crear continúa
+  desde la versión de su lápida, no desde 1.
+
+### 3.5 Resultado
+
+```ts
+{ applied: boolean, outcome: "ok" | "stale", revision: number }
+```
+
+| | `applied` | `outcome` | `revision` |
+|---|---|---|---|
+| Escrito | `true` | `"ok"` | La secuencia del stream del mensaje nuevo |
+| Versión que no avanza | `false` | `"stale"` | La del mensaje **actual**, el que la hizo obsoleta |
+
+`applied` y `outcome` dicen lo mismo; el booleano es para `if`, la cadena para métricas y logs.
+**No hay un tercer valor**: un conflicto agotado es un error (`STATE_CONFLICT`), no un resultado.
+Un `stale` puede darse sobre una escritura que sí se aplicó y la superó otra más nueva mientras
+se perdía su acuse (§3.2, 1b); el estado final es el mismo.
+
+### 3.6 Validación, clasificación y tenant
+
+En este orden, **antes de abrir ninguna petición** (el primero que falla gana):
+
+| Comprobación | Código | Clase |
+|---|---|---|
+| Dominio reservado ([§2.7](#27-dominios-reservados)) | `RESERVED_DOMAIN` | PERMANENT |
+| Forma del contrato ([§2.2](#22-el-subject)) | `INVALID_STATE_CONTRACT` | PERMANENT |
+| Clave ([§2.3](#23-la-clave)) | `INVALID_STATE_KEY` | PERMANENT |
+| Tenant ([§2.4](#24-el-tenant)) | `INVALID_TENANT_FOR_STATE` | PERMANENT |
+| `data` objeto; `aggregateVersion` ([§3.4](#34-la-versión)) | `MISSING_AGGREGATE_VERSION` | PERMANENT |
+| `classification` ([§7](#7-datos-personales-y-supresión)) | `INVALID_DATACLASSIFICATION` | PERMANENT |
+| **L3**: `data` contra el `dataschema` del contrato | `INVALID_SCHEMA` | PERMANENT |
+
+- **L3 en `put`** valida `data` contra el esquema más alto del mayor del contrato, que resuelve el
+  índice `state` del bundle ([§10](#10-qué-debe-un-sdk-state)); como en
+  [00-protocol.md §5](00-protocol.md), no se resuelve por red. Falla **antes** de leer ni escribir
+  y reporta **todos** los errores. **La lápida** valida contra el esquema fijo
+  `https://schemas.internal/system/state/eliminado/1.0.0.json`.
+- **Un fallo de validación nunca copia valores a su mensaje.** Un error como `'ana@example.com'
+  no cumple el formato` acabaría en logs, y en `dlqerror` 90 días: el mensaje cita la **ruta** del
+  campo (`/email`), no su contenido (§7).
+- **Clasificación.** Sin `classification` explícita, un `put` usa **`confidential`**, no el valor
+  por defecto de la conexión: un estado es donde se permite que viva el dato personal, y
+  equivocarse hacia arriba cuesta un log redactado, mientras que equivocarse hacia abajo cuesta
+  PII en un log o en una DLQ. La lápida lleva siempre `internal`. *Decidido provisionalmente.*
+
+### 3.7 Lecturas de réplica — **no medido**
+
+Con `replicas: 3`, `DIRECT.GET` lo puede contestar **cualquier réplica**, incluida una que aún no
+ha aplicado la última escritura. Medido (A-49) en un cluster de 3 nodos locales: 400 `put`
+seguidos de su lectura inmediata, 0 lecturas obsoletas. **Eso no demuestra que no ocurra**: sobre
+una red real, con una réplica retrasada, `get` justo después de un `put` **PUEDE** devolver el
+valor anterior. Para `put` es inocuo —el chequeo de secuencia del paso 3 rechaza una `S`
+vieja— y se traduce en un intento más, o en un `STATE_CONFLICT` si la réplica sigue retrasada en
+los tres (tampoco medido). Para `get` significa que **no hay lectura de
+tu propia escritura garantizada**: quien la necesite la deriva del resultado del `put`
+(`revision`), no relee. No se ha podido medir con latencia de red real.
+
+## 4. Borrar
+
+```ts
+await bus.state.delete("clientes.cliente.v1", "cli-1", { aggregateVersion: 8 });
+// → { applied: true, outcome: "ok", revision: 42 }
+```
+
+`delete` publica una **lápida** en el mismo subject: un CloudEvent con
+
+- `type: com.flux.state.<dominio>.<agregado>.deleted.v<major>`;
+- `data: { "aggregateVersion": n }` — y nada más;
+- `dataclassification: "internal"`;
+- `dataschema: https://schemas.internal/system/state/eliminado/1.0.0.json`, fijo.
+
+Al entrar, **el valor anterior sale del stream** (A-34): sigue habiendo un solo mensaje por clave,
+y el dato personal ya no está en el stream.
+
+- **`delete` es `put` de una lápida.** Mismo algoritmo (§3.2), mismas reglas de versión, mismo
+  resultado. `aggregateVersion` es obligatorio y es la versión **de la lápida**: debe superar la
+  del valor que borra. Una lápida con versión ≤ la actual es `stale`.
+- **Borrar una clave que nunca existió escribe la lápida** (`S = 0`, `applied: true`). Una lápida
+  sobre una clave vacía es inocua, y la alternativa —un `delete` que a veces no hace nada— haría
+  que el dueño tuviera que saber si algún observador llegó a ver el valor. *Decidido
+  provisionalmente.*
+- **La lápida lleva versión** (`data.aggregateVersion`) **porque `put` la lee** (§3.2, paso 1): para
+  decidir si una escritura nueva es `stale` necesita la versión de lo que hay, y lo que hay puede
+  ser una lápida.
+- **La lápida es permanente en 1.1.** Compactarlas queda fuera de alcance. Una pesa unos
+  cientos de bytes, y un observador que entra tarde las recibe en su foto inicial (A-35).
+- **Se puede recrear una clave borrada, con una versión estrictamente mayor que la de la
+  lápida.** `Nats-Expected-Last-Subject-Sequence` funciona contra la secuencia de la lápida, y
+  con `0` falla porque el subject ya tiene mensaje (A-34): es el paso 1 de siempre, que lee la
+  lápida como cualquier otro valor. Un `put` con versión ≤ la de la lápida es `stale`. *Decidido
+  provisionalmente.*
+  **La trampa:** un dueño que borra la fila de su base de datos y, más tarde, la recrea con
+  `aggregateVersion: 1`, recibe `stale` y **la clave sigue borrada** sin ningún error. Su
+  contador tiene que sobrevivir al borrado —una columna `deleted_at` en lugar de un `DELETE`, o
+  un contador aparte— o no debería reutilizar la clave.
+- Un consumidor **DEBE** borrar o anonimizar su copia local al recibir una lápida (§5.3). Es lo
+  que hace real el derecho de supresión **aguas abajo**.
+- `get` de una clave con lápida devuelve **`null`**, igual que de una que nunca existió (§5.1).
+  `flux state get` (el CLI), en cambio, **muestra la lápida**: es una herramienta de diagnóstico, y
+  su versión y su `revision` son justo lo que explica por qué un `put` da `stale`. La diferencia es
+  **intencionada**: el SDK contesta «¿hay un valor?» y el CLI «¿qué hay en esta clave?».
+
+## 5. Leer
+
+### 5.1 `get`
+
+```ts
+const actual = await bus.state.get("clientes.cliente.v1", "cli-1");   // entrada | null
+```
+
+Una lectura puntual por `DIRECT.GET` sobre el subject exacto (A-32):
+
+```
+$JS.API.DIRECT.GET.STATE_<DOM>.state.<dom>.<agr>.v<M>.<tenant>.<clave>
+```
+
+La respuesta lleva el mensaje tal cual —cuerpo y cabeceras `Nats-Subject`, `Nats-Sequence`,
+`Nats-Time-Stamp`, más las que se publicaron— y **no** consume nada: no hay consumidor ni acuse.
+
+- **Clave inexistente → `404 Message Not Found`** (A-32), y el SDK devuelve `null`. Una **lápida**
+  también devuelve `null` (el CLI la muestra: §4).
+- **Un stream que no existe, o sin `allow_direct`, no devuelve 404: no contesta nadie**
+  (`no responders`), y los dos casos se ven igual (A-32). El SDK lanza `NOT_PROVISIONED` con un
+  mensaje que nombra las dos causas y apunta a `flux provision` y a `flux doctor`
+  ([04-errors.md §6](04-errors.md)).
+- Aplica las comprobaciones de §5.4: un mensaje cuyo `tenantid` o `subject` no coincide con el
+  subject lanza `STATE_SUBJECT_MISMATCH` en vez de devolverlo.
+- **Es una lectura de réplica** (§3.7).
+
+**Un cuerpo no sirve para saltarse el permiso.** `DIRECT.GET` por subject **rechaza** una
+petición con cuerpo (`408 Bad Request`, A-38), así que la forma `$JS.API.DIRECT.GET.<stream>` +
+`{"seq": n}` —que sí lee cualquier mensaje— no puede colarse por un permiso de subject.
+
+### 5.2 `watch`
+
+```ts
+await bus.state.watch("clientes.cliente.v1", async (entrada, ctx) => {
+  if (entrada.deleted) return borrarLocal(entrada.tenantId, entrada.key);
+  await guardarLocal(entrada);          // UPDATE … WHERE aggregate_version < $n
+}, { onSynced: () => listo(), tenantId: "acme" });
+```
+
+`watch` entrega **una foto completa y después los cambios, por el mismo canal**: un consumidor
+durable de `STATE_<DOM>`.
+
+- **Durable:** `<servicio>__state_<dom>_<agr>_v<M>` y, si filtra por tenant, el sufijo
+  `__<tenant>`. Los puntos y los guiones **del contrato y del tenant** pasan a `_`, como en
+  [02-naming.md §4](02-naming.md): `tienda-web__state_clientes_cliente_v1__acme`. **El nombre del
+  servicio no se toca**: conserva sus guiones (`tienda-web`, no `tienda_web`), porque es lo que
+  `^[a-z0-9]+(-[a-z0-9]+)*$` y la ACL de `gen-acl.mjs` esperan delante del `__`. El tenant va en
+  el nombre porque **un durable compartido reparte los mensajes entre quienes lo usan**
+  (A-47): dos instancias del mismo servicio, una por tenant, con un durable sin sufijo, se
+  quitarían la mitad de la foto cada una.
+- **`deliver_policy: last_per_subject`**; todo lo demás, la configuración canónica de
+  [03-delivery.md §2](03-delivery.md) (`ack_wait == backoff[0]`, `max_deliver: 6`, …).
+- **Filtro:** `state.<dom>.<agr>.v<M>.<tenant>.*`, o `….*.*` sin tenant. Con
+  `tenantIsolation: "strict"`, el segundo es un error de configuración
+  ([09-multitenancy.md §3](09-multitenancy.md)). **El tenant de un `watch` sale de la opción de la
+  llamada y, si no, de `connect()`** —y **nunca del evento en curso**: §2.4 explica por qué—. Con
+  tenant en `connect()` **siempre** filtra, sea cual sea su valor: aquí `system` es un tenant como
+  cualquier otro (*decidido provisionalmente*).
+- **Un `watch` observa un tenant, o todos; no una lista.** La API de los SDKs toma **un**
+  `tenantId` por llamada, y cada llamada es **un** durable. Un servicio que observa N tenants
+  llama N veces, y cada llamada tiene su `onSynced` ([§5.5](#55-onsynced)).
+- **Un consumidor que estuvo caído recibe solo el último valor de cada clave que cambió**, no los
+  intermedios: no los hay (A-35). Un valor **reemplazado mientras estaba en vuelo no se
+  reentrega**: si el handler hace `nak` de la revisión 10 y mientras tanto entra la 20, la 10 ha
+  salido del stream y el broker no la devuelve (A-36). Nunca se aplica un valor que ya no existe.
+- El `watch` **no necesita** `STREAM.INFO.STATE_<DOM>`: `CONSUMER.INFO` distingue «el consumidor
+  no existe» (10014) de «el stream no existe» (10059) (A-48), que es todo lo que hace falta
+  para dar `NOT_PROVISIONED` o `PERMISSION_DENIED` según [04-errors.md §5](04-errors.md).
+- Como en todo consumo, un `ack` o un pull denegados no lanzan: rige
+  [06-security.md §3.7](06-security.md).
+
+**Resincronizar** es borrar el durable y volver a crearlo: el broker entrega otra vez el último
+valor de cada clave (A-37). Lo hace `flux state resync` con credenciales de **operación**: un
+servicio no puede borrar durables ([06-security.md §3.5](06-security.md)). **Un `resync` de un
+durable que no existe se rechaza** (lo decidió el CLI): no hay nada que resincronizar, y crearlo
+dejaría un durable fantasma por un nombre mal escrito —un `--tenant` que falta, un servicio
+equivocado—; el CLI dice cuáles existen.
+
+**Un `watch` vivo durante un `resync`.** El `resync` borra el durable **bajo un `watch` que sigue abierto**:
+el broker contesta al pull pendiente `409 Consumer Deleted`. El SDK **DEBE** tratarlo como «repite el
+pull» —no como un fallo, y menos como el final del `watch`—: vuelve a consultar el durable **por su
+nombre** (`CONSUMER.INFO`, que el observador ya tiene) con backoff hasta que exista, **comprueba su
+configuración como al abrir** (un durable recreado con otro filtro **no** se consume: entregaría las
+claves de otro tenant sin ningún error) y vuelve a pedir mensajes. **No necesita `CONSUMER.CREATE`**:
+quien recrea el durable es `flux state resync`, con credenciales de operación. Avisa por el logger al
+perder el durable y al recuperarlo, y `close()` lo detiene. `onSynced` **no** se invoca de nuevo
+(§5.5): es una vez por `watch`.
+
+Medido (nats-server 2.14.5; 5 claves, un `watch` abierto y un `resync` inmediato —borrar y recrear—;
+tiempo desde que se recrea el durable hasta la primera entrada de la foto nueva):
+
+| Cliente | Sin tratar `consumer deleted` | Reabriendo el consumo |
+|---|---|---|
+| `nats.js` 3.4.0 (Node) | **43,0 s** (tres veces) | 0,1 s (tres veces) |
+| `async-nats` 0.50 (Rust) | **nunca**: 120 s después el `watch` seguía sin recibir nada, ni un `put` en vivo | 0,2–0,3 s (tres veces) |
+
+Cada cliente falla de forma distinta, y la de Rust es la peor. `nats.js` notifica `consumer_deleted` pero no
+repite el pull hasta que detecta la falta de latidos (`heartbeats_missed`: dos de 15 s y el reintento): ~43 s
+de un `watch` mudo, que luego se recupera solo. `async-nats` da por **terminado** el flujo de mensajes
+(`Err(ConsumerDeleted)` y después `None`), y un bucle que trata el fin del flujo como «me pidieron parar»
+sale **en silencio**: un `watch` muerto con la conexión sana y sin ningún error. Un cliente en el que no se
+pueda reabrir así **DEBE** documentar su tiempo medido, no suponerlo.
+
+### 5.3 La entrada
+
+Lo que recibe el handler, y lo que devuelve `get`:
+
+```ts
+{
+  key:              string,            // la clave
+  tenantId:         string,            // el tenant del subject
+  deleted:          boolean,           // true si es una lápida
+  data:             object | null,     // el `data` del evento; null si deleted
+  aggregateVersion: number,            // la del valor (o la de la lápida)
+  revision:         number,            // la secuencia del stream
+}
+```
+
+- **`tenantId` no estaba en el plan y es necesario.** Un `watch` sin tenant recibe entradas de
+  todos; si la entrada solo trajera la clave, un handler que guarda por clave mezclaría los
+  tenants en silencio: es el choque que el tenant en el subject evita en el broker (§2.2) y que
+  no puede reaparecer en la réplica local. *Desviación del plan, §12.*
+- **`data` es `null` (`None`, `nil`) cuando `deleted`**: la lápida no lleva dato (§4). `null`
+  como valor de una entrada de la API es otra cosa que `null` dentro de `data` en el cable
+  ([01-envelope.md §4](01-envelope.md)).
+- **`revision` es la secuencia del stream**: crece con cada escritura de cualquier clave, y cambia
+  cuando la clave cambia. Sirve para saber *qué mensaje* es; **no** para ordenar versiones de una
+  clave —eso es `aggregateVersion`—, ni se compara entre contratos.
+- **El SDK confirma (`ack`) cuando el handler termina sin error**, como con los eventos
+  ([03-delivery.md §2](03-delivery.md)); lanzar clasifica según [04-errors.md](04-errors.md).
+- **El handler DEBE ser idempotente y no asumir orden**, como siempre: la entrada de una clave
+  puede llegar mientras se procesa la anterior (la anterior ya salió del stream, pero ya se había
+  entregado). La defensa es la de [03-delivery.md §5.1](03-delivery.md): `UPDATE … WHERE
+  aggregate_version < $n`, que aquí es la regla de aplicar la entrada, no una optimización.
+- **Ante una lápida, borrar o anonimizar** la copia local y **recordar la versión** de la lápida
+  (o no recrear la fila con una versión menor): una escritura vieja que llegue después no debe
+  resucitar el dato. Una lápida de una clave que el observador nunca tuvo es un no-op.
+
+### 5.4 Qué comprueba el SDK al consumir
+
+Antes de llamar al handler, en este orden. Lo que falla **nunca** se aplica y **nunca** llega al
+handler:
+
+| Comprobación | Código | Clase |
+|---|---|---|
+| El mensaje es un CloudEvent válido con las cuatro extensiones ([01-envelope.md §3.1](01-envelope.md)) | los de siempre | POISON |
+| `tenantid` = el tenant del subject; `subject` = la clave; `type` = el del contrato (o su lápida) | `STATE_SUBJECT_MISMATCH` | **POISON** |
+| `dataclassification` ≠ `restricted` ([§7](#7-datos-personales-y-supresión)) | `INVALID_DATACLASSIFICATION` | **POISON** |
+| `data` con `aggregateVersion` válido ([§3.4](#34-la-versión)) | `MISSING_AGGREGATE_VERSION` | PERMANENT |
+| Si hay L3 al consumir: `data` contra su esquema | `INVALID_SCHEMA` | PERMANENT |
+
+`STATE_SUBJECT_MISMATCH` es POISON: el mensaje es legible pero **miente sobre su identidad**, y un
+productor que lo hace está roto o es hostil. `watch` lo trata como cualquier POISON
+([04-errors.md §1.3](04-errors.md)): **`term()` + DLQ de estado + alerta**, métrica
+`outcome="poison"`, y la entrada **no** se aplica, de modo que la clave conserva su valor
+anterior. La clave que se registra en la DLQ es la **del subject** —la que decidió el broker—,
+no la del sobre.
+
+### 5.5 `onSynced`
+
+```ts
+{ onSynced: () => listo() }
+```
+
+Se invoca **una sola vez por `watch()`** —no una por reconexión, ni de nuevo tras un `resync`
+(§5.2)— cuando el handler ya ha procesado **todo lo que había pendiente al abrirlo**. Es la señal
+de «mi réplica local ya puede contestar lecturas». Concretamente:
+
+1. Al abrir, el SDK pregunta por el consumidor (`CONSUMER.INFO`): `num_pending` y
+   `num_ack_pending`.
+2. **Stream vacío (o durable al día): `onSynced` se invoca de inmediato**, antes de entregar nada
+   y aunque no llegue ninguna entrada después (A-35: un consumidor sobre un stream vacío informa
+   `num_pending: 0` y no entrega nada). Es lo único correcto: esperar a una entrada que quizá no
+   llegue nunca dejaría al servicio «sincronizando» para siempre.
+3. Si no, cuando una entrega llega con **`pending == 0`** —el número que el broker pone en los
+   metadatos de cada mensaje: cuántos quedan por entregar (A-35)— **y** todos los handlers
+   lanzados hasta ese momento han terminado (con éxito o con error). `num_pending` solo no basta:
+   cuenta lo no entregado y no lo entregado-y-sin-terminar, y con handlers concurrentes llega a 0
+   cuando aún quedan hasta 256 en vuelo.
+
+**Varios tenants.** El contrato es: si una sola llamada observa **N tenants** (N durables), `onSynced`
+se invoca **una vez**, cuando **los N** están sincronizados —con uno solo sincronizado, la réplica
+local aún no puede contestar por los otros—, y de inmediato solo si los N estaban al día. **La API
+actual de Node y de Rust no ofrece esa llamada**: `watch` toma **un** `tenantId` (o ninguno, y observa
+todos con un único durable), y un servicio que observa N tenants hace N llamadas, cada una con su
+`onSynced`. Combinarlas —«listo cuando han llegado las N»— es de la aplicación, que es quien sabe
+cuántos tenants tiene. No se ha inventado una API de lista para tapar esto; si un SDK la añade,
+**DEBE** cumplir la regla de arriba.
+
+**Escrituras durante la sincronización.** La foto no es una fotografía parada: el broker entrega
+en orden de secuencia, y una clave reescrita mientras se sincroniza aparece **una vez, con su
+valor más reciente** (A-35: la clave reescrita llega con la secuencia nueva; una clave nueva se
+entrega al final). `onSynced` espera a que se alcance `pending == 0`; si el dueño escribe más
+deprisa de lo que el handler consume, se retrasa, y eso es lo correcto. No promete que **no**
+lleguen entradas después: promete que **ya se vio** lo que había al abrir. Una entrada que falla
+con un error RETRYABLE **no** retrasa `onSynced`: se cuenta como terminada; su fallo va por el
+camino de siempre, y esa clave puede faltar en la réplica local hasta que se reintente.
+
+### 5.6 Orden
+
+Igual que en los eventos ([03-delivery.md §5](03-delivery.md)): ni global ni por clave. Lo que
+cambia es que **el estado tiene más defensas que un evento**: un valor reemplazado no se
+reentrega (§5.2), y un consumidor nuevo parte de la foto, no de la historia. Lo que queda —dos
+entradas de la misma clave en vuelo a la vez— lo resuelve `WHERE aggregate_version < $n`.
+
+## 6. Errores y DLQ
+
+Misma taxonomía que los eventos ([04-errors.md](04-errors.md)), con los códigos propios de
+§3.6 y §5.4 y los de [04-errors.md §6](04-errors.md). Un `watch` cuyo handler lanza un
+PERMANENT, o agota sus reintentos, manda la entrada a la **DLQ de estado**.
+
+- **Subject:** `dlq.state.<dominio>.<agregado>.v<major>` — **sin tenant ni clave**, para que no
+  se multiplique por ellos: son cinco tokens, uno por contrato. El stream `DLQ_<DOM>` captura
+  `dlq.<dom>.>` **y** `dlq.state.<dom>.>` **cuando el dominio tiene un `STATE_<DOM>`**; un dominio
+  solo de eventos conserva el `DLQ_<DOM>` de la v1.0 sin tocarlo: ampliar los subjects de un
+  stream con datos es posible y no pierde mensajes (A-44), pero no se le pide a quien no usa
+  estado. *Decidido provisionalmente.* `flux provision` lo hace; `flux doctor` lo audita.
+- **El evento de DLQ de estado NO lleva el dato.** `data` se sustituye por
+  `{ "key": "…", "revision": n }` (§2.6). La DLQ guarda 90 días
+  ([02-naming.md §3.3](02-naming.md)); un dato personal que el dueño ya ha borrado seguiría vivo
+  ahí tres meses y **el derecho de supresión no se cumpliría**. El resto del sobre queda como
+  estaba, también `dataclassification`.
+- **`dlqerror` NO DEBE contener valores de `data`**: código, y como mucho la ruta del campo
+  (`INVALID_SCHEMA: /pais …`, nunca el valor). Es la misma razón, vista desde el texto.
+- **Un error que no es de flux no deja su mensaje en la DLQ.** Lo que lanza un driver de base de
+  datos (`duplicate key value violates unique constraint … Key (email)=(ana@example.com)`) cita la
+  fila entera, y la DLQ guarda 90 días. Un error **de flux** —los del SDK y los que lanza la
+  aplicación con `PermanentError`/`RetryableError`, cuyo mensaje escribió quien sabía que iría a la
+  DLQ— conserva el suyo. Cualquier otro se reduce a su código y a una frase fija:
+  `UNKNOWN: error sin clasificar de la aplicación; el mensaje se omite para no copiar datos a la DLQ
+  (10-state.md §6)`, con el código que le dé el clasificador (`UNKNOWN`, o el que reconozca:
+  `HTTP_503`, `ECONNRESET`). Tampoco se concatena la cadena de causas de un error de flux: la causa
+  es, justamente, el error del driver.
+- **Si el original llevaba `signkeyid` y `signature`, el evento de DLQ de estado NO los
+  conserva**: firman un `data` que ya no está, y una firma que no verifica sobre un sobre que
+  parece el original es una afirmación falsa ([07-signing.md §5](07-signing.md)). *Decidido
+  provisionalmente.*
+- **Un mensaje ilegible** (JSON roto, sin sobre) **no se copia a la DLQ**: no se guarda su
+  cuerpo en ninguna forma —ni los `rawBase64` que sí llevan los eventos—, porque podría contener
+  el dato. No hay sobre original que conservar, así que el SDK sintetiza uno con lo único fiable,
+  **el subject**: `id` UUIDv7 nuevo (y `correlationid` igual), `source` y `producerversion` del
+  servicio que consume, `time` = **el instante actual** (el del consumo: no hay otro que decir),
+  `type` y `dataschema` del contrato, `subject` = la clave y `tenantid` = el tenant, **ambos
+  tomados del subject**, `partitionkey` = **la clave**, `dataclassification: "internal"`, las `dlq*`
+  (`dlqreason: "poison"`) y `data: { key, revision }`. Lo único que **no** es reproducible byte a
+  byte entre dos consumos es lo que depende del reloj y del azar: `id`, `correlationid` y `time`.
+- **`Nats-Msg-Id` de la DLQ de estado:** `dlq-<id>-<dlqconsumer>`, como en los eventos.
+
+**El estado no se reproduce desde la DLQ.** Republicar un valor viejo pisaría uno más nuevo —la
+DLQ guarda el *fallo*, no el estado—, y ahora ni siquiera tiene el dato. `flux dlq replay`
+**DEBE** rechazar `dlq.state.>`, con un mensaje que apunte a la recuperación: **`flux state
+resync`** ([§5.2](#52-watch)), que entrega de nuevo el último valor de cada clave por el camino
+normal. Es mejor que un replay: aplica lo **actual**, no lo que había cuando falló.
+
+Un dueño lee la DLQ de estado de su dominio como la de eventos
+([06-security.md §3.1](06-security.md)): con un pull consumer —durable
+`<servicio>__dlq_state_<dominio>`, filtro `dlq.state.<dominio>.>`—. *Decidido provisionalmente.*
+
+## 7. Datos personales y supresión
+
+Aquí se resuelve la contradicción de [06-security.md §5.1](06-security.md): la spec manda no meter
+datos personales en eventos, y «pedirlos al dueño» devuelve las llamadas que flux quiere
+eliminar.
+
+| | Evento | Estado |
+|---|---|---|
+| ¿Datos personales? | **No.** Solo referencias (`clienteId`) | **Sí**: `dataclassification: "confidential"`, y los campos con `"x-pii": true` en el esquema |
+| ¿Se pueden borrar? | No: es un log inmutable | **Sí**: `delete` sustituye el valor por una lápida (§4) |
+
+El evento dice **qué pasó**; el estado lleva **el dato**. El consumidor ya no llama al dueño:
+tiene el dato porque le llegó.
+
+- **`restricted` (credenciales, salud, financiero) no se admite en estado en 1.1.** Un `put` con
+  `classification: "restricted"` lanza `INVALID_DATACLASSIFICATION`; un mensaje de estado que lo
+  lleve es POISON. Meter un dato de 24 h de retención en un almacén sin caducidad no es una
+  decisión que deba tomarse por omisión.
+- **Los campos con PII DEBEN llevar `"x-pii": true`** en el esquema del contrato, y un SDK
+  **DEBERÍA** redactarlos en logs ([06-security.md §5](06-security.md)). Las claves y los tenants
+  **no** son PII: son identificadores opacos.
+- **Un consumidor DEBE honrar la lápida** (§5.3). El derecho de supresión se cumple en el origen
+  con `delete`, y se propaga a cada réplica local por la lápida. Un observador que ignora las
+  lápidas guarda datos de personas que el dueño ya borró.
+- **El estado reemplazado o borrado no conserva historia**, y la DLQ de estado tampoco (§6). Con
+  eso el estado satisface la supresión en el broker. **Lo que NO garantiza**:
+  - **Borrado físico en disco.** Que el valor «salga del stream» no es que sus bytes desaparezcan
+    del fichero: depende de la compactación de JetStream. Mitigación: cifrado en reposo del
+    broker; garantía fuerte, cifrado del payload (fase 7).
+  - **Copias fuera del broker**: backups del stream, y las réplicas locales de observadores que
+    no honren la lápida.
+  - **Las claves y los tenants**: son visibles en los metadatos del stream (§8). Por eso no son
+    PII.
+
+## 8. Permisos
+
+Los permisos de estado los **genera** `gen-acl.mjs` (clave `watches` del manifiesto) y se
+documentan junto a los demás en [06-security.md §3.8](06-security.md#38-estado-replicado-watches-y-sus-permisos)
+(el formato de `watches`, lo que recibe cada rol y los casos S15 a S20 que lo ejecutan); esto es lo que el estado
+necesita, **medido** contra un broker con una ACL escrita a mano (A-38 a A-40), y lo que el
+generador debe producir. `protocol.json` → `state.acl` fija los patrones.
+
+**Dueño** del dominio (escribe, y lee lo suyo):
+
+```
+state.<dom>.>
+$JS.API.DIRECT.GET.STATE_<DOM>.state.<dom>.>
++ el durable de su DLQ de estado: CONSUMER.INFO, MSG.NEXT y ACK de  <servicio>__dlq_state_<dom>
+  (sobre DLQ_<DOM>: son los patrones de `security.acl.permissionPatterns`, no los de `STATE_<DOM>`)
+```
+
+**Observador** (`watch`, y `get` de lo que observa), por contrato y tenant:
+
+```
+$JS.API.CONSUMER.INFO.STATE_<DOM>.<durable>
+$JS.API.CONSUMER.MSG.NEXT.STATE_<DOM>.<durable>
+$JS.ACK.STATE_<DOM>.<durable>.>
+$JS.API.DIRECT.GET.STATE_<DOM>.state.<dom>.<agr>.v<M>.<tenant>.*        (…v<M>.*.* sin tenant)
+dlq.state.<dom>.<agr>.v<M>
+$JS.API.STREAM.INFO.DLQ_<DOM>                                           (el SDK comprueba la DLQ al abrir)
+```
+
+y, solo con `--dev`, `CONSUMER.CREATE.STATE_<DOM>.<durable>.state.<dom>.<agr>.v<M>.<tenant>.*`.
+
+Lo que se midió, y por qué la lista es esta:
+
+- **`DIRECT.GET` por subject se confina por tenant** (A-38). Con el permiso de `…acme.*`: se lee
+  una clave de `acme`; se deniega una de `globex`, la forma `v1.*.*` y la forma `state.<dom>.>`.
+  Un comodín **en la clave** sí pasa (`…acme.*` devuelve el último mensaje escrito de `acme`): es
+  su tenant, lo puede leer todo.
+- **La forma de cuerpo no se concede nunca.** `$JS.API.DIRECT.GET.<stream>` con `{"seq": n}` o
+  `{"last_by_subj": …}` lee cualquier mensaje y ninguna ACL ve el cuerpo; no coincide con el
+  permiso por subject (A-38), y [06-security.md §3.5](06-security.md) la sigue negando. La
+  excepción que esta sección introduce es **solo** la forma por subject de un estado, con el
+  tenant fijado.
+- **El filtro de un consumidor no se puede ampliar por el cuerpo** (A-40): con el subject
+  `CREATE.<S>.<d>.<filtro>`, un `filter_subject` distinto da `Consumer create request did not
+  match filtered subject from create subject` (10131), un `filter_subjects` da 10137, y
+  tampoco hereda el del subject si el cuerpo no trae ninguno.
+- **`STREAM.INFO.STATE_<DOM>` no se concede a observadores, y el SDK no lo necesita.**
+  `STREAM.INFO` con `subjects_filter` en el cuerpo devuelve **todos los subjects del stream con
+  su recuento**, es decir, **todas las claves y todos los tenants** (A-39). Con ese único permiso,
+  un servicio confinado a `acme` conoce los clientes de `globex`. Sin él, `put`, `get` y `watch`
+  funcionan igual (A-38, A-48). **El dueño tampoco lo recibe**: el SDK no lo usa —las claves y los tenants que
+  necesita los conoce porque es quien los escribe, y `subjects_filter` es justo lo que lista todos—, y
+  conceder «por si acaso» lo que nadie usa es el principio de un permiso que alguien acabará ampliando. Si
+  un día hiciera falta, sería un permiso más del dueño, nunca del observador, y entraría aquí primero
+  (06-security.md §3.8).
+  Lo que **sí** queda visible para un observador es lo que expone `STREAM.INFO.DLQ_<DOM>`:
+  los subjects de DLQ —cinco tokens, sin clave ni tenant— y sus recuentos.
+
+> **Esto matiza [06-security.md §3.5](06-security.md)**, que niega a un servicio
+> `$JS.API.DIRECT.GET.*`. La forma por subject de **un contrato y un tenant concretos** —lo que
+> mide A-38— no abre la lectura de otros mensajes; la forma de cuerpo y cualquier comodín por
+> encima del tenant siguen denegados.
+
+## 9. Observabilidad
+
+[08-observability.md §2.4](08-observability.md) define `flux_state_writes_total{contract,outcome}`
+para los SDKs con la capacidad `state`. Las métricas de consumo existentes se **reutilizan** con
+`subject = "state.<contrato>"` (`state.clientes.cliente.v1`) y `consumer` = el durable **sin el
+sufijo de tenant**: con el sufijo, cada tenant nuevo crearía series nuevas, que es lo que
+[08-observability.md §2.2](08-observability.md) prohíbe. Un `watch` con un durable por tenant
+**DEBE** publicar `flux_consumer_pending` como la **suma** de los suyos. **Nunca** se etiqueta con
+la clave ni con el tenant.
+
+## 10. Qué DEBE un SDK `state`
+
+**Los esquemas de estado** viven en `schemas/state/<dominio>/<agregado>/<semver>.json` (un fichero
+por versión, inmutables, con el `$id` igual a su ruta: [05-compatibility.md §4](05-compatibility.md)),
+y valen las mismas reglas de compatibilidad. Dos más, que `bundle-schemas.mjs` y
+`check-compat.mjs` comprueban: `data` es un **objeto** en la raíz y declara **`aggregateVersion`**
+como entero ≥ 1 y `required` (§3.4). La lápida es el esquema fijo
+`schemas/system/state/eliminado/1.0.0.json`. El bundle gana un índice **`state`**: contrato
+(`clientes.cliente.v1`) → URI del esquema de versión más alta de su mayor, igual que `subjects`
+hace con los eventos. La lápida **no** está en el índice —su URI es constante—, pero sí en
+`schemas`.
+
+Un SDK declara la capacidad `state` ([00-protocol.md §5](00-protocol.md)) solo si cumple **todo**:
+
+1. `put`, `delete`, `get` y `watch` según §3 a §5, y los **mismos bytes** que §2.6 y §6 para el
+   sobre, la lápida, el subject y la DLQ de estado (arnés cruzado: `state-build`,
+   `state-tombstone`, `state-subject`, `state-dlq`).
+2. Reconoce **10071 y 10164** como conflicto de secuencia (§3.2) —se prueba contra un cluster, o
+   con una respuesta fabricada de cada forma—.
+3. Los **siete** códigos de [04-errors.md §6](04-errors.md), con su clase.
+4. `publish()` rechaza los dominios reservados (§2.7) con `RESERVED_DOMAIN`.
+5. Resuelve el contrato en el índice `state` del bundle, no por red.
+6. Ejecuta, contra un broker real y con los permisos que genera `gen-acl.mjs`, el ciclo del
+   criterio de aceptación: el dueño escribe 100 claves, un observador **nuevo** las recibe todas
+   y recibe `onSynced`, se borra una, el observador recibe la lápida y `get` de esa clave da
+   `null`. En los dos sentidos: quitar un permiso **se nota**.
+
+## 11. Lo que el estado NO resuelve
+
+Declarado para que nadie asuma de más:
+
+- **No es consistente entre claves.** No hay transacciones: dos claves se actualizan por
+  separado, y un observador puede ver una de las dos cambiada.
+- **No es una consulta.** Solo se lee por clave exacta, o todo el contrato.
+- **No hay lectura de la propia escritura garantizada con réplicas** (§3.7).
+- **No resiste a un dueño que escribe versiones mal.** El broker no sabe qué es una versión
+  correcta: aplica la regla de §3.4 al contador que le dan.
+- **No oculta los nombres de claves ni de tenants** a quien tenga `STREAM.INFO` (§8).
+- **No garantiza el borrado físico** (§7).
+
+## 12. Decidido provisionalmente
+
+Puntos que el plan dejaba abiertos y que se cierran aquí con el criterio que se explica en cada
+sección. Son del dueño del proyecto si prefiere otra cosa; cambiar cualquiera de ellos más tarde
+es barato **ahora** y deja de serlo cuando haya datos en un stream:
+
+| # | Decisión | Sección |
+|---|---|---|
+| 1 | Una clave no puede empezar por `_` (reservado al protocolo) | §2.3 |
+| 2 | Tenant de estado de **64** caracteres como máximo | §2.4 |
+| 3 | Sin tenant por defecto en estado: ni `system` implícito ni el del evento ausente | §2.4 |
+| 4 | `put` sin `classification` usa `confidential`; `restricted` se rechaza | §3.6, §7 |
+| 5 | Un valor ilegible no bloquea la clave: se sobrescribe | §3.3 |
+| 6 | `delete` de una clave que nunca existió escribe la lápida | §4 |
+| 7 | La entrada lleva **`tenantId`** (no estaba en el plan) | §5.3 |
+| 8 | `STATE_SUBJECT_MISMATCH` también cubre un `type` que no es el del contrato | §5.4 |
+| 9 | Con tenant en `connect()`, `watch` filtra siempre, también con `system` | §5.2 |
+| 10 | `onSynced`: `pending == 0` **y** handlers terminados; vacío, inmediato | §5.5 |
+| 11 | El stream `DLQ_<DOM>` captura `dlq.state.<dom>.>` solo si el dominio tiene estado | §6 |
+| 12 | El dueño lee la DLQ de estado con `<servicio>__dlq_state_<dominio>` | §6 |
+| 13 | La DLQ de estado no conserva la firma, ni el cuerpo de un mensaje ilegible | §6 |
+| 14 | `STREAM.INFO.STATE_<DOM>` no se concede a nadie —ni al dueño—; el SDK no lo usa | §8 |
+| 15 | El `consumer` de las métricas de estado es el durable sin tenant, y el gauge la suma | §9 |
+| 16 | `type` de la lápida con `deleted` (del plan) frente a `eliminado` en su esquema | §4 |
+| 17 | El tenant de un `watch` sale de la opción y de `connect()`, nunca del evento en curso | §2.4, §5.2 |
+| 18 | Un contrato mal formado es `INVALID_STATE_CONTRACT` (el séptimo código) | §2.2, §3.6 |
+| 19 | `7.0` se rechaza donde el lenguaje distingue entero de flotante; en Node es indistinguible de `7` | §3.4 |
+| 20 | Un error que no es de flux deja en `dlqerror` solo su código y una frase fija | §6 |
+| 21 | `onSynced` de varios tenants: una vez, cuando todos están sincronizados; la API actual toma un tenant por `watch` | §5.5 |
+| 22 | Un `watch` vivo reabre su consumo cuando el durable se borra (`resync`), sin `CONSUMER.CREATE` y comprobando la configuración | §5.2 |
+
+
+==============================================================================
+== FIN — 12 documentos
 ==============================================================================

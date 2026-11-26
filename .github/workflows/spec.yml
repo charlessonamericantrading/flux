@@ -158,6 +158,21 @@ jobs:
         env:
           FLUX_REQUIRE_BROKER: '1'
         run: node conformance/security.mjs
+      # El estado replicado (10-state.md): los casos del broker, una ACL por tenant escrita a mano y un
+      # cluster de tres nodos. Levanta sus propios servidores con el nats-server compilado arriba.
+      - name: Ejecutar la suite de estado replicado
+        env:
+          FLUX_REQUIRE_BROKER: '1'
+        run: node conformance/state-broker.mjs
+      # Un caso que solo se ha visto en verde no demuestra nada: con una referencia que solo reconoce
+      # el conflicto 10071 (el de un nodo suelto; en un cluster es el 10164) el runner DEBE fallar.
+      - name: Los casos detectan un put que solo reconoce el 10071 (debe FALLAR)
+        run: |
+          if node conformance/state-broker.mjs --mutant only-10071 > /dev/null 2>&1; then
+            echo "✗ el mutante only-10071 NO hizo fallar la suite: el caso de cluster no vigila nada"
+            exit 1
+          fi
+          echo "✓ el mutante fue detectado"
 
   protocol-json-valid:
     name: protocol.json coherente
@@ -174,6 +189,49 @@ jobs:
       # README: una capacidad que solo existe en una tabla es una intención. Se autocomprueba
       # con mutaciones (quitar un código de un SDK debe hacerlo fallar).
       - run: node scripts/check-sdk-codes.mjs
+
+  # La CLI (cli/) contra un nats-server real: `flux state ls|get|resync`, `flux doctor` sobre estado,
+  # `flux tail` y `flux dlq replay` (que DEBE rechazar `dlq.state.>`). Es el equivalente, para el
+  # estado, del paso «flux doctor detecta un cluster roto» del job `conformance`: el doctor se prueba
+  # en los dos sentidos (verde con la configuración buena, rojo con cada una de las doce rotas), y
+  # la simulación de `resync` no cambia nada mientras `--confirm` sí. Un broker PROPIO por suite en
+  # lugar del compartido de `conformance`: ese acaba el job con un cluster roto a propósito.
+  cli:
+    name: CLI contra NATS real — estado, doctor, tail y dlq
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      # nats-server 2.14.5 exige Go 1.25 (su go.mod): se compila la versión exacta que la spec dice
+      # haber medido, igual que en `acl-verify` y `security`.
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+          cache: false
+      - name: Compilar nats-server 2.14.5
+        run: |
+          GOBIN="$PWD/bin" go install github.com/nats-io/nats-server/v2@v2.14.5
+          echo "NATS_SERVER=$PWD/bin/nats-server" >> "$GITHUB_ENV"
+      - run: npm install --no-audit --no-fund
+        working-directory: cli
+      # FLUX_REQUIRE_BROKER=1: que falte nats-server es un FALLO y no un salto con aviso. Sin ella, un
+      # binario que no se compilara dejaría el job verde sin haber ejecutado nunca la CLI contra un broker.
+      - name: Pruebas de la CLI (modelo de estado sin broker; ls, get, resync, doctor, tail y dlq con él)
+        working-directory: cli
+        env:
+          FLUX_REQUIRE_BROKER: '1'
+        run: npm test
+      # En los dos sentidos también aquí: sin broker, las pruebas con broker DEBEN fallar.
+      - name: Sin nats-server, las pruebas con broker FALLAN (no se saltan)
+        working-directory: cli
+        run: |
+          if NATS_SERVER=/no/existe/nats-server FLUX_REQUIRE_BROKER=1 npm test > /dev/null 2>&1; then
+            echo "✗ las pruebas de la CLI pasaron SIN nats-server con FLUX_REQUIRE_BROKER=1: la comprobación no vigila nada"
+            exit 1
+          fi
+          echo "✓ sin nats-server las pruebas de la CLI fallan"
 
   sdk-node:
     name: SDK Node — typecheck, tests e integración contra NATS real
@@ -441,6 +499,33 @@ jobs:
       # las salidas de los siete SDKs BYTE A BYTE con los mismos vectores.
       - name: Vectores idénticos en todos los SDKs
         run: node conformance/cross-sdk.mjs --verbose
+
+      # Las operaciones de estado (state-build, state-tombstone, state-subject, state-dlq) las ejecutan
+      # SOLO los SDKs que declaran `state` en protocol.json (Node y Rust): los otros cinco salen
+      # «N/A: no declara state» en el paso de arriba. Un runner que solo se ha visto en verde no demuestra
+      # que detecte nada: cada mutante estropea a propósito lo que un SDK entrega o declara (un byte, un
+      # tenant, una operación ausente, un arnés sin registrar) y el runner DEBE fallar. Con `--only` para no
+      # recompilar ni invocar lo que el mutante no toca.
+      - name: El runner detecta un byte, un tenant o una operación ausente (debe FALLAR)
+        run: |
+          for par in rust-un-byte:node,rust rust-tenant-cambiado:node,rust rust-ignora-tenant:node,rust \
+                     rust-sin-state-subject:node,rust rust-sin-arnes-registrado:node,rust \
+                     python-declara-state:node,python; do
+            mutante="${par%%:*}"
+            solo="${par#*:}"
+            if node conformance/cross-sdk.mjs --only "$solo" --mutant "$mutante" > /dev/null 2>&1; then
+              echo "✗ el mutante $mutante NO hizo fallar el runner: no vigila lo que dice vigilar"
+              exit 1
+            fi
+            echo "✓ $mutante detectado"
+          done
+
+      # El reverso: un SDK que NO declara `state` no es un fallo, pero tampoco un salto silencioso.
+      - name: Un SDK que no declara state sale N/A y NO falla
+        run: |
+          salida=$(node conformance/cross-sdk.mjs --only node,rust --mutant rust-no-declara-state)
+          echo "$salida" | grep -q "N/A: no declara state — rust" || { echo "✗ no imprimió el N/A"; exit 1; }
+          echo "✓ N/A visible y sin fallo"
 
   conformance:
     name: Conformidad contra NATS real

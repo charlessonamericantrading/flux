@@ -9,6 +9,10 @@
 //! Deliberadamente delgado: **no rellena nada**. `id`, `time` y `dlqtime` vienen del
 //! vector; si los generase el SDK, los bytes no serían comparables entre lenguajes.
 //!
+//! Además de `build`, `dlq`, `sign`, `verify` y `parse`, implementa las cuatro operaciones de la
+//! capacidad `state` (`state-build`, `state-tombstone`, `state-subject` y `state-dlq`): el runner
+//! las ejecuta solo en los SDKs que la declaran en `protocol.json`.
+//!
 //! ```text
 //! echo '{"op":"build","event":{…}}' | cargo run --quiet --bin conformance-harness --features signing
 //! ```
@@ -21,8 +25,9 @@ use std::io::Read;
 use chrono::{DateTime, Utc};
 use flux::signing::{Signer, SigningOptions, VerificationMode, Verifier};
 use flux::{
-    build_event, data_to_raw, parse_event, serialize, to_dlq_event, BuildEventInput,
-    DataClassification, DlqInfo, DlqReason, Event, FluxError,
+    build_event, build_state_event, build_state_tombstone, data_to_raw, parse_event, serialize,
+    state_dataschema, state_subject, to_dlq_event, to_state_dlq_event, BuildEventInput,
+    DataClassification, DlqInfo, DlqReason, Event, FluxError, StateEventInput, StateTombstoneInput,
 };
 use serde::Deserialize;
 use serde_json::value::RawValue;
@@ -87,6 +92,73 @@ struct DlqEntrada {
     dlqtime: String,
 }
 
+// ─── Entrada de estado (capacidad `state`) ───────────────────────────────────
+//
+// PLANA, como el `input` de los fixtures de `cross-sdk-state-envelope.json` más el `op`. Se
+// parsea del mismo texto que `Entrada` (los campos que una no conoce, la otra los ignora) y
+// `data` sigue siendo `RawValue`: los bytes del payload son los del vector.
+
+/// `state-subject`: solo lo que forma el subject de NATS.
+#[derive(Deserialize)]
+struct SujetoEntrada {
+    contract: String,
+    #[serde(rename = "tenantId")]
+    tenant_id: String,
+    key: String,
+}
+
+/// `state-build`, y el `original` de `state-dlq`. `dataschema` NO viene: lo deriva el SDK.
+#[derive(Deserialize)]
+struct PutEntrada {
+    contract: String,
+    #[serde(rename = "tenantId")]
+    tenant_id: String,
+    key: String,
+    id: String,
+    source: String,
+    time: String,
+    correlationid: String,
+    producerversion: String,
+    classification: String,
+    #[serde(default)]
+    causationid: Option<String>,
+    #[serde(default)]
+    traceparent: Option<String>,
+    #[serde(default)]
+    tracestate: Option<String>,
+    data: Box<RawValue>,
+}
+
+/// `state-tombstone`. La lápida no lleva `classification` ni `data`: son fijos.
+#[derive(Deserialize)]
+struct LapidaEntrada {
+    contract: String,
+    #[serde(rename = "tenantId")]
+    tenant_id: String,
+    key: String,
+    id: String,
+    source: String,
+    time: String,
+    correlationid: String,
+    producerversion: String,
+    #[serde(rename = "aggregateVersion")]
+    aggregate_version: u64,
+    #[serde(default)]
+    causationid: Option<String>,
+    #[serde(default)]
+    traceparent: Option<String>,
+    #[serde(default)]
+    tracestate: Option<String>,
+}
+
+/// `state-dlq`: el original (una entrada de `state-build`) y la revisión del stream. Los `dlq*`
+/// se leen de `Entrada::dlq`, igual que en `dlq`.
+#[derive(Deserialize)]
+struct DlqEstadoEntrada {
+    original: PutEntrada,
+    revision: u64,
+}
+
 #[derive(Deserialize)]
 struct FirmaEntrada {
     #[serde(rename = "privateKeyPem")]
@@ -138,18 +210,19 @@ fn cuerpo(e: &Entrada) -> Result<Vec<u8>, Fallo> {
     b64_decode(b64).map_err(|m| Fallo::nuevo("HARNESS_INPUT", m))
 }
 
+/// Una clasificación fuera del enum es `INVALID_DATACLASSIFICATION`, como en el SDK.
+fn clasificacion(texto: &str) -> Result<DataClassification, Fallo> {
+    DataClassification::from_str_exact(texto).ok_or_else(|| {
+        Fallo::nuevo(
+            "INVALID_DATACLASSIFICATION",
+            format!("dataclassification fuera del enum: {texto}"),
+        )
+    })
+}
+
 /// El arnés **NO** rellena nada: todos los atributos salen del vector.
 fn construir(e: &EventoEntrada) -> Result<Event, Fallo> {
-    let dataclassification =
-        DataClassification::from_str_exact(&e.dataclassification).ok_or_else(|| {
-            Fallo::nuevo(
-                "INVALID_DATACLASSIFICATION",
-                format!(
-                    "dataclassification fuera del enum: {}",
-                    e.dataclassification
-                ),
-            )
-        })?;
+    let dataclassification = clasificacion(&e.dataclassification)?;
 
     Ok(build_event(BuildEventInput {
         subject: e.subject.clone(),
@@ -176,6 +249,35 @@ fn instante(s: &str) -> Result<DateTime<Utc>, Fallo> {
         .map_err(|e| Fallo::nuevo("HARNESS_INPUT", format!("`{s}` no es RFC 3339: {e}")))
 }
 
+/// La base de los esquemas del repo: `schemas/state/<dom>/<agr>/<semver>.json` cuelga de aquí. Es
+/// la misma que el SDK de Node llama `STATE_SCHEMA_BASE`; el arnés la fija porque ningún vector
+/// trae `dataschema`: lo que se compara es lo que el SDK deriva del contrato.
+const BASE_ESQUEMAS: &str = "https://schemas.internal";
+
+/// El arnés **NO** rellena nada de estado: todo sale del vector, y `dataschema` del SDK.
+fn construir_estado(e: &PutEntrada) -> Result<Event, Fallo> {
+    Ok(build_state_event(StateEventInput {
+        contract: e.contract.clone(),
+        tenant_id: e.tenant_id.clone(),
+        key: e.key.clone(),
+        id: e.id.clone(),
+        source: e.source.clone(),
+        time: instante(&e.time)?,
+        correlationid: e.correlationid.clone(),
+        producerversion: e.producerversion.clone(),
+        classification: clasificacion(&e.classification)?,
+        dataschema: state_dataschema(BASE_ESQUEMAS, &e.contract)?,
+        causationid: e.causationid.clone(),
+        traceparent: e.traceparent.clone(),
+        tracestate: e.tracestate.clone(),
+        data: e.data.clone(),
+    })?)
+}
+
+fn entrada_de_estado<'a, T: Deserialize<'a>>(texto: &'a str) -> Result<T, Fallo> {
+    serde_json::from_str(texto).map_err(|e| Fallo::nuevo("HARNESS_INPUT", e.to_string()))
+}
+
 fn firmante(e: &Entrada) -> Result<Signer, Fallo> {
     let f = e
         .signing
@@ -199,7 +301,7 @@ fn modo_verificacion(mode: Option<&str>) -> Result<VerificationMode, Fallo> {
     }
 }
 
-fn ejecutar(e: &Entrada) -> Result<Value, Fallo> {
+fn ejecutar(e: &Entrada, texto: &str) -> Result<Value, Fallo> {
     match e.op.as_str() {
         "build" => {
             let bytes = serialize(&construir(evento(e)?)?)?;
@@ -257,6 +359,61 @@ fn ejecutar(e: &Entrada) -> Result<Value, Fallo> {
         "parse" => {
             parse_event(&cuerpo(e)?)?;
             Ok(json!({ "ok": true }))
+        }
+
+        // ─── Estado replicado (capacidad `state`) ────────────────────────────────────────
+        "state-build" => {
+            let p: PutEntrada = entrada_de_estado(texto)?;
+            let bytes = serialize(&construir_estado(&p)?)?;
+            Ok(json!({ "ok": true, "bytes": b64_encode(&bytes) }))
+        }
+
+        "state-tombstone" => {
+            let l: LapidaEntrada = entrada_de_estado(texto)?;
+            let lapida = build_state_tombstone(StateTombstoneInput {
+                contract: l.contract,
+                tenant_id: l.tenant_id,
+                key: l.key,
+                id: l.id,
+                source: l.source,
+                time: instante(&l.time)?,
+                correlationid: l.correlationid,
+                producerversion: l.producerversion,
+                aggregate_version: l.aggregate_version,
+                causationid: l.causationid,
+                traceparent: l.traceparent,
+                tracestate: l.tracestate,
+            })?;
+            Ok(json!({ "ok": true, "bytes": b64_encode(&serialize(&lapida)?) }))
+        }
+
+        "state-subject" => {
+            let s: SujetoEntrada = entrada_de_estado(texto)?;
+            let subject = state_subject(&s.contract, &s.tenant_id, &s.key)?;
+            Ok(json!({ "ok": true, "subject": subject }))
+        }
+
+        "state-dlq" => {
+            let d: DlqEstadoEntrada = entrada_de_estado(texto)?;
+            let info = e
+                .dlq
+                .as_ref()
+                .ok_or_else(|| Fallo::nuevo("HARNESS_INPUT", "la operación requiere `dlq`"))?;
+            let con_dlq = to_state_dlq_event(
+                construir_estado(&d.original)?,
+                // La clave del SUBJECT de NATS, que aquí es la del original.
+                &d.original.key,
+                d.revision,
+                &DlqInfo {
+                    reason: info.reason,
+                    attempts: info.attempts,
+                    consumer: info.consumer.clone(),
+                    error: info.error.clone(),
+                },
+                // `dlqtime` viene del vector, no del reloj.
+                instante(&info.dlqtime)?,
+            );
+            Ok(json!({ "ok": true, "bytes": b64_encode(&serialize(&con_dlq)?) }))
         }
 
         otro => Ok(json!({ "ok": false, "code": "UNSUPPORTED_OP", "detail": otro })),
@@ -332,7 +489,7 @@ fn main() {
             Err(e) => json!({ "ok": false, "code": "HARNESS_INPUT", "detail": e.to_string() }),
             // Un fallo de la operación se REPORTA, no se propaga: exit != 0 significaría
             // que el arnés está roto, no que el caso falló.
-            Ok(entrada) => ejecutar(&entrada)
+            Ok(entrada) => ejecutar(&entrada, &texto)
                 .unwrap_or_else(|f| json!({ "ok": false, "code": f.code, "detail": f.detail })),
         },
     };

@@ -61,6 +61,39 @@ pub enum ConsumeOutcome {
     InvalidSignature,
 }
 
+/// Valor de la etiqueta `outcome` de `flux_state_writes_total` — 10-state.md §9,
+/// `protocol.json` → `state.metrics`.
+///
+/// Son cuatro y **ninguno es «error de transporte»**: la métrica cuenta lo que el *protocolo*
+/// decidió sobre una escritura, no si la red funcionó. Los errores de quien llama
+/// (`INVALID_STATE_KEY`, `INVALID_TENANT_FOR_STATE`, `RESERVED_DOMAIN`) quedan en su excepción.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum StateWriteOutcome {
+    /// `applied: true`: la escritura (o la lápida) entró, o ya había entrado con ese mismo `id`.
+    Ok,
+    /// La versión no avanzaba. **No es un error**: es la respuesta normal de un dueño que
+    /// reproduce un evento viejo o de dos instancias que compiten.
+    Stale,
+    /// `STATE_CONFLICT`: el chequeo de secuencia agotó sus 3 intentos.
+    Conflict,
+    /// `MISSING_AGGREGATE_VERSION`, o `data` no cumple su esquema (L3). Se emite también cuando
+    /// la llamada **lanza**: un contrato roto es justo lo que esta serie existe para ver.
+    InvalidSchema,
+}
+
+impl StateWriteOutcome {
+    /// El literal que va en la etiqueta.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Ok => "ok",
+            Self::Stale => "stale",
+            Self::Conflict => "conflict",
+            Self::InvalidSchema => "invalid_schema",
+        }
+    }
+}
+
 /// Motivo por el que un evento acabó en la DLQ. Etiqueta `reason` — 04-errors.md §1.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DlqReasonLabel {
@@ -182,6 +215,21 @@ pub trait MetricsSink: Send + Sync {
 
     /// `flux_connection_state` — sin etiquetas.
     fn connection_state(&self, state: ConnectionState);
+
+    /// `flux_state_writes_total{contract, outcome}` — solo en un SDK con la capacidad `state`
+    /// (08-observability.md §2.4, 10-state.md §9).
+    ///
+    /// `contract` es el nombre de contrato (`clientes.cliente.v1`): tantas series como contratos
+    /// de estado declarados. **Nunca** la clave ni el tenant: la clave tiene una serie por cada
+    /// agregado del dominio y el tenant una por cada cliente de la plataforma, y esa cardinalidad
+    /// no avisa — ver el trait. Por eso la firma no admite ninguno de los dos.
+    ///
+    /// Tiene implementación por defecto (no hace nada) **a propósito**: añadir un método
+    /// obligatorio a un trait público rompe a todo el que ya lo implementa contra `prometheus`,
+    /// `metrics` u OpenTelemetry, y el estado es una extensión opcional.
+    fn state_write(&self, contract: &str, outcome: StateWriteOutcome) {
+        let _ = (contract, outcome);
+    }
 }
 
 /// No-op. **El default**: un SDK no debe imponer un backend de métricas.
@@ -332,6 +380,7 @@ impl InMemoryMetrics {
             "flux_events_consumed_total",
             "flux_events_dlq_total",
             "flux_events_retried_total",
+            "flux_state_writes_total",
         ] {
             let _ = writeln!(out, "# TYPE {name} counter");
         }
@@ -459,6 +508,13 @@ impl MetricsSink for InMemoryMetrics {
 
     fn connection_state(&self, state: ConnectionState) {
         self.set("flux_connection_state", &[], state.as_f64());
+    }
+
+    fn state_write(&self, contract: &str, outcome: StateWriteOutcome) {
+        self.inc(
+            "flux_state_writes_total",
+            &[("contract", contract), ("outcome", outcome.as_str())],
+        );
     }
 }
 
@@ -709,6 +765,87 @@ mod tests {
         m.consumer_pending(SUBJECT, CONSUMER, 0);
         m.handler_duration(SUBJECT, CONSUMER, 0.1);
         m.connection_state(ConnectionState::Disconnected);
+    }
+
+    /// `flux_state_writes_total{contract,outcome}` — 08-observability.md §2.4: las dos
+    /// etiquetas y los cuatro valores de `outcome` son los de `protocol.json` → `state.metrics`,
+    /// y **nunca** la clave ni el tenant.
+    #[test]
+    fn las_escrituras_de_estado_se_cuentan_por_contrato_y_resultado() {
+        let m = InMemoryMetrics::new();
+        m.state_write("clientes.cliente.v1", StateWriteOutcome::Ok);
+        m.state_write("clientes.cliente.v1", StateWriteOutcome::Ok);
+        m.state_write("clientes.cliente.v1", StateWriteOutcome::Stale);
+
+        assert_eq!(
+            m.counter("flux_state_writes_total{contract=\"clientes.cliente.v1\",outcome=\"ok\"}"),
+            Some(2)
+        );
+        assert_eq!(
+            m.counter(
+                "flux_state_writes_total{contract=\"clientes.cliente.v1\",outcome=\"stale\"}"
+            ),
+            Some(1)
+        );
+        let salida = m.render();
+        assert!(
+            salida.contains("# TYPE flux_state_writes_total counter"),
+            "{salida}"
+        );
+        for prohibida in ["tenantid=", "tenant=", "key=", "id=", "correlationid="] {
+            assert!(!salida.contains(prohibida), "{prohibida}:\n{salida}");
+        }
+    }
+
+    #[test]
+    fn los_valores_de_outcome_de_estado_son_los_de_protocol_json() {
+        let protocol: serde_json::Value =
+            serde_json::from_str(include_str!("../../protocol.json")).expect("protocol.json");
+        let metrica = &protocol["state"]["metrics"]["flux_state_writes_total"];
+        let de_la_spec: Vec<&str> = metrica["outcomes"]
+            .as_array()
+            .expect("outcomes")
+            .iter()
+            .map(|o| o.as_str().expect("cadena"))
+            .collect();
+        assert_eq!(
+            [
+                StateWriteOutcome::Ok.as_str(),
+                StateWriteOutcome::Stale.as_str(),
+                StateWriteOutcome::Conflict.as_str(),
+                StateWriteOutcome::InvalidSchema.as_str(),
+            ],
+            de_la_spec.as_slice()
+        );
+        assert_eq!(
+            metrica["labels"],
+            serde_json::json!(["contract", "outcome"])
+        );
+        // Las siete de `observability.metrics` siguen siendo siete: la de estado vive aparte.
+        assert_eq!(
+            protocol["observability"]["metrics"]
+                .as_object()
+                .expect("observability.metrics")
+                .len(),
+            7
+        );
+    }
+
+    /// Un sumidero que ya existía no se rompe por el método nuevo: tiene implementación por
+    /// defecto. Es la garantía de «no rompas la API existente».
+    #[test]
+    fn un_sumidero_antiguo_sigue_compilando() {
+        struct Antiguo;
+        impl MetricsSink for Antiguo {
+            fn event_published(&self, _: &str, _: PublishOutcome) {}
+            fn event_consumed(&self, _: &str, _: &str, _: ConsumeOutcome) {}
+            fn handler_duration(&self, _: &str, _: &str, _: f64) {}
+            fn event_dlq(&self, _: &str, _: &str, _: DlqReasonLabel, _: &str) {}
+            fn event_retried(&self, _: &str, _: &str, _: u32) {}
+            fn consumer_pending(&self, _: &str, _: &str, _: u64) {}
+            fn connection_state(&self, _: ConnectionState) {}
+        }
+        Antiguo.state_write("clientes.cliente.v1", StateWriteOutcome::Conflict);
     }
 
     #[test]

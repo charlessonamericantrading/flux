@@ -36,7 +36,7 @@ import {
 // ─── Vocabulario: validación del JSON ────────────────────────────────────────
 
 /** Campos que cualquier paso admite, además de los argumentos de su operación. */
-const CAMPOS_COMUNES = ["op", "as", "id", "title", "note", "control", "onlyWith", "knownDeviation", "expect"];
+const CAMPOS_COMUNES = ["op", "as", "id", "title", "note", "control", "onlyWith", "knownDeviation", "expect", "save"];
 
 /** Campos de un actor. Los de variante derivan los permisos de los que genera `gen-acl.mjs`. */
 const CAMPOS_ACTOR = ["service", "inbox", "without", "extraPublish", "extraSubscribe", "replaceSubscribe", "dev"];
@@ -59,6 +59,16 @@ export function validarCaso(caso, vocabulario) {
     throw new Error(`${caso.id}: nace de un bug (${caso.bugs.join(", ")}) y le falta \`counterExample\``);
   }
   if (!Array.isArray(caso.steps) || caso.steps.length === 0) throw new Error(`${caso.id}: sin pasos`);
+
+  // `save` guarda el campo `seq` observado; `{ "ref": nombre }` (con `plus` opcional) lo usa DESPUÉS.
+  // Una referencia a algo que no se ha guardado antes es un error al cargar, no un `undefined`.
+  const guardados = new Set();
+  caso.steps.forEach((paso, i) => {
+    for (const nombre of referenciasDe({ ...paso, save: undefined })) {
+      if (!guardados.has(nombre)) throw new Error(`${caso.id}, paso ${i + 1}: la referencia «${nombre}» no se guardó antes con \`save\``);
+    }
+    if (paso.save !== undefined) guardados.add(paso.save);
+  });
 
   caso.steps.forEach((paso, i) => {
     const def = vocabulario.ops[paso.op];
@@ -86,6 +96,29 @@ export function validarCaso(caso, vocabulario) {
       }
     }
   });
+}
+
+/** Los nombres que un valor referencia con `{ "ref": nombre }`, en todo su árbol. */
+function referenciasDe(valor) {
+  if (Array.isArray(valor)) return valor.flatMap(referenciasDe);
+  if (valor && typeof valor === "object") {
+    if (typeof valor.ref === "string" && Object.keys(valor).every((k) => k === "ref" || k === "plus")) return [valor.ref];
+    return Object.values(valor).flatMap(referenciasDe);
+  }
+  return [];
+}
+
+/** Sustituye cada `{ "ref": nombre, "plus": n }` por el número guardado (+ n). */
+function resolverRefs(valor, guardados) {
+  if (Array.isArray(valor)) return valor.map((v) => resolverRefs(v, guardados));
+  if (valor && typeof valor === "object") {
+    if (typeof valor.ref === "string" && Object.keys(valor).every((k) => k === "ref" || k === "plus")) {
+      if (!guardados.has(valor.ref)) throw new Error(`la referencia «${valor.ref}» no tiene valor guardado: el paso que la guarda falló o no observó \`seq\``);
+      return guardados.get(valor.ref) + (valor.plus ?? 0);
+    }
+    return Object.fromEntries(Object.entries(valor).map(([k, v]) => [k, resolverRefs(v, guardados)]));
+  }
+  return valor;
 }
 
 /** Todos los actores que un paso menciona (`as`, `spy`, `victim`). */
@@ -213,7 +246,7 @@ export class Interprete {
     if (caso.onlyWith === "generated-acl" && !this.ctx.generada) {
       return { id: caso.id, ok: true, pasos: [], omitido: "necesita los permisos que genera gen-acl.mjs (no aplica con --acl)" };
     }
-    const estado = { actores: new Map(), marker: `${caso.id}-${randomUUID().slice(0, 8)}` };
+    const estado = { actores: new Map(), guardados: new Map(), marker: `${caso.id}-${randomUUID().slice(0, 8)}` };
     const pasos = [];
     try {
       for (const paso of caso.steps) {
@@ -237,12 +270,18 @@ export class Interprete {
     const vars = { me: paso.as !== undefined ? normalizarActor(paso.as).service : undefined, marker: estado.marker };
     let observado;
     try {
-      observado = await this.#operar(expandir(paso, vars), estado);
+      observado = await this.#operar(resolverRefs(expandir(paso, vars), estado.guardados), estado);
     } catch (e) {
       if (e instanceof Omitido) return { ...base, ok: true, omitido: e.message };
       observado = { outcome: "error", text: e?.message ?? String(e) };
     }
-    const esperado = expandir(paso.expect, vars);
+    if (paso.save !== undefined && typeof observado?.seq === "number") estado.guardados.set(paso.save, observado.seq);
+    let esperado;
+    try {
+      esperado = resolverRefs(expandir(paso.expect, vars), estado.guardados);
+    } catch (e) {
+      return { ...base, ok: false, observado, fallos: [e.message] };
+    }
     const fallos = evaluar(esperado, observado);
     return { ...base, ok: fallos.length === 0, observado, fallos, esperado };
   }
@@ -254,7 +293,8 @@ export class Interprete {
       publish: () => `publish ${p.subject}`,
       subscribe: () => `subscribe ${p.subject}`,
       request: () => `request ${p.subject}`,
-      js_publish: () => `js_publish ${p.subject}`,
+      js_publish: () => `js_publish ${p.subject}${p.expectedLastSubjectSeq !== undefined ? ` (esperada ${typeof p.expectedLastSubjectSeq === "object" ? `ref ${p.expectedLastSubjectSeq.ref}` : p.expectedLastSubjectSeq})` : ""}`,
+      direct_get: () => `direct_get ${p.stream}${p.subject !== undefined ? `.${p.subject}` : " (forma de cuerpo)"}`,
       create_consumer: () => `create_consumer ${p.stream}/${p.durable} filtro=${p.filter}${p.subjectFilter !== undefined && p.subjectFilter !== p.filter ? ` (subject: ${p.subjectFilter})` : ""}${p.api ? ` api=${p.api}` : ""}`,
       reset_consumer: () => `reset_consumer ${p.stream}/${p.durable} (${p.deliver ?? "all"})`,
       delete_consumer: () => `delete_consumer ${p.stream}/${p.durable}`,
@@ -340,11 +380,36 @@ export class Interprete {
       case "js_publish": {
         const a = await this.#actor(p.as, estado);
         try {
-          const ack = await jetstream(a.nc, { timeout: 1500 }).publish(p.subject, enc.encode(p.data ?? "{}"), { msgID: randomUUID() });
+          const ack = await jetstream(a.nc, { timeout: 1500 }).publish(p.subject, enc.encode(typeof p.data === "string" ? p.data : JSON.stringify(p.data ?? {})), {
+            msgID: p.msgId ?? randomUUID(),
+            ...(p.expectedLastSubjectSeq !== undefined && { expect: { lastSubjectSequence: p.expectedLastSubjectSeq } }),
+          });
           return { outcome: "ok", stream: ack.stream, seq: ack.seq, ms: Date.now() - t0 };
         } catch (e) {
           const denegado = /Permissions Violation/i.test(`${e?.message} ${e?.cause?.message}`);
-          return { outcome: denegado ? "denied" : "error", text: resumen(e), ms: Date.now() - t0 };
+          // `errCode` es el err_code de JetStream (10071 «wrong last sequence», 10164 en un cluster).
+          return { outcome: denegado ? "denied" : "error", errCode: typeof e?.code === "number" ? e.code : undefined, text: resumen(e), ms: Date.now() - t0 };
+        }
+      }
+
+      case "direct_get": {
+        // La lectura por subject (`$JS.API.DIRECT.GET.<stream>.<subject>`, A-32) con las cabeceras que
+        // trae, o —sin `subject`— la forma de CUERPO, que lee cualquier mensaje y que ninguna ACL ve.
+        const a = await this.#actor(p.as, estado);
+        const subj = p.subject === undefined ? `$JS.API.DIRECT.GET.${p.stream}` : `$JS.API.DIRECT.GET.${p.stream}.${p.subject}`;
+        const cuerpo = p.body === undefined ? "" : JSON.stringify(p.body);
+        try {
+          const r = await a.nc.request(subj, cuerpo, { timeout: p.timeoutMs ?? 1500 });
+          const code = r.headers?.code ?? 0;
+          const ms = Date.now() - t0;
+          if (code === 404) return { outcome: "not_found", status: 404, text: r.headers.description, ms };
+          if (code >= 400) return { outcome: "bad_request", status: code, text: r.headers.description, ms };
+          return { outcome: "found", status: 200, seq: Number(r.headers.get("Nats-Sequence")), subject: r.headers.get("Nats-Subject"), data: dec.decode(r.data), ms };
+        } catch (e) {
+          const texto = [...new Set([e?.message, e?.cause?.message].filter(Boolean))].join(" | ");
+          if (/Permissions Violation/i.test(texto)) return { outcome: "denied", text: texto, ms: Date.now() - t0 };
+          // Un stream que no existe, o sin allow_direct, no contesta nadie (A-32).
+          return { outcome: /no responders/i.test(texto) ? "no_answer" : "error", text: texto, ms: Date.now() - t0 };
         }
       }
 
@@ -355,7 +420,7 @@ export class Interprete {
           p.api === "durable_create"
             ? `$JS.API.CONSUMER.DURABLE.CREATE.${p.stream}.${p.durable}`
             : `$JS.API.CONSUMER.CREATE.${p.stream}.${p.durable}${filtroSubject === null ? "" : `.${filtroSubject}`}`;
-        const cuerpo = { stream_name: p.stream, config: configConsumidorCanonica(ctx.canon, p.durable, p.filter) };
+        const cuerpo = { stream_name: p.stream, config: { ...configConsumidorCanonica(ctx.canon, p.durable, p.filter), deliver_policy: p.deliver ?? "all" } };
         return this.#observarPeticion(await pedir(a.nc, subject, cuerpo, 1500));
       }
 

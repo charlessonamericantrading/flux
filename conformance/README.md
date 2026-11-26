@@ -11,11 +11,18 @@ conformance/
 ├── cases/
 │   ├── broker-invariants.json   ← invariantes de NATS de las que depende el protocolo
 │   ├── consumer-config.json     ← la config canónica sobrevive al servidor sin alterarse
-│   └── security-acl.json        ← los permisos generados, ejecutados contra un broker con TLS (S1–S14)
+│   ├── security-acl.json        ← los permisos generados, ejecutados contra un broker con TLS (S1–S20)
+│   ├── state-broker.json        ← estado replicado: lo que hace el BROKER (A-31 … A-49), con ACL y cluster
+│   ├── state-semantics.json     ← estado replicado: el algoritmo de put/delete/get y la foto de watch (A-50)
+│   └── cross-sdk-state-envelope.json ← la entrada de estado, la lápida y la DLQ de estado, byte a byte
 ├── fixtures/
 │   └── acl-v1.conf              ← la ACL v1 de gen-acl.mjs, congelada y rota a propósito (caso S9)
 ├── security.mjs                 ← runner de security-acl.json: los casos son DATOS
 ├── security/                    ← su intérprete, y el ciclo del SDK de Node (S10)
+├── state-broker.mjs             ← runner de los tres ficheros de estado: los casos son DATOS
+├── cross-sdk.mjs                ← runner de la conformidad cruzada: los siete SDKs, byte a byte
+├── harness/                     ← su contrato (README.md), los vectores y la clave de prueba
+├── harnesses.json               ← cómo se invoca el arnés de cada SDK
 └── README.md
 ```
 
@@ -95,7 +102,11 @@ observarse. [`security.mjs`](security.mjs) no sabe qué es S1: monta el entorno 
 desconocido en un caso, o una expectativa sobre algo que la operación no observa, es un error al
 cargar: una errata no puede degradarse a «no se comprueba nada».
 
-Los casos S1–S8 y S12–S14 hablan NATS directamente, sin ningún SDK de flux. S10 y S11 son la
+Los casos S1–S8 y S12–S20 hablan NATS directamente, sin ningún SDK de flux. S15 a S20 son los del
+**estado replicado** ([06-security.md §3.8](../specification/06-security.md)): el ciclo del dueño y de
+los observadores bajo la ACL generada, que solo el dueño escribe, que un tenant no lee el de otro, que
+nadie consulta el stream de estado más allá de lo concedido, la DLQ de estado y la minimalidad de cada
+permiso. Los pasos `save` / `{ "ref": … }` llevan la secuencia de una escritura condicional a la siguiente. S10 y S11 son la
 excepción deliberada: el SDK de Node y el de Rust, sin modificar, hacen un ciclo completo
 (publicar, consumir, ack, reintento, DLQ) **contra la ACL generada**, y el runner mira después,
 desde el broker, lo que dejaron. S9 vuelve a ejecutar S1 y S6 contra la ACL v1 congelada y exige
@@ -117,6 +128,79 @@ errores, `--nkeys`, `--tenants`), `flux provision` (idempotencia, diferencias, n
 minimalidad de cada permiso —quitando uno, el ciclo se rompe—, `--dev` y el Modelo B; esta suite
 verifica el contrato de seguridad de extremo a extremo y con TLS. Comparten la infraestructura
 (`scripts/lib/nats-harness.mjs`).
+
+## La suite de estado replicado
+
+```bash
+(cd conformance && npm install)
+NATS_SERVER=/ruta/a/nats-server node conformance/state-broker.mjs
+node conformance/state-broker.mjs --only conditional-write,one-value-per-key -v
+node conformance/state-broker.mjs --mutant only-10071        # DEBE fallar: demuestra que el caso detecta el fallo
+```
+
+Como `security.mjs`, **los casos son datos**: [`cases/state-broker.json`](cases/state-broker.json) define el
+vocabulario (crear un stream de estado, publicar con `Nats-Expected-Last-Subject-Sequence`, `DIRECT.GET`,
+un consumidor `last_per_subject`, una carrera de escritores…) y [`state-broker.mjs`](state-broker.mjs) no
+sabe qué es «un valor por clave». Habla NATS directamente, sin ningún SDK, y levanta y para sus servidores:
+uno suelto, uno con la ACL escrita a mano de `acls.estado` y, para los casos `topology: cluster3`, un cluster
+de **tres nodos** (se saltan con `--no-cluster`). Un campo desconocido, o una expectativa sobre algo que la
+operación no observa, es un error al cargar.
+
+- [`state-broker.json`](cases/state-broker.json): lo que hace el **broker** (A-31 … A-49): un valor por clave,
+  `DIRECT.GET`, el chequeo de secuencia —y que va **antes** que el de duplicados—, la lápida, la foto de un
+  consumidor, qué deniega una ACL por tenant, qué lista `STREAM.INFO`, y el código del conflicto de secuencia
+  en un nodo (10071) y en un cluster (10164).
+- [`state-semantics.json`](cases/state-semantics.json): el **protocolo** encima (A-50): el algoritmo de
+  `put`/`delete`/`get` de [10-state.md §3.2](../specification/10-state.md) y la foto de `watch` (§5.5), escritos
+  en el runner como implementación de **referencia** sobre NATS crudo. **Los SDKs de Node y Rust ejecutan estos
+  mismos escenarios con su API**: lo esperado es lo de aquí.
+- [`cross-sdk-state-envelope.json`](cases/cross-sdk-state-envelope.json): los ejemplos byte a byte de
+  [10-state.md §2.6](../specification/10-state.md) con su SHA-256, las operaciones del arnés cruzado
+  (`state-build`, `state-tombstone`, `state-subject`, `state-dlq`) y 23 vectores del subject con el
+  **código estable** de cada rechazo. `state-broker.mjs` reconstruye los bytes desde los datos y comprueba el
+  hash; **`cross-sdk.mjs` ejecuta las mismas entradas en los SDKs** y comprueba que `harness/vectors.json`
+  sigue repitiéndolas sin cambios (véase [La conformidad cruzada](#la-conformidad-cruzada-entre-sdks)).
+- `--mutant <nombre>` estropea a propósito la configuración del stream o la referencia (`no-max-msgs-per-subject`,
+  `no-allow-direct`, `discard-new`, `only-10071`, `no-own-write-check`, `equal-version-applies`,
+  `publish-via-core`, `fresh-id-per-attempt`, `no-cas-header`) y **cada uno DEBE hacer fallar el runner**.
+  `only-10071` solo lo detecta el caso de cluster: en un nodo suelto nunca se ve un 10164.
+
+Puertos: `FLUX_TEST_PORTS=desde-hasta` (por defecto `4600-4649`; se usan hasta 8), `NATS_SERVER` y
+`FLUX_REQUIRE_BROKER=1`, como en la suite de seguridad.
+
+## La conformidad cruzada entre SDKs
+
+```bash
+(cd sdk-node && npm install && npm run build)          # y lo que necesite cada SDK que quieras incluir
+node conformance/cross-sdk.mjs --verbose               # sin broker
+node conformance/cross-sdk.mjs --only node,rust        # un subconjunto
+node conformance/cross-sdk.mjs --only node,rust --mutant rust-un-byte    # DEBE fallar
+```
+
+Cada SDK trae un arnés diminuto (una operación por stdin, un JSON por stdout) y el runner los invoca
+con los **mismos vectores** y compara las salidas **byte a byte**: el contrato está en
+[`harness/README.md`](harness/README.md). Es lo único que ejecuta la interoperabilidad entre lenguajes;
+los `cases/cross-sdk-*.json` la describen y nada más. **Un fixture que nadie ejecuta aparenta
+cobertura.**
+
+**El estado replicado** ([10-state.md](../specification/10-state.md)) entra por las operaciones
+`state-build`, `state-tombstone`, `state-subject` y `state-dlq`, con los ejemplos de §2.6, los
+`subjectVectors` de [`cross-sdk-state-envelope.json`](cases/cross-sdk-state-envelope.json) y vectores
+de límites, UTF-8 literal, versión, orden de validación (§3.6) y un **control** (otro `tenantid` da otros
+bytes). Reglas del runner:
+
+- Las operaciones de estado se ejecutan **solo en los SDKs que declaran `state`** en `protocol.json` →
+  `capabilities` (hoy, Node y Rust). Para los demás imprime **`N/A: no declara state`** en el resumen y
+  una `–` en cada fila: nunca un salto silencioso.
+- Un SDK que **declara** `state` y no tiene la operación en su arnés **falla** (`UNSUPPORTED_OP`), y también
+  si no tiene arnés registrado.
+- Node, la referencia, fija lo esperado; el resto debe coincidir byte a byte. Los tres ejemplos de la
+  spec llevan además su SHA-256: ahí el patrón es la spec y no Node.
+
+**Las mutaciones** (`--mutant`, y CI las ejecuta) demuestran que el runner detecta lo que dice detectar: un
+byte cambiado en Rust, un tenant intercambiado o ignorado, una operación ausente en un SDK que declara
+`state`, un SDK sin arnés registrado —todos **fallan**— y un SDK que no declara `state`, que sale `N/A`
+**sin** fallo. La tabla está en [`harness/README.md`](harness/README.md#mutaciones).
 
 ## Añadir un caso
 

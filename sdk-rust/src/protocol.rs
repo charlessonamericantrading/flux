@@ -154,7 +154,11 @@ impl ParsedSubject {
 /// regular que necesitaría todo el SDK y arrastrarlo entero por cuatro tokens no sale
 /// a cuenta. Un test cruza esta función con los ejemplos válidos e inválidos de
 /// `protocol.json` para que la equivalencia no se quede en una afirmación.
-fn is_kebab_lower(token: &str) -> bool {
+///
+/// Es `pub(crate)` porque el estado replicado ([`crate::state`]) valida con ella el
+/// tenant, el dominio y el agregado de un contrato: una sola definición de «kebab-case»
+/// en todo el SDK.
+pub(crate) fn is_kebab_lower(token: &str) -> bool {
     if token.is_empty() || token.starts_with('-') || token.ends_with('-') {
         return false;
     }
@@ -167,7 +171,7 @@ fn is_kebab_lower(token: &str) -> bool {
 }
 
 /// Valida `v<major>`: literal `v` + entero ≥ 1 sin ceros a la izquierda.
-fn parse_major(token: &str) -> Option<u32> {
+pub(crate) fn parse_major(token: &str) -> Option<u32> {
     let digits = token.strip_prefix('v')?;
     if digits.is_empty() || digits.starts_with('0') || !digits.bytes().all(|b| b.is_ascii_digit()) {
         return None;
@@ -281,6 +285,33 @@ pub fn stream_name(domain: &str) -> String {
 #[must_use]
 pub fn dlq_stream_name(domain: &str) -> String {
     format!("DLQ_{}", domain.replace('-', "_").to_uppercase())
+}
+
+/// Los dominios que **no son dominios**: cada uno es un espacio de nombres del protocolo —
+/// 02-naming.md §1.3, `protocol.json` → `naming.reservedDomains`.
+///
+/// Un dominio con ese nombre colisionaría con él **en el broker**, no en el código: con
+/// `STATE_CLIENTES` (`state.clientes.>`) creado, un `EVT_STATE` (`state.>`) falla con
+/// `subjects overlap with an existing stream` (err 10065, A-43), y lo mismo `EVT_DLQ` junto a
+/// `DLQ_PEDIDOS`. Y lo peor no es el error, que es ruidoso: es que `publish()` a un subject de
+/// `state.` **sí** llega al stream de estado, pero sin el chequeo de secuencia de `put` y
+/// sobrescribiendo sin condición (A-45).
+pub const RESERVED_DOMAINS: [&str; 4] = ["dlq", "state", "rpc", "system"];
+
+/// ¿Es `domain` uno de [`RESERVED_DOMAINS`]? Se compara exacto y en minúsculas: los subjects
+/// de NATS distinguen mayúsculas, y `State` ya es un subject inválido por otro motivo.
+#[must_use]
+pub fn is_reserved_domain(domain: &str) -> bool {
+    RESERVED_DOMAINS.contains(&domain)
+}
+
+/// Devuelve `STATE_CLIENTES` para el dominio `clientes` — 10-state.md §2.1.
+///
+/// Un stream **por dominio**, igual que `EVT_` y `DLQ_`: el estado de todos los agregados del
+/// dominio vive junto, y lo que separa un contrato de otro es el subject.
+#[must_use]
+pub fn state_stream_name(domain: &str) -> String {
+    format!("STATE_{}", domain.replace('-', "_").to_uppercase())
 }
 
 /// Valida el nombre de servicio contra `^[a-z0-9]+(-[a-z0-9]+)*$`.
@@ -496,6 +527,35 @@ mod tests {
             source_uri("produccion", "pedidos-api"),
             "/produccion/pedidos-api"
         );
+    }
+
+    /// Los cuatro dominios reservados son los de `protocol.json`, no una copia que pueda
+    /// divergir: si la spec añade uno, este test lo dice.
+    #[test]
+    fn los_dominios_reservados_son_los_de_protocol_json() {
+        let protocol: serde_json::Value =
+            serde_json::from_str(include_str!("../../protocol.json")).expect("protocol.json");
+        let nombres: Vec<&str> = protocol["naming"]["reservedDomains"]["names"]
+            .as_array()
+            .expect("naming.reservedDomains.names")
+            .iter()
+            .map(|n| n.as_str().expect("cadena"))
+            .collect();
+        assert_eq!(nombres, RESERVED_DOMAINS);
+        for d in RESERVED_DOMAINS {
+            assert!(is_reserved_domain(d), "{d}");
+        }
+        // `state-clientes` NO está reservado y convive con `STATE_CLIENTES` (A-43), y las
+        // mayúsculas no son una forma de esquivar la regla: son otro subject inválido.
+        for d in ["pedidos", "state-clientes", "State", "dlqs", ""] {
+            assert!(!is_reserved_domain(d), "{d}");
+        }
+    }
+
+    #[test]
+    fn el_stream_de_estado_no_lleva_puntos_ni_guiones() {
+        assert_eq!(state_stream_name("clientes"), "STATE_CLIENTES");
+        assert_eq!(state_stream_name("linea-envio"), "STATE_LINEA_ENVIO");
     }
 
     /// El inbox es privado por construcción: `_INBOX.<servicio>` y nada más. Como el

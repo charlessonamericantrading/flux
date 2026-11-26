@@ -61,6 +61,28 @@ El orden de los tokens está elegido para que los filtros útiles sean expresabl
 > nombres de dos tokens. Fijando la versión en la posición 3, la forma del subject es
 > invariante y `>` siempre significa "de aquí hacia abajo".
 
+### 1.3 Dominios reservados
+
+`dlq`, `state`, `rpc` y `system` **NO DEBEN** usarse como dominio: cada uno es un espacio de
+nombres del protocolo, y un dominio con su nombre colisionaría con él.
+
+| Nombre | Qué ocupa |
+|---|---|
+| `dlq` | Los subjects de la DLQ: `dlq.<subject original>` (§3.1) y `dlq.state.<dominio>.…` |
+| `state` | El estado replicado: `state.<dominio>.<agregado>.v<major>.<tenant>.<clave>` ([10-state.md](10-state.md)), y `schemas/state/` |
+| `rpc` | La petición/respuesta (`rpc.<dominio>.…`, fase 3), y `schemas/rpc/` |
+| `system` | Lo de la plataforma: `schemas/system/…` y el tenant `"system"` ([09-multitenancy.md §5](09-multitenancy.md)) |
+
+**La colisión es del broker, no solo de estilo.** Medido contra NATS 2.14.5 (A-43): con
+`STATE_CLIENTES` (`state.clientes.>`) creado, `EVT_STATE` (`state.>`) falla con `subjects overlap
+with an existing stream` (err 10065), y lo mismo `EVT_DLQ` (`dlq.>`) junto a `DLQ_PEDIDOS`
+(`dlq.pedidos.>`). O el dominio no se puede crear, o —si se crea primero— es el estado el que no
+puede existir. `dlq` no estaba reservado en v1.0 y debería.
+
+Un SDK **DEBE** rechazar un subject o un contrato en un dominio reservado con **`RESERVED_DOMAIN`**
+([04-errors.md §6](04-errors.md)); `gen-acl.mjs` y `flux validate` rechazan el manifiesto que lo
+declare como dominio, y `bundle-schemas.mjs`, un esquema de evento en `schemas/<reservado>/`.
+
 ## 2. `type` de CloudEvents
 
 Reverse-DNS, derivado **determinísticamente** del subject:
@@ -80,17 +102,35 @@ consumidores distintos: el subject enruta (y necesita la versión en posición f
 para los wildcards), el `type` identifica el contrato en un catálogo (y ahí lee mejor
 con la versión al final, como un sufijo SemVer).
 
+El estado tiene el suyo, con el mismo prefijo que su subject y su ruta de esquema
+([10-state.md §2.5](10-state.md)):
+
+```
+subject (NATS):  state.clientes.cliente.v1.acme.cli-1
+type:            com.flux.state.clientes.cliente.v1
+lápida:          com.flux.state.clientes.cliente.deleted.v1
+```
+
 ## 3. Streams de JetStream
 
 ```
 EVT_<DOMINIO>        subjects: <dominio>.>
 DLQ_<DOMINIO>        subjects: dlq.<dominio>.>
+STATE_<DOMINIO>      subjects: state.<dominio>.>          (solo si el dominio tiene estado)
 ```
 
 ```
 EVT_PEDIDOS          pedidos.>
 DLQ_PEDIDOS          dlq.pedidos.>
+STATE_CLIENTES       state.clientes.>
+DLQ_CLIENTES         dlq.clientes.>  y  dlq.state.clientes.>
 ```
+
+- `STATE_<DOMINIO>` guarda **un valor por clave** y no caduca; su configuración está en
+  [10-state.md §2.1](10-state.md). Solo existe si el dominio tiene contratos de estado.
+- **El stream `DLQ_<DOMINIO>` de un dominio con estado captura además `dlq.state.<dominio>.>`**:
+  la DLQ de estado ([10-state.md §6](10-state.md)). Un dominio sin estado conserva el
+  `DLQ_<DOMINIO>` de siempre, sin tocarlo.
 
 - Un stream **por dominio**, no por evento. Un stream por evento multiplica ficheros
   y consumidores sin ganar aislamiento real.
@@ -145,7 +185,7 @@ DLQ_PEDIDOS
 ## 4. Durable consumers
 
 ```
-<servicio>__<subject con los puntos sustituidos por guiones bajos>
+<servicio>__<subject con los puntos y los guiones sustituidos por guiones bajos>
 ```
 
 ```
@@ -155,13 +195,43 @@ durable:  facturacion-api__pedidos_pedido_v1_creado
 ```
 
 **Los nombres de durable consumer de NATS tampoco admiten `.`** — sustituirlos por
-`_` y separar el servicio con `__` mantiene la reversibilidad: partiendo por `__`
-recuperas servicio y subject exactos. Un nombre de consumidor que no dice qué servicio
-lo tiene abierto es inútil en `nats consumer ls` cuando hay que decidir a las 3 de la
-mañana si se puede borrar.
+`_` y separar el servicio con `__` permite recuperar el servicio partiendo por `__`. Un
+nombre de consumidor que no dice qué servicio lo tiene abierto es inútil en `nats consumer
+ls` cuando hay que decidir a las 3 de la mañana si se puede borrar.
+
+Los **guiones** del subject (`linea-envio`) pasan también a `_`, como hacen `durableName()` de
+los SDKs y `scripts/lib/manifest.mjs`; esta sección solo decía los puntos. Como consecuencia
+`a-b.c…` y `a.b-c…` dan el mismo durable, y el generador de ACLs rechaza un manifiesto que
+consuma los dos ([06-security.md §3.0](06-security.md)).
 
 Un SDK L1 **DEBE** derivar este nombre automáticamente a partir del nombre de servicio
 de `connect()` y del subject de `subscribe()`.
+
+### 4.1 Durables de estado
+
+```
+<servicio>__state_<dominio>_<agregado>_v<major>[__<tenant>]
+```
+
+```
+contrato: clientes.cliente.v1     servicio: tienda-web      tenant: acme
+durable:  tienda-web__state_clientes_cliente_v1__acme        (sin tenant: …_v1)
+```
+
+Es el de un `watch` ([10-state.md §5.2](10-state.md)), sobre `STATE_<DOMINIO>`. El contrato se
+escribe como en un subject —`state.clientes.cliente.v1`— y se transforma igual: puntos y
+guiones a `_`. **El tenant va al final, tras otro `__`, y con sus guiones también a `_`**: un
+durable compartido reparte los mensajes entre quienes lo usan (A-47), así que dos instancias del
+mismo servicio con tenants distintos **necesitan** durables distintos. Con `__` como separador
+caben tres partes sin ambigüedad: ni el servicio (`[a-z0-9-]`) ni los tokens del contrato pueden
+contener `__`.
+
+El dueño de un dominio con estado lee su DLQ de estado con
+`<servicio>__dlq_state_<dominio>` sobre `DLQ_<DOMINIO>` (filtro `dlq.state.<dominio>.>`), el
+paralelo del `<servicio>__dlq_<dominio>` de [06-security.md §3.1](06-security.md).
+
+Un nombre de consumidor admite **255 caracteres** como máximo (A-42); por eso el tenant de un
+estado se limita a 64.
 
 ## 5. Antipatrones
 
@@ -173,8 +243,9 @@ de `connect()` y del subject de `subscribe()`.
 | `pedidos.pedido.v1.creado.retry` | Un 5º token rompe todos los wildcards. | Los reintentos son de JetStream, no del subject |
 | `pedidos.pedido.v1.OrderCreated` | Mayúsculas + idioma mezclado. | `pedidos.pedido.v1.creado` |
 | `core.entidad.v1.cambiado` | Dominio genérico = ningún dominio. | Nombra el bounded context real |
+| `state.cliente.v1.creado`, `dlq.pedido.v1.creado` | Un dominio reservado: choca con un stream del protocolo, y el SDK lo rechaza (`RESERVED_DOMAIN`). | Nombra el bounded context real — [§1.3](#13-dominios-reservados) |
 
-> **Sobre `actualizado`:** es el antipatrón más caro de los seis. Obliga a cada
+> **Sobre `actualizado`:** es el antipatrón más caro de los siete. Obliga a cada
 > consumidor a comparar contra su propia copia para averiguar qué pasó, lo que
 > significa que cada consumidor implementa —y equivoca— su propia lógica de diff.
 > Un evento debe declarar el hecho, no delegar su descubrimiento.

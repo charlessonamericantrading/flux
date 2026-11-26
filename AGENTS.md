@@ -75,6 +75,19 @@ https://raw.githubusercontent.com/charlessonamericantrading/flux/main/protocol.j
 11. **UTF-8 literal, sin escapes `\u`.** `café`, no `café`. Ambos son JSON válido
     y **no son los mismos bytes**.
 
+**Estado replicado** (extensión opcional, [10-state.md](specification/10-state.md)):
+
+12. **Un dato que guarda otro sistema es estado, no una llamada.** `state.watch` / `state.get`,
+    nunca un `GET` por HTTP ni polling. Solo el **dueño** escribe (`put`, `delete`).
+13. **`put` exige `aggregateVersion` (entero ≥ 1) y es condicional.** Una versión que no avanza da
+    `stale`, que **no** es un error. Una clave borrada solo se recrea con una versión mayor que la
+    de su lápida.
+14. **El dato personal solo vive en estado**: clasificado `confidential`, con `x-pii` en el
+    esquema, y borrable con `delete`. `restricted` no se admite. En un **evento**, la regla 5
+    sigue intacta. Un consumidor **DEBE** borrar su copia local al recibir una lápida.
+15. **`dlq`, `state`, `rpc` y `system` no son dominios.** `publish()` los rechaza
+    (`RESERVED_DOMAIN`).
+
 ---
 
 ## 2. Publicar un evento
@@ -196,6 +209,10 @@ Estas no dan error: dan comportamiento incorrecto. Un agente las comete casi sie
 | `_INBOX.>` común a todos los servicios | **Cualquiera lo lee todo.** Las entregas de un pull consumer viajan por el inbox: con `_INBOX.>` compartido, un servicio sin concesión sobre `inventario` leyó un evento completo de `inventario` (medido en NATS 2.14.5). Cada servicio usa **`_INBOX.<servicio>.>`**, fijado por el SDK a partir del nombre de servicio. |
 | Una credencial o un TLS mal puestos fallan con un error | **No siempre.** `waitOnFirstConnect` (Node) y `retry_on_initial_connect` (Rust) reintentan **cualquier** error: un certificado que no verifica deja `connect()` colgado, o el servicio arrancado y mudo. `connect()` espera a un broker caído pero **falla al instante** ante lo que esperar no arregla ([03-delivery.md §6.1](specification/03-delivery.md)). Un `ack` o un pull denegados tampoco lanzan: el evento se reentrega para siempre ([06-security.md §3.7](specification/06-security.md)). |
 | Los formateadores ISO por defecto sirven para `time` | No. Go recorta ceros (`.41Z`), Python da microsegundos y `+00:00`. Formatea explícitamente: **exactamente 3 decimales y sufijo `Z`**. |
+| La clave y el tenant de un estado van en el sobre | **Van en el subject**: `state.<dom>.<agr>.v<M>.<tenant>.<clave>`, y `tenantid` y `subject` del sobre **DEBEN** coincidir (si no, POISON `STATE_SUBJECT_MISMATCH`). El broker **no valida la clave**: acepta `*`, `a.b` (dos tokens: la entrada queda fuera de todo filtro, sin error) y 2000 caracteres. Valídala tú: `^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$`, con coincidencia **completa**: en Python y PHP el `$` acepta un `\n` final (medido). |
+| `put` solo publica | **Es condicional**: lee la secuencia (`DIRECT.GET`), no escribe si la versión no avanza y publica con `Nats-Expected-Last-Subject-Sequence`. Un `publish` de core a un subject de estado sobrescribe **sin chequeo ni acuse**. El conflicto de secuencia tiene **dos** códigos: `10071` (un nodo) y `10164` (cluster, bajo carrera): reconoce los dos o no reintentarás en producción. Reintenta con **el mismo `id`**. |
+| El estado se recupera desde la DLQ | **No se reproduce**: `dlq.state.>` no lleva el dato (`data` es `{ key, revision }`) y republicar un valor viejo pisaría uno nuevo. `flux dlq replay` lo rechaza; la recuperación es `flux state resync`. |
+| Un estado con PII es «lo mismo que un evento con PII» | No: el estado va `confidential` con `x-pii` y **se puede borrar** (`delete` sustituye el valor por una lápida). Pero el borrado **físico** en disco y las **claves** y **tenants** (visibles en `STREAM.INFO`) no los cubre: la clave es un id opaco, nunca un email. |
 
 > Las tres primeras trampas de JetStream comparten forma: **el servidor acepta la
 > petición, no devuelve error, y aplica otra cosa.** Ninguna se detecta leyendo código;
@@ -206,7 +223,7 @@ Estas no dan error: dan comportamiento incorrecto. Un agente las comete casi sie
 Opt-in. Un servicio que no las use sigue siendo conforme, pero si el proyecto ya las
 tiene activas, tu código debe respetarlas.
 
-**Capacidades por SDK:** cada SDK declara las que tiene (`signing`, `security`: columna *Capacidades* del [`README.md`](README.md)), y uno sin `security` no es compatible con las ACLs de `gen-acl.mjs` ([00-protocol.md §5](specification/00-protocol.md)).
+**Capacidades por SDK:** cada SDK declara las que tiene (`signing`, `security`, `state`: columna *Capacidades* del [`README.md`](README.md)), y uno sin `security` no es compatible con las ACLs de `gen-acl.mjs` ([00-protocol.md §5](specification/00-protocol.md)). Uno sin `state` no puede escribir ni leer estado replicado.
 
 ### Validación L3 — [00-protocol.md §5](specification/00-protocol.md)
 
@@ -226,6 +243,38 @@ equipo la semana que viene.
 - Un fallo al **consumir** se clasifica **PERMANENT**, y en Python/Go lo declara el propio
   error en vez de dejarlo en manos de la política de errores desconocidos.
 
+### Estado replicado — [10-state.md](specification/10-state.md)
+
+El **valor actual** de un agregado, que el dueño publica y los demás observan: sustituye a
+`GET /clientes/123`, a la carga inicial y al polling de datos. Un evento dice *qué pasó*; el
+estado lleva *el dato*.
+
+```ts
+await bus.state.put("clientes.cliente.v1", "cli-1",
+  { clienteId: "cli-1", nombre: "Ana", email: "ana@example.com", aggregateVersion: 7 });
+await bus.state.delete("clientes.cliente.v1", "cli-1", { aggregateVersion: 8 });
+const actual = await bus.state.get("clientes.cliente.v1", "cli-1");       // entrada | null
+await bus.state.watch("clientes.cliente.v1", async (entrada) => {         // foto + cambios
+  if (entrada.deleted) return borrarLocal(entrada.tenantId, entrada.key);
+  await guardarLocal(entrada);                  // UPDATE … WHERE aggregate_version < $n
+}, { onSynced: () => listo() });
+```
+
+- Subject `state.<dom>.<agr>.v<M>.<tenant>.<clave>`: **6 tokens**, tenant y clave **dentro**. Un
+  stream `STATE_<DOM>` guarda **un valor por clave**; `delete` publica una **lápida** (con su
+  versión) que lo sustituye.
+- **Tenant explícito**: sin valor por defecto (ni `system` implícito). Una clave que no cumple el
+  patrón es `INVALID_STATE_KEY`, no algo que se escape. El tenant de `put`/`get`/`delete` sale de la
+  opción, del evento en curso y de `connect()`; el de `watch`, solo de la opción y de `connect()`.
+- `onSynced` se invoca **una vez** por `watch`: al terminar la foto inicial, o de inmediato si no hay nada.
+- **Siete códigos**: `INVALID_STATE_CONTRACT`, `INVALID_TENANT_FOR_STATE`, `INVALID_STATE_KEY`,
+  `MISSING_AGGREGATE_VERSION`, `RESERVED_DOMAIN` (PERMANENT), `STATE_SUBJECT_MISMATCH` (POISON) y
+  `STATE_CONFLICT` (RETRYABLE) — [04-errors.md §6](specification/04-errors.md).
+- La DLQ de estado (`dlq.state.<dom>.<agr>.v<M>`) **no lleva el dato**, y el estado **no se
+  reproduce** desde ella.
+- Métrica `flux_state_writes_total{contract,outcome}`; **nunca** la clave ni el tenant como
+  etiqueta. Esquemas en `schemas/state/…`, con `aggregateVersion` obligatoria.
+
 ### Firma Ed25519 — [07-signing.md](specification/07-signing.md)
 
 - Se firma `serialize(evento sin `signature` y sin extensiones `dlq*`)`. **No hay
@@ -240,7 +289,7 @@ equipo la semana que viene.
 ### Métricas — [08-observability.md](specification/08-observability.md)
 
 Los nombres y etiquetas son **contrato**, no decisión de cada servicio. Siete métricas
-`flux_*`.
+`flux_*` (más `flux_state_writes_total` en un SDK con la capacidad `state`).
 
 - **Nunca** etiquetes por `tenantid`, `id` ni `correlationid`: un tenant nuevo no debe
   crear series temporales nuevas. En **trazas** sí.
@@ -271,6 +320,8 @@ Los nombres y etiquetas son **contrato**, no decisión de cada servicio. Siete m
 | Metadatos en la raíz del envelope | Las extensiones CloudEvents solo admiten escalares. Acabarás con JSON dentro de un string. Va todo en `data`. |
 | `core.entidad.v1.cambiado` | Dominio genérico = ningún dominio. |
 | Credenciales `.creds`/`.nk` en el repo | Están en `.gitignore` por algo. Van en el gestor de secretos. |
+| Meter el dato personal en un evento «porque el consumidor lo necesita» | Es lo que el **estado** resuelve: el evento lleva `clienteId`, el estado lleva el dato, clasificado y borrable. |
+| Leer un dato de otro servicio con `GET` por HTTP | Es **estado** (`state.get` / `state.watch`), no petición/respuesta. |
 
 ## 11. Antes de dar por terminado
 
@@ -289,6 +340,9 @@ Los nombres y etiquetas son **contrato**, no decisión de cada servicio. Siete m
       `node scripts/check-compat.mjs`
 - [ ] Si tocaste `AGENTS.md` o `specification/`: `node scripts/build-llms.mjs`
 - [ ] Ninguna métrica etiquetada por `tenantid`, `id` ni `correlationid`
+- [ ] Si escribes **estado**: `aggregateVersion` ≥ 1 en `data` y en el esquema (`schemas/state/…`);
+      el dato personal con `x-pii` y `confidential`; el consumidor borra su copia al recibir una lápida
+- [ ] Ningún dominio llamado `dlq`, `state`, `rpc` ni `system`; ninguna clave o tenant como etiqueta de métrica
 
 ---
 
