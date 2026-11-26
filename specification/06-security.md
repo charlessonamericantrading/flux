@@ -408,14 +408,34 @@ cada handler se acuerde.
 ### 5.1 Derecho de supresión
 
 Los eventos son inmutables; el RGPD exige poder borrar. La contradicción se resuelve
-**no metiendo PII en el evento**:
+**separando lo que pasó de lo que se sabe**: el evento lleva referencias y el dato vive en el
+**estado**, que sí se puede borrar ([10-state.md](10-state.md)).
 
-- El evento lleva **referencias** (`clienteId`), no PII (`email`, `nombre`, `dni`).
-- La PII vive en el servicio dueño, donde se puede borrar de verdad.
-- Un consumidor que necesite la PII la pide al dueño y aplica su propia retención.
+| | Evento | Estado |
+|---|---|---|
+| ¿Datos personales? | **No.** Solo referencias (`clienteId`). La regla dura 5 de `AGENTS.md` no cambia | **Sí**, con `dataclassification: "confidential"` y `"x-pii": true` en los campos del esquema |
+| ¿Se puede borrar? | No: es un log inmutable | **Sí**: `state.delete` sustituye el valor por una lápida |
 
-Un subject cuyo `data` contenga PII directa **DEBE** documentarlo y **DEBERÍA**
-rediseñarse. La alternativa —cripto-borrado con clave por sujeto— queda fuera de v1.
+- El evento dice **qué pasó**: `clienteId`, no `email` ni `nombre`.
+- El estado lleva **el dato**: `put` guarda el valor actual de cada agregado y `delete` lo
+  sustituye por una lápida, con lo que el valor anterior **sale del stream**. El consumidor
+  ya no pide el dato al dueño —que es justo la llamada que flux quiere eliminar—: lo tiene
+  porque le llegó, y lo mantiene al día con `state.watch`.
+- Un consumidor **DEBE** borrar o anonimizar su copia local al recibir una lápida. Es lo que
+  hace real el derecho de supresión **aguas abajo**.
+- **`restricted` no se admite en estado** en 1.1 (credenciales, salud, financiero): su retención
+  de 24 h no cabe en un almacén que no caduca, y no debe tomarse esa decisión por omisión.
+- **La DLQ de estado no conserva el dato** (`data` pasa a `{ key, revision }`), para que un dato
+  borrado no siga 90 días en la DLQ ([10-state.md §6](10-state.md)).
+- Lo que el estado **no** garantiza: el borrado **físico** en disco —depende de la compactación
+  de JetStream—, las copias fuera del broker (backups, réplicas locales que ignoren la lápida) y
+  la privacidad de las **claves** y los **tenants**, visibles en los metadatos del stream
+  ([10-state.md §7 y §8](10-state.md)). Por eso no son PII. La garantía fuerte es el cifrado del
+  payload (fase 7).
+
+Un subject de **evento** cuyo `data` contenga PII directa **DEBE** documentarlo y **DEBERÍA**
+rediseñarse: pasar el dato al estado y dejar la referencia en el evento. La alternativa
+—cripto-borrado con clave por sujeto— queda fuera de v1.
 
 ## 6. Superficie operativa
 

@@ -73,6 +73,8 @@ El SDK no logra siquiera construir un evento a partir del mensaje.
 - Falta un atributo obligatorio de CloudEvents
 - `specversion` desconocida
 - `datacontenttype` no soportado
+- Una entrada de estado cuyo sobre **miente sobre su identidad**: su `tenantid`, su `subject` o su
+  `type` no coinciden con el subject de NATS en el que llegó ([§6](#6-errores-de-la-capacidad-state))
 
 → `term()` + DLQ + **alerta inmediata**. Un POISON casi siempre significa que un
 productor está roto o que alguien publicó a mano en el subject equivocado. Es el único
@@ -211,6 +213,11 @@ nats stream get DLQ_PEDIDOS --last-for 'dlq.pedidos.pedido.v1.creado' --json \
 > todos los consumidores aguas abajo y convierte una recuperación en un incidente
 > nuevo.
 
+> **El estado no se reproduce.** Un evento de `dlq.state.>` no lleva el dato (su `data` es
+> `{ key, revision }`) y, aunque lo llevara, republicar un valor viejo pisaría uno nuevo.
+> `flux dlq replay` **DEBE** rechazar `dlq.state.>`; la recuperación es `flux state resync`
+> ([10-state.md §6](10-state.md)).
+
 ## 5. Errores de la capacidad `security`
 
 Un SDK que declara la capacidad `security` ([00-protocol.md §5](00-protocol.md)) **DEBE**
@@ -336,3 +343,65 @@ estos códigos: son estables.
 > **Alcance.** Esto cubre la **primera** conexión. Qué debe hacer un SDK si el broker rechaza
 > las credenciales durante una *re*conexión (una credencial que caduca o se rota) **no está
 > medido**, y esta spec no lo fija: ninguno de estos códigos se define para ese caso.
+
+## 6. Errores de la capacidad `state`
+
+Un SDK que declara la capacidad `state` ([00-protocol.md §5](00-protocol.md),
+[10-state.md](10-state.md)) **DEBE** emitir estos **seis** códigos estables. La lista es
+**cerrada**: un caso que no encaje en ninguno es un hueco de la spec, no un código nuevo que cada
+SDK inventa.
+
+| Código | Clase | Se lanza en | Se emite cuando |
+|---|---|---|---|
+| `INVALID_TENANT_FOR_STATE` | **PERMANENT** | `put`, `get`, `delete`, `watch` | El tenant no cumple `^[a-z0-9]+(-[a-z0-9]+)*$` con 64 caracteres como máximo, o no se puede resolver ninguno: el estado **no** cae en `system` por defecto ([10-state.md §2.4](10-state.md)) |
+| `INVALID_STATE_KEY` | **PERMANENT** | `put`, `get`, `delete` | La clave no cumple `^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$`: un punto, un comodín, un espacio, vacía, de más de 128 caracteres, o que empieza por `_` ([10-state.md §2.3](10-state.md)) |
+| `MISSING_AGGREGATE_VERSION` | **PERMANENT** | `put`, `delete` (y al consumir) | `data` no tiene `aggregateVersion`, o no es un entero ≥ 1 y ≤ 2^53 − 1 ([10-state.md §3.4](10-state.md)) |
+| `STATE_SUBJECT_MISMATCH` | **POISON** | Al consumir: `watch` y `get` | El `tenantid`, el `subject` o el `type` del sobre no coinciden con el subject de NATS en el que llegó la entrada ([10-state.md §5.4](10-state.md)) |
+| `STATE_CONFLICT` | **RETRYABLE** | `put`, `delete` | El chequeo de secuencia agotó sus 3 intentos: alguien escribió la misma clave entre la lectura y la publicación, las tres veces ([10-state.md §3.2](10-state.md)) |
+| `RESERVED_DOMAIN` | **PERMANENT** | `publish`, `subscribe`, `put`, `get`, `delete`, `watch` | Un subject o un contrato usa un dominio reservado: `dlq`, `state`, `rpc` o `system` ([10-state.md §2.7](10-state.md)) |
+
+**Por qué estas clases.**
+
+- Los cuatro que se lanzan al **llamar** (`INVALID_TENANT_FOR_STATE`, `INVALID_STATE_KEY`,
+  `MISSING_AGGREGATE_VERSION`, `RESERVED_DOMAIN`) son **PERMANENT**: la llamada está mal y
+  repetirla da el mismo error ([§5.1](#51-son-permanent)). Un `put` dentro de un handler que los
+  provoque va a la DLQ en la **primera** entrega.
+- **`STATE_SUBJECT_MISMATCH` es POISON**, no PERMANENT: el mensaje es legible, pero **miente sobre
+  su identidad** —su tenant o su clave—, y un productor que lo hace está roto o es hostil. Es
+  lo que [§1.3](#13-poison) pide despertar a alguien por: **alerta inmediata**.
+- **`STATE_CONFLICT` es RETRYABLE**: el conflicto es del entorno —otra instancia escribe la misma
+  clave—, no de la llamada. Un reintento relee y suele resolverlo, o termina en `stale`.
+- `MISSING_AGGREGATE_VERSION` también se aplica **al consumir**: una entrada sin versión
+  válida no se puede aplicar de forma condicional. Es PERMANENT y va a la DLQ de estado.
+
+**Qué DEBE decir el mensaje.** Lo mismo que [§5.2](#52-qué-debe-decir-el-mensaje): el código es
+fijo y la aplicación no puede sustituirlo; el mensaje nombra **qué** está mal y **cómo se
+arregla** (la clave que no encaja, con el patrón; el tenant que falta y que `connect()` o la
+opción `tenantId` lo dan); y **NO DEBE** incluir valores de `data`, por la misma razón que en
+[§5.2](#52-qué-debe-decir-el-mensaje): acaba en logs y en `dlqerror`, y en estado `data` es dato
+personal. Una **clave y un tenant sí pueden citarse**: son identificadores opacos, no PII.
+
+**Lo que no es un código nuevo.** Estos ya existen y se reutilizan tal cual:
+
+| Situación | Código |
+|---|---|
+| `classification: "restricted"` (o una fuera del enum) en un `put`; un mensaje de estado que la lleve | `INVALID_DATACLASSIFICATION` ([01-envelope.md §3.1](01-envelope.md)) |
+| `data` no cumple el esquema del contrato, o el de la lápida | `INVALID_SCHEMA` |
+| El stream de estado (o el consumidor) no existe o no responde, y el servicio no puede crearlo | `NOT_PROVISIONED` — [§5](#5-errores-de-la-capacidad-security) |
+| El broker deniega la operación por permisos | `PERMISSION_DENIED` — [§5](#5-errores-de-la-capacidad-security) |
+
+**`NOT_PROVISIONED` en estado, un matiz.** [§5](#5-errores-de-la-capacidad-security) lo define
+por una **pareja** de señales: crear → denegado e info → no existe. Un SDK de estado no consulta
+ni crea el stream de estado ([10-state.md §8](10-state.md)), así que su señal es otra, medida
+(A-32, A-48): `CONSUMER.INFO` contesta «stream not found» (10059), o `DIRECT.GET` y la publicación
+**no contestan nadie** (`no responders`). Un stream sin `allow_direct` se ve exactamente igual que
+uno que no existe, y el mensaje **DEBE** nombrar las dos causas, y apuntar a `flux provision`
+(lo crea) y a `flux doctor` (lo audita). Se mantiene la frontera de siempre con
+`PERMISSION_DENIED`: si el broker **deniega** la operación, es un permiso, no un recurso.
+
+**Métricas.** Un handler cuyo error es uno de estos acaba contado por las que ya existen
+(`flux_events_dlq_total{code=…}`, [08-observability.md §2.1](08-observability.md)); un
+`STATE_SUBJECT_MISMATCH` cuenta además como `outcome="poison"`. De los errores de la llamada de
+`put` y `delete`, `flux_state_writes_total` solo cuenta `MISSING_AGGREGATE_VERSION` e
+`INVALID_SCHEMA`, los dos como `invalid_schema` ([08-observability.md §2.4](08-observability.md));
+el resto son errores de quien llama y quedan en su excepción.
