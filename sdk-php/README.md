@@ -16,13 +16,16 @@ composer require flux/sdk        # requiere PHP >= 8.2
 
 > ### Estado de verificación
 >
-> ✅ **Suite ejecutada y en verde: 301 tests, 567 assertions** (PHP 8.3.30, PHPUnit
-> 10.5.64, sin `ext-sodium`: 38 saltados). Cubre naming, envelope, serialización byte a
-> byte, clasificación de errores, firma Ed25519, validación L3 contra el bundle real del
-> repositorio, métricas, aislamiento de tenant y todo el runtime del consumidor.
-> **Ninguno necesita broker.**
+> ✅ **Suite ejecutada y en verde: 304 tests, 826 assertions** (PHP 8.3.6, PHPUnit
+> 10.5.67, con `ext-sodium` y `ext-sockets`, sin broker: **4 saltados**, que son los 3
+> tests de integración y 1 que solo corre cuando `basis-company/nats` NO está instalada).
+> Cubre naming, envelope, serialización byte a byte, clasificación de errores, firma
+> Ed25519, validación L3 contra el bundle real del repositorio, métricas, aislamiento de
+> tenant y todo el runtime del consumidor.
+> **301 no necesitan broker. Los 3 de `tests/Integration/` sí**, y se saltan solos si no lo
+> hay (ver más abajo).
 >
-> Sin `ext-sodium` la suite sigue en verde con los tests de firma saltados, que es
+> Sin `ext-sodium` la suite sigue en verde con los tests de firma saltados (37), que es
 > exactamente el comportamiento que se quiere: la firma es una extensión **opcional** del
 > protocolo y no debe impedir usar el resto del SDK. Lo mismo vale para
 > `opis/json-schema` y la validación L3.
@@ -575,7 +578,8 @@ pasaría a tocar las aplicaciones, que es lo que flux existe para evitar.
 
 Vienen dos implementaciones:
 
-- `BasisNatsTransport` — sobre `basis-company/nats`. Sin verificar (ver el aviso de arriba).
+- `BasisNatsTransport` — sobre `basis-company/nats`. Verificado contra un NATS real (ver el
+  aviso de arriba): `tests/Integration/BasisNatsTransportIntegrationTest.php`.
 - `InMemoryTransport` — para tus tests. Inyéctalo y comprueba qué publica tu handler sin
   levantar nada:
 
@@ -761,22 +765,31 @@ Dos reglas que un port suele dar por hechas y no lo están:
 ```bash
 cd sdk-php
 composer install
-vendor/bin/phpunit                                    # 301 tests, 567 assertions (38 saltados)
-php -d extension=sodium -d extension=sockets vendor/bin/phpunit   # 0 saltados
+vendor/bin/phpunit            # 304 tests, 826 assertions; 4 saltados sin broker
+vendor/bin/phpunit --exclude-group integration,sin-libreria-nats --fail-on-skipped
+                              # 300 tests, 826 assertions, 0 saltados (con sodium y sockets)
+FLUX_NATS_URL=nats://127.0.0.1:4222 vendor/bin/phpunit --group integration   # necesita NATS
 ```
 
-Ninguno necesita broker. Varios leen `protocol.json` del repositorio directamente, de modo
-que una divergencia entre el SDK y el contrato falla en CI en vez de en producción con otro
-SDK del ecosistema — incluidos los buckets del histograma, la lista de las siete métricas y
-las etiquetas prohibidas.
+`composer install` instala `basis-company/nats` porque está en `require-dev`, así que
+`vendor/bin/phpunit` a secas **nunca** da 0 saltados: el test del grupo `sin-libreria-nats`
+solo corre con la librería ausente (`composer remove --dev basis-company/nats`) y se salta
+en cuanto está. Por eso el comando de 0 saltados lo excluye.
+
+**301 de los 304 no necesitan broker.** Los 3 de `tests/Integration/` hablan con un NATS
+real y se saltan solos si no lo hay. Varios de los otros leen `protocol.json` del
+repositorio directamente, de modo que una divergencia entre el SDK y el contrato falla en
+CI en vez de en producción con otro SDK del ecosistema — incluidos los buckets del
+histograma, la lista de las siete métricas y las etiquetas prohibidas.
 
 | Suite | Tests | Se salta sin |
 |---|--:|---|
-| `EnvelopeTest`, `ProtocolTest`, `ClassifierTest`, `FluxBusTest`, `AckTest`, … | 203 | 1 de ellos, `ext-sockets` |
+| `EnvelopeTest`, `ProtocolTest`, `ClassifierTest`, `FluxBusTest`, `AckTest`, … | 203 | 1 de ellos, `ext-sockets`; otro (`sin-libreria-nats`) con `basis-company/nats` instalada |
 | `SigningTest` | 33 | `ext-sodium` |
 | `ValidationTest` (bundle real del repositorio, publish, consumo y sondeo) | 29 | — |
 | `MetricsTest` | 19 | — |
 | `TenantIsolationTest` (incluye firma y métricas **a través del bus**) | 17 | 4 de ellos, `ext-sodium` |
+| `Integration/BasisNatsTransportIntegrationTest` (NATS real) | 3 | el broker o `ext-sockets` |
 
 Dos extensiones opcionales hacen que algunos tests se salten, y en los dos casos eso es
 deliberado:
@@ -785,6 +798,9 @@ deliberado:
   no tenerla no debe impedir usar el resto del SDK.
 - **`ext-sockets`** (1 test): el que comprueba que `SOCKET_ECONNRESET` se traduce a
   `"ECONNRESET"` por **nombre** de constante y no por valor (10054 en Windows, 104 en Linux).
+
+Sin ninguna de las dos extensiones y sin broker se saltan 42 en total: esos 37 + 1, los 3 de
+integración y el de `sin-libreria-nats`.
 
 Para los invariantes que sí requieren un servidor real —que `ack_wait` sobrevive, que un
 durable con puntos es rechazado, que un publish de core a un subject mal escrito se evapora
