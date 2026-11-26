@@ -628,8 +628,9 @@ suscripción es `PERMISSION_DENIED` (§7.1), no `NOT_PROVISIONED`.
 
 - **Nunca** a quien llama `rpc.>`, `rpc.<dominio>.>` ni un comodín por token: podría llamar a todo.
   `protocol.json` → `rpc.acl` fija los patrones (`callerPublish`, `ownerSubscribe`) y lo que nunca se concede.
-- **El generador** (`gen-acl.mjs`, las claves del manifiesto y los casos de seguridad) lo documentará
-  [06-security.md §3](06-security.md) cuando llegue; esta sección fija **lo medido** que debe producir.
+- **El generador** (`gen-acl.mjs`, las claves `calls` y `serves` del manifiesto y los casos de seguridad S21 a S29) está
+  documentado en [06-security.md §3.9](06-security.md#39-peticiónrespuesta-calls-serves-y-sus-permisos); esta sección fija
+  **lo medido** que produce.
 - **Una petición denegada**: con `@nats-io/*` falla en ~1 ms con `Permissions Violation for Publish to
   "rpc.clientes.cliente.v1.obtener"` (A-66); con `async-nats`, **agota su timeout** y el aviso solo se ve en el
   evento de la conexión (A-72). La regla de [06-security.md §3.7](06-security.md) rige aquí: el SDK **DEBE**

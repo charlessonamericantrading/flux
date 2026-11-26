@@ -2393,7 +2393,8 @@ justo lo que un humano no mantiene.
 El manifiesto de ownership ([`examples/services.json`](../examples/services.json)) es
 la fuente, y [`scripts/gen-acl.mjs`](../scripts/gen-acl.mjs) deriva la configuración. Cada servicio
 declara `name`, `owns`, `consumes` y, si observa estado replicado, `watches`
-([§3.8](#38-estado-replicado-watches-y-sus-permisos)).
+([§3.8](#38-estado-replicado-watches-y-sus-permisos)); y, si hace o atiende peticiones, `calls` y `serves`
+([§3.9](#39-peticiónrespuesta-calls-serves-y-sus-permisos)).
 
 ```bash
 node scripts/gen-acl.mjs examples/services.json                       # genera (bloque `accounts`, incluible con `include`)
@@ -2421,7 +2422,7 @@ El generador rechaza los manifiestos que rompen el modelo, no solo los mal forma
 | Un servicio suscrito a su propio dominio | Suele indicar que ese flujo debería ser una llamada interna, no un evento |
 | Nombre de servicio fuera de `[a-z0-9-]`, o repetido | Alimenta los nombres de durable consumer y el prefijo del inbox — [02-naming.md §4](02-naming.md) |
 | Dos subjects que dan el mismo durable | Los puntos y los guiones del subject pasan a `_`: el segundo `consumers.add` reutilizaría el durable del primero con otro filtro, sin error |
-| Una clave desconocida en un servicio, o ser dueño (o consumir, u observar) un dominio reservado (`dlq`, `state`, `rpc`, `system`) | Una errata no puede ser «un servicio sin permisos», y el «dueño» de `state` recibiría `state.>` — y las reglas de `watches`, en [§3.8](#38-estado-replicado-watches-y-sus-permisos) |
+| Una clave desconocida en un servicio, o ser dueño (o consumir, observar, llamar o atender) un dominio reservado (`dlq`, `state`, `rpc`, `system`) | Una errata no puede ser «un servicio sin permisos», y el «dueño» de `state` recibiría `state.>` — y las reglas de `watches`, en [§3.8](#38-estado-replicado-watches-y-sus-permisos), y las de `calls` y `serves`, en [§3.9](#39-peticiónrespuesta-calls-serves-y-sus-permisos) |
 | Con `--nkeys`: un servicio sin clave, una clave repetida, o una semilla | Sin clave no hay identidad; repetida es una credencial compartida (§2); una semilla es un secreto y nunca va a una config |
 
 Con `--tenants` (Modelo B, [09-multitenancy.md](09-multitenancy.md)) los permisos de cada
@@ -2465,7 +2466,9 @@ ese subject—, así que:
   suscripción directa a `inventario.>` sí fue denegada.
 
 **Regla: un servicio no recibe ningún permiso de suscripción sobre subjects de dominio.**
-Su lista de suscripción es `_INBOX.<servicio>.>` y nada más.
+Su lista de suscripción es `_INBOX.<servicio>.>` y nada más. La única excepción es el **dueño de una operación**
+de petición/respuesta, que añade `rpc.<dominio>.>` ([§3.9](#39-peticiónrespuesta-calls-serves-y-sus-permisos)): `rpc.`
+no es un dominio de eventos, ningún stream lo captura y el SDK se suscribe al subject exacto de cada operación.
 
 ### 3.3 El inbox es privado
 
@@ -2511,7 +2514,7 @@ Por qué cada uno, y por qué con esa forma:
 | `CONSUMER.CREATE.<S>.<d>.<subject>` — **solo con `--dev`** | `consumers.add`: crea el durable o confirma el existente | **El filtro va en el subject**: así es la única forma de que *una ACL vea el filtro*. Con el mismo subject y otro filtro en el cuerpo el servidor responde `Consumer create request did not match filtered subject from create subject` (A-4): no se puede ampliar el consumo por esa vía |
 | `CONSUMER.INFO.<S>.<d>` | `consumers.get`, el sondeo de `num_pending`, y **lo primero que `subscribe()` pregunta**: *info antes de crear* | Sin él `subscribe()` no puede saber si el durable existe y falla con `PERMISSION_DENIED` ([§3.7](#37-las-denegaciones-se-ven)); **no** es `NOT_PROVISIONED`, porque no se sabe si falta |
 | `CONSUMER.MSG.NEXT.<S>.<d>` | Pedir mensajes | Es lo que confina el consumo: sin este permiso, el consumidor existe pero no entrega a nadie —y **`subscribe()` falla con `PERMISSION_DENIED`**, en vez de dejarlo inerte ([§3.7](#37-las-denegaciones-se-ven))—. Pedir mensajes del durable *de otro servicio* es una violación (A-8) |
-| `$JS.ACK.<S>.<d>.>` | `ack`, `nak`, `term` y *work-in-progress* | Medido (A-3): `$JS.ACK.EVT_PEDIDOS.<durable>.1.1.1.<ts>.0`, nueve tokens. El `>` final es porque lo que sigue al durable lo pone el broker |
+| `$JS.ACK.<S>.<d>.>` | `ack`, `nak`, `term` y *work-in-progress* | Medido (A-3): `$JS.ACK.EVT_PEDIDOS.<durable>.1.1.1.<ts>.0`, nueve tokens. El `>` final es porque lo que sigue al durable lo pone el broker. **Un servicio con `allow_responses` (el dueño de una operación) confirma una entrega aunque este permiso le falte** (A-109, [§3.9](#39-peticiónrespuesta-calls-serves-y-sus-permisos)) |
 
 > **Riesgo declarado.** La forma del subject de ack es del servidor: con un dominio de
 > JetStream, o en otra versión, puede llevar tokens delante del stream. Si cambia, la ACL
@@ -2773,6 +2776,109 @@ para cada dominio con estado:
 
 Un dominio **sin** contratos de estado conserva su `DLQ_<DOM>` de la 1.0 y no recibe ningún permiso de estado:
 1.1 es aditiva.
+
+### 3.9 Petición/respuesta: `calls`, `serves` y sus permisos
+
+La petición/respuesta ([11-request-reply.md](11-request-reply.md)) viaja por **core NATS**: no hay consumidores, ni
+`$JS.API`, ni `$JS.ACK`. Sus permisos son de otra forma. Los fija `protocol.json` → `rpc.acl` (derivados de A-66, A-68,
+A-71 y A-73, medidos a mano contra un broker), los **genera** [`gen-acl.mjs`](../scripts/gen-acl.mjs) y los **ejecutan**
+contra un nats-server real [`verify-acl.mjs`](../scripts/verify-acl.mjs) (secciones 1c, 3, 4c, 5c, 6c y 8) y los casos S21 a
+S29 de la suite de seguridad, en los dos sentidos: lo concedido funciona y lo no concedido se deniega, y **rápido**. Todo lo
+de [§3.1 a §3.7](#31-dlq) rige igual: inbox privado, nada de `_INBOX.>`, y las denegaciones se ven.
+
+#### El manifiesto
+
+```jsonc
+{ "services": [
+  { "name": "crm-api",         "owns": ["clientes"],
+    "serves": ["clientes.cliente.v1.calcular-descuento", "clientes.cliente.v1.obtener"] },   // el dueño atiende
+  { "name": "facturacion-api", "owns": ["facturacion"],
+    "calls":  ["clientes.cliente.v1.calcular-descuento"] }                                    // quien llama
+] }
+```
+
+`calls` y `serves` son listas de **operaciones**: el nombre de la operación ([11-request-reply.md §2.2](11-request-reply.md)),
+cuatro tokens y **sin el prefijo `rpc.`**, que pone el SDK. Cada una necesita su par `request`/`reply` en
+`schemas/rpc/…` (índice `rpc` de `schemas/bundle.json`), como un `consumes` necesita su esquema.
+
+| El generador rechaza | Por qué |
+|---|---|
+| Una operación con el prefijo `rpc.` (`rpc.clientes.cliente.v1.obtener`) o de otro dominio reservado (`state.…`) | `rpc` es un dominio reservado (`RESERVED_DOMAIN`): el prefijo lo pone el SDK, y el mensaje dice cómo escribirla |
+| Un comodín (`clientes.cliente.v1.*`, `clientes.>`) | `calls` concede publicar en el subject **exacto** de cada operación: con un comodín, quien llama podría llamar a todas. En `serves`, el comodín ya es el permiso (`rpc.<dominio>.>`), no la entrada |
+| Una operación que no existe en el bundle, o una que no cumple el patrón (tres tokens, mayúsculas) | Sin su par de esquemas no hay contrato; casi siempre es una errata o un esquema que falta (el mensaje lista las del contrato y dónde crear el par) |
+| Atender una operación de un dominio que no es del servicio | **Solo el dueño responde**: con dos servicios sobre la misma operación los dos la ejecutan y quien llama ve **una** respuesta (A-60) |
+| Llamar a una operación que **nadie atiende** (`serves`), a un dominio sin dueño, o a una operación **propia** | Quien llama solo vería `no responders` (`RPC_UNAVAILABLE`); una llamada a lo propio es una llamada de función, no una petición por el bus |
+| Una operación repetida, o `calls`/`serves` que no es una lista | Un permiso se concede una vez; una errata no puede ser «sin permisos» |
+
+#### Qué recibe cada rol
+
+| Rol | Publicar | Suscribirse | `allow_responses` |
+|---|---|---|---|
+| **Quien llama** (`calls`) | `rpc.<operación>`, el subject **exacto** de cada una. Nada más de `rpc.` | Solo su inbox privado `_INBOX.<servicio>.>` | No |
+| **El dueño** (`serves`) | **Ningún** permiso sobre `rpc.` ni sobre inboxes | Su inbox y `rpc.<dominio>.>`, **uno por dominio servido** | `{ max: 1, expires: 30s }` |
+| Cualquier otro, y un dueño que no declara `serves` | Nada de `rpc.` | Solo su inbox | No |
+
+Un servicio que **solo llama** no recibe ninguna suscripción de dominio. Con el ejemplo de arriba:
+
+```jsonc
+// facturacion-api — llama a calcular-descuento
+"publish":   [ …, "rpc.clientes.cliente.v1.calcular-descuento" ],              // el subject EXACTO, y nada más
+"subscribe": [ "_INBOX.facturacion-api.>" ]
+
+// crm-api — dueño de clientes; atiende calcular-descuento y obtener
+"publish":   [ … ]                                                              // ni un permiso `rpc.` ni de inboxes
+"subscribe": [ "_INBOX.crm-api.>", "rpc.clientes.>" ],
+"allow_responses": { max: 1, expires: "30s" }
+```
+
+**Cada permiso, y por qué es esa forma exacta** (lo medido, en la suite como S21 a S29):
+
+| Permiso | Para qué | Lo que impide la forma |
+|---|---|---|
+| `rpc.<operación>` (quien llama) | Publicar la petición | Una llamada a lo no concedido falla en **~1 ms** con `Permissions Violation for Publish to "rpc.…"`, aunque sea otra operación del mismo dominio, de otro dominio o del propio dueño (A-66, A-100; S21). Con `rpc.<dominio>.>` llamaría a todas las del dominio; con `rpc.>`, a las de todos |
+| `rpc.<dominio>.>` (el dueño) | Suscribirse. El SDK usa el subject **exacto** de cada operación (A-64): lo que se concede no es lo que se usa | Quien llama no se suscribe ni a la operación, ni a su dominio, ni a `rpc.>`: leería las peticiones de todos, con sus datos personales. **Suplantar el grupo de cola del dueño** tampoco: `Permissions Violation … using queue "crm-api"`. Ni siquiera el dueño recibe `rpc.>` ni un comodín por token (A-102; S22) |
+| Su inbox `_INBOX.<servicio>.>` | Recibir la respuesta | Sin el privado, cualquiera lee las respuestas ajenas, que pueden llevar datos personales: espía de `_INBOX.>` y del inbox de quien llama, ninguna admitida (A-71, A-103; S23). Un servicio que no fija su inbox (el prefijo aleatorio de la librería) no puede ni pedir |
+| `allow_responses: { max: 1, expires: 30s }` | Que el dueño conteste, **sin** ningún permiso de publicación sobre inboxes | De dos respuestas a la misma petición llega una y el broker deniega la otra; una respuesta a un inbox que no es el `reply` de la petición recibida, también; el dueño no puede escribir por su cuenta ni en el inbox de quien llama ni en el suyo (A-68, A-104; S24). Con `_INBOX.>` de publicación desaparece el `max: 1` |
+| …su `expires` | Que el permiso temporal caduque | **30 s, por encima del timeout máximo de una llamada (25 s)**: una respuesta legítima nunca llega después, y una tardía se deniega (A-105; S25: a los 24 s llega, a los 31 s se deniega). `allow_responses: true` admite una respuesta y **no caduca** (A-68) |
+
+**Nunca**, a ningún rol: `rpc.>`, `rpc.<dominio>.>` ni un comodín por token **para publicar**; `rpc.>`, `rpc.*.>` ni `>`
+**para suscribirse**; un permiso de publicación sobre `_INBOX.`; un `allow_responses` sin acotar. `protocol.json` lo
+fija (`callerNeverPublish`, `ownerNeverSubscribe`, `ownerPublishOnInboxes: "never"`) y `check-protocol-json.mjs` **ejecuta
+el generador** sobre servicios de prueba para comprobarlo, con 49 mutaciones (un generador que concede `rpc.<dominio>.>`
+a quien llama, `rpc.>` o publicar en inboxes al dueño, o un `allow_responses` sin acotar, se detecta). La suite lo mide
+además con `conformance/security/mutantes.mjs`: copia el generador, le aplica un error real y exige que los casos fallen.
+
+#### Cómo se ve cada permiso que falta
+
+Es la minimalidad de §3.4, para la petición/respuesta (S27): sin cualquiera de los cuatro, el fallo es el que toca y **no
+parece un servicio sano**. Lo que **DEBE** hacer el SDK con cada uno es la tabla de [§3.7](#37-las-denegaciones-se-ven) y
+[11-request-reply.md §7.1](11-request-reply.md).
+
+| Falta… | Qué ve quien llama | Qué ve el dueño |
+|---|---|---|
+| El permiso de publicación sobre la operación | Denegada en ~1 ms con `@nats-io/*` (con `async-nats`, solo un timeout y el `-ERR` por el evento de la conexión: A-72) | — |
+| Su inbox privado | La librería ve denegada la suscripción de su inbox y **la petición falla en ms** con el subject del inbox; la petición ya salió y **llega al dueño** (A-107) | Contesta a un inbox que nadie lee |
+| La suscripción del dueño | **`no responders`** en ~2 ms: parece un servicio caído (A-73, A-106) | El `-ERR` con el subject y `using queue "<servicio>"`; la suscripción **no lanza** |
+| `allow_responses` | Un timeout | Recibe y **ejecuta**; su respuesta se deniega (un `-ERR` por cada una) |
+
+#### Dos medidas que importan a quien escriba un SDK
+
+- **`allow_responses` admite también el ack.** El `reply` de una entrega de un pull consumer es su subject de ack, y con
+  `allow_responses` el servidor admite **una** publicación al `reply` de cada mensaje recibido: el dueño de una operación
+  confirma (`ack`, `nak`, `term`) una entrega **aunque le falte el permiso `$JS.ACK…`** (A-109). No es una fuga —solo
+  puede confirmar lo que ya recibió—, pero **oculta** un permiso que falta: `working()` seguido de `ack()` publica **dos**
+  veces al mismo `reply`, la segunda se deniega y la entrega queda pendiente. El permiso sigue concediéndose, y la
+  minimalidad de §3.4 se mide **sin** `allow_responses`.
+- **No abras una segunda suscripción a tu propio inbox por la misma conexión que pide.** Una suscripción más —`_INBOX.<servicio>.>`—
+  que case con el `reply` de la petición hace que el estado 503 de `no responders` **no llegue a la librería** y se convierta
+  en un timeout: `RPC_UNAVAILABLE` (inmediato, RETRYABLE) pasaría a `RPC_TIMEOUT` (ambiguo). Medido: 6 de 6 peticiones,
+  con la suscripción antes o después de la primera; por **otra** conexión, o con un subject que no casa, llega (A-101; S29).
+
+#### Modelo B
+
+Con `--tenants` los permisos de cada servicio son **los mismos**, y el espacio `rpc.` es **de la account**: una petición de
+`facturacion-api@globex` a una operación que solo atiende `crm-api@acme` recibe `no responders` en milisegundos
+(`verify-acl.mjs`, sección 8).
 
 ## 4. Multi-tenant
 
@@ -5097,8 +5203,9 @@ suscripción es `PERMISSION_DENIED` (§7.1), no `NOT_PROVISIONED`.
 
 - **Nunca** a quien llama `rpc.>`, `rpc.<dominio>.>` ni un comodín por token: podría llamar a todo.
   `protocol.json` → `rpc.acl` fija los patrones (`callerPublish`, `ownerSubscribe`) y lo que nunca se concede.
-- **El generador** (`gen-acl.mjs`, las claves del manifiesto y los casos de seguridad) lo documentará
-  [06-security.md §3](06-security.md) cuando llegue; esta sección fija **lo medido** que debe producir.
+- **El generador** (`gen-acl.mjs`, las claves `calls` y `serves` del manifiesto y los casos de seguridad S21 a S29) está
+  documentado en [06-security.md §3.9](06-security.md#39-peticiónrespuesta-calls-serves-y-sus-permisos); esta sección fija
+  **lo medido** que produce.
 - **Una petición denegada**: con `@nats-io/*` falla en ~1 ms con `Permissions Violation for Publish to
   "rpc.clientes.cliente.v1.obtener"` (A-66); con `async-nats`, **agota su timeout** y el aviso solo se ve en el
   evento de la conexión (A-72). La regla de [06-security.md §3.7](06-security.md) rige aquí: el SDK **DEBE**

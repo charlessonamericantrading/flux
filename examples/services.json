@@ -1,5 +1,5 @@
 {
-  "$comment": "Manifiesto de ownership del ecosistema. Alimenta scripts/gen-acl.mjs, que deriva las ACLs de NATS, y `flux provision`, que crea los streams y los durables que esas ACLs presuponen. `consumes` es un subject exacto (pedidos.pedido.v1.creado) o un patrón acabado en `>` (pedidos.pedido.v1.>) que se EXPANDE contra schemas/bundle.json: cada subject resultante debe tener su esquema en schemas/, porque el nombre del durable es un único token y NATS no admite comodines dentro de un token. Un patrón sin coincidencias, o un subject exacto que no existe, es un error. Tras añadir un esquema: node scripts/bundle-schemas.mjs. Estado replicado (10-state.md): el dueño de un dominio que tiene esquemas en schemas/state/ recibe permiso para escribirlo, y `watches` lista los contratos de estado que observa un servicio: \"clientes.cliente.v1\" (todos los tenants) o { \"contract\": \"clientes.cliente.v1\", \"tenants\": [\"acme\"] } (confinado a esos tenants: lo aplica el broker). Ver specification/06-security.md §3 y §3.8.",
+  "$comment": "Manifiesto de ownership del ecosistema. Alimenta scripts/gen-acl.mjs, que deriva las ACLs de NATS, y `flux provision`, que crea los streams y los durables que esas ACLs presuponen. `consumes` es un subject exacto (pedidos.pedido.v1.creado) o un patrón acabado en `>` (pedidos.pedido.v1.>) que se EXPANDE contra schemas/bundle.json: cada subject resultante debe tener su esquema en schemas/, porque el nombre del durable es un único token y NATS no admite comodines dentro de un token. Un patrón sin coincidencias, o un subject exacto que no existe, es un error. Tras añadir un esquema: node scripts/bundle-schemas.mjs. Estado replicado (10-state.md): el dueño de un dominio que tiene esquemas en schemas/state/ recibe permiso para escribirlo, y `watches` lista los contratos de estado que observa un servicio: \"clientes.cliente.v1\" (todos los tenants) o { \"contract\": \"clientes.cliente.v1\", \"tenants\": [\"acme\"] } (confinado a esos tenants: lo aplica el broker). Ver specification/06-security.md §3 y §3.8. Petición/respuesta (11-request-reply.md): `serves` lista las OPERACIONES que atiende el dueño de un dominio (<dominio>.<agregado>.v<major>.<operacion>, sin el prefijo `rpc.`, que pone el SDK) y le da una suscripción a `rpc.<dominio>.>` y `allow_responses: { max: 1, expires: 30s }`, sin ningún permiso de publicación sobre inboxes; `calls` lista las operaciones que llama un servicio y le da publicar en el subject EXACTO de cada una (nunca `rpc.>` ni `rpc.<dominio>.>`). Cada operación debe tener su par request/reply en schemas/rpc/ (índice `rpc` del bundle), solo la atiende el dueño de su dominio, y una operación llamada debe estar atendida. Un servicio que solo llama no recibe ninguna suscripción de dominio. Ver specification/06-security.md §3.9.",
   "environment": "produccion",
   "services": [
     {
@@ -9,6 +9,9 @@
       ],
       "consumes": [
         "inventario.stock.v1.>"
+      ],
+      "calls": [
+        "clientes.cliente.v1.calcular-descuento"
       ]
     },
     {
@@ -18,6 +21,10 @@
       ],
       "consumes": [
         "pedidos.pedido.v1.>"
+      ],
+      "calls": [
+        "clientes.cliente.v1.calcular-descuento",
+        "clientes.cliente.v1.obtener"
       ]
     },
     {
@@ -43,6 +50,10 @@
       "name": "crm-api",
       "owns": [
         "clientes"
+      ],
+      "serves": [
+        "clientes.cliente.v1.calcular-descuento",
+        "clientes.cliente.v1.obtener"
       ]
     },
     {

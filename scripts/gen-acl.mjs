@@ -38,11 +38,16 @@
  *   · publish:   su dominio; y, por cada subject consumido, EXACTAMENTE los tres
  *                subjects de `$JS.API`/`$JS.ACK` de su durable (INFO, MSG.NEXT y ACK;
  *                cuatro con --dev, que añade CREATE), más `dlq.<subject>`.
- *   · subscribe: solo su inbox privado `_INBOX.<servicio>.>`. Ningún subject de dominio:
- *                los SDKs consumen por pull, y lo que confina es `$JS.API`.
+ *   · subscribe: su inbox privado `_INBOX.<servicio>.>`. Ningún subject de dominio:
+ *                los SDKs consumen por pull, y lo que confina es `$JS.API`. La ÚNICA excepción es el
+ *                dueño de una operación de petición/respuesta, que añade `rpc.<dominio>.>` (abajo).
  *   · estado:    el dueño, `state.<dom>.>` y DIRECT.GET de su dominio; el observador, los
  *                permisos de su durable de estado y DIRECT.GET con el tenant fijado. Ninguno
  *                recibe `STREAM.INFO.STATE_<DOM>` (lista claves y tenants: A-39).
+ *   · peticiones: quien llama (`calls`) publica SOLO en el subject exacto de cada operación (`rpc.<operación>`);
+ *                el dueño (`serves`) se suscribe a `rpc.<dominio>.>` y responde con
+ *                `allow_responses: { max: 1, expires: 30s }`, sin ningún permiso de publicación sobre inboxes.
+ *                Nunca `rpc.>`, `rpc.<dominio>.>` ni un comodín por token a quien llama.
  *   · nunca:     `CONSUMER.DURABLE.CREATE.*`, `STREAM.MSG.GET.*`, la forma de cuerpo de
  *                DIRECT.GET, ni crear, modificar, borrar o purgar streams. Se deniegan por omisión.
  *   · CONSUMER.CREATE no se concede por defecto: en producción los durables los crea
@@ -71,6 +76,7 @@
  *       { "name": "informes-api",    "watches": ["clientes.cliente.v1"] }
  *     ]
  *   }
+ *   (en el ejemplo real, `crm-api` también lleva `serves` y `pedidos-api` y `facturacion-api`, `calls`)
  *
  * Estado replicado (specification/10-state.md; permisos en 06-security.md §3.8):
  *   · DUEÑO. No hace falta declarar nada más que `owns`: un dominio TIENE estado si el bundle
@@ -86,6 +92,18 @@
  *     ser «un servicio sin permisos».
  *   · Los dominios `dlq`, `state`, `rpc` y `system` no pueden ser de nadie (RESERVED_DOMAIN): el
  *     «dueño» de `state` recibiría `state.>` y escribiría el estado de todos los dominios.
+ *
+ * Petición/respuesta (specification/11-request-reply.md; permisos en 06-security.md §3.9):
+ *   · `calls` y `serves` son listas de OPERACIONES, `<dominio>.<agregado>.v<major>.<operacion>` —sin el prefijo
+ *     `rpc.`, que pone el SDK—, y cada una debe tener su par request/reply en el bundle (índice `rpc`).
+ *   · QUIEN LLAMA (`calls`): publicar en `rpc.<operación>`, el subject EXACTO, y nada más. Ni `rpc.>`, ni
+ *     `rpc.<dominio>.>`, ni un comodín por token: podría llamar a todo. Su inbox privado ya es el de siempre.
+ *   · EL DUEÑO (`serves`): suscribirse a `rpc.<dominio>.>` (el SDK se suscribe al subject exacto de cada
+ *     operación: A-64) y `allow_responses: { max: 1, expires: 30s }` (A-68). NINGÚN permiso de publicación sobre
+ *     inboxes: lo da `allow_responses`, y solo para el `reply` de la petición que recibió.
+ *   · Solo el dueño de un dominio atiende sus operaciones; una operación llamada debe estar atendida; un servicio
+ *     no se llama a sí mismo; una operación con dominio reservado (`rpc.…`, `state.…`) o con comodín se rechaza.
+ *   · Un servicio que solo llama NO recibe ninguna suscripción de dominio ni `allow_responses`.
  */
 
 import { readFile } from "node:fs/promises";
@@ -241,10 +259,13 @@ if (args.check) {
   const durables = servicios.reduce((n, s) => n + permisosDe(s, { dev: !!args.dev }).durables.length, 0);
   const conEstado = new Set(servicios.flatMap((s) => s.stateOwns));
   const observaciones = servicios.reduce((n, s) => n + s.watches.length, 0);
+  const llamadas = servicios.reduce((n, s) => n + s.calls.length, 0);
+  const atendidas = servicios.reduce((n, s) => n + s.serves.length, 0);
   console.log(
     `✓ manifiesto válido: ${servicios.length} servicio(s), ${dueñoDe.size} dominio(s), ` +
       `${durables} durable(s) a aprovisionar` +
       (conEstado.size ? `, ${conEstado.size} dominio(s) con estado y ${observaciones} observación(es) de estado` : "") +
+      (llamadas + atendidas ? `, ${atendidas} operación(es) atendida(s) y ${llamadas} llamada(s) entre servicios` : "") +
       (args.tenants ? `, ${tenants.length} tenant(s)` : "") +
       (claves ? `, ${identidades.length} clave(s) públicas` : ""),
   );
@@ -267,6 +288,9 @@ if (args.json) {
         consumes: s.subjects,
         stateOwns: s.stateOwns,
         watches: s.watches,
+        calls: s.calls,
+        serves: s.serves,
+        allowResponses: perm.allowResponses,
         durables: perm.durables,
       });
     }
@@ -298,6 +322,8 @@ function renderUsuario(svc, { id, placeholder, titulo }) {
     }
   }
   if (svc.stateOwns.length) l.push(`      #   estado de: ${svc.stateOwns.join(", ")} (escribe state.<dominio>.>)`);
+  if (svc.serves.length) l.push(`      #   atiende: ${svc.serves.join(", ")} (rpc.${svc.rpcDomains.join(".>, rpc.")}.> y allow_responses)`);
+  if (svc.calls.length) l.push(`      #   llama a: ${svc.calls.join(", ")} (publica en el subject exacto de cada una)`);
   if (svc.watches.length) {
     l.push(
       `      #   observa estado: ` +
@@ -315,6 +341,11 @@ function renderUsuario(svc, { id, placeholder, titulo }) {
   });
   l.push(`          ] }`);
   l.push(`          subscribe: { allow: [${perm.subscribe.map((s) => `"${s}"`).join(", ")}] }`);
+  // El dueño de una operación responde con `allow_responses`, SIN permiso de publicación sobre inboxes (A-16, A-68):
+  // una respuesta por petición, y que caduque. Medido: `true` admite una y NO caduca.
+  if (perm.allowResponses) {
+    l.push(`          allow_responses: { max: ${perm.allowResponses.max}, expires: "${perm.allowResponses.expires}" }`);
+  }
   l.push(`        }`);
   l.push(`      },`);
   return l;
@@ -326,7 +357,8 @@ function cabeceraComun() {
     `#   · Un servicio solo publica en el dominio del que es dueño.`,
     `#   · NINGÚN permiso de suscripción sobre subjects de dominio. Los SDKs consumen por`,
     `#     pull: lo que confina es $JS.API, y ahí cada servicio recibe los permisos EXACTOS`,
-    `#     de sus durables, ni uno más. Los permisos de subject no gobiernan JetStream.`,
+    `#     de sus durables, ni uno más. Los permisos de subject no gobiernan JetStream. La única`,
+    `#     suscripción que no es el inbox es rpc.<dominio>.> del dueño de una operación (abajo).`,
     `#   · Inbox PRIVADO por servicio, _INBOX.<servicio>.>. Un _INBOX.> común permite a`,
     `#     cualquiera leer las entregas de otro: las de un pull consumer viajan por el inbox.`,
     `#   · Nunca se concede CONSUMER.DURABLE.CREATE.*, STREAM.MSG.GET.*, la forma de cuerpo de`,
@@ -334,6 +366,9 @@ function cabeceraComun() {
     `#     deniegan por omisión.`,
     `#   · Estado (06-security.md §3.8): el dueño escribe state.<dom>.> y lee lo suyo; el observador`,
     `#     lee con DIRECT.GET por subject CON EL TENANT FIJADO si el manifiesto lo confina.`,
+    `#   · Peticiones (06-security.md §3.9): quien llama publica en el subject EXACTO de cada operación,`,
+    `#     nunca rpc.> ni rpc.<dominio>.>; el dueño se suscribe a rpc.<dominio>.> y responde con`,
+    `#     allow_responses { max: 1, expires: 30s }, sin ningún permiso de publicación sobre inboxes.`,
     ...(args.dev
       ? [
           `#   · MODO --dev: se concede además CONSUMER.CREATE de cada durable PROPIO, con su filtro`,
