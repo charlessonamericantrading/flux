@@ -18,6 +18,12 @@ export type ValidationMode = "off" | "warn" | "strict";
 export interface SchemaBundle {
   /** subject → URI del esquema con el MINOR más alto de su mayor. */
   subjects: Record<string, string>;
+  /**
+   * contrato de estado (`clientes.cliente.v1`) → URI del esquema de su versión más alta
+   * (10-state.md §10). Es lo que resuelve el `dataschema` de un `put` sin ir a la red. Opcional:
+   * un bundle generado antes de la capacidad `state` no lo trae.
+   */
+  state?: Record<string, string>;
   /** URI → JSON Schema. */
   schemas: Record<string, object>;
 }
@@ -159,4 +165,9 @@ export async function createValidator(
 /** Resuelve el `dataschema` de un subject desde el bundle. */
 export function schemaUriFor(bundle: SchemaBundle, subject: string): string | undefined {
   return bundle.subjects[subject];
+}
+
+/** Resuelve el `dataschema` de un CONTRATO DE ESTADO desde el índice `state` del bundle. */
+export function stateSchemaUriFor(bundle: SchemaBundle, contract: string): string | undefined {
+  return bundle.state?.[contract];
 }

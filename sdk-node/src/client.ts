@@ -40,6 +40,8 @@ import {
   type FluxEvent,
 } from "./envelope.js";
 import { ErrorClass, PoisonError, type Classification } from "./errors.js";
+import { ConsumerConfigMismatchError, TenantIsolationError } from "./client-errors.js";
+import { StateClient } from "./state.js";
 import { createClassifier, type ClassifierOptions } from "./classify.js";
 import { NO_METRICS, type MetricsSink } from "./metrics.js";
 import {
@@ -97,7 +99,10 @@ export interface ConnectOptions {
   environment: string;
   /** SemVer del servicio. Va en `producerversion`. */
   version: string;
-  /** Tenant por defecto de los eventos publicados. */
+  /**
+   * Tenant por defecto de los eventos publicados (y, si cumple el patrón de estado, de
+   * `bus.state`: ahí NO hay `system` implícito ni se admite cualquier cadena — 10-state.md §2.4).
+   */
   tenantId?: string;
   /**
    * Aislamiento entre tenants — 09-multitenancy.md §3.
@@ -224,33 +229,8 @@ export interface Subscription {
 }
 
 // ─── Errores del cliente ─────────────────────────────────────────────────────
-
-export class ConsumerConfigMismatchError extends Error {
-  constructor(
-    readonly durable: string,
-    readonly differences: Array<{ field: string; requested: unknown; effective: unknown }>,
-  ) {
-    super(
-      `el servidor devolvió una configuración distinta de la solicitada para "${durable}":\n` +
-        differences
-          .map((d) => `  ${d.field}: solicitado ${JSON.stringify(d.requested)}, efectivo ${JSON.stringify(d.effective)}`)
-          .join("\n") +
-        `\nJetStream sobrescribe algunos campos en silencio (03-delivery.md §2.1).`,
-    );
-    this.name = "ConsumerConfigMismatchError";
-  }
-}
-
-export class TenantIsolationError extends Error {
-  constructor(subject: string, motivo: string) {
-    super(
-      `tenantIsolation="strict" pero ${motivo} al suscribirse a "${subject}". ` +
-        `Sin filtro de tenant, este consumidor vería los eventos de TODOS los tenants ` +
-        `y eso no produce ningún error visible (09-multitenancy.md §3).`,
-    );
-    this.name = "TenantIsolationError";
-  }
-}
+// Definidos en client-errors.ts (los usa también state.ts, sin ciclo) y re-exportados aquí.
+export { ConsumerConfigMismatchError, TenantIsolationError };
 
 // ─── Cliente ─────────────────────────────────────────────────────────────────
 
@@ -275,6 +255,13 @@ export class FluxBus {
    */
   readonly #denied = new Map<string, "publish" | "subscribe">();
 
+  /**
+   * Estado replicado — la capacidad `state` (specification/10-state.md): `put`, `delete`, `get`
+   * y `watch`. El valor ACTUAL de un agregado, que su dueño publica y los demás observan;
+   * sustituye a `GET /clientes/123`, a la carga inicial y al polling de datos.
+   */
+  readonly state: StateClient;
+
   constructor(
     nc: NatsConnection,
     js: JetStreamClient,
@@ -290,6 +277,32 @@ export class FluxBus {
     this.#metrics = opts.metrics ?? NO_METRICS;
     this.#metrics.connectionState(1);
     this.#watchPermissionViolations();
+    this.state = new StateClient({
+      nc,
+      js,
+      jsm,
+      options: opts,
+      source: this.#source,
+      metrics: this.#metrics,
+      classify: (e) => this.#classify(e),
+      // Se resuelven en connect() (`initValidation`), después de construir el bus.
+      validator: () => this.#validate,
+      signer: () => this.#signer,
+      verify: (event) => {
+        this.#pendingSignatureFailure = null;
+        this.#verifier?.check(event); // `require` lanza; `warn` solo anota el fallo
+        const fallo = this.#pendingSignatureFailure;
+        this.#pendingSignatureFailure = null;
+        return fallo;
+      },
+      isDenied: (subject) => this.#denied.has(subject),
+      clearDenied: (subject) => void this.#denied.delete(subject),
+      track: (stop) => {
+        const entry = { stop };
+        this.#subscriptions.add(entry);
+        return () => void this.#subscriptions.delete(entry);
+      },
+    });
   }
 
   /**

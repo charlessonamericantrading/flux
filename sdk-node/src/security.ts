@@ -145,17 +145,24 @@ export class NotProvisionedError extends PermanentError {
     readonly resource: { kind: "stream" | "consumer"; name: string; stream?: string },
     readonly service: string,
     readonly deniedSubject: string,
-    opts: { cause?: unknown } = {},
+    /**
+     * `detail` sustituye al texto entero. Lo usa el estado (04-errors.md §6): ahí la señal no
+     * es un `CREATE` denegado sino que **nadie contesta** a la lectura directa —un stream que
+     * no existe y uno sin `allow_direct` se ven igual (A-32)—, y el mensaje DEBE nombrar las
+     * dos causas, no una denegación que no ha habido.
+     */
+    opts: { cause?: unknown; detail?: string } = {},
   ) {
     const que =
       resource.kind === "stream"
         ? `el stream "${resource.name}"`
         : `el consumidor "${resource.name}" del stream "${resource.stream}"`;
     super(
-      `${que} no existe y "${service}" no tiene permiso para crearlo ` +
-        `(el broker denegó publicar en "${deniedSubject}"). ` +
-        `En producción se aprovisiona con \`flux provision <services.json>\`, usando ` +
-        `credenciales de operación, no las del servicio (06-security.md §3).`,
+      opts.detail ??
+        `${que} no existe y "${service}" no tiene permiso para crearlo ` +
+          `(el broker denegó publicar en "${deniedSubject}"). ` +
+          `En producción se aprovisiona con \`flux provision <services.json>\`, usando ` +
+          `credenciales de operación, no las del servicio (06-security.md §3).`,
       { code: "NOT_PROVISIONED", cause: opts.cause },
     );
     this.name = "NotProvisionedError";
@@ -337,6 +344,24 @@ export function permissionViolation(
     const op = x.operation === "subscription" || x.operation === "subscribe" ? "subscribe" : "publish";
     return { operation: op, subject: String(x.subject ?? "") };
   });
+}
+
+/**
+ * ¿Nadie contestó? `no responders`: no hay ningún suscriptor en el subject (medido en NATS
+ * 2.14.5: A-15, y A-32 para `DIRECT.GET`). Con JetStream es lo que se ve cuando el stream no
+ * existe… o existe sin `allow_direct`, que es indistinguible. Se reconoce por nombre, como
+ * `permissionViolation`: una segunda copia de `@nats-io/nats-core` rompería el `instanceof`.
+ */
+export function isNoResponders(e: unknown): boolean {
+  return (
+    enCadena(e, (x) => {
+      if (x.name === "NoResponders" || x.name === "NoRespondersError") return true;
+      if (x.name === "RequestError" && typeof x.isNoResponders === "function") {
+        return (x.isNoResponders as () => boolean).call(x) ? true : undefined;
+      }
+      return undefined;
+    }) === true
+  );
 }
 
 // Códigos de error de la API de JetStream. Son los de `JetStreamApiCodes` del cliente.
