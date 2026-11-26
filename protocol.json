@@ -1082,7 +1082,7 @@
       "rpc": {
         "spec": "specification/11-request-reply.md",
         "evidence": "sdk-files",
-        "$commentEvidence": "Como `state`: cada SDK que la declara cita en `evidence` los ficheros que la ejecutan contra un nats-server real —dos instancias de quien responde, una sin nadie, una denegada— con los permisos exactos que genera gen-acl.mjs; deben existir y, entre todos, nombrar cada codigo de la capacidad (check-sdk-codes.mjs). ADEMAS la integracion exigira que el SDK reproduzca los vectores de conformance/cases/cross-sdk-rpc-envelope.json byte a byte (rpc-request, rpc-reply, rpc-error): eso aun NO lo comprueba check-sdk-codes.mjs. NINGUN SDK declara `rpc` hasta que existan esos tests.",
+        "$commentEvidence": "Como `state`: cada SDK que la declara cita en `evidence` los ficheros que la ejecutan contra un nats-server real —dos instancias de quien responde, una sin nadie, una denegada— con los permisos exactos que genera gen-acl.mjs; deben existir y, entre todos, nombrar cada codigo de la capacidad (check-sdk-codes.mjs). ADEMAS el arnes cruzado (conformance/cross-sdk.mjs) ejecuta las operaciones rpc-request, rpc-reply, rpc-error, rpc-operation y rpc-timeout contra los `rpcVectors` de conformance/harness/vectors.json y compara los bytes de cada SDK que declara `rpc` con los de la referencia (Node) y, en los cuatro ejemplos de 11-request-reply.md §3.5, con su SHA-256 y su longitud; un SDK que la declara y no tiene la operacion FALLA (UNSUPPORTED_OP), y uno que no la declara sale como N/A. Hoy la declaran Node y Rust.",
         "requires": [
           "request-respond",
           "byte-exact-request-reply-error",
@@ -1105,7 +1105,8 @@
         "capabilities": [
           "signing",
           "security",
-          "state"
+          "state",
+          "rpc"
         ],
         "evidence": {
           "security": [
@@ -1117,6 +1118,10 @@
           "state": [
             "sdk-node/test/state.test.ts",
             "sdk-node/test/integration/state.test.ts"
+          ],
+          "rpc": [
+            "sdk-node/test/rpc.test.ts",
+            "sdk-node/test/integration/rpc.test.ts"
           ]
         }
       },
@@ -1144,7 +1149,8 @@
         "capabilities": [
           "signing",
           "security",
-          "state"
+          "state",
+          "rpc"
         ],
         "evidence": {
           "security": [
@@ -1153,6 +1159,10 @@
           "state": [
             "sdk-rust/tests/state.rs",
             "sdk-rust/src/state.rs"
+          ],
+          "rpc": [
+            "sdk-rust/tests/rpc.rs",
+            "sdk-rust/src/rpc.rs"
           ]
         }
       },
@@ -1162,7 +1172,7 @@
         ]
       }
     },
-    "$commentSdks": "Solo Node y Rust declaran `security`: el resto usa el inbox por defecto y no acepta CA propia (plan v1.1, fase 6). `signing` la declaran los siete: los siete tienen su arnes en conformance/harnesses.json y el job `cross-sdk` compara sus operaciones sign y verify byte a byte."
+    "$commentSdks": "Solo Node y Rust declaran `security`, `state` y `rpc`: el resto usa el inbox por defecto y no acepta CA propia (plan v1.1, fase 6), no replica estado y no hace ni atiende peticiones (en el job `cross-sdk` sus vectores de estado y de rpc salen N/A). `signing` la declaran los siete: los siete tienen su arnes en conformance/harnesses.json y el job `cross-sdk` compara sus operaciones sign y verify byte a byte."
   },
   "outOfScopeV1": [
     "sagas",

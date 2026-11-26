@@ -839,7 +839,8 @@ Un SDK declara la capacidad `rpc` ([00-protocol.md §5](00-protocol.md)) solo si
 1. `request` y `respond` según §4 y §5, y los **mismos bytes** que §3.5 para la petición, la respuesta y los dos
    errores (arnés cruzado: `rpc-request`, `rpc-reply`, `rpc-error`, `rpc-operation`, `rpc-timeout`).
 2. Los **seis** códigos de [04-errors.md §7](04-errors.md), con su clase, y `RESERVED_DOMAIN` en `request` y `respond`
-   (hoy solo lo comprueba `check-sdk-codes.mjs` en quien declara `state`, porque el código cuelga de esa capacidad).
+   (lo ejecuta el arnés cruzado en `rpc-operation` y `rpc-request`; `check-sdk-codes.mjs` solo comprueba el literal en quien
+   declara `state`, porque el código cuelga de esa capacidad).
 3. **Una suscripción exacta por operación** y el grupo de cola = nombre de servicio.
 4. La conexión anuncia **`headers` y `no_responders`**.
 5. **Valida la respuesta contra la petición** (las cinco comprobaciones de §4.3).

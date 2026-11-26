@@ -132,12 +132,12 @@ protocolo a v2.
 
 | SDK | Nivel | Tests | Verificado | Capacidades |
 |---|---|---|---|---|
-| [Node / TypeScript](sdk-node/) | **L3** | 105 | ✅ | `signing` `security` `state` |
+| [Node / TypeScript](sdk-node/) | **L3** | 105 | ✅ | `signing` `security` `state` `rpc` |
 | [Python](sdk-python/) | **L3** | 205 | ✅ | `signing` |
 | [Go](sdk-go/) | **L3** | 162 | ✅ (también con `-race`) | `signing` |
 | [Java](sdk-java/) | **L3** | 144 | ✅ (Maven en el runner) | `signing` |
 | [.NET](sdk-dotnet/) | **L3** | 189 | ✅ | `signing` |
-| [Rust](sdk-rust/) | L2 | 175 | ✅ (incl. 14 contra NATS real) | `signing` `security` `state` |
+| [Rust](sdk-rust/) | L2 | 175 | ✅ (incl. 14 contra NATS real) | `signing` `security` `state` `rpc` |
 | [PHP](sdk-php/) | **L3** | 304 | ✅ incl. 3 de integración contra NATS real | `signing` |
 | [PHP](sdk-php/) | L2 | 201 | ✅ (transporte no — ver abajo) | `signing` |
 
@@ -161,8 +161,9 @@ aparte, contra un NATS real: **14/14**.
 | `state` | Estado replicado: `put`/`get`/`delete`/`watch` de un valor por clave, con CAS, lápidas y DLQ de estado — [`10-state.md`](specification/10-state.md) | No replica estado; sigue siendo conforme |
 | `rpc` | Petición/respuesta: `request` y `respond` por core NATS, con `no responders`, grupo de cola, error clasificado y sin stream — [`11-request-reply.md`](specification/11-request-reply.md) | No hace ni atiende peticiones; sigue siendo conforme |
 
-Hoy solo Node y Rust declaran `security` y `state`, y **ningún SDK declara `rpc` todavía**: la especificación y sus casos medidos
-llegan antes que las implementaciones. Un SDK no anuncia una capacidad hasta que la ha ejecutado contra un broker real.
+Hoy solo Node y Rust declaran `security`, `state` y `rpc`: los otros cinco salen **N/A** en las operaciones de estado y de
+petición/respuesta del arnés cruzado (`node conformance/cross-sdk.mjs`), y uno que **declara** una capacidad y no tiene la
+operación en su arnés **falla**. Un SDK no anuncia una capacidad hasta que la ha ejecutado contra un broker real.
 
 ---
 

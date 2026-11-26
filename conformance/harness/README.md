@@ -3,7 +3,7 @@
 Un programa diminuto por SDK que lee **una** operación por stdin y escribe **un**
 resultado por stdout. El runner (`conformance/cross-sdk.mjs`) invoca los siete con los
 mismos vectores y **compara las salidas byte a byte**. Las operaciones de una
-**capacidad** opcional (`state`) las ejecuta solo quien la declara: [Capacidades](#capacidades).
+**capacidad** opcional (`state`, `rpc`) las ejecuta solo quien la declara: [Capacidades](#capacidades).
 
 ## Por qué existe
 
@@ -28,7 +28,8 @@ de este proyecto.
 
 ```jsonc
 { "op": "build" | "dlq" | "sign" | "verify" | "parse"
-      | "state-build" | "state-tombstone" | "state-subject" | "state-dlq", ... }
+      | "state-build" | "state-tombstone" | "state-subject" | "state-dlq"
+      | "rpc-request" | "rpc-reply" | "rpc-error" | "rpc-operation" | "rpc-timeout", ... }
 ```
 
 Todos los campos de entrada son **deterministas** (`id`, `time` y `dlqtime` vienen
@@ -38,14 +39,15 @@ dados) para que dos SDKs puedan producir exactamente los mismos bytes.
 
 ```jsonc
 { "ok": true,  "bytes": "<base64 estándar del evento serializado>" }
-{ "ok": true,  "subject": "state.clientes.cliente.v1.acme.cli-1" }   // solo `state-subject`
+{ "ok": true,  "subject": "state.clientes.cliente.v1.acme.cli-1" }   // `state-subject`; `rpc-operation` da "rpc.clientes.cliente.v1.obtener"
+{ "ok": true,  "effectiveMs": 5000 }                                 // solo `rpc-timeout`
 { "ok": false, "code": "MISSING_REQUIRED_EXTENSION" }
 ```
 
 `code` es el código **estable** del protocolo ([04-errors.md](../../specification/04-errors.md)).
-Un rechazo que la spec no ha dotado de código (hoy, un contrato de estado mal formado) no es
-comparable entre SDKs: cada uno lo llama a su manera (Node por el nombre de su excepción, Rust
-`ERROR`). **Ningún vector depende de uno**.
+Un rechazo que la spec no ha dotado de código (un contrato de estado mal formado, el `error` mal formado
+de un `rpc-error`) no es comparable entre SDKs: cada uno lo llama a su manera (Node por el nombre de su
+excepción, `TypeError`; Rust `ERROR` o `INVALID_RPC_CALL`). **Ningún vector depende de uno**.
 
 `bytes` va en **base64** y no como texto para que ningún paso intermedio pueda
 reescribir el UTF-8 o los saltos de línea — que es justo lo que se está comprobando.
@@ -170,44 +172,158 @@ Lo mismo sin `classification` ni `data`, y con `aggregateVersion` (la versión *
 `MISSING_AGGREGATE_VERSION`, `INVALID_DATACLASSIFICATION`, los tres anteriores…, en el orden de
 [10-state.md §3.6](../../specification/10-state.md): el primero que falla gana.
 
+### Operaciones de petición/respuesta (capacidad `rpc`)
+
+Cinco operaciones para [11-request-reply.md](../../specification/11-request-reply.md), con la entrada **plana**: es
+la misma que el `input` de los fixtures de
+[`cross-sdk-rpc-envelope.json`](../cases/cross-sdk-rpc-envelope.json), más el `op`. Todo es determinista: `id` y
+`time` vienen dados, y **el arnés no rellena nada**: ni `dataschema` (lo deriva el SDK de la operación: sin
+bundle, `<major>.0.0`, y es parte de lo que se compara), ni `subject`, `partitionkey` o `causationid`. `time`
+DEBE llegar ya canónico (3 decimales y `Z`). Sin broker y sin red: lo que se compara es el sobre, no NATS.
+
+#### `rpc-request`
+
+```jsonc
+{ "op": "rpc-request",
+  "operation": "clientes.cliente.v1.calcular-descuento", "tenantId": "acme",
+  "aggregateId": "cli-1",                                   // opcional
+  "id": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10", "source": "/produccion/facturacion-api",
+  "time": "2026-08-20T10:41:07.318Z", "correlationid": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+  "producerversion": "3.4.1", "classification": "internal",
+  "causationid": "…", "traceparent": "…", "tracestate": "…",   // opcionales
+  "data": { "clienteId": "cli-1", "totalCents": 9990 } }
+```
+→ `{ "ok": true, "bytes": "…" }`: la petición de [§3.1](../../specification/11-request-reply.md). `subject` y
+`partitionkey` son el `aggregateId`; **sin él no hay ninguno** (ni `null`). Rechaza con un código estable, en el
+orden de §4.1 (paso 0: el primero que falla gana): `RESERVED_DOMAIN`, `INVALID_RPC_CALL` (operación mal formada, o
+`data` que no es un objeto) e `INVALID_DATACLASSIFICATION`.
+
+#### `rpc-reply`
+
+```jsonc
+{ "op": "rpc-reply",
+  "request": { "operation": "clientes.cliente.v1.calcular-descuento",
+               "id": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+               "correlationid": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10", "tenantid": "acme",
+               "subject": "cli-1" },                          // `subject`, opcional
+  "id": "01924f91-5d0f-7e03-9b6a-1c2d3e4f5a67", "source": "/produccion/crm-api",
+  "time": "2026-08-20T10:41:07.329Z", "producerversion": "2.1.0", "classification": "internal",
+  "traceparent": "…",                                         // opcional
+  "data": { "descuentoCents": 500, "moneda": "EUR" } }
+```
+→ `{ "ok": true, "bytes": "…" }`: la respuesta de [§3.2](../../specification/11-request-reply.md). **Hereda** de
+`request` el `correlationid`, el `tenantid` y el `subject` (y de este, el `partitionkey`), y su `causationid` es
+`request.id`; su `id` es el suyo. `request` es lo que el SDK sacaría del sobre recibido. **Un `correlationid` de
+primer nivel** —los fixtures lo traen— es **redundante y ningún arnés lo usa**: el de la respuesta es el de
+`request`.
+
+#### `rpc-error`
+
+```jsonc
+{ "op": "rpc-error",
+  "request": { …como en `rpc-reply`… },
+  "id": "…", "source": "/produccion/crm-api", "time": "2026-08-20T10:41:07.331Z",
+  "producerversion": "2.1.0", "traceparent": "…",             // `traceparent`, opcional
+  "error": { "class": "retryable", "code": "HTTP_503",
+             "message": "el servicio de tarifas no responde", "retryAfterMs": 5000 } }   // `retryAfterMs`, opcional
+```
+→ `{ "ok": true, "bytes": "…" }`: el error `com.flux.rpc.error.v1` de [§3.3](../../specification/11-request-reply.md), el
+mismo para el de un handler que el que fabrica el SDK de quien responde. `type`, `dataschema` y
+`dataclassification: internal` son **fijos**; `data` lleva las claves en el orden `class, code, message,
+retryAfterMs`, y `retryAfterMs: 0` **se escribe** (solo la ausencia lo omite). Un `error` mal formado (`class` que no
+sea `retryable` o `permanent`, `code` fuera de `errors.codePattern`, `message` vacío o de más de 1000 caracteres,
+`retryAfterMs` negativo o con `permanent`) **no tiene código estable** en la spec y ningún vector depende de él.
+
+#### `rpc-operation`
+
+```jsonc
+{ "op": "rpc-operation", "operation": "clientes.cliente.v1.obtener" }
+```
+→ `{ "ok": true, "subject": "rpc.clientes.cliente.v1.obtener" }` (el subject de NATS: `rpc.` + el nombre, cinco
+tokens; **no** el atributo `subject` del sobre) o `{ "ok": false, "code": "INVALID_RPC_CALL" }` o `"RESERVED_DOMAIN"`.
+El dominio reservado se mira **antes** que la forma ([§2.6](../../specification/11-request-reply.md), §4.1 paso 0): `rpc`
+solo, `state.cliente` o `rpc.clientes.cliente.v1.obtener` son `RESERVED_DOMAIN`; `State.cliente.v1.obtener`
+—mayúscula— no es un dominio reservado sino una operación mal formada. Coincidencia **completa** del patrón (no `$`),
+solo `[a-z0-9]` y `-`: ni dígitos de otros alfabetos, ni espacios, ni NUL, ni normalización.
+
+#### `rpc-timeout`
+
+```jsonc
+{ "op": "rpc-timeout", "timeoutMs": 2000 }      // `timeoutMs` ausente: el valor por defecto
+```
+→ `{ "ok": true, "effectiveMs": 2000 }` o `{ "ok": false, "code": "INVALID_RPC_CALL" }`. Ausente es **5000**; `null` **no**
+es «ausente» y es inválido; un **entero** de 1 a 25 000 y nada más: no se recorta, no se redondea y una cadena
+(`"5000"`), un booleano, un array o un objeto no se convierten ([§4.2](../../specification/11-request-reply.md)).
+
 ## Capacidades
 
 Una **capacidad** es una extensión opcional que un SDK declara en `protocol.json` →
 `capabilities.sdks.<sdk>.capabilities` ([00-protocol.md §5](../../specification/00-protocol.md)). Las
-operaciones de estado solo tienen sentido para quien la declara, y el runner lo aplica en los dos
-sentidos:
+operaciones de una capacidad (`state-*`, `rpc-*`) solo tienen sentido para quien la declara, y el runner lo
+aplica en los dos sentidos. **La lista de quién declara qué no está en el runner ni en `harnesses.json`**: la
+fuente es `protocol.json`.
 
 | El SDK… | Qué hace el runner |
 |---|---|
-| **declara** `state` y su arnés implementa la operación | la ejecuta y compara |
-| **declara** `state` y su arnés **no** la implementa (responde `UNSUPPORTED_OP`) | **FALLO**: declarar una capacidad sin ejecutarla es lo que este runner existe para impedir |
-| **no declara** `state` | no la ejecuta, la marca `–` en la tabla e imprime **`N/A: no declara state`** en el resumen. No es un fallo; tampoco es un salto silencioso |
+| **declara** la capacidad y su arnés implementa la operación | la ejecuta y compara |
+| **declara** la capacidad y su arnés **no** la implementa (responde `UNSUPPORTED_OP`) | **FALLO**: declarar una capacidad sin ejecutarla es lo que este runner existe para impedir |
+| **declara** la capacidad y **no tiene arnés registrado** (o figura en `pending`) | **FALLO**, aunque se ejecute con `--only` que lo excluya: sin arnés no hay evidencia |
+| **no declara** la capacidad | no la ejecuta, la marca `–` en la tabla e imprime **`N/A: no declara state`** (o `rpc`) en el resumen. No es un fallo; tampoco es un salto silencioso |
 
-Hoy declaran `state` Node y Rust; Python, Go, Java, .NET y PHP salen `N/A`.
+Hoy declaran `state` y `rpc` Node y Rust; Python, Go, Java, .NET y PHP salen `N/A` en las dos.
+
+`--exigir state,rpc` añade lo que un «N/A» verde no demuestra: **falla** si ningún SDK de los activos ejecutó esa
+capacidad (porque `protocol.json` dejó de declararla, o porque un `--only` dejó fuera a quien la declara). CI lo
+usa en la ejecución completa.
 
 ## Vectores
 
 `vectors.json` tiene un bloque por clase de operación (`vectors`: bytes; `poisonVectors` y
-`verifyVectors`: códigos) y, para la capacidad, **`stateVectors`**. Cada vector de estado lleva
-`input` (la entrada **sin** el `op`) y dice qué espera:
+`verifyVectors`: códigos) y, para cada capacidad, **`stateVectors`** y **`rpcVectors`**. Cada vector de una
+capacidad lleva `input` (la entrada **sin** el `op`) y dice qué espera:
 
 | Campo | Qué comprueba |
 |---|---|
-| `sha256` | los bytes son los **de la spec** (§2.6), no «lo que dice el SDK de referencia». Lo llevan los tres ejemplos de la spec |
+| `sha256` | los bytes son los **de la spec** (§2.6 de estado, §3.5 de rpc), no «lo que dice el SDK de referencia». Lo llevan los tres ejemplos de estado y los cuatro de rpc |
+| `length` | (solo con `sha256`) la longitud en bytes: 668, 703, 677 y 791 en rpc |
 | `expectSubject` | el subject de NATS |
+| `expectEffectiveMs` | los milisegundos efectivos de un `rpc-timeout` |
 | `expect` | el **código estable** del rechazo |
 | *(ninguno)* | los bytes los fija el SDK de **referencia** (Node) y los demás deben coincidir |
 | `differsFrom: <id>` | **control**: los bytes DEBEN ser distintos de los de ese otro vector en el mismo SDK |
-| `caseFixture` | enlaza con un fixture de `cross-sdk-state-envelope.json` |
+| `caseFixture` | enlaza con un fixture de `cross-sdk-state-envelope.json` o de `cross-sdk-rpc-envelope.json` |
 
 Además de comparar, el runner comprueba lo que la **spec** dice de los bytes de referencia
 (`data` es el último atributo, `subject` y `partitionkey` son la clave, `tenantid` es el tenant,
 UTF-8 literal salvo los escapes de control, la DLQ de estado sin la firma y con solo `{ key,
-revision }`…): que todos coincidan con Node no prueba que Node acierte.
+revision }`…): que todos coincidan con Node no prueba que Node acierte. En **rpc** comprueba, sin llamar
+a ningún SDK: que los atributos van **en el orden normativo** de `attributeOrder` del caso (y `data` el
+último); el `type` y el `dataschema` derivados de la operación (`…request.v2`, `…/reply/2.0.0.json`); que
+`subject` y `partitionkey` son el `aggregateId` y **no aparecen** si no se dio; que la respuesta y el error
+**heredan** `correlationid`, `tenantid`, `subject` y `partitionkey` de la petición, con `causationid` = su `id`
+y un `id` propio; que el error es `internal`, con el `type` y el `dataschema` fijos y las claves de `data` en el
+orden `class, code, message, retryAfterMs`; que no hay `signature` ni `dlq*`; y que `data` conserva el orden y
+los valores del vector.
 
-`vectors.json` repite los fixtures y los 23 `subjectVectors` del caso `cross-sdk-state-envelope.json`
-(el caso los documenta; el runner los ejecuta). Dos copias se desincronizan en silencio, así que el
-runner **aborta** (exit 2) si dejan de coincidir.
+`vectors.json` repite los fixtures y los `subjectVectors` del caso `cross-sdk-state-envelope.json`
+(el caso los documenta; el runner los ejecuta), y de `cross-sdk-rpc-envelope.json`: sus **4 sobres**, sus **20
+vectores de operación** y sus **14 de timeout**. Dos copias se desincronizan en silencio, así que el runner
+**aborta** (exit 2) si dejan de coincidir. En rpc hay más copias de lo mismo y las comprueba todas: los bytes del
+caso (`base64`, `bytes`, `sha256`, y su `event` serializado) **son los de la spec**
+(`specification/11-request-reply.md` §3.5: la línea de cada sobre y su SHA-256 aparecen tal cual), y todo lo que
+`protocol.json` → `rpc` declara válido o inválido en `operation`, y los límites de `timeout` (por defecto, mínimo,
+máximo, y un milisegundo fuera de cada lado), tiene su vector.
+
+Los vectores de rpc que **no** vienen del caso (`rpcVectors` tiene 100: los 38 del caso y 62 más) cubren una garantía
+que los cuatro ejemplos no tocan: la petición **sin** `aggregateId` y la que **nace de otro evento** (`correlationid` ≠
+`id`, `causationid`, `tracestate`); una operación de `v2` con agregado de dos palabras (`type`, `dataschema` y las tres
+clasificaciones que faltan); UTF-8 literal y escapes obligatorios; `data` vacío; la respuesta que **hereda** un
+`correlationid` que no es el `id` de la petición (en los ejemplos valen lo mismo, y un SDK que escribiese el `id`
+pasaría); `retryAfterMs: 0`, que se escribe; los controles de tenant; el **orden de §4.1 paso 0** (`RESERVED_DOMAIN` →
+`INVALID_RPC_CALL` → `INVALID_DATACLASSIFICATION`); `data` que no es un objeto; 25 vectores más de operación
+(sintaxis: dígitos de otros alfabetos, ancho completo, NUL, U+00A0, CR LF, `v01`, guiones; y la coincidencia **exacta**
+con un dominio reservado: `states` no es `state`, `State` no lo es y es una operación mal formada, y `rpc` solo es
+`RESERVED_DOMAIN`) y 10 más de timeout (los límites y los tipos).
 
 **El orden de validación está en los vectores**: cada uno de `state-put-orden-…` rompe dos cosas a la
 vez, porque dos SDKs que validan en otro orden dan el mismo código ante cada defecto suelto y
@@ -223,10 +339,12 @@ distinto ante dos.
 ## Mutaciones
 
 Un runner que solo se ha visto en verde no demuestra que detecte nada. `--mutant <nombre>` estropea a
-propósito lo que un SDK entrega o declara —sin tocar su código— y el runner **DEBE** reaccionar:
+propósito lo que un SDK entrega o declara —sin tocar su código— y el runner **DEBE** reaccionar. Cada mutante
+afecta a las operaciones de **una** capacidad (los de estado, a `state-*`; los `rust-rpc-*`, a `rpc-*`):
 
 ```bash
 node conformance/cross-sdk.mjs --only node,rust --mutant rust-un-byte       # DEBE fallar
+node conformance/cross-sdk.mjs --only node,rust --mutant rust-rpc-un-byte   # DEBE fallar
 ```
 
 | Mutante | Qué simula | Resultado |
@@ -236,11 +354,18 @@ node conformance/cross-sdk.mjs --only node,rust --mutant rust-un-byte       # DE
 | `rust-ignora-tenant` | (b) Rust escribe siempre `acme`, vaya el tenant que vaya | **falla**, y el **control** `state-put-control-tenant` lo dice por sí solo: «los bytes son IGUALES a los de `state-put-minimo`» |
 | `rust-sin-state-subject` | (c) Rust declara `state` y su arnés no implementa `state-subject` | **falla**: `declara state … pero su arnés no implementa state-subject (UNSUPPORTED_OP)` |
 | `python-declara-state` | (c) Python pasa a declarar `state` sin ninguna de las cuatro operaciones | **falla**: todos sus vectores de estado dan `UNSUPPORTED_OP` en el arnés **real** |
-| `rust-sin-arnes-registrado` | (c) Rust declara `state` y su arnés desaparece de `harnesses.json` | **falla**: sin arnés no hay evidencia |
+| `rust-sin-arnes-registrado` | (c) Rust declara `state` y `rpc` y su arnés desaparece de `harnesses.json` | **falla**: sin arnés no hay evidencia (una vez por capacidad) |
 | `rust-no-declara-state` | (d) Rust deja de declarar `state` | **pasa** (exit 0) e imprime `N/A: no declara state — rust` |
+| `rust-rpc-un-byte` | (a) el arnés de Rust devuelve los bytes de **rpc** con un byte cambiado | **falla**: los 4 ejemplos de la spec (SHA-256) y todos los demás vectores de bytes |
+| `rust-rpc-timeout-recortado` | (e) Rust **acepta** un timeout fuera de rango: lo recorta a `[1, 25000]` | **falla**: `esperaba code="INVALID_RPC_CALL", obtuvo ok:true (¡no lo rechazó!)` en `rpc-timeout-0`, `-25001`, `-30000`… |
+| `rust-rpc-dominio-reservado-aceptado` | (f) Rust **no rechaza** un dominio reservado: construye el subject o el sobre | **falla**: los vectores `RESERVED_DOMAIN` de `rpc-operation` y de `rpc-request` |
+| `rust-rpc-correlationid-de-la-peticion` | (g) Rust escribe en la respuesta y en el error el `id` de la petición como `correlationid` | **falla** en `rpc-reply-hereda-correlationid` y `rpc-error-hereda-correlationid`, y en **ninguno más**: los ejemplos de la spec no lo detectan (allí el `correlationid` y el `id` valen lo mismo) |
+| `rust-sin-rpc-operation` | (c) Rust declara `rpc` y su arnés no implementa `rpc-operation` | **falla**: `declara rpc … pero su arnés no implementa rpc-operation (UNSUPPORTED_OP)` |
+| `python-declara-rpc` | (c) Python pasa a declarar `rpc` sin ninguna de las cinco operaciones | **falla**: todos sus vectores de rpc dan `UNSUPPORTED_OP` en el arnés **real** |
+| `rust-no-declara-rpc` | (d) Rust deja de declarar `rpc` | **pasa** (exit 0) e imprime `N/A: no declara rpc — rust` |
 
-CI los ejecuta todos (`.github/workflows/spec.yml`, job `cross-sdk`): los que **deben fallar** y el que
-**debe pasar con N/A**. Un SDK que declara `state` y ni siquiera tiene arnés registrado (o figura en
+CI los ejecuta todos (`.github/workflows/spec.yml`, job `cross-sdk`): los que **deben fallar** y los que
+**deben pasar con N/A**. Un SDK que declara una capacidad y ni siquiera tiene arnés registrado (o figura en
 `pending`) falla igual aunque se ejecute con `--only`: excluir un SDK de una ejecución no es quitarle el
 arnés.
 
@@ -258,6 +383,15 @@ verdad); un vector así decidiría la spec desde un fichero de pruebas, y dejar�
 | `id` o `source` vacíos en `state-build` | construye los bytes (un evento que su propio `parseEvent` rechazaría como `MISSING_REQUIRED_ATTRIBUTE`) | los rechaza (sin código) | los constructores puros de Node no comprueban que `id` y `source` no estén vacíos (los rellena el SDK en `put`, que no se ha medido aquí) |
 | `contract` mal formado (`clientes.cliente`, `v0`, mayúsculas…) | rechaza con `InvalidStateContractError` (sin código) | rechaza (sin código: `ERROR`) | [04-errors.md §6](../../specification/04-errors.md) no tiene código para esto; es un hueco de la spec, no de un SDK |
 | `time` no canónico (`…39.4123Z`, `…39Z`, con `+02:00`) | lo copia tal cual | lo normaliza a UTC con 3 decimales | el arnés **exige** `time` canónico: Rust recibe un instante y Node, una cadena |
+| **rpc**: clasificación inválida **y** `data` que no es un objeto (`rpc-request`, `rpc-reply`) | `INVALID_RPC_CALL`: el orden de §4.1 paso 0 | `INVALID_DATACLASSIFICATION`: el **arnés** convierte la clasificación (cadena → enum) antes de llamar al SDK | la spec es clara, y es el arnés de Rust quien rompe el orden (en `request` la clasificación es un enum: no puede estar mal). Por eso no hay vector del par; sí de `RESERVED_DOMAIN` primero y de la operación antes que la clasificación |
+| **rpc**: versión mayor enorme (`a.b.v9007199254740993.c`, `v99999999999999999999`) | pasa por `Number`: escribe otro entero en el `type` (`…v9007199254740992`) | la conserva como texto | `protocol.json`: el `type` es una transformación «mecánica y biyectiva» del subject, sin tope de versión; el que falla es Node |
+| **rpc**: `error` mal formado en `rpc-error` (`poison`, `code` en minúsculas o de 65, `message` vacío o de 1001, `retryAfterMs` negativo, `1.5`, cadena o con `permanent`) | `TypeError` | `INVALID_RPC_CALL` | [04-errors.md §7](../../specification/04-errors.md) no da código al error mal formado: hueco de la spec |
+| **rpc**: `error` con `retryAfterMs: null` o con una clave de más | `TypeError` | **lo acepta**: omite el `null` y descarta la clave | el arnés de Rust deserializa con `serde`, que ignora lo desconocido; el SDK de Node valida contra el esquema del error (`additionalProperties: false`) |
+| **rpc**: `message` de 501 emojis (501 caracteres, 1002 unidades UTF-16) | lo rechaza (cuenta unidades UTF-16) | lo acepta (cuenta caracteres, como `maxLength` de JSON Schema) | A-95: el que falla es Node |
+| **rpc**: `request.operation` mal formada o reservada en `rpc-error` | la rechaza | construye el error igualmente | el error es el mismo para toda operación (§3.3): la spec no dice si se valida |
+| **rpc**: `tracestate` en `rpc-reply` | lo ignora | lo escribe tras `traceparent` | §3.2 no lo prevé en la respuesta |
+| **rpc**: `id`, `source` o `tenantId` vacíos | construye los bytes | los rechaza (`ERROR`) | A-95: el SDK de Node no comprueba que no estén vacíos en el constructor puro |
+| **rpc**: `data` o `classification` ausentes | `INVALID_RPC_CALL` / `INVALID_DATACLASSIFICATION` | `HARNESS_INPUT` (el arnés deserializa con `serde`) | no es un caso: un SDK no recibe una petición sin `data` |
 
 ## Registro de arneses
 
@@ -271,8 +405,9 @@ fuente es `protocol.json`.
 1. Escríbelo en `<sdk>/conformance-harness.<ext>`.
 2. Regístralo en `conformance/harnesses.json`.
 3. `node conformance/cross-sdk.mjs` — el runner lo incluye solo.
-4. Si el SDK declara `state`: implementa también las cuatro operaciones de estado. El runner no
-   las pide hasta que `protocol.json` lo declare; **desde entonces, su ausencia es un fallo**.
+4. Si el SDK declara `state`: implementa también las cuatro operaciones de estado; si declara `rpc`, las cinco
+   de petición/respuesta. El runner no las pide hasta que `protocol.json` lo declare; **desde entonces, su
+   ausencia es un fallo**.
 
 Debe ser **delgado**: parsear la entrada, llamar al SDK, imprimir el resultado. Toda
 lógica en el arnés es lógica que no está en el SDK y que el runner no verifica.

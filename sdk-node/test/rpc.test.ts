@@ -2202,10 +2202,11 @@ describe("las constantes del SDK son las de protocol.json → rpc", () => {
     assert.deepEqual(rpc.caller.replyChecks.length, 5, "las cinco comprobaciones");
   });
 
-  test("la capacidad `rpc` ya está definida en protocol.json con la evidencia que exige, y este SDK todavía NO la declara (lo hace la integración)", () => {
+  test("la capacidad `rpc` está definida en protocol.json con la evidencia que exige, y este SDK la declara citando ESTOS dos ficheros", () => {
     assert.ok(protocolo.capabilities.definitions.rpc);
     assert.ok(protocolo.capabilities.definitions.rpc.requires.includes("exact-subscription-per-operation"));
-    assert.ok(!protocolo.capabilities.sdks.node.capabilities.includes("rpc"));
+    assert.ok(protocolo.capabilities.sdks.node.capabilities.includes("rpc"));
+    assert.deepEqual(protocolo.capabilities.sdks.node.evidence.rpc, ["sdk-node/test/rpc.test.ts", "sdk-node/test/integration/rpc.test.ts"]);
   });
 
   test("CADA código de la capacidad aparece como literal en este fichero (check-sdk-codes.mjs exige que la evidencia los nombre)", () => {

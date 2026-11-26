@@ -308,7 +308,8 @@ await bus.state.watch("clientes.cliente.v1", async (entrada) => {         // fot
 ### Petición/respuesta — [11-request-reply.md](specification/11-request-reply.md)
 
 Una **orden o un cálculo con respuesta inmediata** entre dos servicios, por core NATS: no se persiste, no tiene stream ni
-DLQ. **Ningún SDK la declara todavía**: la spec y las herramientas llegan antes que las implementaciones.
+DLQ. **La declaran Node y Rust** (columna *Capacidades* del [`README.md`](README.md)); los otros cinco SDKs no la tienen
+y el arnés cruzado los marca `N/A: no declara rpc`.
 
 ```ts
 const r = await bus.request("clientes.cliente.v1.calcular-descuento",

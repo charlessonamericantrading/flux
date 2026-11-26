@@ -198,6 +198,7 @@ Puertos: `FLUX_TEST_PORTS=desde-hasta` (por defecto `4600-4649`; se usan hasta 8
 node conformance/cross-sdk.mjs --verbose               # sin broker
 node conformance/cross-sdk.mjs --only node,rust        # un subconjunto
 node conformance/cross-sdk.mjs --only node,rust --mutant rust-un-byte    # DEBE fallar
+node conformance/cross-sdk.mjs --exigir state,rpc      # falla si ningún SDK activo ejecutó esa capacidad
 ```
 
 Cada SDK trae un arnés diminuto (una operación por stdin, un JSON por stdout) y el runner los invoca
@@ -220,10 +221,19 @@ bytes). Reglas del runner:
 - Node, la referencia, fija lo esperado; el resto debe coincidir byte a byte. Los tres ejemplos de la
   spec llevan además su SHA-256: ahí el patrón es la spec y no Node.
 
+**La petición/respuesta** ([11-request-reply.md](../specification/11-request-reply.md)) entra igual, por las cinco
+operaciones `rpc-request`, `rpc-reply`, `rpc-error`, `rpc-operation` y `rpc-timeout`: con los **cuatro ejemplos de §3.5**
+(su SHA-256 y su longitud), los 20 vectores de operación y los 14 de timeout de
+[`cross-sdk-rpc-envelope.json`](cases/cross-sdk-rpc-envelope.json), y 62 más (`rpcVectors` en `vectors.json`).
+Las mismas reglas, con `rpc` en lugar de `state`: la ejecuta **quien la declara** (hoy, Node y Rust), los demás salen
+**`N/A: no declara rpc`**, y quien la declara y no la cumple **falla**. El runner además **aborta** si la spec
+(§3.5), el caso, los vectores y `protocol.json` → `rpc` dejan de decir lo mismo.
+
 **Las mutaciones** (`--mutant`, y CI las ejecuta) demuestran que el runner detecta lo que dice detectar: un
-byte cambiado en Rust, un tenant intercambiado o ignorado, una operación ausente en un SDK que declara
-`state`, un SDK sin arnés registrado —todos **fallan**— y un SDK que no declara `state`, que sale `N/A`
-**sin** fallo. La tabla está en [`harness/README.md`](harness/README.md#mutaciones).
+byte cambiado en Rust (de estado o de rpc), un tenant intercambiado o ignorado, un timeout fuera de rango
+aceptado, un dominio reservado sin rechazar, un `correlationid` que no se hereda, una operación ausente en un SDK
+que declara la capacidad, un SDK sin arnés registrado —todos **fallan**— y un SDK que no declara `state` o `rpc`,
+que sale `N/A` **sin** fallo. La tabla está en [`harness/README.md`](harness/README.md#mutaciones).
 
 ## Añadir un caso
 
