@@ -9,8 +9,14 @@
 
 **Cómo se trabaja**
 
-- **Una fase = una rama + un PR en borrador.** Las fases van en orden. No empieces una sin
-  cerrar la anterior: cada una construye sobre los nombres y permisos de la previa.
+- **Una fase = una rama de fase + uno o varios PRs en borrador**, uno por frente de
+  trabajo (spec e infraestructura, Node, Rust…), apilados sobre la rama de la fase. Los
+  frentes de una misma fase **pueden ir en paralelo**. Las fases van en orden: no empieces
+  una sin cerrar la anterior, porque cada una construye sobre los nombres y permisos de la
+  previa.
+- **Orden de lenguajes — decisión del dueño, 2026-11-26:** Node (referencia) → **Rust** →
+  Go, Java, .NET y PHP → **Python al final**. Cada primitiva se implementa primero en Node
+  y Rust.
 - Antes de tocar nada, lee `AGENTS.md`, `specification/` entera y este fichero entero.
 - **La spec manda sobre el código**, y **lo medido manda sobre la spec.** Si algo de este
   plan choca con lo que observas contra un NATS real, gana lo observado: corrige el plan
@@ -178,9 +184,10 @@ SDK no anuncia una capacidad hasta que pasa sus vectores cruzados.
 
 ### 4.6 Orden de implementación en los SDKs
 
-Cada primitiva se implementa primero en **Node (referencia) y Python**. Dos
+Cada primitiva se implementa primero en **Node (referencia) y Rust**. Dos
 implementaciones independientes antes de dar la spec por estable: el historial del repo
-muestra que cada port destapó un fallo de la spec. Los otros cinco van en la Fase 6.
+muestra que cada port destapó un fallo de la spec. Los otros cinco van en la Fase 6, en
+este orden: Go, Java, .NET, PHP y Python al final.
 
 ---
 
@@ -267,7 +274,11 @@ Crea streams `EVT_`/`DLQ_` (`02-naming.md` §3.3) y los consumidores durables co
 configuración canónica (`03-delivery.md` §2). Idempotente. Informa de diferencias. **Nunca
 borra.** Usa credenciales de operación, no de servicio.
 
-#### 1.4 Los siete SDKs
+#### 1.4 SDKs — Node y Rust ahora; el resto en la Fase 6
+
+Mientras un SDK no lo implemente, no es compatible con la configuración segura (usaría el
+inbox `_INBOX.>` común y el broker se lo denegaría). La tabla de capacidades del
+`README.md` lo debe decir.
 
 | Cambio | Detalle |
 |---|---|
@@ -294,6 +305,7 @@ arranca un `nats-server` con TLS, aprovisiona con `flux provision`, y ejecuta la
 | S8 | Una conexión sin TLS o con credencial inválida es rechazada |
 | S9 | **Regresión:** con la ACL antigua, congelada como fixture, S1 falla y la fuga de A-2 ocurre |
 | S10 | El SDK de Node pasa su test de integración bajo esta configuración |
+| S11 | El SDK de Rust pasa su test de integración bajo esta configuración |
 
 Job nuevo `security` en `.github/workflows/spec.yml`. Los jobs de integración que ya
 levantan NATS (Rust, PHP) pasan a usar la configuración segura.
@@ -431,7 +443,7 @@ await bus.state.watch("clientes.cliente.v1", async (entrada, ctx) => {
 | `scripts/bundle-schemas.mjs`, `check-compat.mjs` | Recorrer `schemas/state/`; índice `state` en el bundle |
 | `scripts/gen-acl.mjs` | Clave `watches`. Dueño: publica en `state.<dom>.>`. Observador: los cuatro permisos de 1.1 sobre `STATE_<DOM>`, `DIRECT.GET` acotado a su tenant y `dlq.state.<contrato>` |
 | `cli/` | `flux state ls \| get \| resync`; `provision` crea `STATE_`; `doctor` audita su config; `tail` entiende `state.` |
-| `sdk-node/`, `sdk-python/` | La API de 2.6, con tests contra NATS real |
+| `sdk-node/`, `sdk-rust/` | La API de 2.6, con tests contra NATS real |
 | `conformance/cases/` | Un caso por cada observación A-9 … A-14 |
 | `conformance/harness/` | Operaciones `state-build`, `state-tombstone`, `state-subject`, `state-dlq`, con vectores |
 | `conformance/security.mjs` | Otro servicio no escribe estado ajeno; un tenant no lee el de otro |
@@ -519,7 +531,7 @@ await bus.respond("clientes.cliente.v1.calcular-descuento", async (peticion, ctx
 | `scripts/bundle-schemas.mjs`, `check-compat.mjs` | `schemas/rpc/`; índice `rpc` |
 | `scripts/gen-acl.mjs` | Clave `calls`; `allow_responses` para el dueño |
 | `cli/` | `doctor`: ningún stream captura `rpc.>`. `flux call <operacion> --data '{…}'` para depurar |
-| `sdk-node/`, `sdk-python/` | `request` y `respond` |
+| `sdk-node/`, `sdk-rust/` | `request` y `respond` |
 | `conformance/cases/` | A-15 … A-18, y reparto por *queue group* |
 | `conformance/harness/` | Operaciones `rpc-request`, `rpc-reply`, `rpc-error`, con vectores |
 | `conformance/security.mjs` | Llamada no concedida denegada; respuesta ajena no legible |
@@ -642,11 +654,14 @@ pasa su test en CI.
 
 ### Fase 6 — Paridad de SDKs
 
-Estado, petición/respuesta e `id` determinista en los cinco SDKs restantes. Tres PRs:
+Estado, petición/respuesta, `id` determinista y los permisos de la Fase 1 (inbox
+privado, TLS, credenciales, `NOT_PROVISIONED`) en los cinco SDKs restantes. Cuatro PRs, en
+este orden:
 
 1. Go
 2. Java y .NET
-3. Rust y PHP
+3. PHP
+4. Python — el último, por decisión del dueño
 
 Cada uno: arnés ampliado con las operaciones nuevas, vectores cruzados en verde, test de
 integración contra NATS bajo la configuración segura, columna de capacidades en el
@@ -701,7 +716,7 @@ Documento `specification/13-encryption.md`. Diseño de partida:
 | Un `durable` personalizado en `subscribe()` no coincide con la ACL | Falla con violación de permisos. Decláralo en el manifiesto o no lo uses. |
 | Dos instancias del mismo servicio con distinto `tenantId` comparten durable de **eventos** y cada una descarta los del otro | Existe hoy. Evalúalo en la Fase 2 al definir el sufijo de tenant del durable de estado; si se confirma, abre un caso. |
 | `flux provision` y el auto-aprovisionado del SDK divergen | Una sola fuente de la config canónica: `protocol.json`. |
-| El alcance es grande: siete SDKs por tres primitivas | Por eso Node y Python primero. Las fases 1–5 ya dan un sistema completo; la 6 es paridad. |
+| El alcance es grande: siete SDKs por tres primitivas | Por eso Node y Rust primero. Las fases 1–5 ya dan un sistema completo; la 6 es paridad. |
 
 ---
 
