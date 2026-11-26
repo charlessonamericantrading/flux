@@ -622,7 +622,7 @@ hash. `state_dataschema(base, contrato)` deriva el `dataschema` de la URL base d
 ## Petición/respuesta
 
 [11-request-reply.md](../specification/11-request-reply.md). Extensión **opcional** de v1.1 (capacidad `rpc`,
-**aún sin declarar**: la declaran los SDKs, el arnés cruzado y los permisos juntos, al integrar la Fase 3): una
+declarada en `protocol.json` → `capabilities` por Node y Rust: el arnés cruzado reproduce sus vectores byte a byte): una
 **orden** o un **cálculo** con respuesta inmediata entre dos servicios, por **core NATS** —sin stream, sin DLQ,
 sin persistir nada— y con el mismo sobre, tenant, clasificación de errores y permisos que el resto del protocolo.
 Sustituye a un `POST /accion` entre servicios propios. **Si lo que pides es un dato que otro sistema guarda, es

@@ -287,6 +287,16 @@ function mutaciones(real) {
     for (const r of protocol.capabilities.sdks.rust.evidence.security) m.ficheros.set(r, sinLiteral(m.ficheros.get(r), "NOT_PROVISIONED"));
   }, ["rust", "NOT_PROVISIONED"]);
   caso("`security` de Node sin citar evidencia", (m) => { delete m.protocol.capabilities.sdks.node.evidence; }, ["node", "evidencia"]);
+  // Lo mismo para `rpc`, la última capacidad declarada: su evidencia son DOS ficheros por SDK (la suite unitaria o el
+  // código, y la de integración contra un broker real), y quitar cualquiera de las dos pistas debe notarse.
+  for (const sdk of ["node", "rust"]) {
+    const ev = protocol.capabilities.sdks[sdk].evidence.rpc;
+    caso(`la evidencia de \`rpc\` de ${sdk} no existe`, (m) => { for (const r of ev) m.ficheros.set(r, null); }, [sdk, "no existe"]);
+    caso(`la evidencia de \`rpc\` de ${sdk} no nombra RPC_TIMEOUT`, (m) => {
+      for (const r of ev) m.ficheros.set(r, sinLiteral(m.ficheros.get(r), "RPC_TIMEOUT"));
+    }, [sdk, "RPC_TIMEOUT"]);
+    caso(`\`rpc\` de ${sdk} sin citar evidencia`, (m) => { delete m.protocol.capabilities.sdks[sdk].evidence.rpc; }, [sdk, "evidencia"]);
+  }
   caso("PHP sin arnés (`pending`), y declara `signing`", (m) => { m.harnesses.pending = ["php"]; }, ["php", "pending"]);
   caso("PHP fuera de conformance/harnesses.json, y declara `signing`", (m) => { m.harnesses.harnesses = m.harnesses.harnesses.filter((h) => h.sdk !== "php"); }, ["php"]);
   return out;
