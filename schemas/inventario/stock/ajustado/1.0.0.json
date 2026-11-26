@@ -1,0 +1,48 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.internal/inventario/stock/ajustado/1.0.0.json",
+  "title": "inventario.stock.v1.ajustado",
+  "description": "La existencia de un SKU en un almacén ha cambiado por un ajuste (recuento, merma, recepción, devolución). Emitido por inventario-api, dueño del agregado. Lleva la cantidad antes y después para que el consumidor no tenga que llamar de vuelta a inventario-api para conocer el nuevo valor.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["stockId", "sku", "aggregateVersion", "cantidadAnterior", "cantidadNueva", "motivo"],
+  "properties": {
+    "stockId": {
+      "type": "string",
+      "pattern": "^stk-[0-9a-z]{3,32}$",
+      "description": "Identificador del agregado (un SKU en un almacén). Coincide con el atributo `subject` del CloudEvent."
+    },
+    "sku": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 64,
+      "description": "Artículo ajustado. Mismo `sku` que usan las líneas de pedidos.pedido.v1.creado."
+    },
+    "almacenId": {
+      "type": "string",
+      "pattern": "^alm-[0-9a-z]{2,32}$",
+      "description": "Referencia al almacén."
+    },
+    "aggregateVersion": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Contador monotónico del agregado. El consumidor descarta eventos con versión menor o igual a la ya aplicada."
+    },
+    "cantidadAnterior": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Unidades en existencia antes del ajuste."
+    },
+    "cantidadNueva": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Unidades en existencia tras el ajuste. Es el valor, no el delta: un consumidor que pierde un evento no acumula el error."
+    },
+    "motivo": {
+      "type": "string",
+      "enum": ["recuento", "merma", "recepcion", "devolucion"],
+      "x-extensible-enum": true,
+      "description": "Causa del ajuste. Enum EXTENSIBLE: pueden añadirse valores en un MINOR, así que el consumidor DEBE tener una rama por defecto no destructiva — ver 05-compatibility.md §2.3."
+    }
+  }
+}
