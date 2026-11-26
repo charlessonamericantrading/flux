@@ -427,8 +427,19 @@ Cada fila está medida contra un broker real (los casos son los de [§2](#2-mode
 1. Es un **CloudEvent válido** (parsea, con las cuatro extensiones y los tipos exactos).
 2. Su `type` es **el de la respuesta de esa operación** o `com.flux.rpc.error.v1`.
 3. Su `causationid` es **el `id` de la petición**.
-4. Su `correlationid` y su `tenantid` **son los de la petición**.
+4. Su `correlationid` y su `tenantid` **son los de la petición**. **Excepción única**: el error de una petición que
+   el que responde no pudo leer ([§5.2](#52-lo-que-no-cumple-y-qué-se-contesta)) lleva `correlationid` propio y
+   `tenantid` = `system`; ahí quien llama **no** aplica esta comprobación, y le basta la 3 (su `causationid` es el
+   `id` de la petición, que solo él conoce) para atribuirlo y ver el código del sobre (`INVALID_RPC_CALL`,
+   `INVALID_TYPE`…) en vez de `RPC_INVALID_REPLY`. Sin esa excepción, un error legítimo sería rechazado por la
+   comprobación que existe para detectar lo ilegítimo.
 5. Si es un error, su `data` cumple el esquema del error (`class` ∈ `retryable | permanent`, `code` y `message`).
+
+**El SDK NO DEBE suscribirse, por la misma conexión que pide, a un subject que case con el `reply` de sus
+peticiones** (`_INBOX.<servicio>.>` o `_INBOX.<servicio>.*.*`): el servidor ve interés y **no envía el
+`no responders`**, de modo que `RPC_UNAVAILABLE` se convierte en `RPC_TIMEOUT` (A-101: 6 de 6 peticiones, con la
+suscripción antes o después). Con otra conexión de la misma identidad sí llega. Usa el buzón único que ya crea la
+librería para las peticiones.
 
 Una respuesta que no es de esta petición es **un incidente** —un productor roto, un stream mal puesto,
 algo hostil— y no un fallo que esperar: de ahí PERMANENT y su propio `outcome` en la métrica (§10). Si el
@@ -521,9 +532,9 @@ para un fallo que no se arregla esperando —el modo de fallo que la taxonomía 
 
 | El handler… | Se responde | `code` | `message` |
 |---|---|---|---|
-| lanza `RetryableError` | `retryable` (con `retryAfterMs` si lo da) | el suyo, o el del clasificador | el de la aplicación |
+| lanza `RetryableError` | `retryable` (con `retryAfterMs` si lo da) | el suyo, o `RETRYABLE` | el de la aplicación |
 | lanza `PermanentError` | `permanent` | el suyo, o `PERMANENT` | el de la aplicación |
-| lanza un error que el **clasificador reconoce** (un 503 de una dependencia, `ECONNRESET`) | su clase (`retryable` / `permanent`) | el del clasificador (`HTTP_503`) | **genérico** («dependencia no disponible») |
+| lanza un error que el **clasificador reconoce** (un 503 de una dependencia, `ECONNRESET`) | su clase (`retryable` / `permanent`) | el del clasificador (`HTTP_503`) si cumple `errors.codePattern`; si no, `RETRYABLE` / `PERMANENT` | **genérico** («dependencia no disponible») |
 | lanza un error **desconocido** | **`permanent`** | `UNKNOWN` | **genérico**: «error interno del servicio» |
 | devuelve algo que no es un objeto | `permanent` | `INVALID_SCHEMA` | «la respuesta no es un objeto» |
 
@@ -554,7 +565,9 @@ El orden es **dejar de escuchar, esperar a lo que está en vuelo, cerrar**:
    la dio por perdida quien llamó).
 3. **Cerrar** la conexión.
 
-**Cerrar la conexión de golpe pierde lo que se atiende**: medido (A-62), con un handler de 400 ms, cerrar a los
+**Cerrar la conexión de golpe pierde lo que se atiende** —y el `drain()` de la **conexión entera** tampoco espera a los
+handlers: el que está en vuelo no puede publicar su respuesta y quien llama ve un timeout (A-83); hay que
+drenar **cada operación** y esperar a los handlers *antes* de cerrar—: medido (A-62), con un handler de 400 ms, cerrar a los
 100 ms deja la petición sin respuesta; con `unsubscribe` a los 100 ms, la petición en vuelo termina con su
 respuesta y la siguiente falla en ~1 ms con `no responders`.
 
