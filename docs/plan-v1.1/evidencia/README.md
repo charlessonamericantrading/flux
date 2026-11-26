@@ -13,7 +13,14 @@ ejecuta [`conformance/security.mjs`](../../../conformance/security.mjs) contra l
 genera `scripts/gen-acl.mjs`: `acl-generada.mjs` y la parte de ACL de `diseno-candidato.mjs`
 se han borrado. La ACL v1 sigue congelada en `conformance/fixtures/acl-v1.conf` (caso S9).
 
-Lo que queda es lo de las **Fases 2 y 3**:
+**La Fase 2 también.** El estado replicado (A-9 … A-14 y lo que midió la fase: A-31 … A-50) es ahora
+[`conformance/cases/state-broker.json`](../../../conformance/cases/state-broker.json) y
+[`state-semantics.json`](../../../conformance/cases/state-semantics.json), que ejecuta
+[`conformance/state-broker.mjs`](../../../conformance/state-broker.mjs) contra un `nats-server` real
+(uno suelto, uno con ACL por usuario y un cluster de tres nodos): la parte de estado de
+`diseno-candidato.mjs` y el observador de estado de `candidata.conf` se han borrado.
+
+Lo que queda es lo de la **Fase 3**:
 
 ```bash
 (cd conformance && npm install)
@@ -32,9 +39,9 @@ el script de Node, `port:` en la config, si hay que cambiarlo).
 
 | Fichero | Qué demuestra | Lo sustituye |
 |---|---|---|
-| `candidata.conf` | Los usuarios del experimento: observador de estado acotado a su tenant y dueño que atiende peticiones, ambos con inbox privado. Es la forma que `gen-acl.mjs` debe llegar a generar con las claves `watches` y `calls` | Fases 2 y 3 |
-| `diseno-candidato.mjs` | Estado replicado (A-9 … A-14) y petición/respuesta (A-15 … A-18) | Fases 2 y 3 |
-| `ejecutar.sh` | Arranca el servidor con `candidata.conf` y lanza el experimento | Fases 2 y 3 |
+| `candidata.conf` | Los usuarios del experimento: quien llama y el dueño que atiende peticiones, con inbox privado. Es la forma que `gen-acl.mjs` debe llegar a generar con la clave `calls` | Fase 3 |
+| `diseno-candidato.mjs` | Petición/respuesta (A-15 … A-18) | Fase 3 |
+| `ejecutar.sh` | Arranca el servidor con `candidata.conf` y lanza el experimento | Fase 3 |
 
 Una línea `FALLA [debe fallar] …` es el resultado **correcto**: es una denegación que
 se esperaba.

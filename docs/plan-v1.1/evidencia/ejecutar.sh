@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Reproduce las observaciones del plan v1.1 que AÚN no son casos de conformance/cases/ (estado
-# replicado y petición/respuesta, Fases 2 y 3) contra un nats-server REAL. La ACL ya es
-# `node conformance/security.mjs`.
+# Reproduce las observaciones del plan v1.1 que AÚN no son casos de conformance/cases/ (la
+# petición/respuesta, Fase 3) contra un nats-server REAL. La ACL ya es `node conformance/security.mjs`
+# y el estado replicado, `node conformance/state-broker.mjs`.
 #
 #   (cd conformance && npm install)
 #   docs/plan-v1.1/evidencia/ejecutar.sh
@@ -25,7 +25,7 @@ arrancar() {
 }
 parar() { kill "$PID" 2>/dev/null || true; wait "$PID" 2>/dev/null || true; PID=""; }
 
-# ── El diseño candidato: estado replicado y petición/respuesta (Fases 2 y 3) ──────────────────
+# ── El diseño candidato: petición/respuesta (Fase 3) ─────────────────────────────────────────
 sed "s|__STORE__|$TMP/js2|" "$AQUI/candidata.conf" >"$TMP/candidata.conf"
 arrancar "$TMP/candidata.conf"
 node "$AQUI/diseno-candidato.mjs"

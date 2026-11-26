@@ -11,11 +11,15 @@ conformance/
 ├── cases/
 │   ├── broker-invariants.json   ← invariantes de NATS de las que depende el protocolo
 │   ├── consumer-config.json     ← la config canónica sobrevive al servidor sin alterarse
-│   └── security-acl.json        ← los permisos generados, ejecutados contra un broker con TLS (S1–S14)
+│   ├── security-acl.json        ← los permisos generados, ejecutados contra un broker con TLS (S1–S14)
+│   ├── state-broker.json        ← estado replicado: lo que hace el BROKER (A-31 … A-49), con ACL y cluster
+│   ├── state-semantics.json     ← estado replicado: el algoritmo de put/delete/get y la foto de watch (A-50)
+│   └── cross-sdk-state-envelope.json ← la entrada de estado, la lápida y la DLQ de estado, byte a byte
 ├── fixtures/
 │   └── acl-v1.conf              ← la ACL v1 de gen-acl.mjs, congelada y rota a propósito (caso S9)
 ├── security.mjs                 ← runner de security-acl.json: los casos son DATOS
 ├── security/                    ← su intérprete, y el ciclo del SDK de Node (S10)
+├── state-broker.mjs             ← runner de los tres ficheros de estado: los casos son DATOS
 └── README.md
 ```
 
@@ -117,6 +121,43 @@ errores, `--nkeys`, `--tenants`), `flux provision` (idempotencia, diferencias, n
 minimalidad de cada permiso —quitando uno, el ciclo se rompe—, `--dev` y el Modelo B; esta suite
 verifica el contrato de seguridad de extremo a extremo y con TLS. Comparten la infraestructura
 (`scripts/lib/nats-harness.mjs`).
+
+## La suite de estado replicado
+
+```bash
+(cd conformance && npm install)
+NATS_SERVER=/ruta/a/nats-server node conformance/state-broker.mjs
+node conformance/state-broker.mjs --only conditional-write,one-value-per-key -v
+node conformance/state-broker.mjs --mutant only-10071        # DEBE fallar: demuestra que el caso detecta el fallo
+```
+
+Como `security.mjs`, **los casos son datos**: [`cases/state-broker.json`](cases/state-broker.json) define el
+vocabulario (crear un stream de estado, publicar con `Nats-Expected-Last-Subject-Sequence`, `DIRECT.GET`,
+un consumidor `last_per_subject`, una carrera de escritores…) y [`state-broker.mjs`](state-broker.mjs) no
+sabe qué es «un valor por clave». Habla NATS directamente, sin ningún SDK, y levanta y para sus servidores:
+uno suelto, uno con la ACL escrita a mano de `acls.estado` y, para los casos `topology: cluster3`, un cluster
+de **tres nodos** (se saltan con `--no-cluster`). Un campo desconocido, o una expectativa sobre algo que la
+operación no observa, es un error al cargar.
+
+- [`state-broker.json`](cases/state-broker.json): lo que hace el **broker** (A-31 … A-49): un valor por clave,
+  `DIRECT.GET`, el chequeo de secuencia —y que va **antes** que el de duplicados—, la lápida, la foto de un
+  consumidor, qué deniega una ACL por tenant, qué lista `STREAM.INFO`, y el código del conflicto de secuencia
+  en un nodo (10071) y en un cluster (10164).
+- [`state-semantics.json`](cases/state-semantics.json): el **protocolo** encima (A-50): el algoritmo de
+  `put`/`delete`/`get` de [10-state.md §3.2](../specification/10-state.md) y la foto de `watch` (§5.5), escritos
+  en el runner como implementación de **referencia** sobre NATS crudo. **Los SDKs de Node y Rust ejecutan estos
+  mismos escenarios con su API**: lo esperado es lo de aquí.
+- [`cross-sdk-state-envelope.json`](cases/cross-sdk-state-envelope.json): los ejemplos byte a byte de
+  [10-state.md §2.6](../specification/10-state.md) con su SHA-256, las operaciones que el arnés cruzado debe
+  aprender (`state-build`, `state-tombstone`, `state-subject`, `state-dlq`) y 23 vectores del subject con el
+  **código estable** de cada rechazo. El runner reconstruye los bytes desde los datos y comprueba el hash.
+- `--mutant <nombre>` estropea a propósito la configuración del stream o la referencia (`no-max-msgs-per-subject`,
+  `no-allow-direct`, `discard-new`, `only-10071`, `no-own-write-check`, `equal-version-applies`,
+  `publish-via-core`, `fresh-id-per-attempt`, `no-cas-header`) y **cada uno DEBE hacer fallar el runner**.
+  `only-10071` solo lo detecta el caso de cluster: en un nodo suelto nunca se ve un 10164.
+
+Puertos: `FLUX_TEST_PORTS=desde-hasta` (por defecto `4600-4649`; se usan hasta 8), `NATS_SERVER` y
+`FLUX_REQUIRE_BROKER=1`, como en la suite de seguridad.
 
 ## Añadir un caso
 

@@ -158,6 +158,21 @@ jobs:
         env:
           FLUX_REQUIRE_BROKER: '1'
         run: node conformance/security.mjs
+      # El estado replicado (10-state.md): los casos del broker, una ACL por tenant escrita a mano y un
+      # cluster de tres nodos. Levanta sus propios servidores con el nats-server compilado arriba.
+      - name: Ejecutar la suite de estado replicado
+        env:
+          FLUX_REQUIRE_BROKER: '1'
+        run: node conformance/state-broker.mjs
+      # Un caso que solo se ha visto en verde no demuestra nada: con una referencia que solo reconoce
+      # el conflicto 10071 (el de un nodo suelto; en un cluster es el 10164) el runner DEBE fallar.
+      - name: Los casos detectan un put que solo reconoce el 10071 (debe FALLAR)
+        run: |
+          if node conformance/state-broker.mjs --mutant only-10071 > /dev/null 2>&1; then
+            echo "✗ el mutante only-10071 NO hizo fallar la suite: el caso de cluster no vigila nada"
+            exit 1
+          fi
+          echo "✓ el mutante fue detectado"
 
   protocol-json-valid:
     name: protocol.json coherente
