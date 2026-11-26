@@ -430,54 +430,78 @@ describeBroker(describe, test, "gateway de extremo a extremo: HTTP → flux", ()
     const antes = async () => (await eventosEn("EVT_PEDIDOS")).length;
     const conexionCerrada = (s) => new Promise((r) => (s.destroyed ? r(true) : s.once("close", () => r(true))));
 
-    test("un `Content-Length` mayor que el límite: 413 SIN leer el cuerpo, con la conexión cerrada, y no se publica nada", async () => {
+    // Una advertencia que costó un CI en rojo: si el servidor responde y cierra mientras el cliente SIGUE enviando, el kernel manda un RST y
+    // el cliente puede perder la respuesta sin haberla leído (A-152). Es una propiedad de TCP, no del gateway. Por eso la respuesta 413 se
+    // comprueba con clientes que NO siguen enviando, y los que inundan solo comprueban que el servidor dejó de leer y cerró.
+    const conexion = () => net.connect(Number(new URL(e.url).port), "127.0.0.1");
+    const POST = (extra = "") => `POST /v1/events/pedidos.pedido.v1.creado HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer ${t()["tienda-web"]}\r\nContent-Type: application/json\r\n${extra}\r\n`;
+
+    test("un `Content-Length` mayor que el límite: 413 SIN leer el cuerpo, con `Connection: close`, la conexión cerrada, y no se publica nada", async () => {
       const n0 = await antes();
-      const { status, leidosPorElServidor, cerrada, cuerpo } = await new Promise((resolve) => {
-        const s = net.connect(Number(new URL(e.url).port), "127.0.0.1");
+      const r = await new Promise((resolve) => {
+        const s = conexion();
         let resp = "";
-        let enviados = 0;
         s.on("data", (d) => (resp += d));
         s.on("error", () => {});
-        s.write(`POST /v1/events/pedidos.pedido.v1.creado HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer ${t()["tienda-web"]}\r\nContent-Type: application/json\r\nContent-Length: ${50 * 1024 * 1024}\r\n\r\n`);
+        s.once("close", () => resolve(resp));
+        s.write(POST(`Content-Length: ${50 * 1024 * 1024}\r\n`)); // declara 50 MiB y NO envía nada
+        setTimeout(() => s.destroy(), 8000);
+      });
+      assert.match(r, /^HTTP\/1\.1 413/);
+      assert.match(r, /connection: close/i);
+      assert.match(r, /EDGE_BODY_TOO_LARGE/);
+      assert.equal(await antes(), n0, "no se publicó nada");
+    });
+
+    test("un cliente que INUNDA tras declarar 50 MiB: el servidor deja de leer y cierra (sin cerrar, Node leería y descartaría todo lo declarado) y no se publica nada", async () => {
+      const n0 = await antes();
+      const { enviados, cerro } = await new Promise((resolve) => {
+        const s = conexion();
+        let enviados = 0;
+        let cerro = false;
+        s.on("data", () => {});
+        s.on("error", () => {});
+        s.once("close", () => { cerro = true; });
+        s.write(POST(`Content-Length: ${50 * 1024 * 1024}\r\n`));
         const trozo = Buffer.alloc(64 * 1024, 0x61);
-        const bombea = async () => {
+        (async () => {
           const t0 = Date.now();
           while (Date.now() - t0 < 1500 && !s.destroyed) {
             if (!s.write(trozo)) await new Promise((r) => (s.once("drain", r), setTimeout(r, 100)));
             enviados += trozo.length;
           }
+          const antesDeCerrar = s.destroyed;
           s.destroy();
-        };
-        bombea();
-        s.once("close", () => resolve({ status: Number(/HTTP\/1.1 (\d+)/.exec(resp)?.[1]), leidosPorElServidor: enviados, cerrada: true, cuerpo: resp.split("\r\n\r\n")[1] }));
+          resolve({ enviados, cerro: cerro || antesDeCerrar });
+        })();
       });
-      assert.equal(status, 413);
-      assert.ok(cerrada, "el servidor cerró la conexión");
-      assert.match(cuerpo, /EDGE_BODY_TOO_LARGE/);
-      assert.ok(leidosPorElServidor < 20 * 1024 * 1024, `el cliente pudo enviar solo ${leidosPorElServidor} de 52428800 bytes declarados: el servidor no los leyó (sin cerrar, Node los lee y descarta todos)`);
+      assert.ok(cerro, "el servidor cerró la conexión mientras el cliente aún enviaba");
+      assert.ok(enviados < 20 * 1024 * 1024, `el cliente pudo enviar solo ${enviados} de 52428800 bytes declarados: el servidor no los leyó`);
       assert.equal(await antes(), n0, "no se publicó nada");
     });
 
-    test("un cuerpo *chunked* que pasa del límite se corta, con 413 y conexión cerrada", async () => {
+    test("un cuerpo *chunked* que pasa del límite se corta: 413 y conexión cerrada (el cliente deja de enviar al ver el límite superado)", async () => {
       const n0 = await antes();
       const r = await new Promise((resolve) => {
-        const s = net.connect(Number(new URL(e.url).port), "127.0.0.1");
+        const s = conexion();
         let resp = "";
         s.on("data", (d) => (resp += d));
         s.on("error", () => {});
-        s.write(`POST /v1/events/pedidos.pedido.v1.creado HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer ${t()["tienda-web"]}\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\n\r\n`);
+        s.once("close", () => resolve(resp));
+        s.write(POST("Transfer-Encoding: chunked\r\n"));
         const trozo = Buffer.alloc(64 * 1024, 0x61);
         (async () => {
-          const t0 = Date.now();
-          while (Date.now() - t0 < 4000 && !s.destroyed) {
+          // A ritmo de 10 ms por trozo: el servidor consume cada uno antes del siguiente y, al cruzar el límite, no queda nada sin leer
+          // (sin RST). Se detiene en cuanto llega la respuesta, y a los 6 MiB si nunca llega (un servidor sin límite).
+          for (let i = 0; i < 96 && !s.destroyed && resp === ""; i++) {
             s.write(`${trozo.length.toString(16)}\r\n`);
-            if (!s.write(Buffer.concat([trozo, Buffer.from("\r\n")]))) await new Promise((r) => (s.once("drain", r), setTimeout(r, 100)));
+            s.write(Buffer.concat([trozo, Buffer.from("\r\n")]));
+            await new Promise((x) => setTimeout(x, 10));
           }
-          s.destroy();
+          setTimeout(() => s.destroy(), 6000);
         })();
-        s.once("close", () => resolve(resp));
       });
-      assert.match(r, /^HTTP\/1.1 413/);
+      assert.match(r, /^HTTP\/1\.1 413/);
       assert.match(r, /EDGE_BODY_TOO_LARGE/);
       assert.equal(await antes(), n0);
     });

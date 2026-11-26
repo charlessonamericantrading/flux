@@ -160,7 +160,7 @@ describe("A-152: el límite de cuerpo de node:http", () => {
     assert.match(sin.estado, /413/);
     assert.ok(sin.leidos > 20 * LIM, `sin cerrar, el servidor leyó ${sin.leidos} bytes de los 52 428 800 declarados`);
     const con = await declarando50MiB({ cerrar: true });
-    assert.match(con.estado, /413/);
+    // (la respuesta 413 NO se comprueba aquí: con el cliente inundando, el RST del servidor puede borrarla antes de que se lea)
     assert.ok(con.leidos < 2 * LIM, `cerrando, el servidor leyó solo ${con.leidos} bytes`);
     assert.ok(con.cerrada, "y la conexión se cerró");
   });
