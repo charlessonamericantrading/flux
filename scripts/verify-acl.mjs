@@ -32,6 +32,12 @@
  *      forma documentada: H1 (no consume) y H2 (fuga por el inbox común).
  *   8. Modelo B (`--tenants`): mismos permisos, una account por tenant, aislamiento real.
  *
+ * Petición/respuesta (11-request-reply.md; permisos en 06-security.md §3.9), en las mismas secciones: 1c (el generador:
+ * la forma exacta de quien llama y del dueño, lo que rechaza el manifiesto), 3 (cada servicio que llama o atiende
+ * ejecuta su ciclo), 4c (una MATRIZ de sondas × servicios: quién puede llamar, suscribirse o publicar sobre inboxes),
+ * 5c (sin la suscripción o sin `allow_responses`, el dueño se rompe), 6c (mutantes sembrados: `rpc.<dominio>.>`
+ * a quien llama, `rpc.>` o un permiso de publicación sobre inboxes al dueño) y 8 (cada account tiene SU espacio `rpc.`).
+ *
  * Relación con la suite de seguridad (`node conformance/security.mjs`, Fase 1.5): NO es redundante.
  * La suite verifica el contrato de seguridad de extremo a extremo —con TLS, con los SDKs de Node
  * y de Rust— y sus casos son DATOS; este script verifica lo que ella no mira: el generador (sus
@@ -167,13 +173,72 @@ async function reiniciarDurable(ops, stream, durable, filtro) {
 // ─── Ciclo de un servicio ────────────────────────────────────────────────────
 
 /**
+ * La petición/respuesta de un servicio con sus permisos generados, como la haría un SDK `rpc` (11-request-reply.md §4 y
+ * §5): quien llama publica en el subject EXACTO de la operación y recibe la respuesta por su inbox privado; el dueño se
+ * suscribe al subject exacto, con su servicio como grupo de cola, y responde con `allow_responses` (sin ningún permiso de
+ * publicación sobre inboxes). `ops`, sin restricciones, hace de la otra parte.
+ *
+ * Se comprueban EFECTOS, no la ausencia de error: una respuesta denegada no lanza nada en el dueño (el broker avisa por su
+ * conexión) y para quien llama solo es un timeout, así que el paso del dueño mira las dos cosas.
+ */
+async function cicloRpc({ nc, svc, ops, paso }) {
+  for (const op of svc.calls ?? []) {
+    await paso(`request(${op}): publicar en el subject EXACTO rpc.${op} y recibir la respuesta por el inbox privado`, async () => {
+      const resp = ops.nc.subscribe(`rpc.${op}`, { queue: "verify-acl" });
+      (async () => {
+        try {
+          for await (const m of resp) m.respond(enc.encode('{"ok":true}'));
+        } catch {
+          /* suscripción denegada: el iterador lanza (A-8f) */
+        }
+      })();
+      await ops.nc.flush();
+      try {
+        const r = await nc.request(`rpc.${op}`, enc.encode("{}"), { timeout: 2000 });
+        if (!JSON.parse(dec.decode(r.data)).ok) throw new Error("respuesta inesperada");
+      } finally {
+        resp.unsubscribe();
+        await ops.nc.flush();
+      }
+    });
+  }
+  for (const op of svc.serves ?? []) {
+    await paso(`respond(${op}): suscribirse al subject EXACTO rpc.${op} (grupo de cola ${svc.name}) y responder con allow_responses`, async () => {
+      const antes = nc.violaciones.length;
+      const sub = nc.subscribe(`rpc.${op}`, { queue: svc.name });
+      (async () => {
+        try {
+          for await (const m of sub) m.respond(enc.encode('{"ok":true}'));
+        } catch {
+          /* suscripción denegada: el iterador lanza (A-8f) y el paso lo ve en el aviso de la conexión */
+        }
+      })();
+      await nc.flush();
+      await sleep(150);
+      try {
+        const den = nc.violaciones.slice(antes).find((v) => v.includes("Subscription"));
+        if (den) throw new Error(den);
+        const r = await ops.nc.request(`rpc.${op}`, enc.encode("{}"), { timeout: 1500 });
+        if (!JSON.parse(dec.decode(r.data)).ok) throw new Error("respuesta inesperada");
+        await sleep(150);
+        const v = nc.violaciones.slice(antes);
+        if (v.length) throw new Error(v[0]);
+      } finally {
+        sub.unsubscribe();
+        await nc.flush();
+      }
+    });
+  }
+}
+
+/**
  * Lo que hace un servicio con el SDK de Node, paso a paso (sdk-node/src/client.ts). Cada
  * paso es independiente: un permiso que falta rompe SU paso y no oculta los demás.
  *
  * `ops` prepara el terreno (mensajes sembrados, durables limpios) y comprueba EFECTOS, no
  * solo ausencia de error: un ack denegado no falla en el cliente, deja el mensaje pendiente.
  */
-async function ciclo({ nc, svc, ops, subjectPropio, nakTerm = false }) {
+async function ciclo({ nc, svc, ops, subjectPropio, nakTerm = false, rpc = true }) {
   const pasos = [];
   const paso = async (nombre, fn) => {
     try {
@@ -342,6 +407,11 @@ async function ciclo({ nc, svc, ops, subjectPropio, nakTerm = false }) {
     if (i.num_ack_pending !== 0 || i.ack_floor.stream_seq < d.seq) throw new Error("el ack no se registró");
   });
 
+  // Petición/respuesta, si el servicio llama a alguna operación o atiende alguna. Las variantes que miden los permisos de
+  // EVENTOS del dueño (sección 5b) la omiten: con `allow_responses` el `reply` de cada entrega —el subject de ack— admite
+  // UNA publicación, y su ack pasa aunque falte `$JS.ACK…` (A-109).
+  if (rpc) await cicloRpc({ nc, svc, ops, paso });
+
   return { pasos, ok: pasos.every((p) => p.ok), fallidos: pasos.filter((p) => !p.ok).map((p) => p.nombre), ack: primerAck };
 }
 
@@ -387,13 +457,17 @@ async function seccionGenerador(subjectsBundle) {
   // encaje en ninguna es un error del generador. Y lo denegable lo es salvo las dos formas de
   // DIRECT.GET de estado (`security.acl.neverGrantedExceptions`: se miden en las secciones de estado).
   const patronesEstado = Object.entries(proto.state.acl).filter(([k, v]) => typeof v === "string" && !k.startsWith("$") && k !== "observerStreamInfoState");
-  const permitidos = [...Object.entries(acl.permissionPatterns), ...patronesEstado].filter(([k]) => !k.startsWith("$")).map(([, v]) => new RegExp(v));
+  // …y la de petición/respuesta (protocol.json → rpc.acl): quien llama publica en el subject EXACTO de cada operación.
+  const patronesRpc = [["callerPublish", proto.rpc.acl.callerPublish]];
+  const permitidos = [...Object.entries(acl.permissionPatterns), ...patronesEstado, ...patronesRpc].filter(([k]) => !k.startsWith("$")).map(([, v]) => new RegExp(v));
   const excepciones = (acl.neverGrantedExceptions ?? []).map((ruta) => new RegExp(ruta.split(".").reduce((o, k) => o?.[k], proto)));
   const peligroso = { test: (x) => new RegExp(acl.neverGrantedPattern).test(x) && !excepciones.some((re) => re.test(x)) };
   for (const s of json) {
+    // Su inbox privado y, solo si atiende operaciones, `rpc.<dominio>.>` de cada dominio servido: ningún subject de evento.
+    const dominiosRpc = [...new Set(s.serves.map(domainOf))].sort();
     afirmar(
-      s.subscribe.length === 1 && s.subscribe[0] === `_INBOX.${s.name}.>`,
-      `${s.name}: SOLO se suscribe a su inbox privado (ningún subject de dominio, ningún _INBOX.>)`,
+      JSON.stringify(s.subscribe) === JSON.stringify([`_INBOX.${s.name}.>`, ...dominiosRpc.map((d) => `rpc.${d}.>`)]),
+      `${s.name}: SOLO se suscribe a su inbox privado${dominiosRpc.length ? ` y a rpc.${dominiosRpc.join(".>, rpc.")}.> (atiende operaciones)` : ""} (ningún subject de dominio, ningún _INBOX.>)`,
       JSON.stringify(s.subscribe),
     );
     const malos = s.publish.filter((p) => peligroso.test(p) || !permitidos.some((re) => re.test(p)));
@@ -421,8 +495,11 @@ async function seccionGenerador(subjectsBundle) {
     "$JS.API.CONSUMER.INFO.DLQ_FACTURACION.facturacion-api__dlq_facturacion",
     "$JS.API.CONSUMER.MSG.NEXT.DLQ_FACTURACION.facturacion-api__dlq_facturacion",
     "$JS.ACK.DLQ_FACTURACION.facturacion-api__dlq_facturacion.>",
+    // Quien llama: el subject EXACTO de cada operación de su `calls`, y nada más (06-security.md §3.9).
+    "rpc.clientes.cliente.v1.calcular-descuento",
+    "rpc.clientes.cliente.v1.obtener",
   ];
-  afirmar(JSON.stringify(fact.publish) === JSON.stringify(esperado), "facturacion-api: lista de publicación EXACTA (pedidos.pedido.v1.> expandido a sus dos subjects)", fact.publish.join("\n"));
+  afirmar(JSON.stringify(fact.publish) === JSON.stringify(esperado), "facturacion-api: lista de publicación EXACTA (pedidos.pedido.v1.> expandido a sus dos subjects, y un subject rpc EXACTO por operación que llama)", fact.publish.join("\n"));
   afirmar(JSON.stringify(fact.consumes) === JSON.stringify(["pedidos.pedido.v1.cancelado", "pedidos.pedido.v1.creado"]), "`consumes` sale expandido a subjects exactos");
 
   // CONSUMER.CREATE: fuera por defecto (producción = flux provision), dentro con --dev, y solo del durable PROPIO.
@@ -444,6 +521,7 @@ async function seccionGenerador(subjectsBundle) {
   );
 
   seccionGeneradorEstado(json, dev);
+  await seccionGeneradorRpc(json, dev, proto);
 
   const sinMapa = gen(EJEMPLO);
   afirmar(sinMapa.codigo === 0 && /nkey: "<NKEY_DE_PEDIDOS_API>"/.test(sinMapa.salida), "sin --nkeys cada usuario lleva el placeholder <NKEY_DE_…>");
@@ -525,7 +603,8 @@ async function seccionGenerador(subjectsBundle) {
   afirmar(
     tenants.every((t) => {
       const o = json.find((s) => s.name === t.name);
-      return JSON.stringify(o.publish) === JSON.stringify(t.publish) && JSON.stringify(o.subscribe) === JSON.stringify(t.subscribe);
+      return JSON.stringify(o.publish) === JSON.stringify(t.publish) && JSON.stringify(o.subscribe) === JSON.stringify(t.subscribe) &&
+        JSON.stringify(o.allowResponses) === JSON.stringify(t.allowResponses);
     }),
     "--tenants: los permisos de cada servicio son IDÉNTICOS a los del Modelo A",
   );
@@ -536,6 +615,130 @@ async function seccionGenerador(subjectsBundle) {
   );
 
   return { json, claves, subjectsBundle };
+}
+
+/**
+ * El generador y la petición/respuesta (11-request-reply.md §7, 06-security.md §3.9), sin servidor: la forma EXACTA de lo
+ * que recibe quien llama y el dueño, lo que NUNCA recibe nadie, y lo que el manifiesto rechaza y acepta. Los permisos se
+ * EJECUTAN contra un broker en las secciones 3, 4c, 5c, 6c y 8.
+ */
+async function seccionGeneradorRpc(json, dev, proto) {
+  seccion("1c. El generador y la petición/respuesta (`calls`, `serves`): lo que recibe cada rol y lo que el manifiesto rechaza");
+  const rol = (n) => json.find((s) => s.name === n);
+  const crm = rol("crm-api");
+  const pedidos = rol("pedidos-api");
+  const fact = rol("facturacion-api");
+  const ar = proto.rpc.acl.ownerAllowResponses;
+
+  afirmar(
+    JSON.stringify(crm.subscribe) === JSON.stringify(["_INBOX.crm-api.>", "rpc.clientes.>"]) &&
+      JSON.stringify(crm.allowResponses) === JSON.stringify({ max: 1, expires: "30s" }) &&
+      crm.serves.length === 2 && crm.calls.length === 0,
+    "crm-api (el dueño, `serves` 2 operaciones): SE SUSCRIBE a su inbox y a `rpc.clientes.>`, y responde con allow_responses { max: 1, expires: 30s }",
+    JSON.stringify({ subscribe: crm.subscribe, allowResponses: crm.allowResponses }),
+  );
+  afirmar(
+    !crm.publish.some((p) => /^rpc\b|^_INBOX\b/.test(p)),
+    "crm-api: NINGÚN permiso de publicación sobre `rpc.` ni sobre inboxes: responde con allow_responses, no con un permiso (A-16, A-68)",
+    crm.publish.join("\n"),
+  );
+  afirmar(
+    JSON.stringify(fact.publish.filter((p) => /^rpc\./.test(p))) === JSON.stringify(["rpc.clientes.cliente.v1.calcular-descuento", "rpc.clientes.cliente.v1.obtener"]) &&
+      JSON.stringify(fact.subscribe) === JSON.stringify(["_INBOX.facturacion-api.>"]) && fact.allowResponses === null,
+    "facturacion-api (solo llama): publica en el subject EXACTO de cada operación, se suscribe SOLO a su inbox y no tiene allow_responses",
+    JSON.stringify({ rpc: fact.publish.filter((p) => /^rpc\./.test(p)), subscribe: fact.subscribe, allowResponses: fact.allowResponses }),
+  );
+  afirmar(
+    JSON.stringify(pedidos.publish.filter((p) => /^rpc\./.test(p))) === JSON.stringify(["rpc.clientes.cliente.v1.calcular-descuento"]) &&
+      JSON.stringify(pedidos.subscribe) === JSON.stringify(["_INBOX.pedidos-api.>"]) && pedidos.allowResponses === null,
+    "pedidos-api (dueño de `pedidos` que solo llama a una operación): una concesión, ninguna suscripción de dominio y ninguna respuesta",
+  );
+  afirmar(
+    json.filter((s) => s.calls.length === 0 && s.serves.length === 0).every((s) => !s.publish.some((p) => /^rpc\b/.test(p)) && s.subscribe.length === 1 && s.allowResponses === null),
+    "un servicio sin `calls` ni `serves` no recibe NADA de rpc: ni publicación, ni suscripción, ni allow_responses",
+  );
+  // Lo que NUNCA recibe nadie, ni siquiera el dueño.
+  const todos = [...json, ...dev];
+  afirmar(
+    todos.every((s) => s.publish.every((p) => !/^rpc\b/.test(p) || (new RegExp(proto.rpc.acl.callerPublish).test(p) && !/[*>]/.test(p)))),
+    "NINGÚN servicio recibe `rpc.>`, `rpc.<dominio>.>` ni un comodín por token para publicar (solo el subject exacto de cada operación llamada)",
+  );
+  afirmar(
+    todos.every((s) => s.subscribe.every((x) => x === `_INBOX.${s.name}.>` || (new RegExp(proto.rpc.acl.ownerSubscribe).test(x) && !proto.rpc.acl.ownerNeverSubscribe.includes(x)))),
+    "NINGÚN servicio se suscribe a `rpc.>`, `rpc.*.>` ni a `>`: solo `rpc.<dominio>.>` del dominio que atiende",
+  );
+  afirmar(
+    todos.every((s) => !s.publish.some((p) => /^_INBOX\b/.test(p))),
+    "NINGÚN servicio recibe un permiso de publicación sobre inboxes (ni el dueño: allow_responses se lo da, y solo para el `reply` de la petición)",
+  );
+  afirmar(
+    json.filter((s) => s.allowResponses).map((s) => s.name).join() === "crm-api" &&
+      todos.every((s) => !s.allowResponses || (s.allowResponses.max === ar.maxReplies && parseInt(s.allowResponses.expires, 10) * 1000 > proto.rpc.timeout.maxMs)),
+    `allow_responses solo para quien atiende, con max ${ar.maxReplies} y una caducidad (${crm.allowResponses?.expires}) por encima del timeout máximo de una llamada (${proto.rpc.timeout.maxMs / 1000} s): una respuesta legítima nunca llega después`,
+  );
+  afirmar(
+    JSON.stringify(dev.map((s) => [s.subscribe, s.allowResponses, s.publish.filter((p) => /^rpc\./.test(p))])) === JSON.stringify(json.map((s) => [s.subscribe, s.allowResponses, s.publish.filter((p) => /^rpc\./.test(p))])),
+    "--dev no cambia ningún permiso de rpc: CONSUMER.CREATE es lo único que añade",
+  );
+
+  const conf = gen(EJEMPLO);
+  const lineasAllow = conf.salida.split("\n").filter((l) => /allow_responses/.test(l) && !/^\s*#/.test(l));
+  afirmar(
+    conf.codigo === 0 && lineasAllow.length === 1 && lineasAllow[0].trim() === 'allow_responses: { max: 1, expires: "30s" }' && /rpc\.clientes\.>/.test(conf.salida.replace(/^#.*$/gm, "")),
+    "la config de nats-server lleva UN `allow_responses: { max: 1, expires: \"30s\" }` (el de crm-api) y su `rpc.clientes.>`",
+    lineasAllow.join("\n"),
+  );
+  const check = gen(EJEMPLO, "--check");
+  afirmar(check.codigo === 0 && /2 operación\(es\) atendida\(s\) y 3 llamada\(s\)/.test(check.salida), "--check cuenta las operaciones atendidas y llamadas", check.salida);
+
+  // El manifiesto: lo que debe rechazar (con su pista) y lo que acepta.
+  const dueño = { name: "crm-api", owns: ["clientes"], serves: ["clientes.cliente.v1.obtener", "clientes.cliente.v1.calcular-descuento"] };
+  const con = (extra, servicios = [dueño]) => ({ services: [...servicios, ...(extra ? [extra] : [])] });
+  const rechazos = [
+    ["una llamada con el prefijo `rpc.` (dominio reservado)", con({ name: "web-api", calls: ["rpc.clientes.cliente.v1.obtener"] }), /RESERVADO[\s\S]*prefijo `rpc\.` lo pone el SDK/],
+    ["una llamada con comodín de token", con({ name: "web-api", calls: ["clientes.cliente.v1.*"] }), /lleva un comodín[\s\S]*TODAS/],
+    ["una llamada con `>` («para llamarlo todo»)", con({ name: "web-api", calls: ["clientes.>"] }), /lleva un comodín/],
+    ["una operación de un dominio de estado (`state.…`)", con({ name: "web-api", calls: ["state.clientes.cliente.v1"] }), /RESERVADO/],
+    ["una operación que no es una operación (3 tokens)", con({ name: "web-api", calls: ["clientes.cliente.v1"] }), /no es una operación válida[\s\S]*INFINITIVO/],
+    ["una operación con mayúsculas", con({ name: "web-api", calls: ["Clientes.cliente.v1.obtener"] }), /no es una operación válida/],
+    ["una entrada que no es una cadena", con({ name: "web-api", calls: [42] }), /entrada inválida/],
+    ["`calls` que no es una lista", con({ name: "web-api", calls: "clientes.cliente.v1.obtener" }), /debe ser una lista/],
+    ["`serves` que no es una lista", con(null, [{ ...dueño, serves: "clientes.cliente.v1.obtener" }]), /debe ser una lista/],
+    ["una operación repetida", con({ name: "web-api", calls: ["clientes.cliente.v1.obtener", "clientes.cliente.v1.obtener"] }), /está dos veces/],
+    ["una operación que no existe en el bundle", con({ name: "web-api", calls: ["clientes.cliente.v1.crear"] }), /no existe en el bundle[\s\S]*calcular-descuento/],
+    ["una operación sin esquema en un dominio sin ninguno", con(null, [{ name: "x-api", owns: ["pedidos"], serves: ["pedidos.pedido.v1.crear"] }]), /no existe en el bundle[\s\S]*schemas\/rpc\/pedidos\/pedido\/crear\/\{request,reply\}\/1\.0\.0\.json/],
+    ["llamar a una operación que nadie atiende", con({ name: "web-api", calls: ["clientes.cliente.v1.obtener"] }, [{ name: "crm-api", owns: ["clientes"] }]), /que nadie atiende[\s\S]*serves/],
+    ["llamar a un dominio sin dueño", { services: [{ name: "web-api", calls: ["clientes.cliente.v1.obtener"] }] }, /nadie declara ser dueño/],
+    ["llamar a la operación propia", con(null, [{ ...dueño, calls: ["clientes.cliente.v1.obtener"] }]), /su propia operación/],
+    ["atender una operación del dominio de OTRO (dos servicios sobre la misma: los dos la ejecutan)", con({ name: "otro-api", owns: ["pedidos"], serves: ["clientes.cliente.v1.obtener"] }), /es de crm-api[\s\S]*A-60/],
+    ["atender una operación sin ser dueño de nada", con({ name: "web-api", serves: ["clientes.cliente.v1.calcular-descuento"] }, [{ name: "crm-api", owns: ["clientes"] }]), /es de crm-api/],
+    ["atender una operación con comodín", con(null, [{ ...dueño, serves: ["clientes.cliente.v1.*"] }]), /lleva un comodín/],
+    ["una errata de clave (`serve`)", con(null, [{ ...dueño, serve: dueño.serves, serves: undefined }]), /clave desconocida «serve»[\s\S]*serves/],
+  ];
+  for (const [que, m, patron] of rechazos) {
+    const r = gen(manifiestoTemporalSync(m), "--check");
+    afirmar(r.codigo === 1 && patron.test(r.errores), `rechaza ${que}`, `exit ${r.codigo}: ${r.errores.trim()}`);
+  }
+  const sinRpc = path.join(TMP, "bundle-sin-rpc.json");
+  const b = JSON.parse(readFileSync(path.join(ROOT, "schemas", "bundle.json"), "utf8"));
+  delete b.rpc;
+  writeFileSync(sinRpc, JSON.stringify(b));
+  const antiguo = gen(manifiestoTemporalSync(con({ name: "web-api", calls: ["clientes.cliente.v1.obtener"] })), "--bundle", sinRpc, "--check");
+  afirmar(antiguo.codigo === 1 && /no existe en el bundle/.test(antiguo.errores), "con un bundle SIN índice `rpc` (anterior a 1.1) ninguna operación existe: se rechaza, no se concede sin esquema");
+
+  const bueno = gen(manifiestoTemporalSync(con({ name: "web-api", calls: ["clientes.cliente.v1.obtener"] })), "--json");
+  const web = bueno.codigo === 0 ? JSON.parse(bueno.salida).find((x) => x.name === "web-api") : null;
+  afirmar(
+    !!web && JSON.stringify(web.publish) === JSON.stringify(["$JS.API.INFO", "rpc.clientes.cliente.v1.obtener"]) && JSON.stringify(web.subscribe) === JSON.stringify(["_INBOX.web-api.>"]) && web.allowResponses === null,
+    "acepta un servicio que SOLO llama (sin `owns`): `$JS.API.INFO`, el subject exacto y su inbox; ni una suscripción de dominio ni allow_responses",
+    bueno.errores + (web ? web.publish.join("\n") : bueno.salida),
+  );
+  const dos = gen(manifiestoTemporalSync({ services: [{ name: "a-api", owns: ["clientes"], serves: ["clientes.cliente.v1.obtener", "clientes.cliente.v1.calcular-descuento"] }, { name: "b-api", owns: ["pedidos"], serves: [] }] }), "--json");
+  afirmar(
+    dos.codigo === 0 && JSON.parse(dos.salida).find((x) => x.name === "b-api").subscribe.length === 1,
+    "un dueño que no declara `serves` (b-api, dueño de pedidos) no recibe ninguna suscripción de rpc",
+    dos.errores,
+  );
 }
 
 /**
@@ -917,6 +1120,49 @@ async function desviosDeSondasEstado(nc, nombre, sondas) {
   return desvios;
 }
 
+/**
+ * Las sondas de petición/respuesta: lo que cada servicio puede y NO puede hacer sobre `rpc.` y sobre los inboxes. Cada sonda
+ * dice a quién le está permitido; el resto DEBE recibir una violación. Devuelven `true` si lo PELIGROSO estuvo permitido.
+ * Como las de estado, se ejecutan como TODOS los servicios (una matriz) y comparan con lo que dice el manifiesto.
+ * «Llamar» está permitido si el broker NO deniega la publicación: sin nadie escuchando, la respuesta es `no responders`.
+ */
+const OP_OBTENER = "clientes.cliente.v1.obtener";
+const OP_DESCUENTO = "clientes.cliente.v1.calcular-descuento";
+function sondasRpc(marca) {
+  const llamar = (op) => async (nc) => (await pedir(nc, `rpc.${op}`, {}, 800)).estado !== "denegado";
+  const crudo = (subject) => async (nc) => (await publicarCrudo(nc, subject)) === "permitido";
+  /** Suscribirse y soltar la suscripción SIEMPRE: una suscripción permitida dejaría interés y falsearía los `no responders`. */
+  const suscribir = (subject, queue) => async (nc) => {
+    const antes = nc.violaciones.length;
+    const sub = nc.subscribe(subject, queue ? { queue } : undefined);
+    await nc.flush();
+    await sleep(250);
+    const denegada = nc.violaciones.slice(antes).some((v) => v.includes(`Subscription to "${subject}"`));
+    sub.unsubscribe();
+    await nc.flush();
+    return !denegada;
+  };
+  const dueno = ["crm-api"];
+  return [
+    // ── Llamar ───────────────────────────────────────────────────────────────
+    [`llamar a ${OP_OBTENER} (concedida solo a quien la declara en \`calls\`)`, llamar(OP_OBTENER), ["facturacion-api"]],
+    [`llamar a ${OP_DESCUENTO}`, llamar(OP_DESCUENTO), ["facturacion-api", "pedidos-api"]],
+    ["llamar a una operación NO concedida a nadie del MISMO dominio (clientes.cliente.v1.crear)  [A-66]", llamar("clientes.cliente.v1.crear"), []],
+    ["llamar a una operación de OTRO dominio (pedidos.pedido.v1.obtener)", llamar("pedidos.pedido.v1.obtener"), []],
+    ["publicar a pelo, sin respuesta, en rpc.clientes.cliente.v1.crear", crudo("rpc.clientes.cliente.v1.crear"), []],
+    // ── Atender: suscribirse ─────────────────────────────────────────────────
+    ["suscribirse a `rpc.>` (leería las peticiones de todos, con sus datos personales)", suscribir("rpc.>"), []],
+    ["suscribirse a `rpc.*.>`", suscribir("rpc.*.>"), []],
+    ["suscribirse a `rpc.clientes.>` (el permiso del dueño del dominio)", suscribir("rpc.clientes.>"), dueno],
+    ["suscribirse a `rpc.pedidos.>` (un dominio cuyo dueño no atiende ninguna operación)", suscribir("rpc.pedidos.>"), []],
+    ["suscribirse al subject de una operación (rpc.clientes.cliente.v1.obtener) con su grupo de cola", suscribir(`rpc.${OP_OBTENER}`, "verify-acl"), dueno],
+    ["…suplantando el grupo de cola del dueño (`crm-api`) para llevarse la mitad de las peticiones  [A-60]", suscribir(`rpc.${OP_OBTENER}`, "crm-api"), dueno],
+    // ── Los inboxes: nadie publica en uno por su cuenta ──────────────────────
+    [`publicar en el inbox de otro servicio (_INBOX.verify-otro.${marca})`, crudo(`_INBOX.verify-otro.${marca}`), []],
+    ["publicar en el inbox privado PROPIO: el dueño no tiene ningún permiso de publicación sobre inboxes (A-68)", async (nc) => (await publicarCrudo(nc, `${nc.options?.inboxPrefix ?? "_INBOX.x"}.${marca}`)) === "permitido", []],
+  ];
+}
+
 // ─── Principal ───────────────────────────────────────────────────────────────
 
 /** Las sondas de denegación. Devuelven `true` si lo PELIGROSO estuvo permitido. */
@@ -1025,6 +1271,19 @@ async function main() {
     { que: "crm-api + `state.>`: el dueño de un dominio escribe el estado de TODOS", base: "crm-api", anade: ["state.>"], flip: ["escribir el estado de OTRO dominio"] },
     { que: "crm-api + STREAM.INFO.STATE_CLIENTES (decisión: tampoco el dueño)", base: "crm-api", anade: ["$JS.API.STREAM.INFO.STATE_CLIENTES"], flip: ["STREAM.INFO.STATE_CLIENTES con subjects_filter"] },
   ].map((m, i) => ({ ...m, ...nuevaClave(), nombre: `m-estado-${i}` }));
+  // Petición/respuesta: el dueño SIN su suscripción y SIN allow_responses (minimalidad), y mutantes sembrados que conceden DE
+  // MÁS (06-security.md §3.9): `rpc.<dominio>.>` o `rpc.>` a quien llama, `rpc.>` o publicar en los inboxes al dueño.
+  const factP = json.find((s) => s.name === "facturacion-api");
+  const crmSinSub = { quitado: "la suscripción `rpc.clientes.>`", ...nuevaClave(), nombre: "crm-sin-sub-rpc" };
+  const crmSinAllow = { quitado: "allow_responses", ...nuevaClave(), nombre: "crm-sin-allow" };
+  const crmSinAckConAllow = { quitado: "$JS.ACK.DLQ_CLIENTES.crm-api__dlq_clientes.> (CON allow_responses)", ...nuevaClave(), nombre: "crm-sin-ack-con-allow" };
+  const mutantesRpc = [
+    { que: "facturacion-api + `rpc.clientes.>` de PUBLICACIÓN: quien llama podría llamar a todo el dominio", base: "facturacion-api", anadePub: ["rpc.clientes.>"], flip: ["una operación NO concedida a nadie del MISMO dominio", "publicar a pelo, sin respuesta"] },
+    { que: "facturacion-api + `rpc.>` de PUBLICACIÓN: llamar a las operaciones de todos los dominios", base: "facturacion-api", anadePub: ["rpc.>"], flip: ["una operación NO concedida a nadie del MISMO dominio", "una operación de OTRO dominio", "publicar a pelo, sin respuesta"] },
+    { que: "facturacion-api + `rpc.>` de SUSCRIPCIÓN: quien llama leería todas las peticiones", base: "facturacion-api", anadeSub: ["rpc.>"], flip: ["suscribirse a `rpc.>`", "suscribirse a `rpc.*.>`", "suscribirse a `rpc.clientes.>`", "suscribirse a `rpc.pedidos.>`", "con su grupo de cola", "suplantando el grupo de cola"] },
+    { que: "crm-api + `rpc.>` de SUSCRIPCIÓN: el dueño atendería las operaciones de todos", base: "crm-api", anadeSub: ["rpc.>"], flip: ["suscribirse a `rpc.>`", "suscribirse a `rpc.*.>`", "suscribirse a `rpc.pedidos.>`"] },
+    { que: "crm-api + `_INBOX.>` de PUBLICACIÓN: el dueño escribiría en los inboxes de todos y anularía `max: 1`", base: "crm-api", anadePub: ["_INBOX.>"], flip: ["el inbox de otro servicio", "el inbox privado PROPIO"] },
+  ].map((m, i) => ({ ...m, ...nuevaClave(), nombre: `m-rpc-${i}` }));
   const permisosMutante = (m) => {
     const base = json.find((x) => x.name === m.base);
     let pub = base.publish.map((x) => m.cambia?.find(([de]) => de === x)?.[1] ?? x);
@@ -1032,10 +1291,20 @@ async function main() {
     pub = [...pub, ...(m.anade ?? [])];
     return { publish: pub, subscribe: base.subscribe };
   };
+  const permisosMutanteRpc = (m) => {
+    const base = json.find((x) => x.name === m.base);
+    return { publish: [...base.publish, ...(m.anadePub ?? [])], subscribe: [...base.subscribe, ...(m.anadeSub ?? [])], allowResponses: base.allowResponses };
+  };
   const extraEstado =
     variantesTienda.map((x) => usuarioConf(x.pub, tiendaP.publish.filter((p) => p !== x.quitado), tiendaP.subscribe)).join("") +
-    variantesCrm.map((x) => usuarioConf(x.pub, crmP.publish.filter((p) => p !== x.quitado), crmP.subscribe)).join("") +
-    mutantesEstado.map((m) => { const pm = permisosMutante(m); return usuarioConf(m.pub, pm.publish, pm.subscribe); }).join("");
+    // SIN `allow_responses`: con él, el ack de lo que recibe pasa aunque falte `$JS.ACK…` (A-109) y la minimalidad de los
+    // permisos de eventos y de estado no se vería. La del dueño de una operación es la sección 5c.
+    variantesCrm.map((x) => usuarioConf(x.pub, crmP.publish.filter((p) => p !== x.quitado), crmP.subscribe.filter((s) => !s.startsWith("rpc.")))).join("") +
+    mutantesEstado.map((m) => { const pm = permisosMutante(m); return usuarioConf(m.pub, pm.publish, pm.subscribe); }).join("") +
+    usuarioConf(crmSinSub.pub, crmP.publish, crmP.subscribe.filter((x) => x !== "rpc.clientes.>"), crmP.allowResponses) +
+    usuarioConf(crmSinAllow.pub, crmP.publish, crmP.subscribe, null) +
+    usuarioConf(crmSinAckConAllow.pub, crmP.publish.filter((p) => p !== "$JS.ACK.DLQ_CLIENTES.crm-api__dlq_clientes.>"), crmP.subscribe, crmP.allowResponses) +
+    mutantesRpc.map((m) => { const pm = permisosMutanteRpc(m); return usuarioConf(m.pub, pm.publish, pm.subscribe, pm.allowResponses); }).join("");
 
   const extra =
     variantes.map((x) => usuarioConf(x.pub, fact.publish.filter((p) => p !== x.quitado), fact.subscribe)).join("") +
@@ -1051,7 +1320,7 @@ async function main() {
   let A;
   try {
     A = await arrancar("A", conUsuarios(generada, extra));
-    afirmar(true, `nats-server carga la config generada con include (puerto ${A.port}); ${json.length} servicios + ops + ${variantes.length + devSinCreate.length + 4 + variantesTienda.length + variantesCrm.length + mutantesEstado.length} usuarios de prueba`);
+    afirmar(true, `nats-server carga la config generada con include (puerto ${A.port}); ${json.length} servicios + ops + ${variantes.length + devSinCreate.length + 4 + variantesTienda.length + variantesCrm.length + mutantesEstado.length + 3 + mutantesRpc.length} usuarios de prueba`);
   } catch (e) {
     afirmar(false, "nats-server carga la config generada con include", e.message);
     return;
@@ -1315,6 +1584,47 @@ async function main() {
   await espia.close();
   await victima.close();
 
+  // ── 4c. Petición/respuesta: la matriz de sondas × servicios ───────────────────────────────────
+  seccion("4c. Petición/respuesta: quién puede llamar, atender o publicar sobre un inbox, y quién NO (matriz de sondas × servicios)");
+  {
+    const sondasR = sondasRpc(randomUUID().slice(0, 8));
+    const usuarios = ["crm-api", "facturacion-api", "pedidos-api", "logistica-api", "tienda-web"];
+    const desvios = new Map(sondasR.map(([que]) => [que, []]));
+    for (const u of usuarios) {
+      const nc = await comoServicio(A.url, u, pares[u].seed);
+      for (const d of await desviosDeSondasEstado(nc, u, sondasR)) desvios.get(d.que).push(`${u}: esperado ${d.esperado ? "permitido" : "denegado"}, ${d.permitido === true ? "PERMITIDO" : d.permitido === false ? "denegado" : d.permitido}`);
+      await nc.close();
+    }
+    for (const [que, , para] of sondasR) {
+      afirmar(desvios.get(que).length === 0, `${que}  →  ${para.length ? `solo ${para.join(", ")}` : "NADIE"}`, desvios.get(que).join("\n"));
+    }
+    nota(`${sondasR.length} sondas × ${usuarios.length} servicios (el dueño crm-api, los que llaman facturacion-api y pedidos-api, y logistica-api y tienda-web, que no tienen nada de rpc)`);
+
+    // «Una petición, una respuesta»: crm-api contesta DOS veces; llega una y el broker deniega la otra (allow_responses max 1).
+    const nc = await comoServicio(A.url, "crm-api", pares["crm-api"].seed);
+    const op = `rpc.${OP_OBTENER}`;
+    const inbox = `_INBOX.verify-rpc.${randomUUID().slice(0, 8)}`;
+    const recibidas = [];
+    const escucha = opsA.nc.subscribe(inbox);
+    (async () => { for await (const m of escucha) recibidas.push(dec.decode(m.data)); })();
+    const dueñoSub = nc.subscribe(op, { queue: "crm-api" });
+    (async () => { try { for await (const m of dueñoSub) { m.respond(enc.encode('{"n":1}')); m.respond(enc.encode('{"n":2}')); } } catch { /* denegada */ } })();
+    await nc.flush();
+    await opsA.nc.flush();
+    opsA.nc.publish(op, enc.encode("{}"), { reply: inbox });
+    await opsA.nc.flush();
+    await sleep(500);
+    afirmar(recibidas.length === 1, "«una petición, una respuesta»: crm-api contesta DOS veces y llega UNA (allow_responses max 1)", `llegaron ${recibidas.length}: ${recibidas.join(" ")}`);
+    afirmar(
+      nc.violaciones.filter((v) => v.includes(`Publish to "${inbox}"`)).length === 1,
+      "…y el broker deniega la segunda, con un aviso `Permissions Violation` en la conexión del dueño (es la única forma de verlo: A-19, A-28)",
+      nc.violaciones.join("\n"),
+    );
+    dueñoSub.unsubscribe();
+    escucha.unsubscribe();
+    await nc.close();
+  }
+
   // ── 4b. Estado: lo que NO se puede hacer ──────────────────────────────────
   seccion("4b. Estado: quién puede y quién NO puede cada cosa (escribir, leer, el stream, los durables ajenos, la DLQ)");
   {
@@ -1374,12 +1684,77 @@ async function main() {
   for (const x of variantesCrm) {
     const nc = await comoServicio(A.url, x.nombre, x.seed, "crm-api");
     // El ciclo de eventos de crm-api (dominio propio y su DLQ) más el de estado: cada permiso, en el suyo.
-    const eventos = await ciclo({ nc, svc: svcCrm, ops: opsA, subjectPropio: subjectPropio(svcCrm) });
+    const eventos = await ciclo({ nc, svc: svcCrm, ops: opsA, subjectPropio: subjectPropio(svcCrm), rpc: false });
     const estado = await cicloEstadoDueño({ nc, svc: svcCrm, ops: opsA, marca: randomUUID().slice(0, 8) });
     await nc.close();
     const fallidos = [...eventos.fallidos, ...estado.fallidos];
     const corto = fallidos.length > 2 ? `${fallidos.slice(0, 2).join("; ")} (+${fallidos.length - 2} más)` : fallidos.join("; ");
     afirmar(fallidos.length > 0, `crm-api sin ${x.quitado} → el ciclo falla en: ${corto || "(nada: el permiso sobra)"}`);
+  }
+
+  // ── 5c. Minimalidad de la petición/respuesta del dueño ─────────────────────────────────────────
+  seccion("5c. Minimalidad de la petición/respuesta: sin la suscripción `rpc.clientes.>` o sin `allow_responses`, el dueño se rompe");
+  for (const x of [crmSinSub, crmSinAllow]) {
+    const nc = await comoServicio(A.url, x.nombre, x.seed, "crm-api");
+    const pasos = [];
+    await cicloRpc({
+      nc,
+      svc: crmP,
+      ops: opsA,
+      paso: async (nombre, fn) => {
+        try {
+          await conTiempo(fn(), 6000, nombre);
+          pasos.push({ nombre, ok: true });
+        } catch (e) {
+          pasos.push({ nombre, ok: false, detalle: resumen(e) });
+        }
+      },
+    });
+    await nc.close();
+    const fallidos = pasos.filter((p) => !p.ok);
+    afirmar(
+      fallidos.length === pasos.length && pasos.length === 2,
+      `crm-api sin ${x.quitado} → sus ${pasos.length} operaciones fallan: ${fallidos[0]?.detalle ?? "(nada: el permiso sobra)"}`,
+      pasos.map((p) => `${p.ok ? "ok" : "FALLA"}: ${p.nombre}`).join("\n"),
+    );
+  }
+  nota("quien llama (facturacion-api) ya está en la sección 5: su `ciclo` incluye request() y quitar su permiso de publicación sobre una operación, o su inbox, lo rompe");
+
+  // A-109: `allow_responses` admite UNA publicación al `reply` de lo que el servicio recibe, y el `reply` de una entrega de un pull
+  // consumer es su subject de ack. Con él, el dueño confirma una entrega aunque le falte `$JS.ACK…`; el permiso explícito sigue
+  // siendo necesario (`working()` seguido de `ack()` publica DOS veces al mismo `reply`), y se concede igual.
+  {
+    const [stream, durable, filtro] = ["DLQ_CLIENTES", "crm-api__dlq_clientes", "dlq.clientes.>"];
+    const nc = await comoServicio(A.url, crmSinAckConAllow.nombre, crmSinAckConAllow.seed, "crm-api");
+    const probar = async (accion) => {
+      await reiniciarDurable(opsA, stream, durable, filtro);
+      await opsA.js.publish("dlq.clientes.cosa.v1.muerto", enc.encode('{"muerto":1}'));
+      const c = await jetstream(nc).consumers.get(stream, durable);
+      const m = await recibirUno(c, 2500);
+      const antes = nc.violaciones.length;
+      await accion(m);
+      await nc.flush();
+      await sleep(400);
+      return { m, pendientes: (await opsA.jsm.consumers.info(stream, durable)).num_ack_pending, violaciones: nc.violaciones.slice(antes) };
+    };
+    const solo = await probar((m) => m.ack());
+    afirmar(
+      !!solo.m && solo.pendientes === 0 && solo.violaciones.length === 0,
+      "A-109: crm-api CON allow_responses y SIN `$JS.ACK…` confirma una entrega: el `reply` de la entrega admite UNA publicación (por eso 5b mide sus permisos de ack sin allow_responses)",
+      JSON.stringify({ pendientes: solo.pendientes, violaciones: solo.violaciones }),
+    );
+    const doble = await probar(async (m) => {
+      m.working();
+      await nc.flush();
+      await sleep(200);
+      m.ack();
+    });
+    afirmar(
+      !!doble.m && doble.pendientes === 1 && doble.violaciones.some((v) => v.includes("$JS.ACK")),
+      "…pero `working()` seguido de `ack()` publica DOS veces al mismo `reply`: la segunda se deniega y la entrega queda pendiente. El permiso `$JS.ACK…` sigue siendo necesario",
+      JSON.stringify({ pendientes: doble.pendientes, violaciones: doble.violaciones }),
+    );
+    await nc.close();
   }
 
   // ── 6. Las sondas pueden fallar ────────────────────────────────────────────
@@ -1438,6 +1813,23 @@ async function main() {
       afirmar(inesperados.length === 0, `mutante «${m.que}»: no abre NADA más de lo que dice`, inesperados.map((d) => d.que).join("\n"));
     }
     for (const n of ["espia__state", "espia2__state"]) await opsA.jsm.consumers.delete(STREAM_ESTADO, n).catch(() => {});
+  }
+
+  // ── 6c. Mutantes de petición/respuesta ────────────────────────────────────
+  seccion("6c. Las sondas de PETICIÓN/RESPUESTA detectan una ACL que concede DE MÁS: mutantes sembrados");
+  {
+    const sondasR = sondasRpc(randomUUID().slice(0, 8));
+    for (const m of mutantesRpc) {
+      const nc = await comoServicio(A.url, m.nombre, m.seed, m.base);
+      const desvios = await desviosDeSondasEstado(nc, m.base, sondasR);
+      await nc.close();
+      for (const que of m.flip) {
+        const d = desvios.find((x) => x.que.includes(que));
+        afirmar(!!d && d.permitido === true && d.esperado === false, `mutante «${m.que}»: la sonda «${que}» lo DETECTA (permitido)`, d ? JSON.stringify(d) : "la sonda no cambió");
+      }
+      const inesperados = desvios.filter((d) => !m.flip.some((q) => d.que.includes(q)));
+      afirmar(inesperados.length === 0, `mutante «${m.que}»: no abre NADA más de lo que dice`, inesperados.map((d) => d.que).join("\n"));
+    }
   }
 
   await opsA.nc.close();
@@ -1566,6 +1958,29 @@ async function seccionTenants(json) {
   const globex = await conectarOps(D.url, opsPorTenant.globex.seed);
   afirmar((await globex.jsm.streams.info("EVT_PEDIDOS")).state.messages === 0, "el stream EVT_PEDIDOS de globex está vacío: no comparte nada con el de acme");
   await globex.nc.close();
+
+  // Petición/respuesta: cada account tiene SU espacio `rpc.`. crm-api@acme atiende; facturacion-api@acme recibe la respuesta y
+  // facturacion-api@globex —el mismo servicio, con los mismos permisos— solo ve `no responders`: nadie atiende en su account.
+  {
+    const op = `rpc.${OP_OBTENER}`;
+    const dueñoAcme = await comoServicio(D.url, "crm-api@acme", pares["crm-api@acme"].seed, "crm-api");
+    const sub = dueñoAcme.subscribe(op, { queue: "crm-api" });
+    (async () => { try { for await (const m of sub) m.respond(enc.encode('{"ok":true}')); } catch { /* denegada */ } })();
+    await dueñoAcme.flush();
+    const llama = async (t) => {
+      const n = await comoServicio(D.url, `facturacion-api@${t}`, pares[`facturacion-api@${t}`].seed, "facturacion-api");
+      const t0 = Date.now();
+      const r = await n.request(op, enc.encode("{}"), { timeout: 1500 }).then(() => "respondida", (e) => (/no responders/i.test(e?.message ?? "") ? "no responders" : `error: ${resumen(e)}`));
+      await n.close();
+      return { r, ms: Date.now() - t0 };
+    };
+    const a = await llama("acme");
+    const g = await llama("globex");
+    afirmar(a.r === "respondida", "Modelo B: facturacion-api@acme llama a crm-api@acme y recibe la respuesta", JSON.stringify(a));
+    afirmar(g.r === "no responders" && g.ms < 500, "…y facturacion-api@globex solo ve `no responders` en ms: el espacio `rpc.` es de la account, y nadie atiende en la de globex", JSON.stringify(g));
+    sub.unsubscribe();
+    await dueñoAcme.close();
+  }
   await opsAcme.nc.close();
   await parar(D.child);
 }
