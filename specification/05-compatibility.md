@@ -112,6 +112,9 @@ schemas/pedidos/pedido/creado/1.0.0.json
 - El `$id` **DEBE** coincidir exactamente con la URI que aparece en `dataschema`.
 - Extensiones flux permitidas en el esquema: `x-pii`, `x-extensible-enum`,
   `x-deprecated-since`.
+- Otras dos ubicaciones, con las mismas reglas: el **estado**
+  (`schemas/state/<dominio>/<agregado>/<semver>.json`, [10-state.md §10](10-state.md)) y la **petición/respuesta**
+  (`schemas/rpc/<dominio>/<agregado>/<operacion>/{request,reply}/<semver>.json`, §6).
 
 ## 5. Verificación en CI
 
@@ -134,3 +137,24 @@ parecen**:
 - **Un campo monetario declarado como `number`.** Valida perfectamente hoy y pierde
   precisión en producción — el caso de §2.2 "cambiar unidades o semántica", que ningún
   validador de esquemas detecta por sí solo.
+
+## 6. Petición/respuesta: la dirección invertida
+
+Los esquemas de [11-request-reply.md](11-request-reply.md) se rigen por todo lo anterior, con **una inversión** y
+un orden de despliegue. Un esquema describe datos que fluyen de quien **escribe** a quien **lee**; la regla de §2.3
+—un valor nuevo en un enum exige `x-extensible-enum`— existe para proteger **al lector**, y en una operación los
+lectores son otros:
+
+| | Escribe | Lee | Un valor nuevo en un enum cerrado |
+|---|---|---|---|
+| **Respuesta** (`reply/`) | el dueño | **los llamantes**: muchos, independientes, a su ritmo | Exige `x-extensible-enum`, como un evento |
+| **Petición** (`request/`) | **los llamantes** | el dueño: **uno**, que publica el esquema y lo despliega | **No** lo exige: el lector ya conoce el valor |
+
+Todo lo demás (§2.2) rige igual en los dos lados: quitar o renombrar un campo, cambiar un tipo, pasar opcional a
+requerido —**incluido un campo requerido nuevo en la petición**, que los llamantes viejos no envían—, endurecer una
+restricción o cambiar la semántica obliga a un mayor nuevo. Y un **par** —petición y respuesta del mismo mayor— es
+obligatorio: un lado sin el otro es un error de `bundle-schemas.mjs` y de `check-compat.mjs`.
+
+**El orden de despliegue es primero quien responde, después quien llama.** Una petición con un campo opcional nuevo
+contra una instancia que aún valida con el esquema viejo (y `additionalProperties: false`) es `INVALID_SCHEMA`.
+`check-compat.mjs` lo implementa: en un esquema `request/` no exige `x-extensible-enum`; en `reply/` sí.
