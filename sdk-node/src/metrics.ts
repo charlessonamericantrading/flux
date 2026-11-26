@@ -37,6 +37,38 @@ export type ConnectionState = 0 | 1 | 2; // desconectado | conectado | reconecta
 export type StateWriteOutcome = "ok" | "stale" | "conflict" | "invalid_schema";
 
 /**
+ * `outcome` de `flux_rpc_client_requests_total` — 08-observability.md §2.5. Uno por llamada.
+ *
+ * `ok` (llegó una respuesta válida) · `unavailable` (`RPC_UNAVAILABLE`) · `timeout` (`RPC_TIMEOUT`) ·
+ * `retryable` / `permanent` (llegó un error de esa clase; `permanent` incluye `PERMISSION_DENIED`,
+ * `STALE_REQUEST`, `RPC_MESSAGE_TOO_LARGE` y un fallo de firma) · `invalid_schema` (`INVALID_SCHEMA`, al
+ * construir la petición o al validar la respuesta) · `invalid_reply` (`RPC_INVALID_REPLY`).
+ */
+export type RpcClientOutcome =
+  | "ok"
+  | "unavailable"
+  | "timeout"
+  | "retryable"
+  | "permanent"
+  | "invalid_schema"
+  | "invalid_reply";
+
+/**
+ * `outcome` de `flux_rpc_server_requests_total` — 08-observability.md §2.5. Uno por petición recibida.
+ *
+ * `poison` es lo que debe despertar a alguien: la petición no se pudo interpretar, o no traía subject de
+ * respuesta (alguien publica a mano, o hay un SDK roto).
+ */
+export type RpcServerOutcome =
+  | "ok"
+  | "retryable"
+  | "permanent"
+  | "poison"
+  | "invalid_schema"
+  | "invalid_signature"
+  | "stale_request";
+
+/**
  * Destino de las métricas. Impleméntalo para enchufar el backend que uses.
  *
  * Las firmas fuerzan las etiquetas del protocolo: no hay un `labels: object` genérico
@@ -66,6 +98,18 @@ export interface MetricsSink {
    * cliente de la plataforma) — la firma no deja pasarlas, que es por donde se cuelan.
    */
   stateWrite?(contract: string, outcome: StateWriteOutcome): void;
+  /**
+   * Las tres métricas de la capacidad `rpc` (08-observability.md §2.5; `protocol.json` → `rpc.metrics`): van
+   * **fuera de las siete** de todo SDK L2, y son OPCIONALES por la misma razón que `stateWrite`: un
+   * `MetricsSink` escrito antes de la capacidad sigue compilando.
+   *
+   * `operation` es `<dominio>.<agregado>.v<major>.<operacion>` —sin `rpc.`—, acotado por las operaciones
+   * declaradas. **Nunca** el tenant, el `id`, el `correlationid` ni quién llama: la firma no deja pasarlos.
+   */
+  rpcClientRequest?(operation: string, outcome: RpcClientOutcome): void;
+  rpcServerRequest?(operation: string, outcome: RpcServerOutcome): void;
+  /** `role`: `client` (desde que sale la petición hasta que llega la respuesta o falla) o `server` (lo que tarda el handler). */
+  rpcDuration?(operation: string, role: "client" | "server", seconds: number): void;
 }
 
 /** No-op. El default: un SDK no debe imponer un backend de métricas. */
@@ -78,6 +122,9 @@ export const NO_METRICS: MetricsSink = {
   consumerPending() {},
   connectionState() {},
   stateWrite() {},
+  rpcClientRequest() {},
+  rpcServerRequest() {},
+  rpcDuration() {},
 };
 
 // ─── Recolector en memoria ───────────────────────────────────────────────────
@@ -169,6 +216,18 @@ export class InMemoryMetrics implements MetricsSink {
     this.#inc("flux_state_writes_total", { contract, outcome });
   }
 
+  rpcClientRequest(operation: string, outcome: RpcClientOutcome): void {
+    this.#inc("flux_rpc_client_requests_total", { operation, outcome });
+  }
+
+  rpcServerRequest(operation: string, outcome: RpcServerOutcome): void {
+    this.#inc("flux_rpc_server_requests_total", { operation, outcome });
+  }
+
+  rpcDuration(operation: string, role: "client" | "server", seconds: number): void {
+    this.#observe("flux_rpc_duration_seconds", { operation, role }, seconds);
+  }
+
   /** Formato de exposición de Prometheus. Sírvelo en `/metrics`. */
   render(): string {
     const out: string[] = [];
@@ -178,6 +237,8 @@ export class InMemoryMetrics implements MetricsSink {
     out.push("# TYPE flux_events_dlq_total counter");
     out.push("# TYPE flux_events_retried_total counter");
     out.push("# TYPE flux_state_writes_total counter");
+    out.push("# TYPE flux_rpc_client_requests_total counter");
+    out.push("# TYPE flux_rpc_server_requests_total counter");
     for (const [k, v] of [...this.#counters].sort()) out.push(`${k} ${v}`);
 
     out.push("# TYPE flux_consumer_pending gauge");
@@ -185,6 +246,7 @@ export class InMemoryMetrics implements MetricsSink {
     for (const [k, v] of [...this.#gauges].sort()) out.push(`${k.replace("{}", "")} ${v}`);
 
     out.push("# TYPE flux_event_handler_duration_seconds histogram");
+    out.push("# TYPE flux_rpc_duration_seconds histogram");
     for (const [k, h] of [...this.#histograms].sort()) {
       const base = k.slice(0, k.indexOf("{"));
       const labels = k.slice(k.indexOf("{") + 1, -1);
