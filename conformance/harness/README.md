@@ -270,7 +270,7 @@ fuente es `protocol.json`.
 | **declara** la capacidad y **no tiene arnés registrado** (o figura en `pending`) | **FALLO**, aunque se ejecute con `--only` que lo excluya: sin arnés no hay evidencia |
 | **no declara** la capacidad | no la ejecuta, la marca `–` en la tabla e imprime **`N/A: no declara state`** (o `rpc`) en el resumen. No es un fallo; tampoco es un salto silencioso |
 
-Hoy declaran `state` y `rpc` Node y Rust; Python, Go, Java, .NET y PHP salen `N/A` en las dos.
+Hoy declaran `state` y `rpc` Node, Rust y Java; Python, Go, .NET y PHP salen `N/A` en las dos.
 
 `--exigir state,rpc` añade lo que un «N/A» verde no demuestra: **falla** si ningún SDK de los activos ejecutó esa
 capacidad (porque `protocol.json` dejó de declararla, o porque un `--only` dejó fuera a quien la declara). CI lo
@@ -414,11 +414,13 @@ alineados todavía: lo comprueban los tests unitarios de Node (`sdk-node/test/aj
 
 ### Qué SDKs llevan lo decidido
 
-`ajustesSdks` es hoy **Node y Rust** (y `flux call` para §4.3.4 y la versión mayor). De los otros cinco SDKs —Python, Go,
-Java, .NET y PHP— solo llevan el **tope de 1 a 4 dígitos de la versión mayor, y solo en su patrón de subject**
+`ajustesSdks` es hoy **Node, Rust y Java** (y `flux call` para §4.3.4 y la versión mayor). Java lleva todo lo decidido
+(Fase 6): `dlqerror` en bytes, `data` canónico, `time` normalizado, atributos vacíos, UTF-8 estricto, tipos de lo opcional y el
+código de los errores de construcción, con los mismos 93 vectores que Node y Rust. De los otros cuatro SDKs —Python, Go,
+.NET y PHP— solo llevan el **tope de 1 a 4 dígitos de la versión mayor, y solo en su patrón de subject**
 (`SUBJECT_PATTERN`/`SubjectPattern`), con un caso `v99999` rechazado y `v9999` aceptado en su test de unidad: sus tests
 comparan o recorren `protocol.json`, así que el patrón no podía quedarse atrás. **Todo lo demás está pendiente en esos
-cinco SDKs (Fase 6)**: `dlqerror` en bytes, `data` canónico, `time` normalizado, atributos vacíos, UTF-8 estricto, tipos de
+cuatro SDKs (Fase 6)**: `dlqerror` en bytes, `data` canónico, `time` normalizado, atributos vacíos, UTF-8 estricto, tipos de
 lo opcional y el código de los errores de construcción. Al alinearlos, se añaden a `ajustesSdks`.
 
 ### Lo que no se admite

@@ -491,7 +491,7 @@ jobs:
         run: test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
 
   sdk-java:
-    name: SDK Java — tests
+    name: SDK Java — tests e integración contra NATS real (permisos generados)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -499,8 +499,38 @@ jobs:
         with:
           distribution: temurin
           java-version: '17'
-      # Aquí sí hay Maven, a diferencia de la máquina donde se escribió el SDK.
-      - run: mvn -B -q -f sdk-java/pom.xml test
+      # Las pruebas de integración montan el MISMO entorno seguro que `conformance/security.mjs`: nats-server con TLS, los permisos
+      # que genera `scripts/gen-acl.mjs` (Node) y `flux provision` (la CLI, con `npm install`). Un broker abierto no probaría nada de
+      # seguridad. `openssl` viene en el runner.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      # nats-server 2.14.5 exige Go 1.25 (su go.mod): se compila la versión exacta que la spec dice haber medido.
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+          cache: false
+      - name: Compilar nats-server 2.14.5
+        run: |
+          GOBIN="$PWD/bin" go install github.com/nats-io/nats-server/v2@v2.14.5
+          echo "NATS_SERVER=$PWD/bin/nats-server" >> "$GITHUB_ENV"
+      - run: npm install --no-audit --no-fund
+        working-directory: cli
+      # Aquí sí hay Maven, a diferencia de la máquina donde se escribió el SDK. FLUX_REQUIRE_BROKER=1: que falte nats-server, node o
+      # openssl es un FALLO y no un salto con aviso (un job verde que no ejecutó nada aparenta cobertura). Maven Central puede
+      # devolver HTTP 429: es ajeno al SDK, se relanza el job, no se «arregla».
+      - name: Tests (unitarios + integración contra nats-server)
+        env:
+          FLUX_REQUIRE_BROKER: '1'
+        run: mvn -B -q -f sdk-java/pom.xml test
+      # En los dos sentidos también aquí: sin nats-server, las pruebas con broker DEBEN fallar y no saltarse.
+      - name: Sin nats-server, las pruebas con broker FALLAN (no se saltan)
+        run: |
+          if NATS_SERVER=/no/existe/nats-server FLUX_REQUIRE_BROKER=1 mvn -B -q -f sdk-java/pom.xml test -Dtest=SecurityIntegrationTest > /dev/null 2>&1; then
+            echo "✗ las pruebas de integración del SDK de Java pasaron SIN nats-server con FLUX_REQUIRE_BROKER=1: la comprobación no vigila nada"
+            exit 1
+          fi
+          echo "✓ sin nats-server las pruebas de integración de Java fallan"
 
   sdk-dotnet:
     name: SDK .NET — build y tests

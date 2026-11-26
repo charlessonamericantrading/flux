@@ -102,20 +102,26 @@ if (artefactos.every((a) => existsSync(a.origen))) {
 
 // ─── Compilación ─────────────────────────────────────────────────────────────
 
-// Todo el SDK MENOS FluxBus y la validación L3.
+// Todo el SDK MENOS lo que importa `io.nats` o `com.networknt`.
 //
-// · FluxBus es lo único que importa io.nats, y el arnés no toca el broker
-//   (conformance/harness/README.md: "Sin red y sin broker").
-// · Validation/NetworkntValidator son lo único que importa
-//   `com.networknt:json-schema-validator`, que es una dependencia OPCIONAL del pom porque
-//   L3 es opt-in (00-protocol.md §5). Los vectores son de envelope y firma: ninguno valida
-//   contra un JSON Schema, así que incluirlas solo serviría para exigir aquí un jar que el
-//   arnés no ejecuta.
+// · io.nats es el broker (FluxBus, FluxState, FluxRpc, la seguridad de la conexión…), y el arnés no lo toca
+//   (conformance/harness/README.md: "Sin red y sin broker"). Las funciones PURAS —el sobre de estado
+//   (StateEnvelope), el de petición/respuesta (RpcEnvelope), el `id` determinista (ExternalId)— no lo
+//   importan, y es justo lo que el arnés ejecuta.
+// · `com.networknt:json-schema-validator` (Validation, NetworkntValidator) es una dependencia OPCIONAL del pom
+//   porque L3 es opt-in (00-protocol.md §5). Los vectores son de envelope y firma: ninguno valida contra un JSON
+//   Schema, así que incluirlas solo serviría para exigir aquí un jar que el arnés no ejecuta.
 //
-// Dejar ambas fuera hace que el arnés se construya con Jackson y nada más.
-const EXCLUIDAS = new Set(["FluxBus.java", "Validation.java", "NetworkntValidator.java"]);
-const fuentes = readdirSync(join(SDK, "src", "main", "java", "com", "flux"))
-  .filter((f) => f.endsWith(".java") && !EXCLUIDAS.has(f))
+// Se excluye POR CONTENIDO y no por nombre: un fichero nuevo del SDK que hable con el broker sale solo, y uno puro
+// entra solo. Dejar fuera los dos grupos hace que el arnés se construya con Jackson y nada más.
+const DIR_FUENTES = join(SDK, "src", "main", "java", "com", "flux");
+// `Validation` no importa networknt (carga `NetworkntValidator`, de su mismo paquete, a propósito): se detecta por nombrarlo.
+const habla = (f) => {
+  const t = readFileSync(join(DIR_FUENTES, f), "utf8");
+  return /^\s*import\s+(static\s+)?(io\.nats|com\.networknt)\./m.test(t) || /\bNetworkntValidator\b/.test(t);
+};
+const fuentes = readdirSync(DIR_FUENTES)
+  .filter((f) => f.endsWith(".java") && !habla(f))
   .map((f) => join("src", "main", "java", "com", "flux", f));
 
 console.log(`· javac ${fuentes.length} fuentes`);

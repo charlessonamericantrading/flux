@@ -1186,8 +1186,26 @@
       },
       "java": {
         "capabilities": [
-          "signing"
-        ]
+          "signing",
+          "security",
+          "state",
+          "rpc"
+        ],
+        "evidence": {
+          "security": [
+            "sdk-java/src/test/java/com/flux/SecurityIntegrationTest.java",
+            "sdk-java/src/test/java/com/flux/TlsIntegrationTest.java",
+            "sdk-java/src/test/java/com/flux/SecurityUnitTest.java"
+          ],
+          "state": [
+            "sdk-java/src/test/java/com/flux/StateIntegrationTest.java",
+            "sdk-java/src/test/java/com/flux/StateUnitTest.java"
+          ],
+          "rpc": [
+            "sdk-java/src/test/java/com/flux/RpcIntegrationTest.java",
+            "sdk-java/src/test/java/com/flux/RpcUnitTest.java"
+          ]
+        }
       },
       "dotnet": {
         "capabilities": [

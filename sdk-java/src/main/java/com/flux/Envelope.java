@@ -10,7 +10,9 @@
 package com.flux;
 
 import com.fasterxml.jackson.annotation.JsonInclude;
+import com.fasterxml.jackson.core.JsonFactory;
 import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.core.json.JsonWriteFeature;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.DeserializationFeature;
 import com.fasterxml.jackson.databind.JsonNode;
@@ -21,6 +23,9 @@ import com.fasterxml.jackson.databind.cfg.CoercionInputShape;
 import com.fasterxml.jackson.databind.cfg.JsonNodeFeature;
 import com.fasterxml.jackson.databind.json.JsonMapper;
 import com.fasterxml.jackson.databind.type.LogicalType;
+import java.nio.ByteBuffer;
+import java.nio.charset.CharacterCodingException;
+import java.nio.charset.CodingErrorAction;
 import java.nio.charset.StandardCharsets;
 import java.time.Instant;
 import java.time.OffsetDateTime;
@@ -90,7 +95,11 @@ public final class Envelope {
      * (los emoji, entre otros) aunque el mapper no se lo pida. Ver el comentario de ese
      * metodo.
      */
-    private static final ObjectMapper MAPPER = JsonMapper.builder()
+    private static final ObjectMapper MAPPER = JsonMapper.builder(new JsonFactory())
+            // Los escapes de los caracteres de control salen con el hex en MINUSCULAS (`\u001f`), como
+            // JSON.stringify de Node y json.dumps de Python: con el default de Jackson (mayusculas) el
+            // mismo `data` daria otros bytes — 01-envelope.md §4.1.
+            .configure(JsonWriteFeature.WRITE_HEX_UPPER_CASE, false)
             .disable(MapperFeature.ACCEPT_CASE_INSENSITIVE_PROPERTIES)
             .disable(MapperFeature.ACCEPT_CASE_INSENSITIVE_ENUMS)
             .enable(DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES)
@@ -105,6 +114,11 @@ public final class Envelope {
             // Un envelope que significa cosas distintas en dos SDKs deja de ser un contrato.
             .withCoercionConfig(LogicalType.Textual, config -> config
                     .setCoercion(CoercionInputShape.Integer, CoercionAction.Fail)
+                    .setCoercion(CoercionInputShape.Float, CoercionAction.Fail)
+                    .setCoercion(CoercionInputShape.Boolean, CoercionAction.Fail))
+            // Lo mismo para los enteros opcionales (`dlqattempts`): `"1"` no es 1, y `1.5` no se trunca.
+            .withCoercionConfig(LogicalType.Integer, config -> config
+                    .setCoercion(CoercionInputShape.String, CoercionAction.Fail)
                     .setCoercion(CoercionInputShape.Float, CoercionAction.Fail)
                     .setCoercion(CoercionInputShape.Boolean, CoercionAction.Fail))
             .build();
@@ -219,8 +233,11 @@ public final class Envelope {
     private static final List<String> STRING_ATTRIBUTES = List.of(
             "id", "source", "type", "time", "correlationid", "tenantid", "producerversion");
 
-    /** Limite del texto de {@code dlqerror}. */
-    private static final int DLQ_ERROR_MAX_CHARS = 1024;
+    /**
+     * Limite del texto de {@code dlqerror}: 1024 BYTES UTF-8, cortado sin partir un caracter
+     * — 04-errors.md §3. No unidades UTF-16 (cortaria un emoji por la mitad) ni caracteres.
+     */
+    private static final int DLQ_ERROR_MAX_BYTES = 1024;
 
     /**
      * Envelope que el SDK se niega a construir o serializar.
@@ -231,12 +248,31 @@ public final class Envelope {
     public static final class EnvelopeException extends RuntimeException {
         private static final long serialVersionUID = 1L;
 
+        private final String code;
+
         public EnvelopeException(String message) {
+            this(message, (String) null);
+        }
+
+        /**
+         * @param code el codigo estable que daria el parser ante el mismo defecto
+         *             ({@code MISSING_REQUIRED_ATTRIBUTE}, {@code MISSING_REQUIRED_EXTENSION},
+         *             {@code WRONG_ATTRIBUTE_TYPE}), o {@code null} si no lo hay (un hueco de la spec:
+         *             un subject mal formado, un {@code data} que no es un objeto).
+         */
+        public EnvelopeException(String message, String code) {
             super(message);
+            this.code = code;
         }
 
         public EnvelopeException(String message, Throwable cause) {
             super(message, cause);
+            this.code = null;
+        }
+
+        /** El codigo estable de 01-envelope.md §3.1 que corresponde a este rechazo, o {@code null}. */
+        public String code() {
+            return code;
         }
     }
 
@@ -271,6 +307,16 @@ public final class Envelope {
         private String partitionKey;
         private String traceparent;
         private String tracestate;
+        private boolean allowReservedDomain;
+
+        /**
+         * Permite un dominio reservado. Solo para el sobre sintetico de un mensaje ilegible
+         * ({@code system.poison.v1.capturado}), que escribe el propio SDK.
+         */
+        BuildEventInput allowReservedDomain() {
+            this.allowReservedDomain = true;
+            return this;
+        }
 
         /** Subject de NATS. Determina el {@code type}. */
         public BuildEventInput subject(String v) {
@@ -370,19 +416,20 @@ public final class Envelope {
     public static FluxEvent buildEvent(BuildEventInput in) {
         // Valida el subject y deriva el type. Va primero para que un subject mal escrito
         // falle con su mensaje propio y no con "dataschema es obligatorio".
-        String type = Protocol.subjectToType(in.subject);
+        String type = in.allowReservedDomain
+                ? Protocol.subjectToTypeUnchecked(in.subject)
+                : Protocol.subjectToType(in.subject);
 
         JsonNode data = toDataObject(in.data);
 
-        requireNonEmpty("id", in.id);
-        requireNonEmpty("source", in.source);
-        requireNonEmpty("dataschema", in.dataSchema);
-        requireNonEmpty("correlationid", in.correlationId);
-        requireNonEmpty("tenantid", in.tenantId);
-        requireNonEmpty("producerversion", in.producerVersion);
+        requireNonEmpty("id", in.id, false);
+        requireNonEmpty("source", in.source, false);
+        requireNonEmpty("dataschema", in.dataSchema, false);
+        requireNonEmpty("correlationid", in.correlationId, true);
+        requireNonEmpty("tenantid", in.tenantId, true);
+        requireNonEmpty("producerversion", in.producerVersion, true);
         if (in.dataClassification == null) {
-            throw new EnvelopeException("dataclassification es obligatoria: debe ser public, internal, "
-                    + "confidential o restricted (06-security.md §5)");
+            throw new StateErrors.InvalidDataClassificationException(null, false);
         }
 
         Instant when = in.time != null ? in.time : Instant.now();
@@ -415,11 +462,29 @@ public final class Envelope {
                 data);
     }
 
-    private static void requireNonEmpty(String name, String value) {
+    /**
+     * Los atributos que el SDK rellena NO pueden llegar vacios a un constructor: una cadena vacia
+     * y una ausente son lo mismo (01-envelope.md §3.1, §3.3), y un evento que su propio parser
+     * rechazaria no se construye. Lleva el MISMO codigo que daria el parser: un atributo
+     * obligatorio vacio es {@code MISSING_REQUIRED_ATTRIBUTE}; una extension, {@code
+     * MISSING_REQUIRED_EXTENSION}.
+     */
+    static void requireNonEmpty(String name, String value, boolean extension) {
         if (value == null || value.isEmpty()) {
-            throw new EnvelopeException(name + " es obligatorio y llego vacio. Lo rellena el SDK a partir "
-                    + "de ConnectOptions; si estas llamando a buildEvent a mano, rellenalo "
-                    + "(01-envelope.md §5)");
+            throw new EnvelopeException("`" + name + "` es obligatorio y llego "
+                    + (value == null ? "ausente" : "vacio") + ". Lo rellena el SDK a partir de "
+                    + "ConnectOptions y del evento en curso; si estas llamando a un constructor a mano, "
+                    + "rellenalo con una cadena no vacia (01-envelope.md §5).",
+                    extension ? "MISSING_REQUIRED_EXTENSION" : "MISSING_REQUIRED_ATTRIBUTE");
+        }
+    }
+
+    /** {@code value} entre comillas y escapado como JSON (UTF-8 literal). Para citar en mensajes. */
+    static String jsonString(String value) {
+        try {
+            return MAPPER.writeValueAsString(value);
+        } catch (JsonProcessingException e) {
+            return "\"" + value + "\"";
         }
     }
 
@@ -430,7 +495,7 @@ public final class Envelope {
      * despues sin romper el esquema, y toda la politica de compatibilidad de
      * 05-compatibility.md se apoya en poder hacerlo — 01-envelope.md §4.
      */
-    private static JsonNode toDataObject(Object data) {
+    static JsonNode toDataObject(Object data) {
         if (data == null) {
             throw new EnvelopeException("`data` es obligatorio y llego null");
         }
@@ -462,6 +527,23 @@ public final class Envelope {
      * payload exceeded", que no dice que hacer al respecto — 01-envelope.md §6.
      */
     public static byte[] serialize(FluxEvent event) {
+        byte[] bytes = serializeUnbounded(event);
+        if (bytes.length > Protocol.MAX_MESSAGE_BYTES) {
+            throw new EnvelopeException("evento de " + bytes.length + " bytes supera el limite de "
+                    + Protocol.MAX_MESSAGE_BYTES + " (1 MiB). Aplica claim-check: sube el contenido a "
+                    + "almacenamiento de objetos y publica {uri, sha256, bytes} en su lugar "
+                    + "(01-envelope.md §6). El sha256 no es decorativo: sin el, el consumidor no puede "
+                    + "distinguir \"aun no replicado\" de \"fue sustituido\"");
+        }
+        return bytes;
+    }
+
+    /**
+     * Los bytes del evento SIN comprobar el limite de 1 MiB: lo pone quien envia. La peticion/respuesta
+     * comprueba el minimo entre 1 MiB y el {@code max_payload} del broker (11-request-reply.md §4.4) y
+     * contesta con su propio codigo ({@code RPC_MESSAGE_TOO_LARGE}).
+     */
+    static byte[] serializeUnbounded(FluxEvent event) {
         byte[] bytes;
         try {
             // ⚠️ writeValueAsString().getBytes(UTF_8) y NO writeValueAsBytes(): el generador
@@ -481,13 +563,6 @@ public final class Envelope {
             bytes = MAPPER.writeValueAsString(event).getBytes(StandardCharsets.UTF_8);
         } catch (JsonProcessingException e) {
             throw new EnvelopeException("el evento no es serializable a JSON: " + e.getMessage(), e);
-        }
-        if (bytes.length > Protocol.MAX_MESSAGE_BYTES) {
-            throw new EnvelopeException("evento de " + bytes.length + " bytes supera el limite de "
-                    + Protocol.MAX_MESSAGE_BYTES + " (1 MiB). Aplica claim-check: sube el contenido a "
-                    + "almacenamiento de objetos y publica {uri, sha256, bytes} en su lugar "
-                    + "(01-envelope.md §6). El sha256 no es decorativo: sin el, el consumidor no puede "
-                    + "distinguir \"aun no replicado\" de \"fue sustituido\"");
         }
         return bytes;
     }
@@ -511,7 +586,7 @@ public final class Envelope {
     public static FluxEvent parseEvent(byte[] body) {
         JsonNode root;
         try {
-            root = MAPPER.readTree(body);
+            root = MAPPER.readTree(decodeUtf8Strict(body));
         } catch (Exception e) {
             throw new FluxErrors.PoisonException(
                     "el cuerpo del mensaje no es JSON valido", "MALFORMED_JSON", e);
@@ -619,6 +694,19 @@ public final class Envelope {
                     "UNKNOWN_ROOT_ATTRIBUTE");
         }
 
+        // Los tipos son exactos TAMBIEN en lo no obligatorio: `{"subject": 5}` o `{"dlqattempts": "seis"}` no
+        // se propagan. Es el ultimo codigo de `parseEvent` (el orden es parte del contrato entre SDKs) y el
+        // mismo de Node, Rust y .NET. `null` es «ausente» en un opcional.
+        String wrongType = optionalAttributeWithWrongType(root);
+        if (wrongType != null) {
+            JsonNode value = root.get(wrongType);
+            throw new FluxErrors.PoisonException(
+                    wrongType + " tiene un tipo incompatible con el contrato (01-envelope.md §2.4): "
+                            + (value.isContainerNode() ? "un objeto o un array"
+                                    : StateErrors.quote(value.asText())),
+                    "INVALID_ATTRIBUTE_TYPE");
+        }
+
         try {
             return MAPPER.treeToValue(root, FluxEvent.class);
         } catch (Exception e) {
@@ -629,6 +717,52 @@ public final class Envelope {
                     "un atributo del envelope tiene un tipo incompatible con el contrato: " + e.getMessage(),
                     "INVALID_ATTRIBUTE_TYPE", e);
         }
+    }
+
+    private static final List<String> OPTIONAL_STRING_ATTRIBUTES = List.of(
+            "dataschema", "subject", "causationid", "partitionkey", "traceparent", "tracestate",
+            "dlqconsumer", "dlqerror", "dlqtime", "signkeyid", "signature");
+
+    /**
+     * El primer atributo conocido —ni de los siete cadena obligatorios— con un tipo incompatible, o
+     * {@code null}. {@code dlqattempts} es un entero de 0 a 2^32−1 y {@code dlqreason}, una de las
+     * tres clases.
+     */
+    private static String optionalAttributeWithWrongType(JsonNode root) {
+        for (String a : OPTIONAL_STRING_ATTRIBUTES) {
+            JsonNode v = root.get(a);
+            if (v != null && !v.isNull() && !v.isTextual()) {
+                return a;
+            }
+        }
+        JsonNode reason = root.get("dlqreason");
+        if (reason != null && !reason.isNull()
+                && !(reason.isTextual() && List.of("retryable", "permanent", "poison").contains(reason.textValue()))) {
+            return "dlqreason";
+        }
+        JsonNode attempts = root.get("dlqattempts");
+        if (attempts != null && !attempts.isNull()
+                && !(attempts.isIntegralNumber() && attempts.canConvertToLong()
+                        && attempts.longValue() >= 0 && attempts.longValue() <= 4294967295L)) {
+            return "dlqattempts";
+        }
+        return null;
+    }
+
+    /**
+     * UTF-8 ESTRICTO. Un cuerpo que no es UTF-8 no es JSON (RFC 8259 §8.1) y una marca de orden de
+     * bytes tampoco («las implementaciones NO DEBEN anadir una marca»): ambos son
+     * {@code MALFORMED_JSON}. Sin esto, Jackson detecta solo la codificacion (UTF-16, UTF-32, un BOM) y
+     * sustituye los bytes invalidos, y el mismo mensaje tendria dos veredictos segun el SDK.
+     */
+    private static String decodeUtf8Strict(byte[] body) throws CharacterCodingException {
+        if (body.length >= 3 && (body[0] & 0xFF) == 0xEF && (body[1] & 0xFF) == 0xBB && (body[2] & 0xFF) == 0xBF) {
+            throw new CharacterCodingException();
+        }
+        return StandardCharsets.UTF_8.newDecoder()
+                .onMalformedInput(CodingErrorAction.REPORT)
+                .onUnmappableCharacter(CodingErrorAction.REPORT)
+                .decode(ByteBuffer.wrap(body)).toString();
     }
 
     /** El JSON crudo del atributo, para que el operador vea que llego y no una interpretacion. */
@@ -714,7 +848,7 @@ public final class Envelope {
                 info.reason(),
                 info.attempts(),
                 info.consumer(),
-                truncate(info.error(), DLQ_ERROR_MAX_CHARS),
+                Text.truncateUtf8Bytes(info.error(), DLQ_ERROR_MAX_BYTES),
                 formatTime(Instant.now()));
     }
 
@@ -729,23 +863,8 @@ public final class Envelope {
         return event.withoutDlq();
     }
 
-    /**
-     * Recorta sin partir un par suplente.
-     *
-     * <p>El SDK de Node hace {@code .slice(0, 1024)} sobre unidades UTF-16 y puede partir
-     * un emoji por la mitad; Go corta por bytes respetando runas. Aqui se corta por
-     * unidades UTF-16 —lo natural en Java— pero retrocediendo una posicion si el corte
-     * cae entre los dos suplentes de un caracter, porque un {@code dlqerror} con un
-     * suplente huerfano produce un JSON con U+FFFD al reparsear.
-     */
-    static String truncate(String value, int maxChars) {
-        if (value == null || value.length() <= maxChars) {
-            return value;
-        }
-        int cut = maxChars;
-        if (Character.isHighSurrogate(value.charAt(cut - 1))) {
-            cut--;
-        }
-        return value.substring(0, cut);
+    /** Recorta a {@code maxBytes} bytes UTF-8 sin partir un caracter. Ver {@link Text#truncateUtf8Bytes}. */
+    static String truncate(String value, int maxBytes) {
+        return value == null ? null : Text.truncateUtf8Bytes(value, maxBytes);
     }
 }

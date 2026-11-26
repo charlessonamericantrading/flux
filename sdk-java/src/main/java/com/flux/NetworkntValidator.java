@@ -87,25 +87,29 @@ final class NetworkntValidator implements Validation.Validator {
     }
 
     @Override
-    public void check(FluxEvent event, String subject) {
+    public Validation.Mode mode() {
+        return mode;
+    }
+
+    @Override
+    public RuntimeException failure(FluxEvent event, String subject) {
         JsonSchema schema = compiled.get(event.dataschema());
         if (schema == null) {
-            SchemaNotFoundException error = new SchemaNotFoundException(subject, event.dataschema());
-            if (mode == Validation.Mode.STRICT) {
-                throw error;
-            }
-            logger.log(System.Logger.Level.WARNING, "[flux] " + error.getMessage());
-            return;
+            return new SchemaNotFoundException(subject, event.dataschema());
         }
-
-        JsonNode data = event.data();
-        Set<ValidationMessage> messages = schema.validate(data);
+        Set<ValidationMessage> messages = schema.validate(event.data());
         if (messages.isEmpty()) {
+            return null;
+        }
+        return new SchemaValidationException(subject, event.dataschema(), format(messages));
+    }
+
+    @Override
+    public void check(FluxEvent event, String subject) {
+        RuntimeException error = failure(event, subject);
+        if (error == null) {
             return;
         }
-
-        SchemaValidationException error =
-                new SchemaValidationException(subject, event.dataschema(), format(messages));
         if (mode == Validation.Mode.STRICT) {
             throw error;
         }

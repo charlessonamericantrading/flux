@@ -255,6 +255,15 @@ public final class Signing {
      *                             es Ed25519.
      */
     public static Verifier createVerifier(SigningOptions options) {
+        return createVerifier(options, null);
+    }
+
+    /**
+     * Como {@link #createVerifier(SigningOptions)}, y en modo {@code warn} avisa ademas a {@code onWarnCode} con el CODIGO del
+     * fallo (el verificador no lanza y la metrica de consumo necesita saber que paso). El estado y rpc lo usan para contar
+     * {@code invalid_signature} sin cambiar lo que hace un servicio que solo consume eventos.
+     */
+    static Verifier createVerifier(SigningOptions options, Consumer<String> onWarnCode) {
         VerificationMode mode = options != null ? options.verify : VerificationMode.OFF;
         if (mode == null || mode == VerificationMode.OFF) {
             return null;
@@ -279,7 +288,7 @@ public final class Signing {
         return event -> {
             String firma = event.signature();
             if (firma == null || firma.isEmpty()) {
-                fail(mode, warn, CODE_MISSING_SIGNATURE, "evento " + event.id() + " sin firma");
+                fail(mode, warn, onWarnCode, CODE_MISSING_SIGNATURE, "evento " + event.id() + " sin firma");
                 return;
             }
             String keyId = event.signkeyid();
@@ -288,7 +297,7 @@ public final class Signing {
                 // Una clave DESCONOCIDA no es lo mismo que una RETIRADA: si el id no esta
                 // en el mapa, el operador olvido conservar la publica al rotar, o el evento
                 // viene de fuera del ecosistema.
-                fail(mode, warn, CODE_UNKNOWN_SIGNING_KEY,
+                fail(mode, warn, onWarnCode, CODE_UNKNOWN_SIGNING_KEY,
                         "evento " + event.id() + " firmado con signkeyid=" + quote(keyId)
                                 + ", que no esta entre las claves conocidas. ¿Se retiro sin conservar "
                                 + "la publica? Una clave retirada DEBE seguir verificando "
@@ -296,7 +305,7 @@ public final class Signing {
                 return;
             }
             if (!verify(key, signablePayload(event), decodeSignature(firma))) {
-                fail(mode, warn, CODE_INVALID_SIGNATURE,
+                fail(mode, warn, onWarnCode, CODE_INVALID_SIGNATURE,
                         "la firma del evento " + event.id() + " no verifica");
             }
         };
@@ -309,11 +318,15 @@ public final class Signing {
      * cuya firma no cuadra no es un evento que el handler deba ver, igual que uno cuyo JSON
      * no parsea. Y es el unico caso que debe despertar a alguien — 04-errors.md §1.3.
      */
-    private static void fail(VerificationMode mode, Consumer<String> warn, String code, String message) {
+    private static void fail(VerificationMode mode, Consumer<String> warn, Consumer<String> onWarnCode, String code,
+                             String message) {
         if (mode == VerificationMode.REQUIRE) {
             throw new FluxErrors.PoisonException(message, code);
         }
         warn.accept("[flux] " + code + ": " + message);
+        if (onWarnCode != null) {
+            onWarnCode.accept(code);
+        }
     }
 
     private static String quote(String value) {

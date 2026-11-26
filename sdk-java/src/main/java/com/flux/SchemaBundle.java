@@ -50,9 +50,18 @@ public final class SchemaBundle {
     /** URI → JSON Schema. */
     private final Map<String, JsonNode> schemas;
 
-    private SchemaBundle(Map<String, String> subjects, Map<String, JsonNode> schemas) {
+    /** contrato de estado ({@code clientes.cliente.v1}) → URI del esquema de mayor version de su mayor (10-state.md §10). */
+    private final Map<String, String> state;
+
+    /** operacion rpc ({@code clientes.cliente.v1.obtener}) → { request, reply } (11-request-reply.md §11). */
+    private final Map<String, Map<String, String>> rpc;
+
+    private SchemaBundle(Map<String, String> subjects, Map<String, JsonNode> schemas, Map<String, String> state,
+                         Map<String, Map<String, String>> rpc) {
         this.subjects = Collections.unmodifiableMap(subjects);
         this.schemas = Collections.unmodifiableMap(schemas);
+        this.state = Collections.unmodifiableMap(state);
+        this.rpc = Collections.unmodifiableMap(rpc);
     }
 
     /** Lee el bundle desde su texto JSON. */
@@ -108,7 +117,39 @@ public final class SchemaBundle {
                             + "Regeneralo con `node scripts/bundle-schemas.mjs`");
         }
 
-        return new SchemaBundle(subjects, schemas);
+        // `state` y `rpc` son OPCIONALES: un bundle generado antes de esas capacidades no los trae.
+        Map<String, String> state = new LinkedHashMap<>();
+        JsonNode stateNode = root.get("state");
+        if (stateNode != null && stateNode.isObject()) {
+            for (Iterator<String> it = stateNode.fieldNames(); it.hasNext(); ) {
+                String contract = it.next();
+                JsonNode uri = stateNode.get(contract);
+                if (uri != null && uri.isTextual()) {
+                    state.put(contract, uri.textValue());
+                }
+            }
+        }
+        Map<String, Map<String, String>> rpc = new LinkedHashMap<>();
+        JsonNode rpcNode = root.get("rpc");
+        if (rpcNode != null && rpcNode.isObject()) {
+            for (Iterator<String> it = rpcNode.fieldNames(); it.hasNext(); ) {
+                String operation = it.next();
+                JsonNode sides = rpcNode.get(operation);
+                if (sides == null || !sides.isObject()) {
+                    continue;
+                }
+                Map<String, String> pair = new LinkedHashMap<>();
+                for (String side : new String[] {"request", "reply"}) {
+                    JsonNode uri = sides.get(side);
+                    if (uri != null && uri.isTextual()) {
+                        pair.put(side, uri.textValue());
+                    }
+                }
+                rpc.put(operation, Collections.unmodifiableMap(pair));
+            }
+        }
+
+        return new SchemaBundle(subjects, schemas, state, rpc);
     }
 
     /** Lee el bundle desde un recurso del classpath o cualquier otro flujo. */
@@ -144,6 +185,17 @@ public final class SchemaBundle {
      */
     public String schemaUriFor(String subject) {
         return subjects.get(subject);
+    }
+
+    /** La URI de {@code dataschema} de un CONTRATO DE ESTADO, o {@code null}. Sin red. */
+    public String stateSchemaUriFor(String contract) {
+        return state.get(contract);
+    }
+
+    /** La URI de la peticion o de la respuesta de una OPERACION rpc ({@code side}: {@code request} o {@code reply}), o {@code null}. Sin red. */
+    public String rpcSchemaUriFor(String operation, RpcEnvelope.Side side) {
+        Map<String, String> pair = rpc.get(operation);
+        return pair == null ? null : pair.get(side.wire());
     }
 
     /** El esquema indexado por esa URI, o {@code null}. */

@@ -256,6 +256,10 @@ function mutaciones(real) {
         decl.capabilities.push(cap);
         decl.evidence = { ...(decl.evidence ?? {}), ...(protocol.capabilities.sdks.node.evidence?.[cap] && { [cap]: protocol.capabilities.sdks.node.evidence[cap] }) };
         m.readme = m.readme.replace(filaDe(m.readme, sdk), (f) => f.replace(/\s*\|\s*$/, ` \`${cap}\` |`));
+        // «Sin tener su código»: un SDK que YA lleva los códigos de una capacidad que todavía no declara (en una entrega por pasos, el
+        // sobre y los códigos puros llegan antes que la declaración, que espera a la prueba contra un broker real) no sería víctima de
+        // esta mutación. Se le quitan, para simular lo que dice el nombre: declarar lo que no se tiene.
+        for (const { codigo } of codigosPorCapacidad(protocol).get(cap) ?? []) m.fuentes[sdk] = sinLiteral(m.fuentes[sdk], codigo);
       }, [sdk]);
     }
   }
