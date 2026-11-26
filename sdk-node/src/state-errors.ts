@@ -2,9 +2,10 @@
  * Errores de la capacidad `state`.
  * Contrato normativo: specification/04-errors.md §6 y specification/10-state.md.
  *
- * La lista es CERRADA: los seis códigos de abajo y ninguno más. Un caso que no encaje en
- * ninguno es un hueco de la spec, no un código nuevo que este SDK pueda inventar (por eso un
- * contrato mal formado lanza `InvalidSubjectError`, que no lleva código de estado).
+ * La lista es CERRADA: los siete códigos de abajo y ninguno más. Un caso que no encaje en
+ * ninguno es un hueco de la spec, no un código nuevo que este SDK pueda inventar. (El séptimo,
+ * `INVALID_STATE_CONTRACT`, es justo el hueco que dejó la lista de seis: un contrato mal formado
+ * lanzaba un error sin código, y la spec lo cerró en vez de dejar que cada SDK lo resolviera.)
  *
  * Reglas comunes (04-errors.md §6, «Qué DEBE decir el mensaje»):
  *   · el `code` es fijo y la aplicación no puede sustituirlo: es lo que agrupa el panel
@@ -22,6 +23,25 @@ function citar(v: unknown): string {
   if (typeof v !== "string") return `un valor de tipo ${v === null ? "null" : typeof v}`;
   const s = JSON.stringify(v);
   return s.length > 70 ? `${s.slice(0, 67)}…"` : s;
+}
+
+/**
+ * Un contrato que no es `<dominio>.<agregado>.v<major>` —`clientes.cliente` sin versión, cuatro
+ * tokens, mayúsculas—. PERMANENT. Un dominio reservado NO es este error: es `ReservedDomainError`,
+ * que se evalúa antes (10-state.md §3.6). No se cuenta en `flux_state_writes_total`: su valor es la
+ * etiqueta `contract`, y uno mal formado crearía una serie por cada error de tipeo.
+ */
+export class InvalidStateContractError extends PermanentError {
+  readonly code = "INVALID_STATE_CONTRACT";
+  constructor(readonly contract: unknown, motivo: string) {
+    super(
+      `contrato de estado inválido ${citar(contract)}: ${motivo}. ` +
+        `Un contrato es \`<dominio>.<agregado>.v<major>\` —el subject del estado sin \`state.\`, sin ` +
+        `tenant y sin clave—, en minúsculas y kebab-case: \`clientes.cliente.v1\` (10-state.md §2.2).`,
+      { code: "INVALID_STATE_CONTRACT" },
+    );
+    this.name = "InvalidStateContractError";
+  }
 }
 
 /** El tenant no es válido para estado, o no se pudo resolver ninguno. PERMANENT. */

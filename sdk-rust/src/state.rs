@@ -71,6 +71,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use async_nats::jetstream::consumer::pull::MessagesErrorKind;
 use async_nats::jetstream::consumer::{self, AckPolicy, DeliverPolicy, ReplayPolicy};
 use async_nats::jetstream::stream::{self, ConsumerErrorKind, DiscardPolicy, RetentionPolicy};
 use async_nats::jetstream::{AckKind, ErrorCode};
@@ -93,8 +94,8 @@ use crate::envelope::{
     Event,
 };
 use crate::errors::{
-    describe, Classification, ConfigDifference, ErrorClass, FluxError, HandlerError, HandlerResult,
-    ResourceKind,
+    as_classified, Classification, ConfigDifference, ErrorClass, FluxError, HandlerError,
+    HandlerResult, ResourceKind,
 };
 use crate::metrics::{ConsumeOutcome, DlqReasonLabel, StateWriteOutcome};
 use crate::protocol::{
@@ -179,11 +180,12 @@ impl StateContract {
     /// # Errores
     ///
     /// [`FluxError::ReservedDomain`] si el dominio es `dlq`, `state`, `rpc` o `system`;
-    /// [`FluxError::InvalidSubject`] si no son tres tokens kebab-case y `v<major>`.
+    /// [`FluxError::InvalidStateContract`] (`INVALID_STATE_CONTRACT`) si no son tres tokens
+    /// kebab-case y `v<major>`.
     pub fn parse(contract: &str) -> Result<Self, FluxError> {
         reject_reserved_domain(contract)?;
-        let invalid = |reason: &str| FluxError::InvalidSubject {
-            subject: contract.to_string(),
+        let invalid = |reason: &str| FluxError::InvalidStateContract {
+            contract: contract.to_string(),
             reason: reason.to_string(),
         };
         let tokens: Vec<&str> = contract.split('.').collect();
@@ -472,7 +474,7 @@ fn check_version_number(version: u64) -> Result<u64, FluxError> {
 ///
 /// # Errores
 ///
-/// [`FluxError::ReservedDomain`], [`FluxError::InvalidSubject`] (contrato mal formado),
+/// [`FluxError::ReservedDomain`], [`FluxError::InvalidStateContract`] (contrato mal formado),
 /// [`FluxError::InvalidStateKey`] o [`FluxError::InvalidTenantForState`].
 pub fn state_subject(contract: &str, tenant_id: &str, key: &str) -> Result<String, FluxError> {
     let c = StateContract::parse(contract)?;
@@ -2072,6 +2074,31 @@ impl State {
     }
 }
 
+// ─── Qué deja un error en la DLQ de estado — 10-state.md §6 ──────────────────
+
+/// Lo que sigue al código en el `dlqerror` de un error que **no es de flux**. La misma frase que el
+/// SDK de Node (y que `protocol.json` → `state.dlq.dlqerrorFixedPhrase`): el mensaje de un driver de
+/// base de datos puede citar la fila entera —`Key (email)=(ana@example.com)`—, y la DLQ guarda 90
+/// días.
+pub(crate) const UNCLASSIFIED_DLQ_ERROR: &str =
+    "error sin clasificar de la aplicación; el mensaje \
+     se omite para no copiar datos a la DLQ (10-state.md §6)";
+
+/// El `dlqerror` de una entrada de estado: `<código>: <mensaje>`, **sin valores de `data`**.
+///
+/// - Un error **de flux** (un [`FluxError`] clasificado, o uno que lo envuelve) conserva su mensaje:
+///   lo escribió quien sabía que iría a la DLQ, o es del SDK y cita rutas y no valores. **Sin su
+///   cadena de causas**: la causa es, justamente, el error del driver (`describe` la concatenaría).
+/// - Cualquier otro —un error de `sqlx`, un `HttpError`, un `io::Error`— se reduce a su código y a
+///   la frase fija [`UNCLASSIFIED_DLQ_ERROR`]. El código lo da el clasificador (`UNKNOWN`, o el que
+///   reconozca: `HTTP_503`, `ECONNRESET`).
+pub(crate) fn state_dlq_error(code: &str, err: &(dyn std::error::Error + 'static)) -> String {
+    match as_classified(err) {
+        Some(flux) => format!("{code}: {flux}"),
+        None => format!("{code}: {UNCLASSIFIED_DLQ_ERROR}"),
+    }
+}
+
 // ─── Qué comprueba el SDK al consumir — 10-state.md §5.4 ─────────────────────
 
 /// El veredicto de las comprobaciones que no necesitan nada más que el sobre.
@@ -2317,6 +2344,10 @@ struct WatchCtx {
     /// El `dataschema` del contrato, para el sobre sintetizado de un mensaje ilegible.
     synth_dataschema: String,
     gate: Arc<SyncGate>,
+    /// `STATE_<DOM>` y la configuración que se pidió del durable: lo que hace falta para
+    /// **reabrir el consumo** si el durable se borra con el `watch` abierto (`flux state resync`).
+    stream_name: String,
+    requested: consumer::pull::Config,
 }
 
 impl State {
@@ -2350,7 +2381,7 @@ impl State {
     ///
     /// # Errores
     ///
-    /// Antes de la red: [`FluxError::ReservedDomain`], [`FluxError::InvalidSubject`] (contrato) e
+    /// Antes de la red: [`FluxError::ReservedDomain`], [`FluxError::InvalidStateContract`] e
     /// [`FluxError::InvalidTenantForState`]; y [`FluxError::TenantIsolation`] si la conexión es
     /// `strict` y no hay tenant.
     ///
@@ -2453,6 +2484,8 @@ impl State {
                 .unwrap_or_else(|_| c.default_dataschema("https://schemas.internal")),
             contract: c.clone(),
             gate: Arc::clone(&gate),
+            stream_name: stream_name.clone(),
+            requested: requested.clone(),
         });
 
         self.spawn_pending_poll(consumer.clone(), &ctx, &stop_tx);
@@ -2470,6 +2503,16 @@ impl State {
 
     /// El bucle de consumo de un `watch`: una entrada a la vez, en el orden en que el broker las
     /// entrega, hasta que se pide parar.
+    ///
+    /// **Si el durable se borra con el `watch` abierto** (`flux state resync`: borrar y recrear), el
+    /// broker contesta al pull pendiente `409 Consumer Deleted`, y `async-nats` da por **terminado**
+    /// el flujo de mensajes (un `Err(ConsumerDeleted)` y después `None`). Este bucle trataba el
+    /// `None` como «me pidieron parar» y **salía en silencio**: un `watch` muerto que parecía vivo,
+    /// con la conexión sana y sin ningún error. Medido con nats-server 2.14.5 y `async-nats` 0.50:
+    /// **no recibía nada nunca** tras el `resync` (120 s de espera, y ni siquiera un `put` en vivo
+    /// posterior). Ahora se **reabre el consumo** ([`Bus::reopen_state_stream`]): se vuelve a
+    /// consultar el durable por su nombre —`CONSUMER.INFO`, que el observador ya tiene; **no** hace
+    /// falta `CONSUMER.CREATE`— y se vuelve a pedir. `on_synced` no se invoca de nuevo.
     fn spawn_watch_loop(
         &self,
         mut messages: consumer::pull::Stream,
@@ -2481,21 +2524,53 @@ impl State {
         let loop_ctx = ctx;
         tokio::spawn(async move {
             loop {
-                let msg = tokio::select! {
+                let next = tokio::select! {
+                    // `biased`: si se pidió parar, gana sobre un `None` que llega a la vez.
+                    biased;
                     _ = stop_rx.changed() => break,
-                    next = messages.next() => match next {
-                        Some(Ok(m)) => m,
-                        Some(Err(e)) => {
-                            // Un error del stream de mensajes NO debe romper el bucle:
-                            // async-nats reconecta por dentro.
-                            loop_bus.log(LogLevel::Error, &format!(
+                    next = messages.next() => next,
+                };
+                let msg = match next {
+                    Some(Ok(m)) => m,
+                    Some(Err(e)) if matches!(e.kind(), MessagesErrorKind::ConsumerDeleted) => {
+                        // El durable se borró bajo el watch: el flujo de async-nats ya terminó.
+                        match loop_bus
+                            .reopen_state_stream(&loop_ctx, &mut stop_rx, "se borró")
+                            .await
+                        {
+                            Some(reopened) => {
+                                messages = reopened;
+                                continue;
+                            }
+                            None => break,
+                        }
+                    }
+                    Some(Err(e)) => {
+                        // Un error del stream de mensajes NO debe romper el bucle:
+                        // async-nats reconecta por dentro.
+                        loop_bus.log(
+                            LogLevel::Error,
+                            &format!(
                                 "error leyendo de `{}`: {e}. El consumo continúa.",
                                 loop_ctx.durable
-                            ));
-                            continue;
+                            ),
+                        );
+                        continue;
+                    }
+                    None => {
+                        // El flujo terminó sin que nadie pidiera parar. Salir aquí dejaría el
+                        // watch muerto en silencio; se reabre (con backoff, hasta que se pare).
+                        match loop_bus
+                            .reopen_state_stream(&loop_ctx, &mut stop_rx, "terminó")
+                            .await
+                        {
+                            Some(reopened) => {
+                                messages = reopened;
+                                continue;
+                            }
+                            None => break,
                         }
-                        None => break,
-                    },
+                    }
                 };
 
                 // La que lleva `pending == 0` cierra la foto, pero solo DESPUÉS de procesarla:
@@ -2710,6 +2785,109 @@ fn subject_tokens(nats_subject: &str) -> (&str, &str) {
 }
 
 impl Bus {
+    /// Vuelve a abrir el consumo de un durable que se borró bajo un `watch` (o cuyo flujo terminó).
+    ///
+    /// Reintenta con backoff (100 ms … 5 s, con jitter) hasta que el durable exista —`flux state
+    /// resync` lo recrea a continuación del borrado— o hasta que se pida parar (devuelve `None`).
+    /// Antes de consumir comprueba la configuración como al abrir: un durable recreado con otro
+    /// filtro entregaría las claves de otro tenant sin ningún error, y ese no se consume.
+    async fn reopen_state_stream(
+        &self,
+        w: &WatchCtx,
+        stop: &mut watch::Receiver<bool>,
+        what: &str,
+    ) -> Option<consumer::pull::Stream> {
+        self.log(
+            LogLevel::Warn,
+            &format!(
+                "el durable `{}` {what} con el watch de {} abierto (¿`flux state resync`?): se \
+                 vuelve a abrir el consumo cuando exista de nuevo",
+                w.durable, w.metric_subject
+            ),
+        );
+        let mut attempt: u32 = 0;
+        let mut last_reason = String::new();
+        loop {
+            if *stop.borrow() {
+                break;
+            }
+            attempt = attempt.saturating_add(1);
+            let reopened: Result<consumer::pull::Stream, FluxError> = async {
+                // CONSUMER.INFO por su nombre: el observador ya lo tiene.
+                let consumer = self
+                    .inner
+                    .js
+                    .get_consumer_from_stream::<consumer::pull::Config, _, _>(
+                        &w.durable,
+                        &w.stream_name,
+                    )
+                    .await
+                    .map_err(|e| {
+                        transport(
+                            format!("no se pudo consultar el consumidor `{}`", w.durable),
+                            e,
+                        )
+                    })?;
+                assert_state_config_honored(
+                    &w.durable,
+                    &w.requested,
+                    &consumer.cached_info().config,
+                )?;
+                consumer.messages().await.map_err(|e| {
+                    transport(
+                        format!("no se pudo reiniciar el consumo de `{}`", w.durable),
+                        e,
+                    )
+                })
+            }
+            .await;
+            match reopened {
+                Ok(stream) => {
+                    self.log(
+                        LogLevel::Warn,
+                        &format!(
+                            "consumo de `{}` reabierto (intento {attempt}): se entregará la foto \
+                             otra vez",
+                            w.durable
+                        ),
+                    );
+                    return Some(stream);
+                }
+                Err(e) => {
+                    // `consumer not found` (10014): el resync está entre el borrado y la creación.
+                    // Se avisa la primera vez, cada 10 intentos y SIEMPRE que la causa cambia: un
+                    // durable recreado con otra configuración no es «aún no existe».
+                    let reason = crate::errors::describe(&e);
+                    if attempt == 1 || attempt.is_multiple_of(10) || reason != last_reason {
+                        self.log(
+                            LogLevel::Warn,
+                            &format!(
+                                "no se pudo reabrir el consumo de `{}` (intento {attempt}): {reason}. \
+                                 Se reintenta",
+                                w.durable
+                            ),
+                        );
+                        last_reason = reason;
+                    }
+                }
+            }
+            tokio::select! {
+                _ = stop.changed() => break,
+                () = tokio::time::sleep(crate::client::connect_backoff(attempt)) => {}
+            }
+        }
+        // Se pidió parar (`close()`, `unsubscribe()`) mientras se esperaba al durable: se dice, para que
+        // un reintento que se detiene no sea indistinguible de uno que sigue colgado.
+        self.log(
+            LogLevel::Warn,
+            &format!(
+                "el watch de {} se detuvo sin haber podido reabrir el consumo de `{}`",
+                w.metric_subject, w.durable
+            ),
+        );
+        None
+    }
+
     /// Anota el `pending` de este durable y publica la **suma** de los de su serie.
     fn state_report_pending(&self, w: &WatchCtx, pending: u64) {
         let sum =
@@ -2917,7 +3095,7 @@ impl Bus {
         // `rawBase64` de los eventos—: podría contener el dato. Tampoco el texto del error de
         // parseo, que puede citar fragmentos de lo recibido. El `dlqerror` dice el código.
         let (event, error_text) = match original {
-            Some(event) => (event, format!("{code}: {}", describe(&err))),
+            Some(event) => (event, state_dlq_error(&code, &err)),
             None => (
                 self.synth_state_event(w, tenant, key),
                 format!(
@@ -3055,7 +3233,7 @@ impl Bus {
                 reason,
                 attempts: attempt,
                 consumer: w.durable.clone(),
-                error: format!("{}: {}", c.code, describe(handler_err.as_ref())),
+                error: state_dlq_error(&c.code, handler_err.as_ref()),
             },
             Utc::now(),
         );
@@ -3121,8 +3299,9 @@ mod tests {
 
     use super::*;
     use crate::errors::{
-        INVALID_STATE_KEY_CODE, INVALID_TENANT_FOR_STATE_CODE, MISSING_AGGREGATE_VERSION_CODE,
-        RESERVED_DOMAIN_CODE, STATE_CONFLICT_CODE, STATE_SUBJECT_MISMATCH_CODE,
+        INVALID_STATE_CONTRACT_CODE, INVALID_STATE_KEY_CODE, INVALID_TENANT_FOR_STATE_CODE,
+        MISSING_AGGREGATE_VERSION_CODE, RESERVED_DOMAIN_CODE, STATE_CONFLICT_CODE,
+        STATE_SUBJECT_MISMATCH_CODE,
     };
 
     const FIXTURES: &str = include_str!("../../conformance/cases/cross-sdk-state-envelope.json");
@@ -3694,29 +3873,64 @@ mod tests {
     fn el_primer_fallo_gana_en_el_orden_de_la_spec() {
         let r = state_subject("state.cliente.v1", "ACME", "a.b");
         assert_eq!(code_of(&r).as_deref(), Some("RESERVED_DOMAIN"));
+        // …después la forma del contrato (el séptimo código), antes que la clave y el tenant…
+        let r = state_subject("clientes.cliente", "ACME", "a.b");
+        assert_eq!(code_of(&r).as_deref(), Some("INVALID_STATE_CONTRACT"));
         let r = state_subject("clientes.cliente.v1", "ACME", "a.b");
         assert_eq!(code_of(&r).as_deref(), Some("INVALID_STATE_KEY"));
         let r = state_subject("clientes.cliente.v1", "ACME", "a");
         assert_eq!(code_of(&r).as_deref(), Some("INVALID_TENANT_FOR_STATE"));
     }
 
+    /// El séptimo código (04-errors.md §6): antes un contrato mal formado lanzaba un
+    /// `InvalidSubject`, que no es de estado y no lleva código.
     #[test]
-    fn un_contrato_mal_formado_no_es_uno_de_los_seis_codigos() {
-        // La lista de seis es CERRADA (04-errors.md §6): un contrato que no son 3 tokens es un
-        // `InvalidSubject`, sin código estable, y no un código nuevo inventado por este SDK.
+    fn un_contrato_mal_formado_es_invalid_state_contract() {
         for c in [
             "clientes.cliente",
             "clientes.cliente.v1.creado",
             "clientes.cliente.1",
+            "clientes.cliente.v0",
+            "Clientes.cliente.v1",
+            "clientes.Cliente.v1",
             "",
         ] {
             let r = StateContract::parse(c);
             assert!(
-                matches!(r, Err(FluxError::InvalidSubject { .. })),
+                matches!(&r, Err(FluxError::InvalidStateContract { .. })),
                 "{c:?}: {r:?}"
             );
-            assert_eq!(code_of(&r), None);
+            assert_eq!(
+                code_of(&r).as_deref(),
+                Some("INVALID_STATE_CONTRACT"),
+                "{c:?}"
+            );
+            assert_eq!(r.unwrap_err().class(), Some(ErrorClass::Permanent), "{c:?}");
         }
+        // Un dominio reservado NO es este código, y se evalúa antes aunque la forma también esté mal.
+        for c in [
+            "state.cliente.v1",
+            "state.cliente",
+            "dlq.pedidos.pedido.v1.creado",
+        ] {
+            assert_eq!(
+                code_of(&StateContract::parse(c)).as_deref(),
+                Some("RESERVED_DOMAIN"),
+                "{c:?}"
+            );
+        }
+        // CONTROL: uno bien formado pasa.
+        assert!(StateContract::parse("clientes.cliente.v1").is_ok());
+        // El mensaje dice qué contrato y cuál es la forma, y no cita ningún valor de `data`.
+        let m = StateContract::parse("clientes.cliente")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            m.contains("\"clientes.cliente\"")
+                && m.contains("<dominio>.<agregado>.v<major>")
+                && m.contains("clientes.cliente.v1"),
+            "{m}"
+        );
     }
 
     // ── El durable, el filtro, los nombres ───────────────────────────────────
@@ -3908,11 +4122,19 @@ mod tests {
         }
     }
 
-    // ── Los seis códigos de error — 04-errors.md §6 ──────────────────────────
+    // ── Los siete códigos de error — 04-errors.md §6 ─────────────────────────
 
     #[test]
-    fn los_seis_codigos_de_estado_con_su_clase() {
-        let casos: [(FluxError, &str, ErrorClass); 6] = [
+    fn los_siete_codigos_de_estado_con_su_clase() {
+        let casos: [(FluxError, &str, ErrorClass); 7] = [
+            (
+                FluxError::InvalidStateContract {
+                    contract: "clientes.cliente".into(),
+                    reason: "x".into(),
+                },
+                "INVALID_STATE_CONTRACT",
+                ErrorClass::Permanent,
+            ),
             (
                 FluxError::InvalidTenantForState {
                     tenant: None,
@@ -3965,6 +4187,7 @@ mod tests {
             assert_eq!(err.class(), Some(*class), "{err:?}");
         }
         // Las constantes públicas son los literales de la spec, y los de `protocol.json`.
+        assert_eq!(INVALID_STATE_CONTRACT_CODE, "INVALID_STATE_CONTRACT");
         assert_eq!(INVALID_TENANT_FOR_STATE_CODE, "INVALID_TENANT_FOR_STATE");
         assert_eq!(INVALID_STATE_KEY_CODE, "INVALID_STATE_KEY");
         assert_eq!(MISSING_AGGREGATE_VERSION_CODE, "MISSING_AGGREGATE_VERSION");
@@ -3978,6 +4201,7 @@ mod tests {
             assert_eq!(codes[*code]["class"], class.as_str(), "{code}");
             assert_eq!(codes[*code]["capability"], "state", "{code}");
         }
+
         // Una aplicación NO puede sustituir el código.
         assert_eq!(
             FluxError::StateConflict {
@@ -3997,6 +4221,45 @@ mod tests {
             .retry_after(),
             None
         );
+    }
+
+    /// La lista es CERRADA (04-errors.md §6): `protocol.json` declara exactamente estos siete para
+    /// `state`, y un octavo sería un hueco de la spec, no un código que este SDK pueda inventar.
+    #[test]
+    fn la_lista_de_codigos_de_estado_es_cerrada() {
+        let protocol = json_of(PROTOCOL);
+        let mut declarados: Vec<&str> = protocol["errors"]["codes"]
+            .as_object()
+            .expect("errors.codes")
+            .iter()
+            .filter(|(k, v)| !k.starts_with('$') && v["capability"] == "state")
+            .map(|(k, _)| k.as_str())
+            .collect();
+        declarados.sort_unstable();
+        assert_eq!(
+            declarados,
+            [
+                "INVALID_STATE_CONTRACT",
+                "INVALID_STATE_KEY",
+                "INVALID_TENANT_FOR_STATE",
+                "MISSING_AGGREGATE_VERSION",
+                "RESERVED_DOMAIN",
+                "STATE_CONFLICT",
+                "STATE_SUBJECT_MISMATCH",
+            ]
+        );
+        // y cada constante pública es uno de ellos
+        for c in [
+            INVALID_STATE_CONTRACT_CODE,
+            INVALID_STATE_KEY_CODE,
+            INVALID_TENANT_FOR_STATE_CODE,
+            MISSING_AGGREGATE_VERSION_CODE,
+            RESERVED_DOMAIN_CODE,
+            STATE_CONFLICT_CODE,
+            STATE_SUBJECT_MISMATCH_CODE,
+        ] {
+            assert!(declarados.contains(&c), "{c}");
+        }
     }
 
     /// Un handler cuyo `put` falla con uno de los cuatro de la llamada va a la DLQ en la
@@ -4028,6 +4291,75 @@ mod tests {
             subject: "b".into(),
         });
         assert_eq!(c.class, ErrorClass::Poison);
+    }
+
+    /// Una capa de la aplicación que envuelve un error de flux (y cuyo propio mensaje cita la fila).
+    #[derive(Debug)]
+    struct Capa(FluxError);
+
+    impl fmt::Display for Capa {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str("capa de la app: Key (email)=(ana@example.com)")
+        }
+    }
+
+    impl std::error::Error for Capa {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            Some(&self.0)
+        }
+    }
+
+    /// Un error que no es de flux no deja su mensaje en la DLQ (10-state.md §6): el de un driver de
+    /// base de datos cita la fila entera y la DLQ guarda 90 días. Un error **de flux** conserva el
+    /// suyo, **sin su cadena de causas** (la causa es justo el error del driver).
+    #[test]
+    fn el_dlqerror_no_copia_el_mensaje_de_un_error_que_no_es_de_flux() {
+        let cita = "duplicate key value violates unique constraint: Key (email)=(ana@example.com)";
+        let frase_fija = json_of(PROTOCOL)["state"]["dlq"]["dlqerrorFixedPhrase"]
+            .as_str()
+            .expect("dlqerrorFixedPhrase")
+            .to_string();
+        // La frase frase_fija es la de protocol.json (una sola fuente) y la misma que la de Node.
+        assert_eq!(UNCLASSIFIED_DLQ_ERROR, frase_fija);
+
+        // 1. Un error cualquiera: un `io::Error` (o el de un driver) → solo código y frase frase_fija.
+        let driver = std::io::Error::other(cita);
+        let t = state_dlq_error("UNKNOWN", &driver);
+        assert_eq!(t, format!("UNKNOWN: {frase_fija}"));
+        assert!(
+            !t.contains("ana@example.com") && !t.contains("duplicate key"),
+            "{t}"
+        );
+
+        // 2. Un `HttpError` (lo reconoce el clasificador, con su código) tampoco es de flux: el código se
+        // conserva y el mensaje —y la causa del driver que envuelve— no.
+        let http = crate::HttpError::new(422, format!("POST /clientes: {cita}"));
+        let t = state_dlq_error("HTTP_422", &http);
+        assert_eq!(t, format!("HTTP_422: {frase_fija}"));
+        assert!(!t.contains("ana@example.com"), "{t}");
+
+        // 3. Un error de flux conserva SU mensaje…
+        let flux = FluxError::permanent("pedido ya cancelado").with_code("PEDIDO_YA_CANCELADO");
+        assert_eq!(
+            state_dlq_error("PEDIDO_YA_CANCELADO", &flux),
+            "PEDIDO_YA_CANCELADO: pedido ya cancelado"
+        );
+        // …sin la cadena de causas: el error del driver que lo causó NO se concatena (como haría `describe`).
+        let con_causa = FluxError::permanent("conflicto con otra cita")
+            .with_code("FILA_DUPLICADA")
+            .with_source(std::io::Error::other(cita));
+        assert!(
+            crate::errors::describe(&con_causa).contains("ana@example.com"),
+            "CONTROL: `describe` SÍ concatena la causa, y por eso no se usa aquí"
+        );
+        let t = state_dlq_error("FILA_DUPLICADA", &con_causa);
+        assert_eq!(t, "FILA_DUPLICADA: conflicto con otra cita");
+        assert!(!t.contains("ana@example.com"), "{t}");
+
+        // 4. Un error de flux envuelto por una capa de la aplicación: se encuentra por la cadena de causas
+        // (como el clasificador) y se usa el mensaje del de flux, no el de la capa.
+        let t = state_dlq_error("PEDIDO_YA_CANCELADO", &Capa(flux));
+        assert_eq!(t, "PEDIDO_YA_CANCELADO: pedido ya cancelado");
     }
 
     /// El mensaje de cada código dice qué está mal y cómo se arregla, y nombra lo que la spec
@@ -4552,6 +4884,10 @@ mod tests {
             })),
             Some(StateWriteOutcome::Conflict)
         );
+        // Todo fallo de L3 es `invalid_schema`, también el esquema AUSENTE del bundle en modo
+        // estricto (`SCHEMA_NOT_FOUND`), igual que `publish()` con un evento — y `protocol.json` lo
+        // lista: `invalidSchemaCodes`.
+        let mut codigos_invalid_schema = Vec::new();
         for invalido in [
             FluxError::MissingAggregateVersion { reason: "x".into() },
             FluxError::SchemaValidation(crate::SchemaValidationError {
@@ -4559,7 +4895,12 @@ mod tests {
                 dataschema: "d".into(),
                 errors: vec![],
             }),
+            FluxError::SchemaNotFound(crate::SchemaNotFoundError {
+                subject: "s".into(),
+                dataschema: "d".into(),
+            }),
         ] {
+            codigos_invalid_schema.push(invalido.code().expect("código").to_string());
             assert_eq!(
                 outcome_of(&Err(invalido)),
                 Some(StateWriteOutcome::InvalidSchema)
@@ -4567,6 +4908,10 @@ mod tests {
         }
         // `notCounted` de protocol.json: errores de quien llama y de transporte.
         for no_cuenta in [
+            FluxError::InvalidStateContract {
+                contract: "clientes.cliente".into(),
+                reason: "x".into(),
+            },
             FluxError::InvalidStateKey {
                 key: "a.b".into(),
                 reason: "x".into(),
@@ -4588,7 +4933,28 @@ mod tests {
             assert_eq!(outcome_of(&Err(no_cuenta)), None);
         }
         let metrica = &json_of(PROTOCOL)["state"]["metrics"]["flux_state_writes_total"];
-        assert_eq!(metrica["notCounted"].as_array().unwrap().len(), 4);
+        assert_eq!(
+            strings(&metrica["invalidSchemaCodes"]),
+            [
+                "MISSING_AGGREGATE_VERSION",
+                "INVALID_SCHEMA",
+                "SCHEMA_NOT_FOUND"
+            ]
+        );
+        assert_eq!(
+            strings(&metrica["invalidSchemaCodes"]),
+            codigos_invalid_schema
+        );
+        assert_eq!(
+            strings(&metrica["notCounted"]),
+            [
+                "INVALID_STATE_CONTRACT",
+                "INVALID_STATE_KEY",
+                "INVALID_TENANT_FOR_STATE",
+                "RESERVED_DOMAIN",
+                "transport-errors"
+            ]
+        );
     }
 
     // ── Qué comprueba el SDK al consumir — §5.4 ──────────────────────────────

@@ -194,7 +194,13 @@ impl fmt::Debug for Credentials {
 /// `service`, `environment` y `version` son obligatorios porque alimentan `source` y
 /// `producerversion`, que son atributos obligatorios del envelope.
 pub struct ConnectOptions {
-    /// `nats://host:4222`, o varios separados por coma para HA.
+    /// `nats://host:4222`, o **varios separados por coma** para HA
+    /// (`nats://a:4222,nats://b:4222`): se prueban hasta que uno contesta, y la reconexión usa la
+    /// lista entera. Los espacios alrededor de cada dirección y las comas sobrantes se toleran.
+    ///
+    /// `async-nats` 0.50 interpreta un `&str` como **una** dirección y una lista con comas falla
+    /// con «NATS server URL is invalid» (medido): `connect()` la separa antes de dárselo. Para
+    /// construirla desde una lista, [`ConnectOptions::with_servers`] (el `string[]` de Node).
     pub servers: String,
     /// Nombre del servicio. Alimenta `source` y los nombres de durable. Se valida contra
     /// `^[a-z0-9]+(-[a-z0-9]+)*$` en [`connect`].
@@ -299,7 +305,63 @@ impl fmt::Debug for ConnectOptions {
     }
 }
 
+/// Separa la lista de servidores de [`ConnectOptions::servers`]: por comas, sin espacios
+/// alrededor y sin entradas vacías. **Una** dirección (el caso corriente) es una lista de uno.
+///
+/// Existe porque `async-nats` 0.50 interpreta una `&str` como **una** dirección: una lista con
+/// comas no se entiende ni cuando todas sus direcciones son válidas (medido), así que una alta
+/// disponibilidad configurable como `nats://a:4222,nats://b:4222` —lo que la documentación de
+/// `servers` prometía— no funcionaba. Node admite `string | string[]`; aquí es una cadena con
+/// comas, o [`ConnectOptions::with_servers`].
+pub(crate) fn split_servers(servers: &str) -> Vec<String> {
+    servers
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToString::to_string)
+        .collect()
+}
+
+/// [`split_servers`], y un error claro si no queda ninguna: una lista vacía es un descuido (una
+/// variable de entorno sin definir) y falla **antes de la red** diciéndolo.
+fn require_servers(servers: &str) -> Result<Vec<String>, FluxError> {
+    let list = split_servers(servers);
+    if list.is_empty() {
+        return Err(FluxError::Config(
+            "`servers` está vacío: pasa `nats://host:4222`, o varias direcciones separadas por coma \
+             (`ConnectOptions::with_servers`). Una lista vacía suele ser una variable de entorno \
+             sin definir"
+                .to_string(),
+        ));
+    }
+    Ok(list)
+}
+
 impl ConnectOptions {
+    /// Sustituye la lista de servidores por la dada, **una dirección por elemento** — el
+    /// `servers: string[]` de Node. Equivale a pasar a [`ConnectOptions::new`] las direcciones
+    /// unidas por comas.
+    ///
+    /// ```
+    /// let opts = flux::ConnectOptions::new("nats://a:4222", "pedidos-api", "produccion", "1.0.0")
+    ///     .with_servers(["nats://a:4222", "nats://b:4222", "nats://c:4222"]);
+    /// assert_eq!(opts.servers, "nats://a:4222,nats://b:4222,nats://c:4222");
+    /// ```
+    #[must_use]
+    pub fn with_servers<I, S>(mut self, servers: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: AsRef<str>,
+    {
+        self.servers = servers
+            .into_iter()
+            .map(|s| s.as_ref().trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>()
+            .join(",");
+        self
+    }
+
     /// Los cuatro campos obligatorios. El resto tiene defaults de la spec.
     #[must_use]
     pub fn new(
@@ -734,7 +796,7 @@ pub(crate) fn transport(context: impl Into<String>, source: impl Into<HandlerErr
 /// Además, [`FluxError::Config`] si falta alguno de los cuatro campos obligatorios,
 /// [`FluxError::InvalidServiceName`] si el servicio no es kebab-case —lo que produciría
 /// durables no parseables— y [`FluxError::Transport`] si la lista de servidores no se
-/// entiende.
+/// entiende (una dirección que no es `nats://host:4222`), o [`FluxError::Config`] si está vacía.
 pub async fn connect(mut opts: ConnectOptions) -> Result<Bus, FluxError> {
     if opts.service.is_empty() || opts.environment.is_empty() || opts.version.is_empty() {
         return Err(FluxError::Config(
@@ -747,6 +809,8 @@ pub async fn connect(mut opts: ConnectOptions) -> Result<Bus, FluxError> {
     // error y el incumplimiento solo se descubriría al parsear nombres en una
     // herramienta de operación, así que se valida aquí y no al crear el durable.
     validate_service_name(&opts.service)?;
+
+    let servers = require_servers(&opts.servers)?;
 
     // El firmante y el verificador se construyen ANTES de tocar la red: una clave mal
     // configurada es un fallo de arranque, no algo que descubrir con el primer evento
@@ -822,7 +886,7 @@ pub async fn connect(mut opts: ConnectOptions) -> Result<Bus, FluxError> {
         }
     }
 
-    let client = open_connection(&nats, &opts).await?;
+    let client = open_connection(&nats, &opts, &servers).await?;
 
     let js = async_nats::jetstream::new(client.clone());
     let source = source_uri(&opts.environment, &opts.service);
@@ -934,10 +998,11 @@ fn not_blank(what: &str, value: &str) -> Result<(), FluxError> {
 async fn open_connection(
     nats: &async_nats::ConnectOptions,
     opts: &ConnectOptions,
+    servers: &[String],
 ) -> Result<async_nats::Client, FluxError> {
     let mut attempt: u32 = 0;
     loop {
-        let err = match nats.clone().connect(opts.servers.clone()).await {
+        let err = match nats.clone().connect(servers.to_vec()).await {
             Ok(client) => return Ok(client),
             Err(e) => e,
         };
@@ -962,7 +1027,7 @@ async fn open_connection(
 /// 100 ms, 200 ms, … hasta 5 s, más hasta 250 ms de jitter: sin él, mil servicios que
 /// arrancan a la vez reintentan en el mismo milisegundo y tiran el broker que acaba de
 /// levantarse — 03-delivery.md §6.
-fn connect_backoff(attempt: u32) -> Duration {
+pub(crate) fn connect_backoff(attempt: u32) -> Duration {
     let exp = attempt.saturating_sub(1).min(6);
     let base = Duration::from_millis(100u64 << exp).min(Duration::from_secs(5));
     // Los bits bajos de un UUIDv7 son aleatorios: no hace falta una dependencia más para
@@ -991,7 +1056,7 @@ fn fatal_connect_error(
         FatalConnect::BadServers => transport(
             format!(
                 "no se pudo conectar a `{}`: la lista de servidores no se entiende \
-                 (`nats://host:4222`)",
+                 (`nats://host:4222`, o varias direcciones separadas por coma)",
                 opts.servers
             ),
             err,
@@ -2549,6 +2614,69 @@ pub(crate) fn base64(input: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── La lista de servidores ───────────────────────────────────────────────
+
+    /// `async-nats` 0.50 interpreta un `&str` como UNA dirección: una lista con comas no se entiende
+    /// ni cuando todas sus direcciones son válidas (medido). Aquí se separa, y se comprueba **que
+    /// lo que sale lo entiende `async-nats`** (el otro sentido: sin separar, no).
+    #[test]
+    fn la_lista_de_servidores_se_separa_por_comas() {
+        use async_nats::ToServerAddrs;
+
+        assert_eq!(split_servers("nats://a:4222"), ["nats://a:4222"]);
+        assert_eq!(
+            split_servers("nats://a:4222,nats://b:4222,nats://c:4222"),
+            ["nats://a:4222", "nats://b:4222", "nats://c:4222"]
+        );
+        // Espacios y comas sobrantes se toleran (una variable de entorno escrita a mano).
+        assert_eq!(
+            split_servers(" nats://a:4222 , nats://b:4222,, "),
+            ["nats://a:4222", "nats://b:4222"]
+        );
+        assert_eq!(split_servers("a:4222,b:4222"), ["a:4222", "b:4222"]);
+        // Nada que separar: vacía (y `connect()` falla antes de la red).
+        assert_eq!(split_servers(""), Vec::<String>::new());
+        assert_eq!(split_servers(" , ,"), Vec::<String>::new());
+
+        // CONTROL, el defecto medido: la cadena entera NO la entiende `async-nats`…
+        let lista = "nats://a:4222,nats://b:4222";
+        assert!(
+            lista.to_server_addrs().is_err(),
+            "async-nats 0.50 debería rechazar la lista entera"
+        );
+        // …y lo que sale de `split_servers` SÍ: dos direcciones, en orden.
+        let direcciones: Vec<_> = split_servers(lista)
+            .to_server_addrs()
+            .expect("cada dirección es válida")
+            .collect();
+        assert_eq!(direcciones.len(), 2);
+        assert_eq!(direcciones[0].host(), "a");
+        assert_eq!(direcciones[1].host(), "b");
+        // Una dirección mal escrita SIGUE siendo un error de entrada (no se traga).
+        assert!(split_servers("nats://a:4222,no es una url")
+            .to_server_addrs()
+            .is_err());
+    }
+
+    /// `with_servers` es el `servers: string[]` de Node: lo mismo que unir por comas.
+    #[test]
+    fn with_servers_equivale_a_la_lista_con_comas() {
+        let a = ConnectOptions::new("x", "pedidos-api", "dev", "1.0.0").with_servers([
+            "nats://a:4222",
+            " nats://b:4222 ",
+            "",
+            "nats://c:4222",
+        ]);
+        assert_eq!(a.servers, "nats://a:4222,nats://b:4222,nats://c:4222");
+        assert_eq!(
+            split_servers(&a.servers),
+            ["nats://a:4222", "nats://b:4222", "nats://c:4222"]
+        );
+        let b = ConnectOptions::new("x", "pedidos-api", "dev", "1.0.0")
+            .with_servers(vec![String::from("nats://solo:4222")]);
+        assert_eq!(b.servers, "nats://solo:4222");
+    }
 
     fn requested() -> consumer::pull::Config {
         consumer::pull::Config {

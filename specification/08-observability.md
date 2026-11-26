@@ -140,12 +140,15 @@ es un valor más.
 | `ok` | Se escribió: `applied: true` |
 | `stale` | La versión no avanzaba: `applied: false`, `outcome: "stale"`. **No es un error** |
 | `conflict` | El chequeo de secuencia agotó sus 3 intentos: `STATE_CONFLICT` |
-| `invalid_schema` | `MISSING_AGGREGATE_VERSION`, o `data` no cumple su esquema (L3): `INVALID_SCHEMA` |
+| `invalid_schema` | `MISSING_AGGREGATE_VERSION`, o la validación L3 de `data` falla: `INVALID_SCHEMA` (no cumple su esquema) **o `SCHEMA_NOT_FOUND`** (modo estricto: el esquema del contrato, o el de la lápida, no está en el bundle) |
 
 **`invalid_schema` se emite también cuando la llamada lanza**, por la misma razón que en
 [§2.1](#21-valores-de-las-etiquetas): una excepción sirve a quien la provoca, y la métrica a quien
-opera el ecosistema. Los demás errores de la llamada —`INVALID_STATE_KEY`,
-`INVALID_TENANT_FOR_STATE`, `RESERVED_DOMAIN`— son errores de programación y **no** se cuentan;
+opera el ecosistema. Es lo mismo que hace `publish()` con un evento: **cualquier** fallo de L3 es
+`invalid_schema`, también el esquema ausente del bundle en modo estricto. Los demás errores de la
+llamada —`INVALID_STATE_CONTRACT`, `INVALID_STATE_KEY`, `INVALID_TENANT_FOR_STATE`,
+`RESERVED_DOMAIN`— son errores de programación y **no** se cuentan (el primero, además, porque su
+valor es el de la etiqueta `contract`: uno mal formado crearía una serie por cada error de tipeo);
 tampoco un fallo de transporte, que es RETRYABLE y ya lo cuenta la conexión.
 
 **Cardinalidad.** `contract` está acotado —hay tantos como contratos de estado declarados— y sirve

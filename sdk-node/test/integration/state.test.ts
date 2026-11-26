@@ -44,6 +44,7 @@ import {
   type StateEntry,
 } from "../../src/index.js";
 import { CONSUMER_DEFAULTS, STREAM_DEFAULTS, nanos } from "../../src/protocol.js";
+import { runWithContext } from "../../src/context.js";
 import {
   durableDeDlqDeEstado,
   durableDeEstado,
@@ -864,6 +865,9 @@ describeBroker("SDK Node: estado replicado bajo ACL exacta", () => {
       assert.equal(de("roto-1").data.revision, revRoto);
       assert.equal(de("roto-1").subject, "roto-1", "sintetizado con lo único fiable: el subject");
       assert.equal(de("roto-1").tenantid, "acme");
+      assert.equal(de("roto-1").partitionkey, "roto-1", "partitionkey = la clave (10-state.md §6)");
+      assert.match(de("roto-1").time, /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$/);
+      assert.ok(Math.abs(Date.now() - Date.parse(de("roto-1").time)) < 60_000, "time = el instante ACTUAL del consumo, no uno inventado (10-state.md §6)");
       assert.equal(de("roto-1").source, "/test/tienda-web", "el servicio que consume");
       assert.equal(de("roto-1").dataclassification, "internal");
       assert.equal(de("roto-1").id, de("roto-1").correlationid);
@@ -873,7 +877,11 @@ describeBroker("SDK Node: estado replicado bajo ACL exacta", () => {
       assert.equal(de("err-tipado").dlqreason, "permanent");
       assert.equal(de("err-tipado").dlqerror, "PAIS_NO_SOPORTADO: país fuera del catálogo");
       assert.equal(de("err-plano").dlqreason, "permanent");
-      assert.match(de("err-plano").dlqerror, /^UNKNOWN: error sin clasificar/, "el mensaje de un error que no es de flux se omite: podría citar la fila entera");
+      assert.equal(
+        de("err-plano").dlqerror,
+        `UNKNOWN: ${protocolo.state.dlq.dlqerrorFixedPhrase}`,
+        "el mensaje de un error que no es de flux se omite —podría citar la fila entera—: solo el código y la frase fija de protocol.json",
+      );
 
       // 7. métricas: el consumer SIN el sufijo del tenant; los POISON cuentan como `poison`
       const c = metricas.snapshot().counters;
@@ -960,5 +968,135 @@ describeBroker("SDK Node: estado replicado bajo ACL exacta", () => {
     const final = await instancias[0].state.get(C, "carrera");
     assert.equal(final!.aggregateVersion, 30, `resultados: ${JSON.stringify(resultados)}`);
     assert.equal((await jsm.streams.info(STREAM)).state.messages, 1, "un valor por clave");
+  });
+
+  // ══════════════════════════════════════════════════════════════════════════
+  // Un `watch` vivo durante `flux state resync` (10-state.md §5.2)
+  // ══════════════════════════════════════════════════════════════════════════
+
+  test(
+    "un watch VIVO sobrevive a `flux state resync` (borrar y recrear su durable): reabre el consumo y entrega la foto otra vez",
+    { timeout: 60_000 },
+    async () => {
+      // Sin el arreglo, nats.js 3.4.0 recibe `consumer_deleted` y NO vuelve a pedir hasta `heartbeats_missed`: 43 s medidos
+      // entre recrear el durable y la primera entrada. El observador no tiene CONSUMER.CREATE (permisos exactos): reabrir
+      // usa solo CONSUMER.INFO y MSG.NEXT.
+      await limpiar();
+      const dueno = await abrir("crm-api", { tenantId: "acme" });
+      for (const k of ["r1", "r2", "r3", "r4", "r5"]) await dueno.state.put(C, k, dato(k, 1));
+      await provisionar("tienda-web", "acme");
+      const { l, logger } = logs();
+      const web = await abrir("tienda-web", { tenantId: "acme", logger });
+      const vistas: Array<[string, number]> = [];
+      let sincronizado = 0;
+      await web.state.watch(C, async (e) => void vistas.push([e.key, e.aggregateVersion]), { onSynced: () => void sincronizado++ });
+      assert.ok(await esperarHasta(() => vistas.length === 5 && sincronizado === 1, 10_000), "la foto inicial");
+
+      // `flux state resync`: borrar y recrear con la configuración canónica
+      const t0 = Date.now();
+      await provisionar("tienda-web", "acme");
+      assert.ok(
+        await esperarHasta(() => vistas.length >= 10, 15_000),
+        `tras el resync debe volver la foto entera (5 más), y llegaron ${vistas.length - 5}. Log: ${l.join(" | ")}`,
+      );
+      const tardo = Date.now() - t0;
+      assert.ok(tardo < 15_000, `la foto volvió a los ${tardo} ms: reabrir debe tardar segundos, no los ~43 s de heartbeats_missed`);
+      assert.deepEqual(vistas.slice(5).map(([k]) => k).sort(), ["r1", "r2", "r3", "r4", "r5"]);
+      assert.equal(sincronizado, 1, "`onSynced` NO se vuelve a invocar tras un resync (una vez por watch)");
+      assert.ok(l.some((m) => /se borró con el watch/.test(m)) && l.some((m) => /reabierto/.test(m)), "se avisa por el logger");
+
+      // …y el canal en VIVO sigue vivo: un cambio posterior llega
+      await dueno.state.put(C, "r1", dato("r1", 2));
+      assert.ok(await esperarHasta(() => vistas.some(([k, v]) => k === "r1" && v === 2), 10_000), "un put en vivo tras el resync");
+    },
+  );
+
+  test("un watch cuyo durable se borra y NO se recrea reintenta con aviso, sin colgarse, y `close()` lo para", { timeout: 60_000 }, async () => {
+    await limpiar();
+    const dueno = await abrir("crm-api", { tenantId: "acme" });
+    await dueno.state.put(C, "a1", dato("a1", 1));
+    await provisionar("tienda-web", "acme");
+    const { l, logger } = logs();
+    const web = await abrir("tienda-web", { tenantId: "acme", logger });
+    const vistas: string[] = [];
+    await web.state.watch(C, async (e) => void vistas.push(e.key));
+    assert.ok(await esperarHasta(() => vistas.length === 1, 10_000));
+    await jsm.consumers.delete(STREAM, durableDeEstado("tienda-web", C, "acme")); // y nadie lo recrea
+    assert.ok(await esperarHasta(() => l.some((m) => /no se pudo reabrir/.test(m)), 10_000), `debe avisar: ${l.join(" | ")}`);
+    const t0 = Date.now();
+    await web.close();
+    assert.ok(Date.now() - t0 < 5_000, "close() no espera al durable que no vuelve");
+    // El bucle de reapertura NOTA el cierre y lo dice: un reintento que se detiene no es indistinguible de uno que sigue colgado.
+    assert.ok(await esperarHasta(() => l.some((m) => /se detuvo sin haber podido reabrir/.test(m)), 8_000), `debe detenerse y decirlo: ${l.join(" | ")}`);
+  });
+
+  test("el durable recreado con OTRO filtro NO se consume tras un resync: ni un dato de otro tenant sin error", { timeout: 60_000 }, async () => {
+    await limpiar();
+    const dueno = await abrir("crm-api");
+    await dueno.state.put(C, "a1", dato("a1", 1), { tenantId: "acme" });
+    await dueno.state.put(C, "g1", dato("g1", 1), { tenantId: "globex" });
+    await provisionar("tienda-web", "acme");
+    const { l, logger } = logs();
+    const web = await abrir("tienda-web", { tenantId: "acme", logger });
+    const vistas: string[] = [];
+    await web.state.watch(C, async (e) => void vistas.push(`${e.tenantId}/${e.key}`));
+    assert.ok(await esperarHasta(() => vistas.length === 1, 10_000));
+    // alguien lo recrea con el filtro de TODOS los tenants
+    const durable = durableDeEstado("tienda-web", C, "acme");
+    await jsm.consumers.delete(STREAM, durable);
+    await jsm.consumers.add(STREAM, {
+      durable_name: durable,
+      filter_subject: `state.${C}.*.*`,
+      deliver_policy: DeliverPolicy.LastPerSubject,
+      ack_policy: AckPolicy.Explicit,
+      ack_wait: nanos(CONSUMER_DEFAULTS.ackWaitMs),
+      max_deliver: CONSUMER_DEFAULTS.maxDeliver,
+      backoff: CONSUMER_DEFAULTS.backoffMs.map(nanos),
+      max_ack_pending: CONSUMER_DEFAULTS.maxAckPending,
+      replay_policy: ReplayPolicy.Instant,
+    });
+    assert.ok(await esperarHasta(() => l.some((m) => /no se pudo reabrir/.test(m) && /filter_subject/.test(m)), 10_000), `debe avisar: ${l.join(" | ")}`);
+    await new Promise((r) => setTimeout(r, 500));
+    assert.deepEqual(vistas, ["acme/a1"], "el durable con otro filtro no se consume: globex/g1 no llega");
+  });
+
+  // ══════════════════════════════════════════════════════════════════════════
+  // El tenant de un `watch`: la opción y connect(), nunca el evento en curso (10-state.md §2.4)
+  // ══════════════════════════════════════════════════════════════════════════
+
+  test("un watch abierto DENTRO de un handler no hereda el tenant del evento: con connect() filtra por el suyo, sin él observa todos", async () => {
+    await limpiar();
+    await provisionar("tienda-web", "acme");
+    await provisionar("tienda-todos");
+    const conTenant = await abrir("tienda-web", { tenantId: "acme" });
+    const sinTenant = await abrir("tienda-todos");
+    const contexto = { correlationid: "corr-1", causationid: "ev-9", tenantid: "globex" };
+    const a = await runWithContext(contexto, () => conTenant.state.watch(C, () => {}));
+    assert.equal(a.tenantId, "acme", "gana el de connect(), no el del evento en curso");
+    assert.equal(a.durable, durableDeEstado("tienda-web", C, "acme"));
+    const b = await runWithContext(contexto, () => sinTenant.state.watch(C, () => {}));
+    assert.equal(b.tenantId, undefined, "sin tenant en la opción ni en connect(), se observan TODOS: no el del evento");
+    assert.equal(b.durable, durableDeEstado("tienda-todos", C));
+    // CONTROL: `put` dentro del mismo contexto SÍ hereda el tenant del evento (un estado derivado pertenece al del evento que lo causó)
+    const dueno = await abrir("crm-api");
+    await runWithContext(contexto, () => dueno.state.put(C, "derivado-1", dato("derivado-1")));
+    assert.ok(await enElStream("state.clientes.cliente.v1.globex.derivado-1"), "el put heredó `globex`");
+    assert.equal(await enElStream("state.clientes.cliente.v1.acme.derivado-1"), null);
+  });
+
+  test("`onSynced` con N tenants: la API toma UN tenant por watch, así que son N watches y N invocaciones, una por cada uno", async () => {
+    await limpiar();
+    const dueno = await abrir("crm-api");
+    await dueno.state.put(C, "a1", dato("a1"), { tenantId: "acme" });
+    await dueno.state.put(C, "g1", dato("g1"), { tenantId: "globex" });
+    await provisionar("tienda-multi", "acme");
+    await provisionar("tienda-multi", "globex");
+    const m = await abrir("tienda-multi");
+    const sinc: string[] = [];
+    await m.state.watch(C, async () => {}, { tenantId: "acme", onSynced: () => void sinc.push("acme") });
+    await m.state.watch(C, async () => {}, { tenantId: "globex", onSynced: () => void sinc.push("globex") });
+    assert.ok(await esperarHasta(() => sinc.length === 2, 10_000));
+    await new Promise((r) => setTimeout(r, 300));
+    assert.deepEqual(sinc.sort(), ["acme", "globex"], "cada watch invoca el suyo UNA vez; combinarlas («listo cuando han llegado las N») es de la aplicación");
   });
 });

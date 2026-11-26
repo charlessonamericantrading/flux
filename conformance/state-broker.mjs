@@ -51,7 +51,7 @@ const VERBOSE = flag("-v");
  * para demostrar que los casos DETECTAN el fallo (una comprobación que solo se ha visto en verde no
  * demuestra nada). Con un mutante, el runner debe FALLAR; `--mutant` sin fallos es lo preocupante.
  *   no-max-msgs-per-subject · no-allow-direct · discard-new · only-10071 · no-own-write-check ·
- *   equal-version-applies · publish-via-core · fresh-id-per-attempt · no-cas-header
+ *   equal-version-applies · publish-via-core · fresh-id-per-attempt · no-cas-header · no-contract-check
  */
 const MUTANT = opt("--mutant");
 const ONLY = opt("--only")?.split(",");
@@ -203,6 +203,7 @@ const CAS = MUTANT === "only-10071" ? new Set([10071]) : new Set([10071, 10164])
 const subjectDe = (c, tenant, key) => { const [d, a, v] = c.split("."); return `state.${d}.${a}.${v}.${tenant}.${key}`; };
 const streamDe = (c) => `STATE_${c.split(".")[0].toUpperCase().replace(/-/g, "_")}`;
 const KEY = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
+const CONTRATO = /^[a-z0-9]+(-[a-z0-9]+)*\.[a-z0-9]+(-[a-z0-9]+)*\.v[1-9][0-9]*$/;
 
 async function leeEstado(nc, stream, subject) {
   const r = await nc.request(`$JS.API.DIRECT.GET.${stream}.${subject}`, "", { timeout: 2000 });
@@ -234,6 +235,8 @@ const nuevoId = () => `01924f8e-7c3a-7b2d-9e14-${String(++seqId).padStart(12, "0
 async function escribe(actor, tipo, p, hook) {
   const stream = streamDe(p.contract);
   const subject = subjectDe(p.contract, p.tenant, p.key);
+  // §3.6: la forma del contrato se evalúa ANTES que la clave (el dominio reservado, antes aún).
+  if (MUTANT !== "no-contract-check" && !CONTRATO.test(p.contract)) return { outcome: "error", errCode: "INVALID_STATE_CONTRACT", text: `contrato «${p.contract}»` };
   if (!KEY.test(p.key)) return { outcome: "error", errCode: "INVALID_STATE_KEY", text: `clave «${p.key}»` };
   if (!Number.isSafeInteger(p.version) || p.version < 1) return { outcome: "error", errCode: "MISSING_AGGREGATE_VERSION", text: `versión ${p.version}` };
   const id = p.id ?? nuevoId();
@@ -581,7 +584,7 @@ console.log(`\n\x1b[1mcross-sdk-state-envelope\x1b[0m  (10-state.md §2.6)`);
   const derivado = (v) => {
     const [dom, agr] = v.contract.split(".");
     if (protocol.naming.reservedDomains.names.includes(dom)) return { code: "RESERVED_DOMAIN" };
-    if (!new RegExp(st.contract.pattern).test(v.contract)) return { code: "INVALID_CONTRACT" };
+    if (!new RegExp(st.contract.pattern).test(v.contract)) return { code: st.contract.errorCode };
     if (!new RegExp(st.key.pattern).test(v.key)) return { code: "INVALID_STATE_KEY" };
     if (!new RegExp(st.tenant.pattern).test(v.tenantId) || v.tenantId.length > st.tenant.maxLength) return { code: "INVALID_TENANT_FOR_STATE" };
     const sub = `state.${v.contract}.${v.tenantId}.${v.key}`;

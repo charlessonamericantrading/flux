@@ -405,7 +405,7 @@
     },
     "codePattern": "^[A-Z][A-Z0-9]*(_[A-Z0-9]+)*$",
     "codes": {
-      "$comment": "Codigos de error ESTABLES de las capacidades opcionales (specification/04-errors.md §5). El codigo agrupa el panel (flux_events_dlq_total{code}) y encabeza dlqerror, asi que la aplicacion NO puede sustituirlo. Cada uno declara su capacidad: scripts/check-sdk-codes.mjs comprueba que todo SDK que la declara (capabilities.sdks) lo contiene en su codigo. Los codigos de la firma estan en signing.poisonCodes. Los tres con phase=connect son los de connect() (04-errors.md §5.3, security.sdk.firstConnect.stableCodes): los dos SDKs que declaran security los emiten, y todos son PERMANENT. Los seis codigos de la capacidad state (specification/04-errors.md §6) son una lista CERRADA: un caso que no encaje en ninguno es un hueco de la spec, no un codigo nuevo que cada SDK inventa.",
+      "$comment": "Codigos de error ESTABLES de las capacidades opcionales (specification/04-errors.md §5). El codigo agrupa el panel (flux_events_dlq_total{code}) y encabeza dlqerror, asi que la aplicacion NO puede sustituirlo. Cada uno declara su capacidad: scripts/check-sdk-codes.mjs comprueba que todo SDK que la declara (capabilities.sdks) lo contiene en su codigo. Los codigos de la firma estan en signing.poisonCodes. Los tres con phase=connect son los de connect() (04-errors.md §5.3, security.sdk.firstConnect.stableCodes): los dos SDKs que declaran security los emiten, y todos son PERMANENT. Los siete codigos de la capacidad state (specification/04-errors.md §6) son una lista CERRADA: un caso que no encaje en ninguno es un hueco de la spec, no un codigo nuevo que cada SDK inventa.",
       "NOT_PROVISIONED": {
         "class": "permanent",
         "capability": "security",
@@ -496,6 +496,29 @@
         ],
         "messageMustSay": "que reintentar no lo arregla"
       },
+      "INVALID_STATE_CONTRACT": {
+        "class": "permanent",
+        "capability": "state",
+        "spec": "specification/04-errors.md §6",
+        "thrownBy": [
+          "put",
+          "get",
+          "delete",
+          "watch"
+        ],
+        "emittedWhen": "el contrato no cumple state.contract.pattern: no son tres tokens (<dominio>.<agregado>.v<major>), un token no es kebab-case en minusculas o la version no es 'v' + un entero >= 1. Un dominio reservado NO es este codigo: es RESERVED_DOMAIN, que se evalua antes (10-state.md §3.6)",
+        "failsBeforeNetwork": true,
+        "notCountedInMetrics": true,
+        "$commentNotCounted": "flux_state_writes_total lleva el contrato en la etiqueta `contract`: uno mal formado es una cadena arbitraria que crearia una serie por cada error de tipeo.",
+        "$commentOrigin": "El septimo codigo. Nacio como hueco de la lista de seis: un contrato mal formado no cabia en ninguno, y Node lanzaba un error sin codigo mientras Rust lanzaba InvalidSubject (que no es de estado).",
+        "messageMustName": [
+          "contract",
+          "expected-form"
+        ],
+        "messageMustNeverInclude": [
+          "data-values"
+        ]
+      },
       "INVALID_TENANT_FOR_STATE": {
         "class": "permanent",
         "capability": "state",
@@ -544,7 +567,7 @@
           "delete"
         ],
         "alsoWhenConsuming": true,
-        "emittedWhen": "data no tiene aggregateVersion, o no es un entero >= 1 y <= 2^53 - 1: null, cadena, decimal (tambien 7.0), 0, negativo o mayor. Se comprueba SIEMPRE, con o sin validacion L3",
+        "emittedWhen": "data no tiene aggregateVersion, o no es un entero >= 1 y <= 2^53 - 1: null, cadena, decimal (tambien 7.0 donde el parser de JSON distingue entero de flotante; en Node es indistinguible de 7), 0, negativo o mayor. Se comprueba SIEMPRE, con o sin validacion L3",
         "failsBeforeNetwork": true,
         "metricOutcome": "invalid_schema",
         "messageMustName": [
@@ -756,7 +779,7 @@
         "observer": "consumerInfo, consumerNext, ack, observerDirectGet per tenant, dlqPublish, streamInfo of DLQ_<DOM>",
         "observerStreamInfoState": "never",
         "createOnlyWithDev": true,
-        "$comment": "El generador no concede STREAM.INFO.STATE_<DOM> a NINGUN rol, ni siquiera al dueno (state.acl dice que PUEDE tenerlo): el SDK no lo usa (put, get y watch funcionan sin el, A-38, A-48) y con subjects_filter lista todas las claves y todos los tenants (A-39). Si un dia hace falta, es un permiso mas del dueno, no del observador."
+        "$comment": "El generador no concede STREAM.INFO.STATE_<DOM> a NINGUN rol, ni siquiera al dueno (10-state.md §8: el dueno tampoco lo recibe): el SDK no lo usa (put, get y watch funcionan sin el, A-38, A-48) y con subjects_filter lista todas las claves y todos los tenants (A-39). Si un dia hace falta, es un permiso mas del dueno, no del observador."
       },
       "reservedDomains": {
         "ownsRejected": true,
@@ -941,7 +964,7 @@
           "put-delete-get-watch",
           "byte-exact-envelope-tombstone-dlq",
           "cas-conflict-codes-10071-and-10164",
-          "six-state-error-codes",
+          "seven-state-error-codes",
           "reserved-domains-rejected-in-publish",
           "bundle-state-index",
           "broker-cycle-100-keys-both-directions"
@@ -1292,7 +1315,8 @@
         "state.clientes.cliente.v1",
         "Clientes.cliente.v1"
       ],
-      "$comment": "El subject sin `state.`, sin tenant y sin clave. Es lo que recibe watch(), lo que indexa bundle.state y lo que va en la etiqueta `contract` de las metricas."
+      "$comment": "El subject sin `state.`, sin tenant y sin clave. Es lo que recibe watch(), lo que indexa bundle.state y lo que va en la etiqueta `contract` de las metricas. Una cadena que no tiene esta forma es INVALID_STATE_CONTRACT; un dominio reservado, RESERVED_DOMAIN (se evalua antes).",
+      "errorCode": "INVALID_STATE_CONTRACT"
     },
     "key": {
       "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$",
@@ -1330,6 +1354,17 @@
         "event-in-progress",
         "connection-tenantId"
       ],
+      "resolutionOrderAppliesTo": [
+        "put",
+        "delete",
+        "get"
+      ],
+      "watchResolutionOrder": [
+        "call-option",
+        "connection-tenantId"
+      ],
+      "watchNeverUsesEventInProgress": true,
+      "watchWithoutTenant": "observes-all-tenants-except-strict",
       "errorCode": "INVALID_TENANT_FOR_STATE",
       "valid": [
         "acme",
@@ -1347,7 +1382,7 @@
         "acme--corp",
         "acme.corp"
       ],
-      "$comment": "El tenant de un EVENTO es cualquier cadena (01-envelope.md §3.1); el de un ESTADO, no. maxLength 64 sale de que el durable de un observador lleva el tenant en el nombre y NATS limita los nombres de consumidor a 255 (A-42). Sin valor por defecto: un evento sin tenant cae en `system`; un estado no, porque aqui el tenant es una direccion y un tenant equivocado es un dato guardado en otro sitio. El patron es puro (sin lookahead, que Rust `regex` no admite); la longitud va aparte."
+      "$comment": "El tenant de un EVENTO es cualquier cadena (01-envelope.md §3.1); el de un ESTADO, no. maxLength 64 sale de que el durable de un observador lleva el tenant en el nombre y NATS limita los nombres de consumidor a 255 (A-42). Sin valor por defecto: un evento sin tenant cae en `system`; un estado no, porque aqui el tenant es una direccion y un tenant equivocado es un dato guardado en otro sitio. El patron es puro (sin lookahead, que Rust `regex` no admite); la longitud va aparte. Resolucion: put/delete/get = opcion de la llamada -> evento en curso -> tenantId de connect() (un estado derivado dentro de un handler pertenece al tenant del evento que lo causo). watch = opcion -> tenantId de connect(), NUNCA el evento en curso: un watch no corre dentro de un handler, se abre al arrancar y vive tanto como el servicio, y heredar el tenant del evento que se este procesando haria que su filtro dependiera de que evento llego primero."
     },
     "type": {
       "value": {
@@ -1399,7 +1434,15 @@
       "decimalIsInvalid": true,
       "equalVersionIs": "stale",
       "survivesDeletes": true,
-      "$comment": "Lo pone el DUENO (el contador monotonico de su agregado), no el SDK. 2^53-1 es el mayor entero que Node, y todo lo que use double, representa sin perder precision. Una version igual a la actual tampoco avanza: dos escrituras con la misma version son, por contrato, el mismo dato. El contador sobrevive a los borrados: una clave borrada y recreada continua desde la version de su lapida."
+      "$comment": "Lo pone el DUENO (el contador monotonico de su agregado), no el SDK. 2^53-1 es el mayor entero que Node, y todo lo que use double, representa sin perder precision. Una version igual a la actual tampoco avanza: dos escrituras con la misma version son, por contrato, el mismo dato. El contador sobrevive a los borrados: una clave borrada y recreada continua desde la version de su lapida. `7.0`: un SDK cuyo parser separa el entero del flotante (Rust con serde_json) DEBE rechazarlo; en un lenguaje de numero JSON unico (Node) es indistinguible de `7` y se acepta como `7`: limite conocido del lenguaje, no un fallo del SDK. Por eso conformance/cases/state-semantics.json (JSON, que Node tambien lee) no lo incluye.",
+      "sevenPointZero": {
+        "rejectedWhenParserDistinguishesIntFromFloat": true,
+        "singleNumberLanguages": [
+          "node"
+        ],
+        "singleNumberLanguagesAcceptItAs": "7",
+        "inStateSemanticsJson": false
+      }
     },
     "tombstone": {
       "dataschema": "https://schemas.internal/system/state/eliminado/1.0.0.json",
@@ -1507,9 +1550,43 @@
         "emptyStream": "immediately-before-any-entry",
         "firesWhen": "delivery-metadata-pending-is-0-and-all-started-handlers-finished",
         "retryableFailureDelaysIt": false,
-        "guaranteesNoLaterEntries": false
+        "guaranteesNoLaterEntries": false,
+        "severalTenantsInOneCall": "once-when-all-synced",
+        "apiTakesOneTenantPerWatch": true,
+        "afterResyncFiresAgain": false
       },
-      "$comment": "Un durable compartido REPARTE los mensajes entre quienes lo usan (A-47): por eso el tenant va en el nombre. Un consumidor que estuvo caido recibe solo el ultimo valor de cada clave (A-35). Un valor reemplazado mientras esta en vuelo NO se reentrega: el nak de la revision 10 y la entrada de la 20 dejan al broker sin la 10 (A-36). El watch no necesita STREAM.INFO.STATE_<DOM>: CONSUMER.INFO distingue 'consumidor no existe' (10014) de 'stream no existe' (10059) (A-48). num_pending de un consumidor last_per_subject es el numero de claves del filtro, lapidas incluidas, y los metadatos `pending` de cada entrega bajan hasta 0 en la ultima (A-35). onSynced: num_pending solo NO basta (no cuenta lo entregado y sin terminar). La entrada lleva tenantId, que no estaba en el plan: un watch sin tenant recibe entradas de todos y la clave sola mezclaria los tenants en la copia local."
+      "$comment": "Un durable compartido REPARTE los mensajes entre quienes lo usan (A-47): por eso el tenant va en el nombre. Un consumidor que estuvo caido recibe solo el ultimo valor de cada clave (A-35). Un valor reemplazado mientras esta en vuelo NO se reentrega: el nak de la revision 10 y la entrada de la 20 dejan al broker sin la 10 (A-36). El watch no necesita STREAM.INFO.STATE_<DOM>: CONSUMER.INFO distingue 'consumidor no existe' (10014) de 'stream no existe' (10059) (A-48). num_pending de un consumidor last_per_subject es el numero de claves del filtro, lapidas incluidas, y los metadatos `pending` de cada entrega bajan hasta 0 en la ultima (A-35). onSynced: num_pending solo NO basta (no cuenta lo entregado y sin terminar). La entrada lleva tenantId, que no estaba en el plan: un watch sin tenant recibe entradas de todos y la clave sola mezclaria los tenants en la copia local. Un watch vivo durante un `flux state resync` (borrar y recrear su durable): el broker contesta 409 Consumer Deleted al pull pendiente y el SDK DEBE reabrir el consumo (CONSUMER.INFO por nombre, con backoff; sin CONSUMER.CREATE), comprobando la configuracion como al abrir. Medido: nats.js 3.4.0 tarda 43 s en repetir el pull por si solo; async-nats 0.50 da por terminado el flujo (Err y luego None) y un bucle que lo trata como `parar` sale en silencio: un watch muerto con la conexion sana. 10-state.md §5.2.",
+      "durableDeletedWhileWatching": {
+        "action": "reopen-the-consumption",
+        "mustNot": [
+          "stop-silently",
+          "treat-end-of-stream-as-stop-request"
+        ],
+        "needsConsumerCreate": false,
+        "reusesPermissions": [
+          "consumerInfo",
+          "consumerNext"
+        ],
+        "checksConfigBeforeConsuming": true,
+        "backoffMs": [
+          100,
+          5000
+        ],
+        "warnsThroughLogger": true,
+        "stoppedByClose": true,
+        "afterResyncOnSyncedFiresAgain": false,
+        "measured": {
+          "server": "nats-server 2.14.5",
+          "withoutHandling": {
+            "nats.js 3.4.0": "43.0 s (three times)",
+            "async-nats 0.50": "never: 120 s with nothing received, not even a later live put"
+          },
+          "reopening": {
+            "nats.js 3.4.0": "0.1 s",
+            "async-nats 0.50": "0.2-0.3 s"
+          }
+        }
+      }
     },
     "dlq": {
       "subject": {
@@ -1552,7 +1629,25 @@
         "filter": "dlq.state.<dominio>.>",
         "example": "crm-api__dlq_state_clientes"
       },
-      "$comment": "Sin tenant ni clave en el subject para que no se multiplique. El evento de DLQ de estado NO lleva el dato: data pasa a {key, revision}, porque la DLQ guarda 90 dias y un dato personal ya borrado seguiria vivo ahi tres meses. El stream DLQ_<DOM> captura dlq.state.<dom>.> SOLO si el dominio tiene STATE_<DOM> (decidido provisionalmente: 1.1 es aditiva y no se le pide un cambio a quien no usa estado); ampliar los subjects de un stream con datos es posible y no pierde mensajes (A-44). El estado NO se reproduce desde la DLQ: republicar un valor viejo pisaria uno nuevo, y ya no tiene ni el dato; flux dlq replay DEBE rechazar dlq.state.> y la recuperacion es flux state resync (borrar y recrear el durable: el broker entrega otra vez el ultimo valor de cada clave, A-37)."
+      "$comment": "Sin tenant ni clave en el subject para que no se multiplique. El evento de DLQ de estado NO lleva el dato: data pasa a {key, revision}, porque la DLQ guarda 90 dias y un dato personal ya borrado seguiria vivo ahi tres meses. El stream DLQ_<DOM> captura dlq.state.<dom>.> SOLO si el dominio tiene STATE_<DOM> (decidido provisionalmente: 1.1 es aditiva y no se le pide un cambio a quien no usa estado); ampliar los subjects de un stream con datos es posible y no pierde mensajes (A-44). El estado NO se reproduce desde la DLQ: republicar un valor viejo pisaria uno nuevo, y ya no tiene ni el dato; flux dlq replay DEBE rechazar dlq.state.> y la recuperacion es flux state resync (borrar y recrear el durable: el broker entrega otra vez el ultimo valor de cada clave, A-37). Un mensaje ilegible sintetiza un sobre con time = el instante actual y partitionkey = la clave. Un error que NO es de flux (un driver de base de datos, que puede citar la fila entera) deja en dlqerror solo `<codigo>: <frase fija>`; uno de flux conserva su mensaje, sin su cadena de causas.",
+      "unreadableSynthesizedEnvelope": {
+        "idIsNewUuidV7": true,
+        "time": "now",
+        "partitionkey": "key-from-subject",
+        "subject": "key-from-subject",
+        "tenantid": "tenant-from-subject",
+        "dataclassification": "internal",
+        "dlqreason": "poison",
+        "notReproducibleByteForByte": [
+          "id",
+          "correlationid",
+          "time"
+        ]
+      },
+      "dlqerrorOfNonFluxErrors": "code-and-fixed-phrase-only",
+      "dlqerrorFixedPhrase": "error sin clasificar de la aplicación; el mensaje se omite para no copiar datos a la DLQ (10-state.md §6)",
+      "dlqerrorFluxErrorsKeepOwnMessage": true,
+      "dlqerrorNeverConcatenatesCauseChain": true
     },
     "schemaPath": {
       "format": "schemas/state/<dominio>/<agregado>/<major>.<minor>.<patch>.json",
@@ -1596,11 +1691,12 @@
       "ownerPermissions": [
         "ownerPublish",
         "ownerDirectGet",
-        "consumerInfo (durable dlq_state)",
-        "consumerNext (durable dlq_state)",
-        "ack (durable dlq_state)"
+        "security.acl.permissionPatterns.consumerInfo",
+        "security.acl.permissionPatterns.consumerNext",
+        "security.acl.permissionPatterns.ack"
       ],
-      "$commentStreamInfo": "STREAM.INFO con `subjects_filter` en el cuerpo devuelve TODOS los subjects del stream con su recuento, es decir todas las claves y todos los tenants (A-39): con ese unico permiso un servicio confinado a `acme` conoce los clientes de `globex`. Sin el, put, get y watch funcionan igual (A-38, A-48). El dueno PUEDE tenerlo (ya ve todos sus tenants), y gen-acl.mjs NO se lo concede: el SDK no lo usa (security.manifest.stateOwnership.ownerStreamInfoState). Lo que si queda visible para un observador es STREAM.INFO.DLQ_<DOM>: los subjects de DLQ (cinco tokens, sin clave ni tenant) y sus recuentos.",
+      "$commentOwnerPermissions": "El durable de la DLQ de estado del dueno (<servicio>__dlq_state_<dom>) vive en DLQ_<DOM>, NO en STATE_<DOM>: sus permisos de CONSUMER.INFO, CONSUMER.MSG.NEXT y $JS.ACK son los de security.acl.permissionPatterns (consumerInfo, consumerNext, ack), que ya admiten ese nombre, y NO los consumerInfo/consumerNext/ack de este bloque, que son de STATE_<DOM> y del observador. Medido con regex: check-protocol-json.mjs (los de este bloque no casan con DLQ_ y los de security.acl si).",
+      "$commentStreamInfo": "STREAM.INFO con `subjects_filter` en el cuerpo devuelve TODOS los subjects del stream con su recuento, es decir todas las claves y todos los tenants (A-39): con ese unico permiso un servicio confinado a `acme` conoce los clientes de `globex`. Sin el, put, get y watch funcionan igual (A-38, A-48). El dueno TAMPOCO lo recibe (10-state.md §8): el SDK no lo usa (security.manifest.stateOwnership.ownerStreamInfoState) y conceder lo que nadie usa es el principio de un permiso que alguien acabara ampliando. Lo que si queda visible para un observador es STREAM.INFO.DLQ_<DOM>: los subjects de DLQ (cinco tokens, sin clave ni tenant) y sus recuentos.",
       "$commentCreate": "El filtro de un consumidor no se puede ampliar por el cuerpo: con CREATE.<S>.<d>.<filtro>, un filter_subject distinto da 10131 y un filter_subjects da 10137, y tampoco hereda el del subject si el cuerpo no trae ninguno (A-40). Un `*` final en el permiso admite tambien un filtro por UNA clave: mas estrecho, inocuo."
     },
     "metrics": {
@@ -1625,16 +1721,22 @@
           "ok": "applied: true",
           "stale": "la version no avanzaba: NO es un error",
           "conflict": "STATE_CONFLICT: el chequeo de secuencia agoto sus 3 intentos",
-          "invalid_schema": "MISSING_AGGREGATE_VERSION, o data no cumple su esquema (L3)"
+          "invalid_schema": "MISSING_AGGREGATE_VERSION, o la validacion L3 de data falla: INVALID_SCHEMA (no cumple su esquema) o SCHEMA_NOT_FOUND (modo estricto: el esquema no esta en el bundle). Igual que publish() con un evento"
         },
         "emittedAlsoWhenThrowing": [
           "invalid_schema"
         ],
         "notCounted": [
+          "INVALID_STATE_CONTRACT",
           "INVALID_STATE_KEY",
           "INVALID_TENANT_FOR_STATE",
           "RESERVED_DOMAIN",
           "transport-errors"
+        ],
+        "invalidSchemaCodes": [
+          "MISSING_AGGREGATE_VERSION",
+          "INVALID_SCHEMA",
+          "SCHEMA_NOT_FOUND"
         ]
       },
       "forbiddenLabels": [

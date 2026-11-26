@@ -259,8 +259,8 @@ sola mezclaría los tenants en tu copia local.
 - Reconoce **los dos códigos** de conflicto de secuencia, `10071` y `10164` (el segundo, sin número,
   es el de un cluster bajo carrera; un SDK que solo conozca el primero pasa sus pruebas contra un nodo
   y no reintenta en producción). Tres intentos y, agotados, `STATE_CONFLICT` (**RETRYABLE**).
-- **Valida antes de la red**, en este orden: dominio reservado, clave, tenant, `aggregateVersion`,
-  clasificación y —con L3— el esquema. Sin `classification`, usa **`confidential`** (no el default de
+- **Valida antes de la red**, en este orden: dominio reservado, forma del contrato, clave, tenant,
+  `aggregateVersion`, clasificación y —con L3— el esquema. Sin `classification`, usa **`confidential`** (no el default de
   la conexión); `restricted` se rechaza.
 - **Nunca por core NATS.** Un `publish` de core a un subject de estado sobrescribe sin acuse ni chequeo.
 
@@ -276,16 +276,18 @@ sigue borrada, sin error**; su contador tiene que sobrevivir al borrado (`delete
 |---|---|
 | Subject | `state.<dom>.<agr>.v<M>.<tenant>.<clave>` — 6 tokens. La clave y el tenant van **dentro**: el tenant lo confina el **broker** |
 | Clave | `^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$`, coincidencia completa, sin codificar. El broker **no** la valida (acepta `*`, `a.b` y 2000 caracteres): `INVALID_STATE_KEY` |
-| Tenant | `^[a-z0-9]+(-[a-z0-9]+)*$`, máximo 64, **sin valor por defecto** (ni `system` implícito). Sale de la llamada, del evento en curso o de `connect()`; si no, `INVALID_TENANT_FOR_STATE` |
-| `aggregateVersion` | Entero ≥ 1 y ≤ 2^53 − 1, **siempre** (con o sin L3). En Node `7.0` es el entero 7 |
+| Tenant | `^[a-z0-9]+(-[a-z0-9]+)*$`, máximo 64, **sin valor por defecto** (ni `system` implícito). `put`, `delete` y `get`: la opción, el evento en curso o `connect()`; si no, `INVALID_TENANT_FOR_STATE`. **`watch`: solo la opción y `connect()`, nunca el evento en curso** (no corre dentro de un handler) |
+| `aggregateVersion` | Entero ≥ 1 y ≤ 2^53 − 1, **siempre** (con o sin L3). **En Node `7.0` es el entero 7**: `JSON.parse("7.0")` y `7` son el mismo `number`, así que no se puede rechazar. Es un límite conocido del lenguaje (10-state.md §3.4), no un fallo: un SDK cuyo parser distingue entero de flotante (Rust) sí lo rechaza |
 | Dominios | `dlq`, `state`, `rpc` y `system` no son dominios: `publish()`, `subscribe()` y todo `bus.state.*` lanzan `RESERVED_DOMAIN` |
 | `watch` | Durable `<servicio>__state_<dom>_<agr>_v<M>` (+ `__<tenant>`), `deliver_policy: last_per_subject`; con `tenantIsolation: "strict"` exige tenant |
-| `onSynced` | **Una vez** por `watch()`: con el contrato vacío, de inmediato y antes de entregar nada; si no, cuando llega una entrega con `pending == 0` **y** el handler ha terminado. No promete que no lleguen entradas después |
+| `onSynced` | **Una vez** por `watch()` (ni por reconexión ni tras un `resync`): con el contrato vacío, de inmediato y antes de entregar nada; si no, cuando llega una entrega con `pending == 0` **y** el handler ha terminado. No promete que no lleguen entradas después. **`watch` toma un tenant**: un servicio que observa N tenants hace N llamadas y recibe N `onSynced`; combinarlas es de la aplicación |
+| `watch` y `flux state resync` | Si el durable se **borra** con el `watch` abierto, el SDK reabre el consumo (`CONSUMER.INFO` por nombre, sin `CONSUMER.CREATE`, comprobando la configuración) y la foto vuelve a entregarse. Medido con `nats.js` 3.4.0 (tres veces): **43 s** hasta la primera entrada sin esto, 0,1 s con ello |
 
-**Los seis códigos** ([04-errors.md §6](../specification/04-errors.md)) — `code` fijo, clase fija:
+**Los siete códigos** ([04-errors.md §6](../specification/04-errors.md)) — `code` fijo, clase fija:
 
 | Código | Clase | Cuándo |
 |---|---|---|
+| `INVALID_STATE_CONTRACT` | PERMANENT | Un contrato que no es `<dominio>.<agregado>.v<major>` (`clientes.cliente`); un dominio reservado es `RESERVED_DOMAIN` |
 | `INVALID_TENANT_FOR_STATE` | PERMANENT | Tenant que no cumple el patrón, o ninguno |
 | `INVALID_STATE_KEY` | PERMANENT | Clave que no cabe en un token de NATS |
 | `MISSING_AGGREGATE_VERSION` | PERMANENT | Falta, o no es un entero ≥ 1 (también al consumir) |
@@ -293,8 +295,8 @@ sigue borrada, sin error**; su contador tiene que sobrevivir al borrado (`delete
 | `STATE_CONFLICT` | RETRYABLE | Tres conflictos de secuencia seguidos |
 | `RESERVED_DOMAIN` | PERMANENT | Un dominio reservado en un subject o contrato |
 
-Un contrato mal formado (`clientes.cliente`) lanza `InvalidStateContractError` (PERMANENT) **sin código**:
-la lista es cerrada y no tiene uno para esto. Reutiliza, sin código nuevo, `INVALID_DATACLASSIFICATION`
+Un contrato mal formado (`clientes.cliente`) lanza `InvalidStateContractError`, con su código
+`INVALID_STATE_CONTRACT` (el séptimo: antes no tenía ninguno). Reutiliza, sin código nuevo, `INVALID_DATACLASSIFICATION`
 (`restricted` en un `put`; POISON si llega en un mensaje), `INVALID_SCHEMA` (L3), `NOT_PROVISIONED` y
 `PERMISSION_DENIED`. Ningún mensaje cita valores de `data`: una clave o un tenant sí, una versión por su tipo.
 
@@ -305,7 +307,8 @@ nombra las dos causas y apunta a `flux provision` y `flux doctor`.
 
 **La DLQ de estado** (`dlq.state.<dom>.<agr>.v<M>`, sin tenant ni clave) guarda el sobre original **sin el
 dato**: `data` pasa a `{ key, revision }`, sin `signkeyid` ni `signature`; un mensaje ilegible no se copia
-en ninguna forma, y el `dlqerror` de un error que no es de flux se reduce a su código (puede citar la fila
+en ninguna forma, y el `dlqerror` de un error que no es de flux se reduce a su código y a una frase fija
+(`UNKNOWN: error sin clasificar de la aplicación; el mensaje se omite…`: el de un driver puede citar la fila
 entera). `onPoison` recibe `raw` **vacío**. El estado **no se reproduce** desde la DLQ (`flux dlq replay` lo
 rechaza): se resincroniza con `flux state resync`. `watch` avisa al abrir si `DLQ_<DOM>` no captura
 `dlq.state.<dom>.>`.
@@ -315,7 +318,8 @@ rechaza): se resincroniza con `flux state resync`. `watch` avisa al abrir si `DL
 El mensaje reporta **todos** los errores y cita la **ruta** (`/email`), nunca el valor.
 
 **Métrica.** `flux_state_writes_total{contract,outcome}` (`ok | stale | conflict | invalid_schema`) por el
-`MetricsSink` (`stateWrite`, opcional: un sink anterior sigue funcionando). **Nunca** la clave ni el tenant
+`MetricsSink` (`stateWrite`, opcional: un sink anterior sigue funcionando). `invalid_schema` es todo fallo de
+L3 —también `SCHEMA_NOT_FOUND` en modo estricto— y `MISSING_AGGREGATE_VERSION`, como en un evento. **Nunca** la clave ni el tenant
 como etiqueta. Un `watch` reutiliza las métricas de consumo con `subject="state.<contrato>"` y el `consumer`
 **sin** el sufijo de tenant; `flux_consumer_pending` es la **suma** de sus durables.
 

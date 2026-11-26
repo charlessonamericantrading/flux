@@ -108,11 +108,10 @@ export { currentContext } from "./context.js";
 export type { EventContext } from "./context.js";
 
 // ─── Estado replicado — la capacidad `state` (specification/10-state.md) ─────────────────
-// `bus.state.put | delete | get | watch`; los seis códigos de 04-errors.md §6; y las funciones
+// `bus.state.put | delete | get | watch`; los siete códigos de 04-errors.md §6; y las funciones
 // PURAS y deterministas que construyen los bytes (el arnés cruzado las usa: sin reloj ni UUID).
 
 export {
-  InvalidStateContractError,
   // funciones puras
   stateSubject,
   stateStreamName,
@@ -168,6 +167,7 @@ export type {
 } from "./state.js";
 
 export {
+  InvalidStateContractError,
   InvalidTenantForStateError,
   InvalidStateKeyError,
   MissingAggregateVersionError,
