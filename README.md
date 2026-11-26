@@ -34,10 +34,10 @@ sola descarga**, sin auth y sin clonar.
 
 | Recurso | Qué es | Tamaño |
 |---|---|---|
-| [`llms-full.txt`](https://raw.githubusercontent.com/charlessonamericantrading/flux/main/llms-full.txt) | **La spec completa en un fichero.** Si solo cargas uno, es este. | ~55 KB |
-| [`llms.txt`](https://raw.githubusercontent.com/charlessonamericantrading/flux/main/llms.txt) | Índice curado con enlaces raw, por si prefieres cargar solo una parte | ~4 KB |
-| [`AGENTS.md`](AGENTS.md) | Reglas accionables: cómo publicar, cómo consumir, qué nunca hacer | ~9 KB |
-| [`protocol.json`](https://raw.githubusercontent.com/charlessonamericantrading/flux/main/protocol.json) | Constantes verificables — regex de naming, defaults, taxonomía de errores. Para **validar**, no para recordar | ~8 KB |
+| [`llms-full.txt`](https://raw.githubusercontent.com/charlessonamericantrading/flux/main/llms-full.txt) | **La spec completa en un fichero.** Si solo cargas uno, es este. | ~110 KB |
+| [`llms.txt`](https://raw.githubusercontent.com/charlessonamericantrading/flux/main/llms.txt) | Índice curado con enlaces raw, por si prefieres cargar solo una parte | ~5 KB |
+| [`AGENTS.md`](AGENTS.md) | Reglas accionables: cómo publicar, cómo consumir, qué nunca hacer | ~15 KB |
+| [`protocol.json`](https://raw.githubusercontent.com/charlessonamericantrading/flux/main/protocol.json) | Constantes verificables — regex de naming, defaults, taxonomía de errores. Para **validar**, no para recordar | ~28 KB |
 
 **Pégale esto a tu agente:**
 
@@ -110,16 +110,20 @@ protocolo a v2.
 ├── schemas/                ← JSON Schemas versionados por evento
 │   └── <dominio>/<agregado>/<evento>/<semver>.json
 ├── cli/                    ← flux doctor · tail · dlq · validate
-├── conformance/            ← el contrato, ejecutable contra NATS real
+├── conformance/            ← el contrato, ejecutable: contra NATS real y entre SDKs
+├── docs/
+│   └── plan-v1.1/          ← plan hacia v1.1 y la evidencia medida en que se apoya
 ├── docker-compose.yml      ← NATS JetStream local
 ├── examples/services.json  ← manifiesto de ownership → ACLs
-├── scripts/                ← build-llms · check-compat · bundle-schemas · gen-acl
-├── sdk-node/               ← fase 1
-├── sdk-python/             ← fase 1
-├── sdk-go/                 ← fase 1
-├── sdk-java/               ← fase 2
-├── sdk-dotnet/             ← fase 2
-└── sdk-php/                ← fase 2
+├── scripts/                ← build-llms · check-compat · check-protocol-json · check-workflow
+│                             · bundle-schemas · gen-acl
+├── sdk-node/               ← Node / TypeScript (el SDK de referencia)
+├── sdk-python/             ← Python
+├── sdk-go/                 ← Go
+├── sdk-java/               ← Java
+├── sdk-dotnet/             ← .NET
+├── sdk-rust/               ← Rust
+└── sdk-php/                ← PHP
 ```
 
 ---
@@ -129,22 +133,19 @@ protocolo a v2.
 | SDK | Nivel | Tests | Verificado |
 |---|---|---|---|
 | [Node / TypeScript](sdk-node/) | **L3** | 105 | ✅ |
-| [Python](sdk-python/) | **L3** | 205 | ✅ |
-| [Go](sdk-go/) | **L3** | 162 | ✅ (también con `-race`) |
+| [Python](sdk-python/) | **L3** | 205 (con `nats-py` y `jsonschema`) | ✅ |
+| [Go](sdk-go/) | **L3** | 162 (tests y subtests) | ✅ (también con `-race`) |
 | [Java](sdk-java/) | **L3** | 144 | ✅ (Maven en el runner) |
-| [.NET](sdk-dotnet/) | **L3** | 189 | ✅ |
-| [Rust](sdk-rust/) | L2 | 175 | ✅ (incl. 14 contra NATS real) |
-| [PHP](sdk-php/) | **L3** | 304 | ✅ incl. 3 de integración contra NATS real |
-| [PHP](sdk-php/) | L2 | 201 | ✅ (transporte no — ver abajo) |
+| [.NET](sdk-dotnet/) | **L3** | ver CI | ✅ solo en CI |
+| [Rust](sdk-rust/) | **L3** con la feature `validation` (L2 sin ella) | 200 con `--all-features` (146 sin features) | ✅ incl. 17 de integración que necesitan NATS |
+| [PHP](sdk-php/) | **L3** | 304 | ✅ incl. 3 de integración que necesitan NATS |
 
-Los cinco primeros se compilan y ejecutan en CI en cada push. La suite de conformidad corre
-aparte, contra un NATS real: **14/14**.
-
-> **PHP.** Su adaptador de transporte sobre `basis-company/nats` **no está verificado
-> contra un broker real**: el ecosistema PHP de NATS no está consolidado y el SDK aísla esa
-> incertidumbre tras un puerto (`Flux\Transport\NatsTransport`), probado con un cliente
-> falso. Todo lo demás —envelope, naming, clasificación y el runtime del consumidor— se
-> prueba sin broker y está en verde. Ver [`sdk-php/README.md`](sdk-php/).
+Los siete tienen su job en CI (`.github/workflows/spec.yml`), y un job aparte, `cross-sdk`,
+compara los siete byte a byte. Los recuentos de tests son los de una ejecución local del
+2026-11-26; el de .NET no se ha medido porque ese entorno no tiene `dotnet`. Los tests de
+integración **necesitan un NATS**: sin broker se saltan solos (los de Rust acaban en
+«pasado» sin haber probado nada). La suite de conformidad corre aparte, contra un NATS
+real: **14/14**.
 
 ---
 
@@ -160,11 +161,12 @@ Un SDK **no** necesita implementarlo todo para ser útil:
   que **falla la publicación** si no cumple, reportando **todos** los errores y no solo el
   primero.
 
-Node, Python, Go, Java y .NET implementan **L3** de forma opt-in: el default es `off` y
-entonces se comportan exactamente como L2, sin pagar ni la dependencia del validador. Los
-esquemas **no** se resuelven por red: se empaquetan con `node scripts/bundle-schemas.mjs` y
-se despliegan con el servicio, así que la versión del esquema queda clavada a la del
-servicio.
+Los siete SDKs implementan **L3** de forma opt-in: el default es `off` y entonces se
+comportan exactamente como L2, sin coste en ejecución. El validador es además una
+dependencia opcional —extra en Python, *feature* `validation` en Rust, `suggest` en PHP—,
+salvo en Go, donde no existe esa figura y va en `go.mod`. Los esquemas **no** se resuelven
+por red: se empaquetan con `node scripts/bundle-schemas.mjs` y se despliegan con el
+servicio, así que la versión del esquema queda clavada a la del servicio.
 
 > En Java la dependencia del validador es `<optional>true</optional>` dentro del mismo
 > artefacto; en .NET, donde toda `PackageReference` es transitiva, "opcional" solo puede
