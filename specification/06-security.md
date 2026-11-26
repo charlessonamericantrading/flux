@@ -45,10 +45,18 @@ Account DEV          eventos de desarrollo
     acabar con TLS «obligatorio» y sin protección.
   - **Inbox privado**: fijar el prefijo del inbox a `_INBOX.<servicio>` a partir del nombre
     de servicio de `connect()` — [§3.3](#33-el-inbox-es-privado). No es una opción.
+  - **Conexión inicial**: esperar a un broker que aún no ha arrancado, pero **fallar de
+    inmediato** ante credenciales rechazadas o un TLS que no encaja — [03-delivery.md
+    §6.1](03-delivery.md). Con TLS propio, el fallo que no se ve es el peor: un certificado
+    que no verifica dejaba al servicio arrancado y mudo.
+  - **Denegaciones visibles**: un permiso que falta no puede parecer un servicio sano —
+    [§3.7](#37-las-denegaciones-se-ven).
 
-  Mientras un SDK no lo cumpla, **no es compatible con la configuración segura** y su
-  README **DEBE** decirlo: con el inbox por defecto (`_INBOX.<aleatorio>`) el broker le
-  deniega la suscripción a su propio inbox y **su primera petición falla**
+  Un SDK que cumple todo esto —y el aprovisionamiento de [§3.6](#36-aprovisionamiento-los-streams-no-los-crea-el-servicio)—
+  declara la capacidad **`security`** ([00-protocol.md §5](00-protocol.md)). Mientras un SDK
+  no la declare, **no es compatible con la configuración segura** y su README **DEBE**
+  decirlo: con el inbox por defecto (`_INBOX.<aleatorio>`) el broker le deniega la
+  suscripción a su propio inbox y **su primera petición falla**
   (`Permissions Violation for Subscription to "_INBOX.….*"`, en milisegundos).
 
 ## 3. ACLs a nivel de subject
@@ -296,17 +304,54 @@ nunca.
 
 Un SDK que intente crear un stream o un consumidor y reciba una denegación **DEBE** fallar
 con un error accionable, **`NOT_PROVISIONED`**, que nombre el recurso que falta y diga que
-lo crea `flux provision`. **NO DEBE** acabar en un *timeout* de un minuto sin explicación. Si
-el recurso existe, un `CREATE` denegado **NO** es un error: el SDK sigue con `INFO`. La señal
-medida (`verify-acl`) es `consumers.add` → `Permissions Violation` **y** `consumers.info` →
-`404`: esa pareja, y no solo la primera, es lo que significa «falta y no puedo crearlo».
+lo crea `flux provision` (contenido exacto del mensaje y frontera con `PERMISSION_DENIED`:
+[04-errors.md §5](04-errors.md)). **NO DEBE** acabar en un *timeout* de un minuto sin
+explicación. Si el recurso existe, un `CREATE` denegado **NO** es un error: el SDK sigue con
+`INFO`. La señal medida (`verify-acl`) es `consumers.add` → `Permissions Violation` **y**
+`consumers.info` → `404`: esa pareja, y no solo la primera, es lo que significa «falta y no
+puedo crearlo».
 
 Para quien implemente un SDK, dos cosas medidas (A-8f) sobre cómo se manifiestan las
 denegaciones en las librerías `@nats-io/*` 3.4.0: una **petición** a un subject sin permiso
 falla *en milisegundos* con `Permissions Violation for Publish to "…"` —no es un timeout—;
 pero una **suscripción** denegada no lanza nada al suscribirse: el error llega por el canal
 de estado y, además, hace que el **iterador de esa suscripción lance** al consumirlo. Si no
-se captura, el proceso muere.
+se captura, el proceso muere. Qué **DEBE** hacer un SDK ante cada denegación, en
+[§3.7](#37-las-denegaciones-se-ven).
+
+### 3.7 Las denegaciones se ven
+
+Un servicio al que le falta un permiso **no puede parecer sano.** El broker no ayuda: cuando
+una ACL deniega una publicación, el servidor la descarta y manda un `-ERR 'Permissions
+Violation …'` aparte, por la conexión; no hay respuesta que pueda fallar (A-28). Lo que ve
+cada operación, medido contra nats-server 2.14.5, y lo que el SDK **DEBE** hacer con ello:
+
+| Operación denegada | Qué ve el cliente | El SDK |
+|---|---|---|
+| Petición a la API de JetStream (consultar o crear un stream o un consumidor) o `publish()` | Depende de la librería: un error en ~1 ms (`RequestError` con `cause: PermissionViolationError`, A-21) o **nada**, y la petición espera su *timeout* de 5 a 30 s (A-28) | **DEBE** fallar en tiempo útil, no por *timeout*, con `PERMISSION_DENIED` o `NOT_PROVISIONED` ([04-errors.md §5](04-errors.md)), **nombrando el subject denegado**. Si la librería no entrega la denegación, **DEBE** escuchar los `-ERR` de la conexión y competirlos con la respuesta |
+| Suscripción core (la de su inbox) | No lanza al suscribirse: el error llega por el canal de estado y el **iterador** de esa suscripción lanza al consumirla (A-8f). Sin permiso sobre el inbox, ninguna respuesta puede llegar | **DEBE** fallar la operación que la necesita con `PERMISSION_DENIED`, y **NO DEBE** dejar que el error del iterador tumbe el proceso |
+| `ack` (y `nak`, `term` y WIP, que publican en el mismo `$JS.ACK.…`: el denegado que se midió fue el ack) | **Silencio.** Son publicaciones sin respuesta: el evento se procesa y se **reentrega cada `ack_wait`, para siempre** (A-19) | **DEBE** registrarlo en el `logger` del SDK, a nivel de error, con el subject denegado y esa consecuencia |
+| Petición de mensajes de un pull (`CONSUMER.MSG.NEXT`) | **Silencio.** El consumidor queda inerte y parece sano (A-20) | **DEBE** registrarlo igual. **DEBERÍA** además hacer fallar `subscribe()` con `PERMISSION_DENIED` si lo detecta al arrancar: descubrirlo por la ausencia de eventos semanas después es el peor momento |
+
+- Las dos filas silenciosas **solo** tienen el log como salida, así que un SDK `security`
+  **DEBE** ofrecer un `logger` configurable y su README **DEBE** pedir que se configure. Sin
+  él, un ack o un pull denegados no dejan rastro en ninguna parte.
+- Un ack denegado se repite con cada mensaje. Un SDK **DEBERÍA** avisar una vez por subject:
+  un log por mensaje entierra la causa bajo su propio volumen.
+- Cómo llega la denegación lo decide la librería. Cuando da un tipo (`PermissionViolationError`)
+  se reconoce por él, **recorriendo la cadena de causas** —llega envuelta en el error de la
+  petición— y por **nombre** y no por `instanceof`, que con dos copias de la librería en el
+  árbol de dependencias falla sin ruido. Cuando solo da texto (`async-nats`: el `-ERR` llega
+  como `ServerError::Other`), se interpreta ese texto, y es el único sitio donde hacerlo está
+  justificado.
+- **No se define ninguna métrica nueva.** El contrato de [08-observability.md](08-observability.md)
+  no tiene una para esto y ampliarlo es otra decisión. Un handler cuyo error es
+  `PERMISSION_DENIED` o `NOT_PROVISIONED` sí queda contado por la que ya existe
+  (`flux_events_dlq_total{code=…}`, [04-errors.md §5.2](04-errors.md)); un ack o un pull
+  denegados, no: solo el log.
+
+Se comprueba **de extremo a extremo** y **en los dos sentidos** ([§3.4](#34-permisos-exactos-por-consumidor-durable)):
+con el permiso quitado, la denegación se *nota* por el canal que corresponde a su fila.
 
 ## 4. Multi-tenant
 
