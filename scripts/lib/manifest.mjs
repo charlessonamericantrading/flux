@@ -270,7 +270,7 @@ export function analizarManifiesto(manifiesto, bundleSubjects) {
 
 /**
  * Lo que un servicio necesita del broker, derivado de lo que el SDK de Node hace de
- * verdad (sdk-node/src/client.ts) y de docs/plan-v1.1/evidencia/candidata.conf:
+ * verdad (sdk-node/src/client.ts) y comprobado por conformance/security.mjs (S1, S10 y S11):
  *
  *   connect()            jetstreamManager(nc)                        → $JS.API.INFO
  *   publish()            #ensureStream(dominio)                      → STREAM.INFO.EVT_<DOM>
