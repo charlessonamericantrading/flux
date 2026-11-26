@@ -1191,8 +1191,15 @@
       },
       "dotnet": {
         "capabilities": [
-          "signing"
-        ]
+          "signing",
+          "security"
+        ],
+        "evidence": {
+          "security": [
+            "sdk-dotnet/tests/Flux.Tests/Integration/SecurityIntegrationTests.cs",
+            "sdk-dotnet/tests/Flux.Tests/SecurityTests.cs"
+          ]
+        }
       },
       "rust": {
         "capabilities": [
