@@ -161,7 +161,7 @@ describe("los permisos del test de petición/respuesta encajan en protocol.json 
 // El broker
 // ═════════════════════════════════════════════════════════════════════════════
 
-function configDelBroker(port: number, store: string): string {
+function configDelBroker(port: number, store: string, extra = ""): string {
   const usuarios = [
     `{ user: "ops", password: "pw" }`, // IaC: aprovisiona. Sin restricciones.
     ...Object.values(SERVICIOS).map((s) => usuarioRpc(s.service, permisosRpc(s))),
@@ -170,6 +170,7 @@ function configDelBroker(port: number, store: string): string {
     usuarioRpc("rogue", { publish: ["$JS.API.INFO"], subscribe: ["_INBOX.rogue.>", "rpc.clientes.>"], allowResponses: true }),
   ];
   return `listen: 127.0.0.1:${port}
+${extra}
 jetstream { store_dir: "${store}" }
 accounts {
   PROD: {
@@ -246,7 +247,7 @@ describeBroker("SDK Node: petición/respuesta bajo ACL exacta", () => {
   // ══════════════════════════════════════════════════════════════════════════
 
   test(
-    "CICLO: dos instancias atienden la operación y REPARTEN las peticiones (cada una la atiende UNA) → al parar ambas, RPC_UNAVAILABLE en < 100 ms",
+    "CICLO (A-86): dos instancias atienden la operación y REPARTEN las peticiones (cada una la atiende UNA) → al parar ambas, RPC_UNAVAILABLE en < 100 ms",
     { timeout: 60_000 },
     async () => {
       const crm1 = await abrir("crm-api");
@@ -517,7 +518,7 @@ describeBroker("SDK Node: petición/respuesta bajo ACL exacta", () => {
     });
   });
 
-  test("A-67: un STREAM que captura `rpc.>` contesta con su acuse → RPC_INVALID_REPLY que apunta a `flux doctor`", async () => {
+  test("A-67, A-88: un STREAM que captura `rpc.>` contesta con su acuse → RPC_INVALID_REPLY que apunta a `flux doctor`", async () => {
     await jsm.streams.add({ name: "TRAMPA", subjects: ["rpc.clientes.>"], storage: StorageType.Memory });
     try {
       const llama = await abrir("facturacion-api");
@@ -598,7 +599,7 @@ describeBroker("SDK Node: petición/respuesta bajo ACL exacta", () => {
     assert.deepEqual(await enVuelo, DESCUENTO);
   });
 
-  test("`maxConcurrent`: con 4 y 12 peticiones de 100 ms nunca hay más de 4 handlers a la vez, y las 12 se contestan", async () => {
+  test("A-89: `maxConcurrent`: con 4 y 12 peticiones de 100 ms nunca hay más de 4 handlers a la vez, y las 12 se contestan", async () => {
     const crm = await abrir("crm-api");
     let dentro = 0;
     let maximo = 0;
@@ -615,6 +616,23 @@ describeBroker("SDK Node: petición/respuesta bajo ACL exacta", () => {
     assert.equal(rs.length, 12);
     assert.equal(maximo, 4);
     assert.ok(performance.now() - t0 >= 290, "tres tandas de 100 ms: el exceso esperó en la cola");
+  });
+
+  test("A-89: por defecto son 256 handlers a la vez: 300 peticiones de 50 ms → pico de 256, las 300 contestadas (el exceso espera en la cola, sin perderse)", async () => {
+    const crm = await abrir("crm-api");
+    let dentro = 0;
+    let maximo = 0;
+    await crm.respond(OP, async () => {
+      dentro++;
+      maximo = Math.max(maximo, dentro);
+      await dormir(50);
+      dentro--;
+      return DESCUENTO;
+    });
+    const llama = await abrir("facturacion-api");
+    const rs = await Promise.allSettled(Array.from({ length: 300 }, () => llama.request(OP, PETICION, { timeoutMs: 10_000 })));
+    assert.equal(rs.filter((r) => r.status === "fulfilled").length, 300, JSON.stringify(rs.filter((r) => r.status === "rejected").slice(0, 2)));
+    assert.equal(maximo, 256);
   });
 
   // ══════════════════════════════════════════════════════════════════════════
@@ -681,6 +699,11 @@ describeBroker("SDK Node: petición/respuesta bajo ACL exacta", () => {
         assert.ok(performance.now() - t0 < 100, `la denegación tardó ${(performance.now() - t0).toFixed(0)} ms`);
       }
       assert.ok(l.some((x) => x.includes(SUBJECT) && /denegó publicar/.test(x)), "además se registró en el logger");
+      // CINCO a la vez al mismo subject denegado: cada `-ERR` rechaza a una petición distinta, ninguna espera su timeout (A-82)
+      const t1 = performance.now();
+      const cinco = await Promise.allSettled(Array.from({ length: 5 }, () => sin.request(OP, PETICION, { timeoutMs: 5000 })));
+      assert.ok(cinco.every((r) => r.status === "rejected" && r.reason instanceof PermissionDeniedError), JSON.stringify(cinco.map((r) => r.status)));
+      assert.ok(performance.now() - t1 < 200, `las cinco tardaron ${(performance.now() - t1).toFixed(0)} ms`);
     });
 
     test("una operación concedida a otro NO la puede llamar quien solo tiene la suya: `rpc.<dominio>.>` no es un permiso de llamada", async () => {
@@ -706,7 +729,7 @@ describeBroker("SDK Node: petición/respuesta bajo ACL exacta", () => {
       await assert.doesNotReject(ajeno.respond("otros.cosa.v1.hacer", contador().handler), "en SU dominio sí puede");
     });
 
-    test("un dueño SIN `allow_responses` no puede contestar (A-68): quien llama ve RPC_TIMEOUT, y el dueño LO DICE en su log (sin inundarlo)", async () => {
+    test("A-68, A-87: un dueño SIN `allow_responses` no puede contestar: quien llama ve RPC_TIMEOUT, y el dueño LO DICE en su log (sin inundarlo)", async () => {
       const { l, logger } = logs();
       const dueno = await abrir("sin-allow-api", { logger });
       const c = contador();
@@ -736,6 +759,81 @@ describeBroker("SDK Node: petición/respuesta bajo ACL exacta", () => {
       assert.ok(errores.some((e) => /Permissions Violation for Subscription to "_INBOX\.facturacion-api\.>"/.test(e)), JSON.stringify(errores));
       await espia.close();
     });
+  });
+
+  // ══════════════════════════════════════════════════════════════════════════
+  // Lo que la librería hace y el SDK sabe (A-81, A-84, A-85)
+  // ══════════════════════════════════════════════════════════════════════════
+
+  test("A-81: una petición SIN subject de respuesta (`nats pub` a mano) llega con `reply` vacío y NO se atiende: el handler no se invoca y se cuenta `poison`", async () => {
+    const ms = new InMemoryMetrics();
+    const { l, logger } = logs();
+    const poison: string[] = [];
+    const crm = await abrir("crm-api", { metrics: ms, logger, onPoison: ({ subject }: { subject: string }) => void poison.push(subject) });
+    const c = contador();
+    await crm.respond(OP, c.handler);
+    const cuerpo = encodeRpcMessage(buildRpcRequest({
+      operation: OP, tenantId: "acme", id: "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10", source: "/test/crudo", time: new Date().toISOString(),
+      correlationid: "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10", producerversion: "1", classification: "internal", data: PETICION, dataschema: rpcDataschema(OP, "request") }));
+    opsNc.publish(SUBJECT, cuerpo); // sin `reply`
+    await opsNc.flush();
+    assert.ok(await esperarHasta(() => poison.length === 1, 2000), "no se contó como POISON");
+    assert.equal(c.n, 0, "ejecutar a ciegas aplicaría una orden que nadie espera");
+    assert.equal(ms.snapshot().counters.get(`flux_rpc_server_requests_total{operation="${OP}",outcome="poison"}`), 1);
+    assert.ok(l.some((x) => /SIN subject de respuesta/.test(x)));
+    // y sigue atendiendo
+    assert.deepEqual(await (await abrir("facturacion-api")).request(OP, PETICION), DESCUENTO);
+  });
+
+  test("A-84: el límite es el `max_payload` que ANUNCIA el broker (8192 aquí): exactamente eso pasa, un byte más es RPC_MESSAGE_TOO_LARGE, de ida y de vuelta", async () => {
+    const pequeno = await startBroker(({ port, store }) => configDelBroker(port, store, "max_payload: 8192"));
+    const abrirEn = async (service: string) => {
+      const b = await connect({ ...base(service), servers: pequeno.url });
+      abiertos.push(b);
+      return b;
+    };
+    try {
+      const crm = await abrirEn("crm-api");
+      let respuesta: object = DESCUENTO;
+      await crm.respond(OP, () => respuesta as never);
+      const llama = await abrirEn("facturacion-api");
+      const vacia = encodeRpcMessage(buildRpcRequest({ operation: OP, tenantId: "system", id: "0".repeat(36), source: "/test/facturacion-api", time: new Date().toISOString(),
+        correlationid: "0".repeat(36), producerversion: "1.0.0", classification: "internal", data: { relleno: "" }, dataschema: rpcDataschema(OP, "request") })).byteLength;
+      // la PETICIÓN: exactamente 8192 pasa; 8193 no sale
+      assert.deepEqual(await llama.request(OP, { relleno: "x".repeat(8192 - vacia) }), DESCUENTO);
+      await assert.rejects(llama.request(OP, { relleno: "x".repeat(8193 - vacia) }), (e: { code?: string; bytes?: number; limit?: number }) => e.code === "RPC_MESSAGE_TOO_LARGE" && e.bytes === 8193 && e.limit === 8192);
+      // la RESPUESTA: más de 8192 → quien responde contesta el error (la librería lanzaría en él, A-65) y quien llama lo ve en ms
+      respuesta = { relleno: "x".repeat(9000) };
+      const t0 = performance.now();
+      await assert.rejects(llama.request(OP, PETICION, { timeoutMs: 5000 }), (e: { code?: string; message: string }) => e.code === "RPC_MESSAGE_TOO_LARGE" && /8192/.test(e.message));
+      assert.ok(performance.now() - t0 < 1000);
+    } finally {
+      for (const b of abiertos.splice(0)) await b.close().catch(() => {});
+      await pequeno.stop();
+    }
+  });
+
+  test("A-85: la librería de NATS convierte un `timeout` de 0 o NaN en 1000 ms SIN avisar, y rechaza 0,5 y los negativos: por eso el SDK valida `timeoutMs` antes y no lo recorta", async () => {
+    const mudos = opsNc.subscribe("rpc.clientes.cliente.v1.callado", { callback: () => {} }); // escucha y no contesta
+    await opsNc.flush();
+    try {
+      for (const t of [0, Number.NaN]) {
+        const t0 = performance.now();
+        await assert.rejects(opsNc.request("rpc.clientes.cliente.v1.callado", enc.encode("{}"), { timeout: t }), (e: Error) => e.name === "TimeoutError");
+        const ms = performance.now() - t0;
+        assert.ok(ms >= 900 && ms < 1500, `timeout ${t}: ${ms.toFixed(0)} ms (la librería lo sustituye por 1000)`);
+      }
+      for (const t of [0.5, -1]) {
+        await assert.rejects(opsNc.request("rpc.clientes.cliente.v1.callado", enc.encode("{}"), { timeout: t }), (e: Error) => e.name === "InvalidArgumentError");
+      }
+    } finally {
+      mudos.unsubscribe();
+    }
+    // el SDK no se lo pasa: 0, NaN, 0,5 y -1 son INVALID_RPC_CALL antes de tocar la red
+    const llama = await abrir("facturacion-api");
+    for (const t of [0, Number.NaN, 0.5, -1]) {
+      await assert.rejects(llama.request(OP, PETICION, { timeoutMs: t }), (e: { code?: string }) => e.code === "INVALID_RPC_CALL");
+    }
   });
 
   // ══════════════════════════════════════════════════════════════════════════

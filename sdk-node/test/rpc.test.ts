@@ -1308,6 +1308,9 @@ describe("respond() — los errores del handler (§5.3)", () => {
   test("`retryAfterMs` en un error permanent no viaja (el esquema lo prohíbe); uno inválido en un retryable tampoco", async () => {
     const a = (await lanza(new PermanentError("no", { code: "X" }))).data as unknown as Record<string, unknown>;
     assert.ok(!("retryAfterMs" in a));
+    // aunque un `PermanentError` llegue con uno (el tipo no lo admite, JavaScript sí): el esquema del error lo prohíbe con `permanent`
+    const a2 = (await lanza(new PermanentError("no", { code: "X", retryAfterMs: 5000 } as never))).data as unknown as Record<string, unknown>;
+    assert.ok(!("retryAfterMs" in a2));
     const b = (await lanza(new RetryableError("luego", { code: "X", retryAfterMs: -5 }))).data as unknown as Record<string, unknown>;
     assert.ok(!("retryAfterMs" in b));
     const c = (await lanza(new RetryableError("luego", { code: "X", retryAfterMs: 1.5 }))).data as unknown as Record<string, unknown>;
@@ -1977,6 +1980,14 @@ describe("respond() — parada ordenada (§5.5): dejar de escuchar, esperar a lo
     assert.ok(dura >= 70 && dura < 500, `tardó ${dura.toFixed(0)} ms`);
     assert.ok(s.logs.some((l2) => /siguen en vuelo/.test(l2)));
     l.abre();
+  });
+
+  test("tras dejar de escuchar espera un margen breve antes de volver: en un cluster el interés se propaga de forma asíncrona (A-70)", async () => {
+    const s = await atiende();
+    const t0 = performance.now();
+    await s.r.stop();
+    const dura = performance.now() - t0;
+    assert.ok(dura >= 20, `volvió en ${dura.toFixed(1)} ms: sin margen, la petición que sale justo al irse el último puede agotar su timeout en vez de recibir \`no responders\``);
   });
 
   test("`stop()` es idempotente", async () => {
