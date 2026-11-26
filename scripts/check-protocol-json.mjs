@@ -58,6 +58,14 @@ const CASES = [
     ["correlationid", "tenantid", "dlqattempts"],
     ["correlation_id", "correlationId", "correlation-id", ""]],
 
+  // ── Códigos de error estables — 04-errors.md §5 ──────────────────────────────
+  // MAYÚSCULAS y guiones bajos: es lo que va en `code` de las métricas y encabeza `dlqerror`.
+  // Un código con minúsculas o con guiones es otra serie temporal, no el mismo código.
+  ["errors.codePattern",
+    ["NOT_PROVISIONED", "PERMISSION_DENIED", "INVALID_SIGNATURE", "HTTP_503", "PEDIDO_YA_CANCELADO"],
+    ["not_provisioned", "NotProvisioned", "NOT-PROVISIONED", "NOT PROVISIONED", "_NOT_PROVISIONED",
+     "NOT_PROVISIONED_", "NOT__PROVISIONED", "NOT_PROVISIONED ", "503_HTTP", ""]],
+
   // ── Permisos de la ACL — 06-security.md §3 ───────────────────────────────────
   // Una lista CERRADA de formas concedibles. Cada patrón se prueba en los dos sentidos: lo
   // exacto pasa, y la forma ancha («para que funcione») falla. Es la diferencia entre un
@@ -215,6 +223,47 @@ if (acl.ackSubject.format.split(".").length !== acl.ackSubject.tokens) fallos.pu
 if (p.security.provisioning.notProvisionedErrorCode !== "NOT_PROVISIONED") fallos.push("security.provisioning.notProvisionedErrorCode debe ser NOT_PROVISIONED");
 if (p.security.provisioning.neverDeletes !== true || p.security.provisioning.neverOverwritesDifferentConfig !== true) fallos.push("security.provisioning: nunca borra ni sobrescribe");
 
+// ─── Códigos de error y capacidades: 04-errors.md §5 y 00-protocol.md §5 ──────────────────────
+// Lo que mira el SDK en `connect()` y en `publish()` es lo que dice aquí, así que un código
+// huérfano (sin capacidad), una clase que no existe o una capacidad declarada pero sin definir
+// son errores de esta tabla y no de ningún SDK. Que cada SDK CONTENGA sus códigos lo comprueba
+// scripts/check-sdk-codes.mjs, que necesita leer sus fuentes.
+const codePat = new RegExp(p.errors.codePattern);
+const capDefs = p.capabilities.definitions;
+const codigosDe = Object.entries(p.errors.codes).filter(([k]) => !k.startsWith("$"));
+for (const [codigo, def] of codigosDe) {
+  if (!codePat.test(codigo)) fallos.push(`errors.codes.${codigo}: no cumple errors.codePattern`);
+  if (!Object.hasOwn(p.errors.classes, def.class)) fallos.push(`errors.codes.${codigo}: class "${def.class}" no es una clase de errors.classes`);
+  if (!Object.hasOwn(capDefs, def.capability)) fallos.push(`errors.codes.${codigo}: capability "${def.capability}" no está en capabilities.definitions`);
+}
+for (const codigo of Object.keys(p.signing.poisonCodes)) {
+  if (!codePat.test(codigo)) fallos.push(`signing.poisonCodes.${codigo}: no cumple errors.codePattern`);
+  if (p.errors.codes[codigo]) fallos.push(`${codigo} está en errors.codes y en signing.poisonCodes: una sola fuente por código`);
+}
+// 04-errors.md §5.1: una denegación no se arregla esperando, así que NO es RETRYABLE ni queda
+// a la política de lo desconocido.
+for (const codigo of ["NOT_PROVISIONED", "PERMISSION_DENIED"]) {
+  if (p.errors.codes[codigo]?.class !== "permanent") fallos.push(`errors.codes.${codigo}.class debe ser "permanent"`);
+  if (p.errors.codes[codigo]?.capability !== "security") fallos.push(`errors.codes.${codigo}.capability debe ser "security"`);
+}
+if (!Object.hasOwn(p.errors.codes, p.security.provisioning.notProvisionedErrorCode)) fallos.push("security.provisioning.notProvisionedErrorCode no está en errors.codes");
+if (!Object.hasOwn(capDefs, p.security.sdk.capability)) fallos.push(`security.sdk.capability "${p.security.sdk.capability}" no está en capabilities.definitions`);
+
+for (const [sdk, decl] of Object.entries(p.capabilities.sdks)) {
+  const dadas = decl.capabilities;
+  if (!Array.isArray(dadas)) { fallos.push(`capabilities.sdks.${sdk}.capabilities debe ser una lista (vacía si no declara ninguna)`); continue; }
+  if (new Set(dadas).size !== dadas.length) fallos.push(`capabilities.sdks.${sdk}: capacidad repetida en [${dadas.join(", ")}]`);
+  for (const cap of dadas) {
+    if (!Object.hasOwn(capDefs, cap)) { fallos.push(`capabilities.sdks.${sdk}: declara "${cap}", que no está en capabilities.definitions`); continue; }
+    if (capDefs[cap].evidence === "sdk-files" && !decl.evidence?.[cap]?.length) {
+      fallos.push(`capabilities.sdks.${sdk}: declara "${cap}" sin citar su evidencia (capabilities.sdks.${sdk}.evidence.${cap}). Una capacidad sin evidencia ejecutada es una intención`);
+    }
+  }
+  for (const cap of Object.keys(decl.evidence ?? {})) {
+    if (!dadas.includes(cap)) fallos.push(`capabilities.sdks.${sdk}: cita evidencia de "${cap}" sin declararla`);
+  }
+}
+
 // El generador y protocol.json tienen que decir lo mismo: cada permiso que emite encaja con UNA
 // categoría concedible y con ninguna denegable, y su inbox con el patrón del inbox.
 const servicioDePrueba = {
@@ -254,4 +303,4 @@ if (fallos.length) {
   process.exit(1);
 }
 
-console.log(`✓ protocol.json coherente (${CASES.length} patrones + invariantes numéricas)`);
+console.log(`✓ protocol.json coherente (${CASES.length} patrones + invariantes numéricas, de códigos y de capacidades)`);

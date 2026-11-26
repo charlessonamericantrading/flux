@@ -128,6 +128,10 @@ jobs:
       # No basta con que sea JSON válido: un patrón con las barras invertidas comidas
       # sigue compilando y rechaza TODO lo que debería aceptar. Pasó de verdad.
       - run: node scripts/check-protocol-json.mjs
+      # Cruza `protocol.json` → `capabilities` con el código de cada SDK y con la tabla del
+      # README: una capacidad que solo existe en una tabla es una intención. Se autocomprueba
+      # con mutaciones (quitar un código de un SDK debe hacerlo fallar).
+      - run: node scripts/check-sdk-codes.mjs
 
   sdk-node:
     name: SDK Node — typecheck, tests e integración contra NATS real
