@@ -155,15 +155,18 @@ Un SDK **declara** `security` solo si cumple **todo** lo siguiente:
 2. **TLS con CA propia**, y opcionalmente mTLS. Si se exige TLS y el servidor no lo ofrece,
    falla: nunca baja a texto plano ([06-security.md §2](06-security.md)).
 3. **Credenciales** `.creds` (JWT + NKey) y semilla NKey ([06-security.md §2](06-security.md)).
-   Un valor mal formado falla en `connect()`, antes de tocar la red.
+   Un valor mal formado falla en `connect()`, antes de tocar la red, con `INVALID_CREDENTIALS`
+   (o `INVALID_TLS_OPTIONS` si es de TLS) — [04-errors.md §5.3](04-errors.md).
 4. **`NOT_PROVISIONED` y `PERMISSION_DENIED`**, ambos PERMANENT y con el mensaje que exige
    [04-errors.md §5](04-errors.md). Y *info antes de crear*: un `CREATE` denegado sobre un
    recurso que existe no es un error ([06-security.md §3.4](06-security.md)).
 5. **Primera conexión** que espera a un broker caído pero falla de inmediato ante lo que
-   reintentar no arregla ([03-delivery.md §6.1](03-delivery.md)).
-6. **Denegaciones visibles**: una petición denegada falla en tiempo útil nombrando el subject,
-   y un `ack` o un pull denegados quedan registrados por el `logger`
-   ([06-security.md §3.7](06-security.md)).
+   reintentar no arregla ([03-delivery.md §6.1](03-delivery.md)), con `CONNECTION_REJECTED`
+   —motivo `auth` o `tls`— ([04-errors.md §5.3](04-errors.md)). Con los dos códigos de
+   opciones mal formadas del punto 3, son los **tres** códigos de `connect()`.
+6. **Denegaciones visibles**: una petición denegada falla en tiempo útil nombrando el subject;
+   un pull denegado hace fallar `subscribe()` con `PERMISSION_DENIED` y un `ack` denegado queda
+   registrado por el `logger` ([06-security.md §3.7](06-security.md)).
 
 Se declara por **evidencia ejecutada**, no por intención: contra un broker real, con los
 permisos exactos que genera [`scripts/gen-acl.mjs`](../scripts/gen-acl.mjs), y en los dos

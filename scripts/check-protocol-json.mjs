@@ -62,9 +62,12 @@ const CASES = [
   // MAYÚSCULAS y guiones bajos: es lo que va en `code` de las métricas y encabeza `dlqerror`.
   // Un código con minúsculas o con guiones es otra serie temporal, no el mismo código.
   ["errors.codePattern",
-    ["NOT_PROVISIONED", "PERMISSION_DENIED", "INVALID_SIGNATURE", "HTTP_503", "PEDIDO_YA_CANCELADO"],
+    ["NOT_PROVISIONED", "PERMISSION_DENIED", "INVALID_SIGNATURE", "HTTP_503", "PEDIDO_YA_CANCELADO",
+     "CONNECTION_REJECTED", "INVALID_CREDENTIALS", "INVALID_TLS_OPTIONS"],
     ["not_provisioned", "NotProvisioned", "NOT-PROVISIONED", "NOT PROVISIONED", "_NOT_PROVISIONED",
-     "NOT_PROVISIONED_", "NOT__PROVISIONED", "NOT_PROVISIONED ", "503_HTTP", ""]],
+     "NOT_PROVISIONED_", "NOT__PROVISIONED", "NOT_PROVISIONED ", "503_HTTP", "",
+     // La forma de Node en la clase, no el código: `ConnectionRejectedError` no es un `code`.
+     "ConnectionRejectedError", "connection_rejected", "INVALID-TLS-OPTIONS"]],
 
   // ── Permisos de la ACL — 06-security.md §3 ───────────────────────────────────
   // Una lista CERRADA de formas concedibles. Cada patrón se prueba en los dos sentidos: lo
@@ -160,6 +163,66 @@ const CASES = [
      "pedidos.>", "dlq.pedidos.pedido.v1.creado", "_INBOX.pedidos-api.>"]],
 ];
 
+// ─── Los tres códigos de connect() — 04-errors.md §5.3 ───────────────────────────────────────
+// Se escriben como función PURA sobre el documento para poder probarla en los dos sentidos: la
+// de abajo se ejecuta sobre el protocol.json real (debe dar cero fallos) y sobre copias
+// estropeadas a propósito (cada una debe dar al menos uno). Una invariante que solo se ha visto
+// en verde no demuestra nada.
+const CODIGOS_CONNECT = ["CONNECTION_REJECTED", "INVALID_CREDENTIALS", "INVALID_TLS_OPTIONS"];
+
+/** @returns {string[]} */
+function fallosDeConnect(doc) {
+  const f = [];
+  const cs = doc.errors?.codes ?? {};
+  for (const c of CODIGOS_CONNECT) {
+    const def = cs[c];
+    if (!def) { f.push(`errors.codes.${c}: falta (04-errors.md §5.3)`); continue; }
+    if (def.phase !== "connect") f.push(`errors.codes.${c}.phase debe ser "connect"`);
+  }
+  // CONNECTION_REJECTED: dos motivos, y ni uno más — la librería de NATS no distingue más.
+  if (JSON.stringify(cs.CONNECTION_REJECTED?.reasons) !== JSON.stringify(["auth", "tls"])) {
+    f.push(`errors.codes.CONNECTION_REJECTED.reasons debe ser ["auth","tls"], es ${JSON.stringify(cs.CONNECTION_REJECTED?.reasons)}`);
+  }
+  // Qué los distingue es si hubo red: las dos opciones mal formadas fallan ANTES de abrir un
+  // socket; el rechazo supone que el broker contestó.
+  if (cs.CONNECTION_REJECTED?.failsBeforeNetwork !== false) f.push("errors.codes.CONNECTION_REJECTED.failsBeforeNetwork debe ser false: el broker contestó");
+  for (const c of ["INVALID_CREDENTIALS", "INVALID_TLS_OPTIONS"]) {
+    if (cs[c]?.failsBeforeNetwork !== true) f.push(`errors.codes.${c}.failsBeforeNetwork debe ser true: se detecta sin hablar con el broker`);
+  }
+  // Ninguno se emite con un broker que aún no ha arrancado: se espera.
+  for (const c of CODIGOS_CONNECT) {
+    if (!cs[c]?.neverEmittedFor?.includes("broker-not-started")) f.push(`errors.codes.${c}.neverEmittedFor debe incluir "broker-not-started": un broker caído se espera`);
+  }
+  // La tabla de 03-delivery.md §6.1: cada causa que falla rápido tiene su código, y existe.
+  const fc = doc.security?.sdk?.firstConnect ?? {};
+  if ("stableCode" in fc) f.push("security.sdk.firstConnect.stableCode (singular) ya no existe: ahora son stableCodes (04-errors.md §5.3)");
+  const stable = fc.stableCodes ?? {};
+  const causas = [...(fc.failFastOn ?? []), ...(fc.shouldFailFastOn ?? [])];
+  for (const causa of causas) {
+    if (!(causa in stable)) f.push(`security.sdk.firstConnect.stableCodes no dice qué código lleva «${causa}»`);
+  }
+  for (const [causa, cod] of Object.entries(stable)) {
+    for (const c of [].concat(cod)) {
+      if (!CODIGOS_CONNECT.includes(c)) f.push(`stableCodes.${causa}: "${c}" no es uno de los tres códigos de connect()`);
+    }
+  }
+  // Los dos únicos fallos «sin red» son opciones mal formadas; el resto son rechazos.
+  for (const causa of ["credentials-rejected", "tls-verification-failed", "tls-required-not-offered"]) {
+    if (stable[causa] !== "CONNECTION_REJECTED") f.push(`stableCodes.${causa} debe ser CONNECTION_REJECTED`);
+  }
+  if (JSON.stringify(stable["malformed-local-options"]) !== JSON.stringify(["INVALID_CREDENTIALS", "INVALID_TLS_OPTIONS"])) {
+    f.push("stableCodes.malformed-local-options debe ser [INVALID_CREDENTIALS, INVALID_TLS_OPTIONS]");
+  }
+  // 06-security.md §3.7: el pull denegado DEBE hacer fallar subscribe() (ya no DEBERÍA).
+  const den = doc.security?.sdk?.denials ?? {};
+  if ("shouldFailSubscribe" in den) f.push("security.sdk.denials.shouldFailSubscribe ya no existe: es mustFailSubscribe (06-security.md §3.7, DEBE)");
+  if (!den.mustFailSubscribe?.includes("pull")) f.push('security.sdk.denials.mustFailSubscribe debe incluir "pull"');
+  if (den.mustFailSubscribeWith !== "PERMISSION_DENIED" || !cs.PERMISSION_DENIED) f.push("security.sdk.denials.mustFailSubscribeWith debe ser PERMISSION_DENIED, que debe existir en errors.codes");
+  if (!den.mustLog?.includes("ack") || !den.mustLog?.includes("pull")) f.push('security.sdk.denials.mustLog debe incluir "ack" y "pull": se registran los dos');
+  if (JSON.stringify(den.mustLogOnly) !== JSON.stringify(["ack"])) f.push('security.sdk.denials.mustLogOnly debe ser ["ack"]: lo único que SOLO puede salir por el logger');
+  return f;
+}
+
 const fallos = [];
 
 for (const [path, deben, noDeben] of CASES) {
@@ -242,10 +305,11 @@ for (const codigo of Object.keys(p.signing.poisonCodes)) {
 }
 // 04-errors.md §5.1: una denegación no se arregla esperando, así que NO es RETRYABLE ni queda
 // a la política de lo desconocido.
-for (const codigo of ["NOT_PROVISIONED", "PERMISSION_DENIED"]) {
+for (const codigo of ["NOT_PROVISIONED", "PERMISSION_DENIED", ...CODIGOS_CONNECT]) {
   if (p.errors.codes[codigo]?.class !== "permanent") fallos.push(`errors.codes.${codigo}.class debe ser "permanent"`);
   if (p.errors.codes[codigo]?.capability !== "security") fallos.push(`errors.codes.${codigo}.capability debe ser "security"`);
 }
+fallos.push(...fallosDeConnect(p));
 if (!Object.hasOwn(p.errors.codes, p.security.provisioning.notProvisionedErrorCode)) fallos.push("security.provisioning.notProvisionedErrorCode no está en errors.codes");
 if (!Object.hasOwn(capDefs, p.security.sdk.capability)) fallos.push(`security.sdk.capability "${p.security.sdk.capability}" no está en capabilities.definitions`);
 
@@ -296,6 +360,34 @@ const emitido = permisosDe(servicioDePrueba);
 // …y el nombre del durable de DLQ que emite cumple el patrón que protocol.json le da.
 const dlqDurables = emitido.durables.filter((d) => d.kind === "dlq").map((d) => d.durable);
 if (!dlqDurables.length || !dlqDurables.every((d) => new RegExp(acl.dlqReaderDurable.pattern).test(d))) fallos.push(`los durables de DLQ que emite el generador (${dlqDurables.join(", ")}) no cumplen security.acl.dlqReaderDurable.pattern`);
+
+// Autocomprobación de `fallosDeConnect`: cada copia estropeada DEBE dar un fallo, o la invariante
+// no vigila nada.
+{
+  const mutaciones = {
+    "quitar CONNECTION_REJECTED": (d) => { delete d.errors.codes.CONNECTION_REJECTED; },
+    "un tercer motivo": (d) => { d.errors.codes.CONNECTION_REJECTED.reasons.push("mtls"); },
+    "quitar un motivo": (d) => { d.errors.codes.CONNECTION_REJECTED.reasons = ["tls"]; },
+    "INVALID_CREDENTIALS con red": (d) => { d.errors.codes.INVALID_CREDENTIALS.failsBeforeNetwork = false; },
+    "INVALID_TLS_OPTIONS con red": (d) => { d.errors.codes.INVALID_TLS_OPTIONS.failsBeforeNetwork = false; },
+    "CONNECTION_REJECTED sin red": (d) => { d.errors.codes.CONNECTION_REJECTED.failsBeforeNetwork = true; },
+    "un código esperaría a un broker caído": (d) => { d.errors.codes.INVALID_CREDENTIALS.neverEmittedFor = []; },
+    "volver al stableCode sin decidir": (d) => { d.security.sdk.firstConnect.stableCode = null; },
+    "una causa sin código": (d) => { delete d.security.sdk.firstConnect.stableCodes["tls-required-not-offered"]; },
+    "una causa con el código equivocado": (d) => { d.security.sdk.firstConnect.stableCodes["credentials-rejected"] = "INVALID_CREDENTIALS"; },
+    "un código ajeno en stableCodes": (d) => { d.security.sdk.firstConnect.stableCodes["tls-verification-failed"] = "PERMISSION_DENIED"; },
+    "opciones mal formadas con un solo código": (d) => { d.security.sdk.firstConnect.stableCodes["malformed-local-options"] = ["INVALID_CREDENTIALS"]; },
+    "el pull vuelve a DEBERÍA": (d) => { d.security.sdk.denials.shouldFailSubscribe = ["pull"]; delete d.security.sdk.denials.mustFailSubscribe; },
+    "subscribe falla con otro código": (d) => { d.security.sdk.denials.mustFailSubscribeWith = "NOT_PROVISIONED"; },
+    "el pull deja de registrarse": (d) => { d.security.sdk.denials.mustLog = ["ack"]; },
+    "el pull pasa a ser solo-log": (d) => { d.security.sdk.denials.mustLogOnly = ["ack", "pull"]; },
+  };
+  for (const [nombre, estropea] of Object.entries(mutaciones)) {
+    const copia = structuredClone(p);
+    estropea(copia);
+    if (!fallosDeConnect(copia).length) fallos.push(`autocomprobación: la mutación «${nombre}» NO la detecta fallosDeConnect`);
+  }
+}
 
 if (fallos.length) {
   console.error(`\n✗ ${fallos.length} problema(s) en protocol.json\n`);

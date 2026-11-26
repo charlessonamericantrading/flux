@@ -139,8 +139,9 @@ pub use envelope::{
 };
 pub use errors::{
     as_classified, describe, Classification, ConfigDifference, ErrorClass, Failure, FluxError,
-    HandlerError, HandlerResult, ResourceKind, SchemaNotFoundError, SchemaValidationError,
-    INVALID_SCHEMA_CODE, NOT_PROVISIONED_CODE, PERMISSION_DENIED_CODE, SCHEMA_NOT_FOUND_CODE,
+    HandlerError, HandlerResult, RejectionReason, ResourceKind, SchemaNotFoundError,
+    SchemaValidationError, CONNECTION_REJECTED_CODE, INVALID_CREDENTIALS_CODE, INVALID_SCHEMA_CODE,
+    INVALID_TLS_OPTIONS_CODE, NOT_PROVISIONED_CODE, PERMISSION_DENIED_CODE, SCHEMA_NOT_FOUND_CODE,
 };
 pub use metrics::{
     ConnectionState, ConsumeOutcome, DlqReasonLabel, InMemoryMetrics, MetricsSink, NoMetrics,

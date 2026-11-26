@@ -214,7 +214,9 @@ nats stream get DLQ_PEDIDOS --last-for 'dlq.pedidos.pedido.v1.creado' --json \
 ## 5. Errores de la capacidad `security`
 
 Un SDK que declara la capacidad `security` ([00-protocol.md §5](00-protocol.md)) **DEBE**
-emitir estos dos errores. Existen por algo medido: **cuando una ACL deniega una operación,
+emitir estos **cinco** códigos estables: dos para lo que se deniega o falta con el servicio ya
+en marcha —la tabla de abajo— y tres para `connect()` ([§5.3](#53-errores-de-connect-la-conexión-inicial)).
+Los dos primeros existen por algo medido: **cuando una ACL deniega una operación,
 el broker no contesta.** Descarta el mensaje y avisa aparte, por la conexión, con un
 `-ERR 'Permissions Violation …'` ([A-28](../docs/plan-v1.1/PLAN.md#apéndice-a--evidencia),
 medido contra nats-server 2.14.5). Lo que ve la aplicación depende de la librería de NATS:
@@ -245,6 +247,11 @@ ejemplo, publicando en un dominio sin aprovisionar— va a la DLQ en la **primer
 Sin una clase propia caerían en la política de lo desconocido ([§2.1](#21-el-default-para-lo-desconocido-retryable-acotado)):
 dos entregas y ~30 s de cola ocupada para acabar en el mismo sitio.
 
+Los tres de `connect()` ([§5.3](#53-errores-de-connect-la-conexión-inicial)) lo son por lo
+mismo, aunque no nazcan en un handler y la clase no decida ningún `ack`: dice que reintentar
+—el SDK, o un bucle de la aplicación alrededor de `connect()`— da el mismo fallo, y que quien
+lo ve tiene que **cambiar algo** (la configuración del servicio o la del broker).
+
 ### 5.2 Qué DEBE decir el mensaje
 
 Un error accionable es el que no obliga a abrir el log del broker para saber qué hacer.
@@ -254,7 +261,7 @@ Un error accionable es el que no obliga a abrir el log del broker para saber qu�
 | **DEBE nombrar** | El **recurso** que falta: el stream, o el consumidor **y** su stream. Y el **subject denegado** (el de la creación), tal como lo comunicó el broker | Lo que el SDK intentaba (publicar o suscribirse y, en términos de flux, a qué: «abrir el stream `EVT_PEDIDOS`») y el **subject denegado**, completo y sin normalizar |
 | **DEBE apuntar a** | **`flux provision`**, que se ejecuta con credenciales de **operación**, no con las del servicio ([06-security.md §3.6](06-security.md)) | La ACL del servicio, que es donde se arregla: [06-security.md §3](06-security.md) |
 
-Además, los dos:
+Además, los dos de esta tabla (los de `connect()` tienen la suya en [§5.3](#53-errores-de-connect-la-conexión-inicial)):
 
 - Llevan un **código fijo que la aplicación no puede sustituir**: es lo que agrupa el panel
   (`code` de [08-observability.md §2.2](08-observability.md)), y dejar que cada servicio lo
@@ -269,19 +276,63 @@ code="NOT_PROVISIONED"}`, porque `code` es «el código estable de la clasificac
 ([08-observability.md §2.1](08-observability.md)). Las denegaciones que no son un error
 —`ack` y pull, [06-security.md §3.7](06-security.md)— no tienen contador: solo el log.
 
-### 5.3 Fallo de la conexión inicial: sin código estable todavía
+### 5.3 Errores de `connect()`: la conexión inicial
 
 Un `connect()` que falla porque reintentar no lo arregla ([03-delivery.md §6.1](03-delivery.md))
 **DEBE** lanzar un error que se distinga de «el broker aún no está» —es decir, que **no** se
-espere—, que diga la **causa** (credencial rechazada, certificado que no verifica, TLS exigido
-y no ofrecido) y que diga **qué revisar**.
+espere—, que diga la **causa**, que diga **qué revisar** y que lleve uno de estos **tres**
+códigos estables, todos **PERMANENT** ([§5.1](#51-son-permanent)):
 
-> **Sin decidir: esta spec no fija un código estable para este fallo.** Los dos SDKs que
-> declaran `security` divergen, y no se elige por ellos. Node lanza `ConnectionRejectedError`
-> con `code = "CONNECTION_REJECTED"` y `reason` ∈ `tls | auth`, y para las opciones mal
-> formadas `INVALID_CREDENTIALS` e `INVALID_TLS_OPTIONS`. Rust devuelve `FluxError::Transport`
-> para el rechazo y `FluxError::Config` para las opciones mal formadas, y **ninguno de los dos
-> lleva código** (`code()` es `None`). Unificarlos es una decisión de diseño —¿tres códigos?,
-> ¿uno con motivo?, ¿ninguno?— que no corresponde tomar aquí. Hasta entonces, una aplicación
-> **NO DEBERÍA** ramificar por un código de este fallo: es un error de arranque, y lo que
-> hay que hacer con él es leer el mensaje.
+| Código | Se emite cuando | Se arregla en |
+|---|---|---|
+| `CONNECTION_REJECTED` | El broker **contestó** y rechazó la **primera** conexión por algo que esperar no arregla. Lleva un motivo, `reason`, con dos valores: **`auth`** —el broker rechazó las credenciales— o **`tls`** —el certificado del servidor no verifica (CA ausente o equivocada, host fuera de los SAN, caducado), o se exigió TLS y el servidor no lo ofrece, o el broker exige certificado de cliente y no se presentó ninguno (esto último **DEBERÍA**: no todos los clientes NATS lo distinguen, [03-delivery.md §6.1](03-delivery.md))—. | El broker (el usuario, su certificado) o lo que el servicio le pasa (la CA, el host): la opción está **bien formada** y el broker no la acepta |
+| `INVALID_CREDENTIALS` | Las opciones de credenciales están **mal formadas** y eso se sabe **sin hablar con el broker**: un valor vacío o que no es un texto (casi siempre una variable de entorno sin definir); un nombre de opción desconocido (uno equivocado, `password` por `pass`, no puede degradar a «sin credenciales»); `user` sin `pass`, o al revés; más de un método a la vez (es ambiguo: el servidor aceptaría uno y el otro sería ruido); un fichero `.creds` ilegible o sin JWT y semilla; una semilla que no es de usuario (`SU…`). Se emite **antes de abrir ningún socket**. | Lo que se pasó a `connect()` |
+| `INVALID_TLS_OPTIONS` | Las opciones TLS están **mal formadas** y se sabe **sin red**: la opción no es del tipo esperado (un valor «ausente» que la librería de NATS leería como «sin TLS» es justo lo contrario de quien lo pasa); un nombre de opción desconocido; una ruta vacía, ilegible o —en los SDKs que lo comprueban— que no es un PEM; un certificado de cliente sin su clave, o al revés. Se emite **antes de abrir ningún socket**. | Lo que se pasó a `connect()` |
+
+**Qué los distingue es si hubo red.** `INVALID_CREDENTIALS` e `INVALID_TLS_OPTIONS` se detectan
+**sin hablar con el broker**: éste ni se entera, y el remedio está en la configuración local.
+`CONNECTION_REJECTED` supone que hubo conversación y que el broker **contestó**: la opción
+estaba bien formada y no es lo que él espera. De ahí tres consecuencias, que cada SDK **DEBE**
+cumplir y que se comprueban **en los dos sentidos**:
+
+- Una credencial **bien formada pero equivocada** es `CONNECTION_REJECTED` (`auth`), **nunca**
+  `INVALID_CREDENTIALS`. Un `.creds` ilegible es `INVALID_CREDENTIALS`, **nunca**
+  `CONNECTION_REJECTED`.
+- Un certificado que el broker no acepta es `CONNECTION_REJECTED` (`tls`), **nunca**
+  `INVALID_TLS_OPTIONS`. Una CA que no existe es `INVALID_TLS_OPTIONS`.
+- Un broker que **aún no ha arrancado** (conexión rechazada, DNS, timeout) **no es ninguno de
+  los tres**: se espera. Tampoco lo son el resto de fallos de `connect()` —un nombre de
+  servicio inválido, una lista de servidores que no se entiende—, que **NO DEBEN** llevar
+  ninguno de estos códigos: no son estas situaciones.
+
+Por qué tres y no uno con un motivo: el remedio y **quién** lo aplica son distintos. Los dos
+`INVALID_*` los arregla quien despliega el servicio, mirando lo que pasó a `connect()`;
+`CONNECTION_REJECTED` lo arregla, normalmente, quien opera el broker o los certificados (una
+CA rotada, un usuario que falta en la account). Un panel o una alerta agrupa por `code`
+([08-observability.md §2.2](08-observability.md)): mezclar los tres mandaría la alerta al
+equipo equivocado. Y el motivo de `CONNECTION_REJECTED` tiene **dos** valores y no más
+porque más no los da la librería de NATS: que el TLS falle por un certificado que no verifica,
+por un servidor sin TLS o por un mTLS sin certificado de cliente llega, según la librería,
+como el mismo error (A-24, A-30); esos matices viajan en el **mensaje**, no en el motivo.
+
+**Qué DEBE decir el mensaje**
+
+| | `CONNECTION_REJECTED` | `INVALID_CREDENTIALS` | `INVALID_TLS_OPTIONS` |
+|---|---|---|---|
+| **DEBE nombrar** | A qué broker se intentaba conectar y la **causa** tal como la da la librería cuando la da (`authorization violation`, `certificate not valid for name`, `UnknownIssuer`). Si el SDK solo sabe que falló el handshake TLS, **DEBE** listar las causas candidatas (el certificado no verifica, el broker no ofrece TLS, exige mTLS) | **Qué** opción está mal y por qué (`la ruta del .creds no se puede leer`). Una **ruta** sí; **nunca el valor** de una credencial | **Qué** opción está mal y por qué. Una ruta sí |
+| **DEBE apuntar a** | Con `auth`: las credenciales y que el usuario exista en la account. Con `tls`: la CA, los SAN del certificado, si el broker ofrece TLS y si exige mTLS ([06-security.md §2](06-security.md)) | Lo que se pasa a `connect()` ([06-security.md §2](06-security.md)) | Lo que se pasa a `connect()` ([06-security.md §2](06-security.md)) |
+
+Y los tres: un **código fijo que la aplicación no puede sustituir**, y **ninguna credencial**
+en el mensaje —acaba en logs—. **DEBE** decir también que reintentar no lo arregla, para que
+nadie envuelva `connect()` en un bucle.
+
+**Cada SDK lo expresa con su mecanismo.** Lo normativo es el `code` estable y, en el rechazo,
+el motivo `auth | tls`. Node lanza `ConnectionRejectedError` (`code`, `reason`),
+`InvalidCredentialsError` e `InvalidTlsOptionsError`; Rust devuelve
+`FluxError::ConnectionRejected { reason, .. }`, `FluxError::InvalidCredentials` y
+`FluxError::InvalidTlsOptions`, con `code()` y `class()`. Una aplicación **PUEDE** ramificar por
+estos códigos: son estables.
+
+> **Alcance.** Esto cubre la **primera** conexión. Qué debe hacer un SDK si el broker rechaza
+> las credenciales durante una *re*conexión (una credencial que caduca o se rota) **no está
+> medido**, y esta spec no lo fija: ninguno de estos códigos se define para ese caso.

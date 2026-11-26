@@ -48,7 +48,8 @@ use crate::protocol::{
     STREAM_MAX_AGE,
 };
 use crate::security::{
-    is_fatal_connect_error, parse_violation, validate_nkey_seed, Denial, DenialLog, TlsOptions,
+    connect_error_detail, fatal_connect_kind, parse_violation, validate_nkey_seed, Denial,
+    DenialLog, FatalConnect, TlsOptions,
 };
 
 // ─── Observabilidad ──────────────────────────────────────────────────────────
@@ -60,6 +61,12 @@ use crate::security::{
 /// consumidor es despreciable frente al tráfico de eventos, y es de sobra frecuente para
 /// una alerta de "consumidor atascado" que dispara a los 10 minutos.
 pub const DEFAULT_PENDING_POLL: Duration = Duration::from_secs(15);
+
+/// Cuánto espera la sonda del permiso de pull (`Bus::ensure_pull_allowed`) antes de darse por
+/// no concluyente. Una respuesta o una denegación llegan en ~1 ms; 2 s solo se agotan con un
+/// broker que no contesta, y entonces `subscribe()` sigue —no poder comprobar un permiso no es
+/// lo mismo que no tenerlo— y avisa por el `logger`.
+const PULL_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Severidad de un mensaje del SDK.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -133,9 +140,11 @@ pub enum TenantIsolation {
 
 /// Credenciales de NATS. **NUNCA versionadas** — 06-security.md §2.
 ///
-/// Un valor mal formado (un `.creds` ilegible o sin JWT, una semilla que no es `SU…`) falla
-/// **en [`connect`]**, antes de tocar la red. Una credencial bien formada pero rechazada por
-/// el broker también devuelve el error en `connect()`: reintentarla no la arregla.
+/// Un valor mal formado (un valor vacío, un `.creds` ilegible o sin JWT, una semilla que no es
+/// `SU…`) falla **en [`connect`]**, antes de tocar la red, con [`FluxError::InvalidCredentials`]
+/// (`INVALID_CREDENTIALS`). Una credencial bien formada pero rechazada por el broker también
+/// devuelve el error en `connect()`, con [`FluxError::ConnectionRejected`]
+/// (`CONNECTION_REJECTED`, motivo [`crate::RejectionReason::Auth`]): reintentarla no la arregla.
 ///
 /// `Debug` **no imprime secretos**: un `{:?}` de la configuración acaba en un log.
 #[derive(Clone, Default)]
@@ -703,12 +712,24 @@ fn transport(context: impl Into<String>, source: impl Into<HandlerError>) -> Flu
 ///
 /// # Errores
 ///
-/// [`FluxError::Config`] si falta alguno de los cuatro campos obligatorios o si un valor de
-/// [`Credentials`] / [`TlsOptions`] está mal formado (un `.creds` ilegible, una semilla que
-/// no es `SU…`, una CA que no es PEM) —se comprueba **antes** de tocar la red—,
+/// Los tres códigos estables de la conexión inicial (04-errors.md §5.3), todos PERMANENT:
+///
+/// - [`FluxError::InvalidCredentials`] (`INVALID_CREDENTIALS`) si un valor de [`Credentials`]
+///   está mal formado: vacío, un `.creds` ilegible o sin JWT y semilla, una semilla que no es
+///   `SU…`. Se comprueba **antes** de tocar la red.
+/// - [`FluxError::InvalidTlsOptions`] (`INVALID_TLS_OPTIONS`) si [`TlsOptions`] está mal
+///   formado: un fichero ilegible o que no es PEM, o un certificado de cliente sin su clave.
+///   También **antes** de tocar la red.
+/// - [`FluxError::ConnectionRejected`] (`CONNECTION_REJECTED`) si el broker **sí** contestó y
+///   rechazó la conexión por algo que esperar no arregla: la credencial
+///   ([`crate::RejectionReason::Auth`]) o el handshake TLS ([`crate::RejectionReason::Tls`]: el certificado
+///   no verifica, o se exigió TLS y el broker no lo ofrece). Un broker que no ha arrancado
+///   **no** es esto: se espera.
+///
+/// Además, [`FluxError::Config`] si falta alguno de los cuatro campos obligatorios,
 /// [`FluxError::InvalidServiceName`] si el servicio no es kebab-case —lo que produciría
-/// durables no parseables— y [`FluxError::Transport`] si el broker rechaza la credencial o
-/// el TLS no se puede establecer.
+/// durables no parseables— y [`FluxError::Transport`] si la lista de servidores no se
+/// entiende.
 pub async fn connect(mut opts: ConnectOptions) -> Result<Bus, FluxError> {
     if opts.service.is_empty() || opts.environment.is_empty() || opts.version.is_empty() {
         return Err(FluxError::Config(
@@ -844,7 +865,7 @@ async fn apply_credentials(
             // `credentials_file` lee Y parsea (JWT + semilla): un fichero ilegible o sin
             // las dos secciones falla aquí. Es un error de CONFIGURACIÓN, no de transporte.
             nats.credentials_file(path).await.map_err(|e| {
-                FluxError::Config(format!(
+                FluxError::InvalidCredentials(format!(
                     "el fichero .creds `{}` no se puede usar: {e}. Debe llevar el JWT de \
                      usuario y la semilla `SU…`",
                     path.display()
@@ -858,7 +879,7 @@ async fn apply_credentials(
         }
         Credentials::NkeyFile(path) => {
             let seed = std::fs::read_to_string(path).map_err(|e| {
-                FluxError::Config(format!(
+                FluxError::InvalidCredentials(format!(
                     "no se puede leer el fichero de semilla nkey `{}`: {e}",
                     path.display()
                 ))
@@ -867,11 +888,30 @@ async fn apply_credentials(
             validate_nkey_seed(seed)?;
             nats.nkey(seed.to_string())
         }
-        Credentials::Token(t) => nats.token(t.clone()),
+        Credentials::Token(t) => {
+            not_blank("el token", t)?;
+            nats.token(t.clone())
+        }
         Credentials::UserPassword { user, password } => {
+            not_blank("el usuario", user)?;
+            not_blank("la contraseña", password)?;
             nats.user_and_password(user.clone(), password.clone())
         }
     })
+}
+
+/// Un valor de credencial vacío no es «sin credencial»: es un descuido —una variable de
+/// entorno sin definir— que el broker rechazaría después con un mensaje que no lo dice. Misma
+/// regla que en el SDK de Node (`credentials.<campo>` debe ser un texto no vacío). Nunca se
+/// vuelca el valor: acaba en un log.
+fn not_blank(what: &str, value: &str) -> Result<(), FluxError> {
+    if value.trim().is_empty() {
+        return Err(FluxError::InvalidCredentials(format!(
+            "{what} está vacío: una credencial en blanco suele ser una variable de entorno \
+             sin definir. Si no quieres autenticarte, usa `Credentials::None`"
+        )));
+    }
+    Ok(())
 }
 
 /// Abre la conexión inicial: espera al broker, pero no reintenta lo que no se arregla.
@@ -884,7 +924,7 @@ async fn apply_credentials(
 ///
 /// Aquí el reintento es propio y filtra: el broker que aún no ha arrancado se espera con
 /// backoff y jitter —03-delivery.md §6— y lo que reintentar no arregla se devuelve al
-/// instante ([`is_fatal_connect_error`]).
+/// instante ([`fatal_connect_kind`]), con su código estable (04-errors.md §5.3).
 async fn open_connection(
     nats: &async_nats::ConnectOptions,
     opts: &ConnectOptions,
@@ -895,8 +935,8 @@ async fn open_connection(
             Ok(client) => return Ok(client),
             Err(e) => e,
         };
-        if is_fatal_connect_error(&err) {
-            return Err(fatal_connect_error(opts, err));
+        if let Some(fatal) = fatal_connect_kind(&err) {
+            return Err(fatal_connect_error(opts, fatal, err));
         }
         attempt = attempt.saturating_add(1);
         let wait = connect_backoff(attempt);
@@ -926,23 +966,31 @@ fn connect_backoff(attempt: u32) -> Duration {
 }
 
 /// El error de `connect()` para un fallo que reintentar no arregla, con la causa dicha.
-fn fatal_connect_error(opts: &ConnectOptions, err: async_nats::ConnectError) -> FluxError {
-    use async_nats::ConnectErrorKind as K;
-    let why = match err.kind() {
-        K::AuthorizationViolation | K::Authentication => {
-            "el broker rechazó la credencial de este servicio: revisa `Credentials` y que el \
-             usuario exista en la account"
-        }
-        K::ServerParse => "la lista de servidores no se entiende (`nats://host:4222`)",
-        _ => {
-            "falló el handshake TLS: ¿el broker ofrece TLS?, ¿la CA de `TlsOptions` es la que \
-             firma su certificado?, ¿exige certificado de cliente?"
-        }
-    };
-    transport(
-        format!("no se pudo conectar a `{}`: {why}", opts.servers),
-        err,
-    )
+///
+/// Un rechazo del broker (credencial o TLS) es [`FluxError::ConnectionRejected`], con su
+/// código estable. Una lista de servidores que no se entiende no es un rechazo del broker y
+/// sigue siendo un fallo de transporte sin código.
+fn fatal_connect_error(
+    opts: &ConnectOptions,
+    fatal: FatalConnect,
+    err: async_nats::ConnectError,
+) -> FluxError {
+    match fatal {
+        FatalConnect::Rejected(reason) => FluxError::ConnectionRejected {
+            reason,
+            servers: opts.servers.clone(),
+            detail: connect_error_detail(&err),
+            source: Box::new(err),
+        },
+        FatalConnect::BadServers => transport(
+            format!(
+                "no se pudo conectar a `{}`: la lista de servidores no se entiende \
+                 (`nats://host:4222`)",
+                opts.servers
+            ),
+            err,
+        ),
+    }
 }
 
 impl Bus {
@@ -1276,6 +1324,14 @@ impl Bus {
     /// consumidor, y sobre todo [`FluxError::ConsumerConfigMismatch`] si el servidor
     /// aplicó una configuración distinta de la solicitada — requisito **L2**, y la única
     /// defensa contra la sobrescritura silenciosa de `ack_wait` (03-delivery.md §2.1).
+    ///
+    /// [`FluxError::PermissionDenied`] (`PERMISSION_DENIED`) si la ACL del servicio no
+    /// concede alguno de los permisos que hacen falta, **incluido el de pedir mensajes del
+    /// consumidor** (`$JS.API.CONSUMER.MSG.NEXT.<stream>.<durable>`). Ese último es el
+    /// peligroso: el broker no contesta a un pull denegado, así que sin esta comprobación
+    /// `subscribe()` devolvería `Ok` y el consumidor se quedaría inerte, sin un solo error
+    /// (06-security.md §3.7). Un permiso que se pierda **después** de suscribirse ya no puede
+    /// devolverse como `Result`; solo lo registra el `logger`.
     pub async fn subscribe_with<H: Handler>(
         &self,
         subject: &str,
@@ -1329,6 +1385,11 @@ impl Bus {
 
         // El servidor no siempre devuelve lo que se le pide. Requisito L2.
         assert_config_honored(&durable, &requested, &consumer.cached_info().config)?;
+
+        // Sin permiso de pull el consumidor queda inerte y PARECE sano: es el peor modo de
+        // fallo, y se descubriría semanas después por la ausencia de eventos. 06-security.md
+        // §3.7 manda fallar aquí, antes de arrancar nada.
+        self.ensure_pull_allowed(&stream_name, &durable).await?;
 
         let mut messages = consumer
             .messages()
@@ -2019,6 +2080,69 @@ impl Bus {
         }
     }
 
+    /// Comprueba que el servicio PUEDE pedir mensajes de su consumidor, o falla con
+    /// [`FluxError::PermissionDenied`] nombrando el subject denegado.
+    ///
+    /// **Por qué una sonda y no esperar al primer pull.** Un pull denegado no da error: el
+    /// servidor descarta el mensaje y manda un `-ERR` aparte (A-20, A-28). El SDK de Node lo
+    /// detecta arrancando el bucle, cediendo un turno y haciendo un `flush`, que allí es un
+    /// PING/PONG: el `-ERR` llega antes que el PONG porque el protocolo es ordenado. Aquí no
+    /// hay equivalente. El `flush()` de `async-nats` solo vacía el buffer de escritura —no hace
+    /// ida y vuelta— y el primer pull lo publica una tarea de fondo de la librería, sin orden
+    /// respecto a quien llama: esperar «un poco» y mirar sería una carrera. Se midió: con el
+    /// permiso quitado, `subscribe()` devolvía `Ok` a los ~4 ms y la denegación se registraba
+    /// ~2 ms **después**.
+    ///
+    /// Lo determinista es no depender del pull de la librería: se pregunta lo mismo sobre
+    /// **el mismo subject** (`$JS.API.CONSUMER.MSG.NEXT.<stream>.<durable>`, el que usará el
+    /// pull) con una petición propia y se compite su respuesta con la denegación, que es el
+    /// mecanismo de [`Self::guarded`]. El cuerpo es un JSON truncado, `{`, **a propósito**: el
+    /// servidor lo contesta `400 Bad Request` al instante, sin apuntar la petición como
+    /// pendiente y sin sacar ningún mensaje del consumidor —cualquier pull válido podría
+    /// llevarse uno, que quedaría sin ack hasta `ack_wait—. Medido contra nats-server 2.14.5:
+    /// `400 Bad Request - unexpected end of JSON input` en ~0,4 ms. Lo único que importa de la
+    /// respuesta es que **no** sea una denegación.
+    ///
+    /// Si la sonda no obtiene respuesta ni denegación (el broker no contesta, o contesta algo
+    /// inesperado) **no** se falla: se avisa por el `logger` y se sigue. No poder comprobarlo
+    /// no es lo mismo que estar denegado, y una denegación posterior sigue llegando al
+    /// `logger` por su cauce de siempre.
+    async fn ensure_pull_allowed(&self, stream_name: &str, durable: &str) -> Result<(), FluxError> {
+        let subject = format!("$JS.API.CONSUMER.MSG.NEXT.{stream_name}.{durable}");
+        let probe = tokio::time::timeout(
+            PULL_PROBE_TIMEOUT,
+            self.inner.client.request(subject.clone(), "{".into()),
+        );
+        match self.guarded(&[subject], probe).await {
+            Err(denial) => Err(permission_denied(
+                format!(
+                    "pedir mensajes del consumidor `{durable}` del stream `{stream_name}` \
+                     (sin ese permiso el consumidor se quedaría inerte, sin recibir nada y sin \
+                     ningún error)"
+                ),
+                &denial,
+            )),
+            Ok(Ok(Ok(reply))) if reply.status.is_some_and(|st| st == 400) => Ok(()),
+            Ok(other) => {
+                self.log(
+                    LogLevel::Warn,
+                    &format!(
+                        "no se pudo comprobar el permiso de pull de `{durable}` en \
+                         `{stream_name}`: la sonda no obtuvo el 400 esperado ({}). Si la ACL no \
+                         concede `$JS.API.CONSUMER.MSG.NEXT.{stream_name}.{durable}`, el \
+                         consumidor se quedará inerte y solo lo dirá este logger",
+                        match other {
+                            Ok(Ok(reply)) => format!("respuesta {:?}", reply.status),
+                            Ok(Err(e)) => e.to_string(),
+                            Err(_) => format!("sin respuesta en {PULL_PROBE_TIMEOUT:?}"),
+                        }
+                    ),
+                );
+                Ok(())
+            }
+        }
+    }
+
     /// Ejecuta una petición al broker vigilando las denegaciones de permisos — ver
     /// [`crate::security`].
     ///
@@ -2034,19 +2158,28 @@ impl Bus {
             .await
     }
 
-    /// El consumidor durable: lo crea (o lo reconcilia) y, si la ACL no se lo permite, usa
-    /// el que **ya existe** porque lo aprovisionó infraestructura.
+    /// El consumidor durable: **pregunta primero** si existe, y solo si no existe lo crea.
     ///
     /// ```text
-    /// CONSUMER.CREATE concedido           → crea / reconcilia (desarrollo, o ACL amplia)
-    /// CONSUMER.CREATE denegado + existe   → lo usa tal cual; `assert_config_honored`
-    ///                                       sigue comparando su config con la canónica
-    /// CONSUMER.CREATE denegado + no existe → NotProvisioned (nombra el consumidor)
-    /// ni crear ni consultar               → PermissionDenied
+    /// CONSUMER.INFO → existe                    → lo usa tal cual; `assert_config_honored`
+    ///                                             sigue comparando su config con la canónica
+    /// CONSUMER.INFO → no existe
+    ///   + CONSUMER.CREATE concedido             → lo crea (desarrollo, o ACL amplia)
+    ///   + CONSUMER.CREATE denegado              → NotProvisioned (nombra el consumidor)
+    /// CONSUMER.INFO denegado                    → PermissionDenied (ni siquiera puede mirar)
     /// ```
     ///
-    /// El segundo caso es el de producción con `flux provision`: la ACL de un servicio puede
-    /// omitir `CONSUMER.CREATE` y conservar `CONSUMER.INFO`, `MSG.NEXT` y los acks.
+    /// **Por qué info antes de crear** (06-security.md §3.4, y es lo que hace el SDK de Node):
+    /// en producción `flux provision` crea el consumidor y la ACL del servicio **no** concede
+    /// `CONSUMER.CREATE`. Intentar crear primero provocaba, en cada arranque, una denegación
+    /// que el broker dejaba escrita en su log (`Publish Violation - Subject
+    /// "$JS.API.CONSUMER.CREATE…"`) aunque el SDK la absorbiera: ruido que entierra las
+    /// violaciones de verdad, y una ACL que funciona «con un error por arranque». Preguntar
+    /// primero lo deja en cero.
+    ///
+    /// «No existe» y «no puedo crearlo» son **dos** respuestas del broker, y `NotProvisioned`
+    /// nace de la pareja: consultar → no existe **y** crear → denegado. Una denegación sola no
+    /// lo es (un `CREATE` denegado sobre un consumidor que existe ni se intenta).
     async fn obtain_consumer(
         &self,
         js_stream: &stream::Stream,
@@ -2054,25 +2187,50 @@ impl Bus {
         durable: &str,
         requested: consumer::pull::Config,
     ) -> Result<consumer::Consumer<consumer::pull::Config>, FluxError> {
+        // 1. ¿Existe ya? (lo normal en producción: lo aprovisionó infraestructura)
+        if let Some(existing) = self.consumer_info(js_stream, stream_name, durable).await? {
+            return Ok(existing);
+        }
+
+        // 2. No existe: crearlo, si la ACL lo permite.
         let create = format!(
             "$JS.API.CONSUMER.CREATE.{stream_name}.{durable}.{}",
             requested.filter_subject
         );
-        let denial = match self
+        match self
             .guarded(&[create], js_stream.create_consumer(requested))
             .await
         {
-            Ok(Ok(consumer)) => return Ok(consumer),
-            Ok(Err(e)) => {
-                return Err(transport(
+            Ok(Ok(consumer)) => Ok(consumer),
+            Ok(Err(create_error)) => {
+                // Otra instancia del servicio pudo crearlo entre la pregunta y la creación.
+                if let Ok(Some(existing)) =
+                    self.consumer_info(js_stream, stream_name, durable).await
+                {
+                    return Ok(existing);
+                }
+                Err(transport(
                     format!("no se pudo crear el consumidor `{durable}` en `{stream_name}`"),
-                    e,
+                    create_error,
                 ))
             }
-            Err(denial) => denial,
-        };
+            Err(denial) => Err(FluxError::NotProvisioned {
+                kind: ResourceKind::Consumer,
+                name: durable.to_string(),
+                denied: denial.describe(),
+            }),
+        }
+    }
 
-        // No puede crearlo. ¿Existe ya?
+    /// `CONSUMER.INFO` del durable: `Some` si existe, `None` si el servidor contesta «no
+    /// existe» (error 10014), y un error si no se puede saber —sin permiso de consulta es
+    /// [`FluxError::PermissionDenied`]—.
+    async fn consumer_info(
+        &self,
+        js_stream: &stream::Stream,
+        stream_name: &str,
+        durable: &str,
+    ) -> Result<Option<consumer::Consumer<consumer::pull::Config>>, FluxError> {
         let info = format!("$JS.API.CONSUMER.INFO.{stream_name}.{durable}");
         match self
             .guarded(&[info], js_stream.consumer_info(durable))
@@ -2089,24 +2247,23 @@ impl Bus {
                             e,
                         )
                     })?;
-                Ok(consumer::Consumer::new(config, info, self.inner.js.clone()))
+                Ok(Some(consumer::Consumer::new(
+                    config,
+                    info,
+                    self.inner.js.clone(),
+                )))
             }
-            Ok(Err(e)) if matches!(e.kind(), ConsumerInfoErrorKind::NotFound) => {
-                Err(FluxError::NotProvisioned {
-                    kind: ResourceKind::Consumer,
-                    name: durable.to_string(),
-                    denied: denial.describe(),
-                })
-            }
+            Ok(Err(e)) if matches!(e.kind(), ConsumerInfoErrorKind::NotFound) => Ok(None),
             Ok(Err(e)) => Err(transport(
                 format!("no se pudo consultar el consumidor `{durable}` en `{stream_name}`"),
                 e,
             )),
-            Err(_) => Err(permission_denied(
+            Err(denial) => Err(permission_denied(
                 format!(
-                    "crear ni consultar el consumidor `{durable}` en `{stream_name}` \
-                     (la ACL debe conceder CONSUMER.CREATE o, si lo aprovisiona \
-                     infraestructura, CONSUMER.INFO)"
+                    "consultar el consumidor `{durable}` en `{stream_name}` (la ACL debe \
+                     conceder `$JS.API.CONSUMER.INFO.{stream_name}.{durable}`: es lo que el \
+                     SDK pregunta antes de crear, y lo único que necesita si lo aprovisiona \
+                     infraestructura)"
                 ),
                 &denial,
             )),
@@ -2686,7 +2843,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn un_creds_mal_formado_es_un_error_de_configuracion() {
+    async fn un_creds_mal_formado_es_invalid_credentials() {
         let dir = TmpDir::new();
         for (nombre, contenido) in [
             ("vacio.creds", ""),
@@ -2703,7 +2860,11 @@ mod tests {
             )
             .await
             .unwrap_err();
-            assert!(matches!(err, FluxError::Config(_)), "{nombre}: {err:?}");
+            assert!(
+                matches!(err, FluxError::InvalidCredentials(_)),
+                "{nombre}: {err:?}"
+            );
+            assert_eq!(err.code(), Some("INVALID_CREDENTIALS"));
             assert!(err.to_string().contains(".creds"), "{err}");
         }
         let err = apply_credentials(
@@ -2712,7 +2873,7 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert!(matches!(err, FluxError::Config(_)), "{err:?}");
+        assert!(matches!(err, FluxError::InvalidCredentials(_)), "{err:?}");
     }
 
     /// Las cinco formas se cablean; las dos de nkey validan la semilla antes de aceptarla.
@@ -2748,7 +2909,53 @@ mod tests {
             let err = apply_credentials(async_nats::ConnectOptions::new(), &malo)
                 .await
                 .unwrap_err();
-            assert!(matches!(err, FluxError::Config(_)), "{malo:?}: {err:?}");
+            assert!(
+                matches!(err, FluxError::InvalidCredentials(_)),
+                "{malo:?}: {err:?}"
+            );
+        }
+    }
+
+    /// Un valor en blanco no es «sin credencial»: es una variable de entorno sin definir. Se
+    /// rechaza antes de tocar la red —como en Node— y sin volcar el valor. Y lo contrario: un
+    /// valor con contenido, aunque lleve espacios dentro, se acepta.
+    #[tokio::test]
+    async fn un_token_usuario_o_contrasena_en_blanco_es_invalid_credentials() {
+        for malo in [
+            Credentials::Token(String::new()),
+            Credentials::Token("   ".into()),
+            Credentials::UserPassword {
+                user: String::new(),
+                password: "pw".into(),
+            },
+            Credentials::UserPassword {
+                user: "ana".into(),
+                password: " \t".into(),
+            },
+        ] {
+            let err = apply_credentials(async_nats::ConnectOptions::new(), &malo)
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err, FluxError::InvalidCredentials(_)),
+                "{malo:?}: {err:?}"
+            );
+            assert_eq!(err.code(), Some("INVALID_CREDENTIALS"));
+            assert!(err.to_string().contains("Credentials::None"), "{err}");
+        }
+        for bueno in [
+            Credentials::Token("tok en".into()),
+            Credentials::UserPassword {
+                user: "ana".into(),
+                password: "con espacio".into(),
+            },
+        ] {
+            assert!(
+                apply_credentials(async_nats::ConnectOptions::new(), &bueno)
+                    .await
+                    .is_ok(),
+                "{bueno:?}"
+            );
         }
     }
 
