@@ -78,7 +78,7 @@ final class Protocol
      * `<dominio>.<agregado>.v<major>.<evento>`, sin delimitadores de PCRE para poder
      * compararlo carácter a carácter con `protocol.json` en los tests.
      */
-    public const SUBJECT_PATTERN = '^[a-z0-9]+(-[a-z0-9]+)*\.[a-z0-9]+(-[a-z0-9]+)*\.v[1-9][0-9]*\.[a-z0-9]+(-[a-z0-9]+)*$';
+    public const SUBJECT_PATTERN = '^[a-z0-9]+(-[a-z0-9]+)*\.[a-z0-9]+(-[a-z0-9]+)*\.v[1-9][0-9]{0,3}\.[a-z0-9]+(-[a-z0-9]+)*$';
 
     /**
      * Nombre de servicio. NATS aceptaría un durable `FacturacionAPI__pedidos_…` sin

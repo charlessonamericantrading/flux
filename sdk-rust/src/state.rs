@@ -90,8 +90,8 @@ use crate::client::{
 };
 use crate::context::{self, EventContext};
 use crate::envelope::{
-    format_time, parse_event, serialize, to_dlq_event, DataClassification, DlqInfo, DlqReason,
-    Event,
+    canonical_data, format_time, parse_event, require_non_empty, serialize, to_dlq_event,
+    DataClassification, DlqInfo, DlqReason, Event,
 };
 use crate::errors::{
     as_classified, Classification, ConfigDifference, ErrorClass, FluxError, HandlerError,
@@ -207,7 +207,8 @@ impl StateContract {
         }
         let Some(major) = parse_major(tokens[2]) else {
             return Err(invalid(
-                "el tercer token debe ser la versión mayor: literal `v` + entero >= 1 (`v1`)",
+                "el tercer token debe ser la versión mayor: literal `v` + un entero de 1 a 4 dígitos, \
+                 sin ceros a la izquierda (`v1`…`v9999`)",
             ));
         };
         Ok(Self {
@@ -594,20 +595,6 @@ pub struct StateTombstoneInput {
     pub tracestate: Option<String>,
 }
 
-/// Campos obligatorios que no pueden llegar vacíos: mismo criterio que `build_event`.
-fn require_non_empty(fields: &[(&str, &str)]) -> Result<(), FluxError> {
-    for (name, value) in fields {
-        if value.is_empty() {
-            return Err(FluxError::Envelope(format!(
-                "`{name}` es obligatorio y llegó vacío. Lo rellena el SDK a partir de \
-                 ConnectOptions; si estás construyendo la entrada a mano, rellénalo \
-                 (01-envelope.md §5)"
-            )));
-        }
-    }
-    Ok(())
-}
-
 #[allow(clippy::too_many_arguments)]
 fn assemble(
     contract: &StateContract,
@@ -675,17 +662,19 @@ pub fn build_state_event(input: StateEventInput) -> Result<Event, FluxError> {
     let contract = StateContract::parse(&input.contract)?;
     validate_state_key(&input.key)?;
     validate_state_tenant(&input.tenant_id)?;
-    let data: Value = serde_json::from_str(input.data.get())
+    let value: Value = serde_json::from_str(input.data.get())
         .map_err(|e| FluxError::Envelope(format!("`data` no es JSON válido: {e}")))?;
-    aggregate_version_of(&data)?;
+    aggregate_version_of(&value)?;
     reject_restricted(input.classification)?;
     require_non_empty(&[
-        ("id", &input.id),
-        ("source", &input.source),
-        ("dataschema", &input.dataschema),
-        ("correlationid", &input.correlationid),
-        ("producerversion", &input.producerversion),
+        ("id", &input.id, false),
+        ("source", &input.source, false),
+        ("dataschema", &input.dataschema, false),
+        ("correlationid", &input.correlationid, true),
+        ("producerversion", &input.producerversion, true),
     ])?;
+    // La forma canónica de `data` (01-envelope.md §4.1): sin espacios, UTF-8 literal, una clave repetida una sola vez.
+    let data = canonical_data(&input.data).map_err(FluxError::Envelope)?;
     Ok(assemble(
         &contract,
         false,
@@ -701,7 +690,7 @@ pub fn build_state_event(input: StateEventInput) -> Result<Event, FluxError> {
         input.causationid,
         input.traceparent,
         input.tracestate,
-        input.data,
+        data,
     ))
 }
 
@@ -717,10 +706,10 @@ pub fn build_state_tombstone(input: StateTombstoneInput) -> Result<Event, FluxEr
     validate_state_tenant(&input.tenant_id)?;
     let version = check_version_number(input.aggregate_version)?;
     require_non_empty(&[
-        ("id", &input.id),
-        ("source", &input.source),
-        ("correlationid", &input.correlationid),
-        ("producerversion", &input.producerversion),
+        ("id", &input.id, false),
+        ("source", &input.source, false),
+        ("correlationid", &input.correlationid, true),
+        ("producerversion", &input.producerversion, true),
     ])?;
     let data = serde_json::value::to_raw_value(&json!({ "aggregateVersion": version }))
         .map_err(|e| FluxError::Envelope(format!("la lápida no es serializable: {e}")))?;
@@ -5366,8 +5355,24 @@ mod tests {
             con(&|i| i.data = raw_of(&json!([1]))).as_deref(),
             Some("MISSING_AGGREGATE_VERSION")
         );
-        // Un campo obligatorio vacío es un error del que construye, no uno de los seis.
-        assert_eq!(con(&|i| i.id = String::new()), None);
+        // Un campo obligatorio vacío es un error del que construye, no uno de los siete de estado: lleva el código que daría el
+        // parser ante el mismo defecto (el conjunto de estado es cerrado y ninguno de sus siete encaja).
+        assert_eq!(
+            con(&|i| i.id = String::new()).as_deref(),
+            Some("MISSING_REQUIRED_ATTRIBUTE")
+        );
+        assert_eq!(
+            con(&|i| i.source = String::new()).as_deref(),
+            Some("MISSING_REQUIRED_ATTRIBUTE")
+        );
+        assert_eq!(
+            con(&|i| i.correlationid = String::new()).as_deref(),
+            Some("MISSING_REQUIRED_EXTENSION")
+        );
+        assert_eq!(
+            con(&|i| i.producerversion = String::new()).as_deref(),
+            Some("MISSING_REQUIRED_EXTENSION")
+        );
     }
 
     #[test]

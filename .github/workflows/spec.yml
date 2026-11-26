@@ -633,6 +633,13 @@ jobs:
       - name: Vectores idénticos en todos los SDKs
         run: node conformance/cross-sdk.mjs --verbose --exigir state,rpc
 
+      # Los 93 vectores de «Ajustes» (conformance/harness/vectors.json → ajustesVectors): lo que se decidió donde la
+      # spec callaba o discrepaba (dlqerror en bytes, `maxLength` en puntos de código, versión mayor de 1 a 4
+      # dígitos, `id`/`source` vacíos, `time` canónico, `data` canónico). Son de CUALQUIER operación de estado o de
+      # rpc y de dos SDKs (`ajustesSdks`), por eso los ejecuta su propio runner y no cross-sdk.mjs.
+      - name: Los ajustes (93 vectores) dan lo decidido en Node y Rust
+        run: node conformance/ajustes.mjs
+
       # Las operaciones de estado (state-build, state-tombstone, state-subject, state-dlq) y de petición/respuesta
       # (rpc-request, rpc-reply, rpc-error, rpc-operation, rpc-timeout) las ejecutan SOLO los SDKs que declaran
       # `state` o `rpc` en protocol.json (Node y Rust): los otros cinco salen «N/A: no declara …» en el paso de

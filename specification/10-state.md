@@ -108,8 +108,9 @@ CloudEvents ([01-envelope.md §2.1](01-envelope.md)), que aquí vale la clave.
 El **nombre de contrato** de un estado es `<dominio>.<agregado>.v<major>` (`clientes.cliente.v1`):
 el subject sin `state.`, sin tenant y sin clave. Es lo que recibe `state.watch` y lo que figura
 en las métricas. Una cadena que no tiene esa forma —`clientes.cliente` sin versión,
-`clientes.cliente.v1.creado` con cuatro tokens, `Clientes.cliente.v1` con mayúsculas— es
-**`INVALID_STATE_CONTRACT`** (PERMANENT); un dominio reservado ([§2.7](#27-dominios-reservados)),
+`clientes.cliente.v1.creado` con cuatro tokens, `Clientes.cliente.v1` con mayúsculas,
+`clientes.cliente.v10000` con una versión de cinco dígitos —el tope es `v9999`,
+[02-naming.md §1](02-naming.md)— es **`INVALID_STATE_CONTRACT`** (PERMANENT); un dominio reservado ([§2.7](#27-dominios-reservados)),
 `RESERVED_DOMAIN`, que se evalúa antes (§3.6).
 
 **Por qué el tenant va en el subject y no solo en el sobre.** Con el tenant solo en el sobre, dos
@@ -704,7 +705,8 @@ PERMANENT, o agota sus reintentos, manda la entrada a la **DLQ de estado**.
   ahí tres meses y **el derecho de supresión no se cumpliría**. El resto del sobre queda como
   estaba, también `dataclassification`.
 - **`dlqerror` NO DEBE contener valores de `data`**: código, y como mucho la ruta del campo
-  (`INVALID_SCHEMA: /pais …`, nunca el valor). Es la misma razón, vista desde el texto.
+  (`INVALID_SCHEMA: /pais …`, nunca el valor). Es la misma razón, vista desde el texto. Y mide
+  **1024 bytes UTF-8 como máximo**, cortado sin partir un carácter ([04-errors.md §3](04-errors.md)).
 - **Un error que no es de flux no deja su mensaje en la DLQ.** Lo que lanza un driver de base de
   datos (`duplicate key value violates unique constraint … Key (email)=(ana@example.com)`) cita la
   fila entera, y la DLQ guarda 90 días. Un error **de flux** —los del SDK y los que lanza la

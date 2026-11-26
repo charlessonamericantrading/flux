@@ -105,6 +105,11 @@ class TestSubject:
 
         assert SUBJECT_PATTERN.pattern == PROTOCOL["naming"]["subject"]["pattern"]
 
+    def test_el_mayor_admite_hasta_cuatro_digitos(self):
+        # 02-naming.md §1: el tope de 4 dígitos es el de protocol.json; v10000 no es un subject.
+        assert parse_subject("pedidos.pedido.v9999.creado").major == 9999
+        assert not is_valid_subject("pedidos.pedido.v10000.creado")
+
     def test_las_mayusculas_dan_un_mensaje_sobre_el_subject_fantasma(self):
         # El mensaje importa: NATS acepta el publish sin error y el evento simplemente
         # no existe para nadie (conformance/cases/broker-invariants.json).
@@ -124,6 +129,7 @@ class TestSubject:
             "pedidos.crear-pedido",  # comando, y le faltan tokens
             "pedidos.pedido.1.creado",  # falta la 'v'
             "pedidos.pedido.v0.creado",  # el mayor empieza en 1
+            "pedidos.pedido.v99999.creado",  # el mayor lleva de 1 a 4 dígitos
             "pedidos.pedido_v1.creado",  # guion bajo prohibido
             "pedidos..v1.creado",  # token vacío
             "pedidos.pedido.v1.creado ",  # espacio

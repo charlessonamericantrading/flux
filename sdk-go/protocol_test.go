@@ -71,10 +71,22 @@ func TestParseSubjectRechazaTokensIncorrectos(t *testing.T) {
 	}
 }
 
+func TestParseSubjectAdmiteHastaCuatroDigitosDeMajor(t *testing.T) {
+	// 02-naming.md §1: el tope de 4 dígitos es el de protocol.json; v10000 no es un subject.
+	got, err := ParseSubject("pedidos.pedido.v9999.creado")
+	if err != nil || got.Major != 9999 {
+		t.Fatalf("ParseSubject(v9999) = %+v, %v; se esperaba major 9999", got, err)
+	}
+	if IsValidSubject("pedidos.pedido.v10000.creado") {
+		t.Error("IsValidSubject(v10000) = true, se esperaba false")
+	}
+}
+
 func TestParseSubjectRechazaFormatosInvalidos(t *testing.T) {
 	invalidos := []string{
 		"pedidos.pedido.1.creado",        // falta la 'v'
 		"pedidos.pedido.v0.creado",       // v0 no existe: el major empieza en 1
+		"pedidos.pedido.v99999.creado",   // el major lleva de 1 a 4 dígitos
 		"pedidos.pedido.v1.creado_x",     // guion bajo prohibido
 		"pedidos.pedido.v1.creado nuevo", // espacio prohibido
 		"pedidos.pedido.v1.*",            // wildcard no es un subject

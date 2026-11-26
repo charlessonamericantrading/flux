@@ -199,6 +199,7 @@ llamada: `timeoutMs`, `tenantId`, `classification`). **Todo lo demás lo rellena
 | `dataclassification` | La de la llamada; si no, la de la conexión (§3.6) |
 | `partitionkey` | El `aggregateId`, si se da: la misma convención que en los eventos, aunque aquí no particione nada |
 | `traceparent` | El contexto de trazas activo |
+| `tracestate` | El del evento o la petición **en curso**, junto a su `traceparent`; ausente si no hay |
 | `data` | Un **objeto** JSON ([01-envelope.md §4](01-envelope.md)) |
 
 **Una llamada hecha dentro de un handler continúa la cadena**: dentro de un handler de eventos o de otra
@@ -222,6 +223,7 @@ La respuesta **hereda** de la petición y **no se escribe a mano**:
 | `subject`, `partitionkey` | Los de la petición, si los traía |
 | `dataclassification` | La de la operación; si no, la de la conexión. Un error, `internal` |
 | `traceparent` | El contexto del que responde, **de la misma traza** |
+| `tracestate` | **Ausente**: la respuesta y el error llevan solo `traceparent`. Rust lo escribía si se lo daban y Node no |
 | `data` | Lo que devuelve el handler: un **objeto** |
 
 Va dirigida al subject de respuesta (`reply`) de la petición, que es un inbox privado y único por llamada
@@ -242,7 +244,7 @@ Cuando el handler falla, o cuando el SDK de quien responde rechaza la petición,
 |---|---|
 | `class` | **`retryable` o `permanent`**, y nada más. `poison` **no viaja** (más abajo) |
 | `code` | Identificador **estable** (`errors.codePattern`): el que agrupa el panel y el que ramifica la aplicación. Nunca el mensaje |
-| `message` | Qué falló y cómo se arregla. **NO DEBE** contener valores de `data` (acaba en logs) ni —para un error no lanzado a propósito— el texto de una excepción |
+| `message` | Qué falló y cómo se arregla. De **1 a 1000 caracteres Unicode** (puntos de código, como `maxLength` de JSON Schema: mil emojis caben; el «tamaño» en unidades UTF-16 de JavaScript o en bytes no cuenta). **NO DEBE** contener valores de `data` (acaba en logs) ni —para un error no lanzado a propósito— el texto de una excepción. Quien responde **trunca** el de la aplicación que no cabe a 999 caracteres + `…`, y sustituye uno vacío o solo de espacios por «el servicio rechazó la petición» |
 | `retryAfterMs` | Opcional, entero ≥ 0, **solo con `retryable`**: una sugerencia para el *primer* reintento, como en [04-errors.md §2.2](04-errors.md) |
 
 - **`dataclassification: internal`**, siempre, y `dataschema` fijo:
@@ -431,8 +433,12 @@ Cada fila está medida contra un broker real (los casos son los de [§2](#2-mode
    el que responde no pudo leer ([§5.2](#52-lo-que-no-cumple-y-qué-se-contesta)) lleva `correlationid` propio y
    `tenantid` = `system`; ahí quien llama **no** aplica esta comprobación, y le basta la 3 (su `causationid` es el
    `id` de la petición, que solo él conoce) para atribuirlo y ver el código del sobre (`INVALID_RPC_CALL`,
-   `INVALID_TYPE`…) en vez de `RPC_INVALID_REPLY`. Sin esa excepción, un error legítimo sería rechazado por la
-   comprobación que existe para detectar lo ilegítimo.
+   `MALFORMED_JSON`…) en vez de `RPC_INVALID_REPLY`. Sin esa excepción, un error legítimo sería rechazado por la
+   comprobación que existe para detectar lo ilegítimo. **La forma es estrecha a propósito**: la excepción exige que sea
+   un **error** (`com.flux.rpc.error.v1`), con `tenantid` = `system` **y** `correlationid` **igual al `id` del propio
+   error**. Un `tenantid: system` cualquiera, un `correlationid` cualquiera o una respuesta que no es un error siguen
+   siendo `RPC_INVALID_REPLY`; y las comprobaciones 3 y 5 siguen en pie. Medida contra un broker real con un responder en
+   bruto (Node, Rust y `flux call`; A-120).
 5. Si es un error, su `data` cumple el esquema del error (`class` ∈ `retryable | permanent`, `code` y `message`).
 
 **El SDK NO DEBE suscribirse, por la misma conexión que pide, a un subject que case con el `reply` de sus
@@ -520,8 +526,10 @@ para un fallo que no se arregla esperando —el modo de fallo que la taxonomía 
 
 - **Si la petición ni siquiera se puede leer**, no hay `correlationid` ni `tenantid` que heredar: el error lleva
   `correlationid` = su propio `id`, `tenantid` = `system` (es un aviso de plataforma sobre un mensaje que no se
-  pudo atribuir) y `causationid` = el `id` de la petición **solo si es una cadena válida**. *Decidido
-  provisionalmente.*
+  pudo atribuir) y `causationid` = el `id` de la petición **solo si es una cadena válida**: **no vacía, de 128
+  caracteres Unicode como máximo y sin caracteres de control** (U+0000–U+001F ni U+007F–U+009F). Es lo que el error cita:
+  un valor que quien llama no reconocería como suyo, o que llena un log, no se copia. Node aceptaba hasta 256 y
+  controles; Rust, hasta 128 y sin ellos. *Decidido provisionalmente.*
 - **El mensaje cita rutas, no valores**, con una frase que diga **qué** estaba mal —«la petición no cumple…» o
   «la respuesta no cumple…»— porque quien llama recibe el mismo `INVALID_SCHEMA` en los dos casos y debe saber a
   quién arreglar. Es la regla de [10-state.md §3.6](10-state.md), por la misma razón.
@@ -534,6 +542,7 @@ para un fallo que no se arregla esperando —el modo de fallo que la taxonomía 
 |---|---|---|---|
 | lanza `RetryableError` | `retryable` (con `retryAfterMs` si lo da) | el suyo, o `RETRYABLE` | el de la aplicación |
 | lanza `PermanentError` | `permanent` | el suyo, o `PERMANENT` | el de la aplicación |
+| lanza un `PoisonError` (la calificación de quien *consume*, no de quien responde) | `permanent`: `poison` no viaja | el suyo, o **`PERMANENT`** —el código de la clase con la que viaja, no el de la que no viaja—: Node contestaba `POISON` y Rust `PERMANENT` | el de la aplicación |
 | lanza un error que el **clasificador reconoce** (un 503 de una dependencia, `ECONNRESET`) | su clase (`retryable` / `permanent`) | el del clasificador (`HTTP_503`) si cumple `errors.codePattern`; si no, `RETRYABLE` / `PERMANENT` | **genérico** («dependencia no disponible») |
 | lanza un error **desconocido** | **`permanent`** | `UNKNOWN` | **genérico**: «error interno del servicio» |
 | devuelve algo que no es un objeto | `permanent` | `INVALID_SCHEMA` | «la respuesta no es un objeto» |
@@ -608,7 +617,7 @@ no un código que cada SDK inventa. Se documentan en [04-errors.md §7](04-error
 | `STALE_REQUEST` | **PERMANENT** | quien responde (en un error) | Firma en `require` y `time` a más de 300 s |
 | `RPC_INVALID_REPLY` | **PERMANENT** | `request` | Lo que llega no es la respuesta a esta petición (§4.3) |
 | `RPC_MESSAGE_TOO_LARGE` | **PERMANENT** | `request`; quien responde (en un error) | El mensaje no cabe (§4.4, §5.4) |
-| `INVALID_RPC_CALL` | **PERMANENT** | `request`, `respond`; quien responde (en un error) | Operación mal formada, `timeoutMs` fuera de rango, `data` que no es un objeto; o, en quien responde, un `type` que no es el de la operación |
+| `INVALID_RPC_CALL` | **PERMANENT** | `request`, `respond`; quien responde (en un error); **los constructores del sobre** | Operación mal formada (la versión mayor, de 1 a 4 dígitos), `timeoutMs` fuera de rango, `data` que no es un objeto; o, en quien responde, un `type` que no es el de la operación. En un **constructor** (el arnés cruzado: `rpc-request`, `rpc-reply`, `rpc-error`): un atributo que rellena el SDK que llega vacío, un `time` que no es un instante RFC 3339, o un error que no cumple su esquema (§3.3): un código estable, nunca una excepción sin código |
 
 **Por qué estos seis y no menos.** `RPC_UNAVAILABLE` y `RPC_TIMEOUT` son las dos situaciones que **solo existe
 aquí** y con **clases distintas en la práctica**: la primera no gasta tiempo, la segunda sí y es ambigua.
@@ -901,3 +910,8 @@ serlo cuando haya servicios en producción:
 | 16 | El doctor compara contra `rpc.*.*.*.*` y marca también los filtros anchos sin acuse | §8 |
 | 17 | La compatibilidad se invierte para la petición: sin `x-extensible-enum`; el dueño despliega primero | §11.2 |
 | 18 | El SDK limita los handlers concurrentes (~256) | §5.6 |
+| 19 | La excepción de la comprobación 4 es **estrecha**: un error con `tenantid: system` y `correlationid` igual a su propio `id` | §4.3 |
+| 20 | `message` del error: 1000 **caracteres Unicode**, no unidades UTF-16 ni bytes | §3.3 |
+| 21 | El `id` que cita un error de una petición ilegible: no vacío, ≤ 128 caracteres, sin controles | §5.2 |
+| 22 | Un `PoisonError` del handler lleva `PERMANENT` si no trae código; un mensaje solo de espacios se sustituye | §5.3 |
+| 23 | Los constructores del sobre rechazan lo vacío, un `time` que no es un instante y un error mal formado con `INVALID_RPC_CALL` | §6 |

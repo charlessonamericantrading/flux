@@ -132,7 +132,7 @@ func TotalTimeToDLQ() time.Duration {
 
 // SubjectPattern valida `<dominio>.<agregado>.v<major>.<evento>` — 02-naming.md §1.
 var SubjectPattern = regexp.MustCompile(
-	`^[a-z0-9]+(-[a-z0-9]+)*\.[a-z0-9]+(-[a-z0-9]+)*\.v[1-9][0-9]*\.[a-z0-9]+(-[a-z0-9]+)*$`,
+	`^[a-z0-9]+(-[a-z0-9]+)*\.[a-z0-9]+(-[a-z0-9]+)*\.v[1-9][0-9]{0,3}\.[a-z0-9]+(-[a-z0-9]+)*$`,
 )
 
 // ParsedSubject son los cuatro tokens de un subject ya validado.

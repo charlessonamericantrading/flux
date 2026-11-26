@@ -165,6 +165,18 @@ solo hay que borrar las extensiones `dlq*` y republicar en el subject original. 
 un wrapper habría que desenvolver, y cada consumidor de la DLQ tendría que conocer dos
 formatos. El replay se convierte en `jq 'del(.dlq*)'`.
 
+**`dlqerror` mide 1024 bytes UTF-8 como máximo, y se corta sin partir un carácter.** Es un texto libre que acaba en
+un almacén de 90 días, no un campo con esquema: lo que cuenta es el tamaño que ocupa, **en bytes**, no «caracteres».
+Si no cabe, el SDK conserva los caracteres **enteros** que caben —el corte cae en la frontera del último carácter que
+entra— y descarta el resto: `a`×1023 + `é` (1025 bytes) queda en `a`×1023; `a`×1021 + `😀` + `b` queda en `a`×1021;
+`a`×1022 + `é` (exactamente 1024 bytes) se conserva entero. No se añade `…`: el prefijo `<código>:` ya está al
+principio y es lo que agrupa el panel. Sin esta regla, tres SDKs daban tres cortes distintos del mismo texto (Node
+contaba 1024 unidades UTF-16 —2693 bytes con 1500 `é`—, Rust 1024 bytes, Python puntos de código y Go runas), y el
+**mismo** evento muerto no tenía los mismos bytes en la DLQ, que es de lo que depende el replay verbatim
+([01-envelope.md §6](01-envelope.md)). Los vectores `ajuste-dlqerror-*` de
+[`conformance/harness/vectors.json`](../conformance/harness/vectors.json) lo fijan para Node y Rust; **pendiente en
+Python, Go, Java, .NET y PHP** (Fase 6), que deben alinearse con ellos.
+
 `dlqattempts` es el número de entrega en que el evento murió, **no** una propiedad de
 su clase. Un PERMANENT suele registrar `1` porque no gasta reintentos, pero si el
 handler falló dos veces con errores transitorios y a la tercera lanzó un PERMANENT,
@@ -356,7 +368,7 @@ lanzaba un error sin código mientras Rust lanzaba `InvalidSubject`, que no es d
 | Código | Clase | Se lanza en | Se emite cuando |
 |---|---|---|---|
 | `INVALID_TENANT_FOR_STATE` | **PERMANENT** | `put`, `get`, `delete`, `watch` | El tenant no cumple `^[a-z0-9]+(-[a-z0-9]+)*$` con 64 caracteres como máximo, o no se puede resolver ninguno: el estado **no** cae en `system` por defecto ([10-state.md §2.4](10-state.md)) |
-| `INVALID_STATE_CONTRACT` | **PERMANENT** | `put`, `get`, `delete`, `watch` | El contrato no es `<dominio>.<agregado>.v<major>` —el subject sin `state.`, sin tenant y sin clave—: no son tres tokens, un token no es `kebab-case` en minúsculas o la versión no es `v` y un entero ≥ 1 (`clientes.cliente`, `clientes.cliente.v1.creado`, `Clientes.cliente.v1`). Un dominio reservado **no** es este código: es `RESERVED_DOMAIN`, que se evalúa antes ([10-state.md §2.2](10-state.md)) |
+| `INVALID_STATE_CONTRACT` | **PERMANENT** | `put`, `get`, `delete`, `watch` | El contrato no es `<dominio>.<agregado>.v<major>` —el subject sin `state.`, sin tenant y sin clave—: no son tres tokens, un token no es `kebab-case` en minúsculas o la versión no es `v` y un entero de 1 a 4 dígitos (`v1`…`v9999`, [02-naming.md §1](02-naming.md)) (`clientes.cliente`, `clientes.cliente.v1.creado`, `Clientes.cliente.v1`). Un dominio reservado **no** es este código: es `RESERVED_DOMAIN`, que se evalúa antes ([10-state.md §2.2](10-state.md)) |
 | `INVALID_STATE_KEY` | **PERMANENT** | `put`, `get`, `delete` | La clave no cumple `^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$`: un punto, un comodín, un espacio, vacía, de más de 128 caracteres, o que empieza por `_` ([10-state.md §2.3](10-state.md)) |
 | `MISSING_AGGREGATE_VERSION` | **PERMANENT** | `put`, `delete` (y al consumir) | `data` no tiene `aggregateVersion`, o no es un entero ≥ 1 y ≤ 2^53 − 1 ([10-state.md §3.4](10-state.md)) |
 | `STATE_SUBJECT_MISMATCH` | **POISON** | Al consumir: `watch` y `get` | El `tenantid`, el `subject` o el `type` del sobre no coinciden con el subject de NATS en el que llegó la entrada ([10-state.md §5.4](10-state.md)) |
@@ -427,7 +439,7 @@ cada SDK inventa.
 | `STALE_REQUEST` | **PERMANENT** | quien responde, **en un error** | Con la firma en modo `require`, el `time` de la petición se aleja más de **300 s** del reloj de quien responde, por delante o por detrás ([11-request-reply.md §7.4](11-request-reply.md)) |
 | `RPC_INVALID_REPLY` | **PERMANENT** | `request` | Lo que llega **no es la respuesta a esta petición**: no es un CloudEvent válido, su `type` no es el de la respuesta ni `com.flux.rpc.error.v1`, su `causationid` no es el `id` de la petición, o su `correlationid`/`tenantid` no los hereda. Es lo que ve quien llama cuando un stream captura `rpc.>` y contesta con su acuse |
 | `RPC_MESSAGE_TOO_LARGE` | **PERMANENT** | `request`; quien responde, **en un error** | El mensaje serializado no cabe en el mínimo entre 1 MiB y el `max_payload` del broker. En la respuesta es la única forma de que quien llama se entere: publicarla lanzaría **en quien responde** y quien llama solo vería un timeout |
-| `INVALID_RPC_CALL` | **PERMANENT** | `request`, `respond`; quien responde, **en un error** | La llamada o el registro está mal formado y se sabe **sin red**: la operación no cumple el patrón (cuatro tokens, sin el prefijo `rpc.`, minúsculas y `kebab-case`), `timeoutMs` no es un entero entre 1 y 25 000, o `data` no es un objeto. En quien responde, además: un `type` que no es el de la petición de esa operación |
+| `INVALID_RPC_CALL` | **PERMANENT** | `request`, `respond`; quien responde, **en un error** | La llamada o el registro está mal formado y se sabe **sin red**: la operación no cumple el patrón (cuatro tokens, sin el prefijo `rpc.`, minúsculas y `kebab-case`), `timeoutMs` no es un entero entre 1 y 25 000, o `data` no es un objeto. **Lo mismo vale para los constructores del sobre** (el arnés cruzado los ejecuta: `rpc-request`, `rpc-reply`, `rpc-error`): un atributo que rellena el SDK (`id`, `source`, `tenantid`, `correlationid`, `producerversion`) que llega **vacío**, un `time` que no es un instante RFC 3339, o un error cuyo `class`/`code`/`message`/`retryAfterMs` no cumple el esquema del error (`message` de más de 1000 **caracteres Unicode**, no unidades UTF-16): un código estable, **nunca** una excepción sin código ([11-request-reply.md §3.3](11-request-reply.md)). En quien responde, además: un `type` que no es el de la petición de esa operación |
 
 **Por qué estas clases.**
 

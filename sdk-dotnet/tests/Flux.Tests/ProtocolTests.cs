@@ -52,6 +52,7 @@ public class ProtocolTests
     [Theory]
     [InlineData("pedidos.pedido.1.creado")]      // falta la `v`
     [InlineData("pedidos.pedido.v0.creado")]     // major debe ser >= 1
+    [InlineData("pedidos.pedido.v99999.creado")] // el major lleva de 1 a 4 dígitos
     [InlineData("pedidos.pedido_x.v1.creado")]   // guion bajo prohibido
     [InlineData("pedidos..v1.creado")]           // token vacío
     [InlineData("pedidos.pedido.v1.-creado")]    // kebab mal formado
@@ -59,6 +60,14 @@ public class ProtocolTests
     {
         Assert.Throws<InvalidSubjectException>(() => Protocol.ParseSubject(subject));
         Assert.False(Protocol.IsValidSubject(subject));
+    }
+
+    [Fact]
+    public void ParseSubjectAdmiteHastaCuatroDigitosDeMajor()
+    {
+        // 02-naming.md §1: el tope de 4 dígitos es el de protocol.json; v10000 no es un subject.
+        Assert.Equal(9999, Protocol.ParseSubject("pedidos.pedido.v9999.creado").Major);
+        Assert.False(Protocol.IsValidSubject("pedidos.pedido.v10000.creado"));
     }
 
     [Fact]

@@ -51,6 +51,7 @@ import {
 } from "./rpc.js";
 import { createClassifier, createDetailedClassifier, type ClassifierOptions } from "./classify.js";
 import { NO_METRICS, type MetricsSink } from "./metrics.js";
+import { truncateUtf8Bytes } from "./text.js";
 import {
   createSigner,
   createVerifier,
@@ -965,7 +966,7 @@ export class FluxBus {
       dlqreason: "poison" as const,
       dlqattempts: 1,
       dlqconsumer: consumer,
-      dlqerror: error.slice(0, 1024),
+      dlqerror: truncateUtf8Bytes(error, 1024),
       dlqtime: new Date().toISOString(),
       data: {
         originalSubject: subject,

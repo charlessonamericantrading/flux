@@ -157,7 +157,7 @@ public final class Protocol {
 
     /** Valida {@code <dominio>.<agregado>.v<major>.<evento>} — 02-naming.md §1. */
     public static final Pattern SUBJECT_PATTERN = Pattern.compile(
-            "^[a-z0-9]+(-[a-z0-9]+)*\\.[a-z0-9]+(-[a-z0-9]+)*\\.v[1-9][0-9]*\\.[a-z0-9]+(-[a-z0-9]+)*$");
+            "^[a-z0-9]+(-[a-z0-9]+)*\\.[a-z0-9]+(-[a-z0-9]+)*\\.v[1-9][0-9]{0,3}\\.[a-z0-9]+(-[a-z0-9]+)*$");
 
     /**
      * Nombre de servicio valido: kebab-case en minusculas.

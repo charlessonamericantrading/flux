@@ -19,7 +19,7 @@ import { fileURLToPath } from "node:url";
 
 import {
   ErrorRpc, acuseDeStream, ahoraRfc3339, canonRpc, capturaOperaciones, comprobarTamano, construirPeticion,
-  erroresDatosError, limiteBytes, parsearTimeout, serializar, solapan, uuidv7, validarClasificacion,
+  erroresDatosError, esErrorDeUnaPeticionIlegible, limiteBytes, parsearTimeout, serializar, solapan, uuidv7, validarClasificacion,
   validarData, validarEntorno, validarOperacion, validarRespuesta, validarTenantLlamada, validarTimeout,
 } from "../src/rpc-model.mjs";
 import { auditarStreamsRpc } from "../src/doctor-rpc.mjs";
@@ -242,6 +242,15 @@ describe("el tamaño (11-request-reply.md §4.4)", () => {
 
 // ─── Lo que se comprueba de lo que llega (§4.3) ─────────────────────────────────────────────────
 
+describe("la versión mayor de una operación son de 1 a 4 dígitos (02-naming.md §1)", () => {
+  test("v1…v9999 sí; v10000, lo enorme, v0 y los ceros a la izquierda → INVALID_RPC_CALL, y el mensaje dice el tope", () => {
+    for (const v of ["v1", "v9", "v10", "v9999"]) assert.equal(validarOperacion(`clientes.cliente.${v}.obtener`).major, Number(v.slice(1)));
+    for (const v of ["v10000", "v99999", "v4294967296", "v99999999999999999999", "v0", "v01"]) {
+      assert.throws(() => validarOperacion(`clientes.cliente.${v}.obtener`), (e) => e instanceof ErrorRpc && e.code === "INVALID_RPC_CALL" && /`v1`…`v9999`/.test(e.message), v);
+    }
+  });
+});
+
 describe("validarRespuesta: las cinco comprobaciones (11-request-reply.md §4.3)", () => {
   const peticion = { operacion: "clientes.cliente.v1.calcular-descuento", id: "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10", correlationid: "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10", tenantid: "acme" };
   const buena = () => structuredClone(fixture("rpc-reply").event);
@@ -293,6 +302,53 @@ describe("validarRespuesta: las cinco comprobaciones (11-request-reply.md §4.3)
     malo((e) => { e.correlationid = "otro"; }, /correlationid.*HEREDA/);
     malo((e) => { e.tenantid = "globex"; }, /tenantid.*hereda sin modificar/);
   });
+  describe("la excepción única de la comprobación 4 (§4.3): el error de una petición que quien responde no pudo leer", () => {
+    const ID_ERROR = "01924f91-5d13-7b85-a3e1-6a7b8c9d0e22";
+    /** Lo que contesta un SDK a una petición que no pudo leer (§5.2): `correlationid` = su propio `id` y `tenantid: system`. */
+    const ilegible = (cambia = () => {}, data = { class: "permanent", code: "MALFORMED_JSON", message: "la petición no es un CloudEvent válido de flux" }) => {
+      const e = structuredClone(fixture("rpc-error-sdk").event);
+      e.id = ID_ERROR; e.correlationid = ID_ERROR; e.tenantid = "system"; e.causationid = peticion.id; e.data = data;
+      delete e.subject; delete e.partitionkey;
+      cambia(e);
+      return e;
+    };
+    const noPasa = (e, esperado) =>
+      assert.throws(() => validarRespuesta(peticion, bytes(e)), (x) => x instanceof ErrorRpc && x.code === "RPC_INVALID_REPLY" && esperado.test(x.message));
+
+    test("SÍ pasa: es un error con el código del sobre, no RPC_INVALID_REPLY", () => {
+      for (const code of ["MALFORMED_JSON", "MISSING_REQUIRED_EXTENSION", "INVALID_RPC_CALL", "WRONG_ATTRIBUTE_TYPE"]) {
+        const r = validarRespuesta(peticion, bytes(ilegible(() => {}, { class: "permanent", code, message: "la petición no se pudo leer" })));
+        assert.equal(r.clase, "error");
+        assert.equal(r.error.code, code);
+        assert.equal(r.error.class, "permanent");
+      }
+    });
+    test("la comprobación 3 SIGUE en pie: sin `causationid`, o con el de otra petición", () => {
+      noPasa(ilegible((e) => { delete e.causationid; }), /causationid/);
+      noPasa(ilegible((e) => { e.causationid = "01924f91-ffff-7c1a-8e22-9a4b3c2d1e10"; }), /causationid.*no es el `id` de esta petición/);
+    });
+    test("es ESTRECHA: solo un ERROR con `tenantid: system` Y `correlationid` igual a su propio `id`", () => {
+      noPasa(ilegible((e) => { e.correlationid = "otro-flujo"; }), /correlationid.*HEREDA/);
+      noPasa(ilegible((e) => { e.tenantid = "globex"; }), /correlationid|tenantid/);
+      // una RESPUESTA (no un error) con la misma forma
+      const r = buena(); r.id = ID_ERROR; r.correlationid = ID_ERROR; r.tenantid = "system";
+      noPasa(r, /correlationid.*HEREDA/);
+      // CONTROL: un error de una petición leída sigue heredando
+      noPasa(ilegible((e) => { e.correlationid = "otra-cadena"; e.tenantid = peticion.tenantid; }), /correlationid.*HEREDA/);
+    });
+    test("la quinta comprobación SIGUE en pie: el `data` del error ilegible debe cumplir el esquema del error", () => {
+      noPasa(ilegible(() => {}, { class: "poison", code: "MALFORMED_JSON", message: "m" }), /`poison` no viaja/);
+      noPasa(ilegible(() => {}, { class: "permanent", code: "malformed_json", message: "m" }), /\/code debe ser un identificador estable/);
+    });
+    test("el predicado: la forma exacta, y solo para un error", () => {
+      const e = { id: ID_ERROR, correlationid: ID_ERROR, tenantid: "system" };
+      assert.equal(esErrorDeUnaPeticionIlegible(e, true), true);
+      assert.equal(esErrorDeUnaPeticionIlegible(e, false), false);
+      assert.equal(esErrorDeUnaPeticionIlegible({ ...e, tenantid: "acme" }, true), false);
+      assert.equal(esErrorDeUnaPeticionIlegible({ ...e, correlationid: "x" }, true), false);
+    });
+  });
+
   test("5. un error con un `data` que no cumple el esquema del error", () => {
     const err = () => structuredClone(fixture("rpc-error-handler").event);
     const malError = (cambia, esperado) => {
@@ -311,6 +367,16 @@ describe("validarRespuesta: las cinco comprobaciones (11-request-reply.md §4.3)
     malError((d) => { d.code = "A".repeat(65); }, /\/code no puede pasar de 64/);
     malError((d) => { d.message = "x".repeat(1001); }, /\/message no puede pasar de 1000/);
     assert.deepEqual(erroresDatosError({ class: "permanent", code: "X", message: "m" }), []);
+  });
+
+  test("`message` del error se cuenta en CARACTERES UNICODE (puntos de código), no en unidades UTF-16: mil emojis caben, 1001 no", () => {
+    const e = (message) => ({ class: "permanent", code: "X", message });
+    assert.deepEqual(erroresDatosError(e("😀".repeat(1000))), []);
+    assert.match(erroresDatosError(e("😀".repeat(1001))).join(), /\/message no puede pasar de 1000/);
+    assert.deepEqual(erroresDatosError(e(`${"😀".repeat(999)}ñ`)), []);
+    assert.deepEqual(erroresDatosError(e("ñ".repeat(1000))), []);
+    assert.match(erroresDatosError(e("ñ".repeat(1001))).join(), /\/message no puede pasar de 1000/);
+    assert.equal("😀".repeat(1000).length, 2000, "CONTROL: `length` de JavaScript cuenta 2000 y la CLI lo rechazaba");
   });
 
   test("EL ACUSE DE UN STREAM (A-18, A-67): RPC_INVALID_REPLY que nombra el stream, apunta a `flux doctor` y lleva el acuse", () => {
