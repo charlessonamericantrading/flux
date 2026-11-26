@@ -277,5 +277,11 @@ func retryAfterOf(err error) time.Duration {
 	if errors.As(err, &re) {
 		return re.RetryAfter
 	}
+	// Un error de otra capacidad que también sabe cuánto pide esperar (el RETRYABLE que contestó quien
+	// respondió una petición, 11-request-reply.md §3.3).
+	var ra RetryAfterError
+	if errors.As(err, &ra) {
+		return ra.RetryAfter()
+	}
 	return 0
 }

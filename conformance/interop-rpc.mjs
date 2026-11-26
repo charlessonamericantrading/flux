@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * Interoperabilidad de la petición/respuesta entre los SDKs REALES de Node y de Rust, bajo los permisos que genera `gen-acl.mjs`.
+ * Interoperabilidad de la petición/respuesta entre los SDKs REALES de Node, de Rust y de Go, bajo los permisos que genera `gen-acl.mjs`.
  *
  *   (cd conformance && npm install) && (cd cli && npm install) && (cd sdk-node && npm install && npm run build)
  *   NATS_SERVER=/ruta/a/nats-server node conformance/interop-rpc.mjs
@@ -11,11 +11,11 @@
  * Los casos son DATOS (`cases/interop-rpc.json`): este fichero no sabe qué es I1. Monta el MISMO entorno que la suite de seguridad
  * (`security/entorno.mjs`: PKI efímera, nats-server con TLS, la ACL que genera `gen-acl.mjs` de `examples/services.json`,
  * `flux provision`) y ejecuta cada caso con el intérprete de `security/interprete.mjs`, cuya operación `sdk_script` lanza cada
- * instancia como un PROCESO con un SDK real (`security/participante-node.mjs` y `sdk-rust/examples/rpc_participant.rs`) y le da
+ * instancia como un PROCESO con un SDK real (`security/participante-node.mjs`, `sdk-rust/examples/rpc_participant.rs` y `sdk-go/cmd/rpc-participant`) y le da
  * órdenes por stdin. El orquestador no sabe qué SDK es cuál: compara lo que cada uno cuenta de sí mismo con lo que el broker anotó.
  *
- * Un caso con `matrix` se expande en uno por combinación (`{caller}` y `{responder}`: `node` | `rust`), y el id queda
- * `I1[node→rust]`: quien llama es el primero. Las cuatro combinaciones incluyen las dos de control (el mismo SDK a los dos lados).
+ * Un caso con `matrix` se expande en uno por combinación (`{caller}` y `{responder}`: `node` | `rust` | `go`), y el id queda
+ * `I1[node→rust]`: quien llama es el primero. Las nueve combinaciones incluyen las tres de control (el mismo SDK a los dos lados).
  * Si el SDK de uno de los dos no es el de la combinación, el caso falla: no hay un valor por defecto que lo tape.
  *
  * Entorno
@@ -136,7 +136,7 @@ const seccion = (t) => console.log(`\n${t}`);
 async function main() {
   const version = banco.version();
   const tmp = await banco.iniciar();
-  console.log("flux — interoperabilidad de petición/respuesta: los SDKs REALES de Node y de Rust, bajo los permisos generados");
+  console.log("flux — interoperabilidad de petición/respuesta: los SDKs REALES de Node, de Rust y de Go, bajo los permisos generados");
   console.log(`  ${version} · ${opensslDisponible().version} · temporales en ${tmp}`);
   const medido = [...new Set(suite.cases.map((c) => c.observed.server))];
   const num = (v) => /(\d+\.\d+\.\d+)/.exec(v)?.[1];

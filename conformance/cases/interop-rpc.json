@@ -17,10 +17,10 @@
       "spec": "11-request-reply.md §3.1, §3.2, §4.3",
       "plan": "PLAN Fase 3 (ola 2: interoperabilidad entre SDKs)",
       "covers": ["A-144"],
-      "needs": ["sdk-node/dist", "cargo"],
-      "matrix": {"caller": ["node", "rust"], "responder": ["node", "rust"]},
+      "needs": ["sdk-node/dist", "cargo", "go"],
+      "matrix": {"caller": ["node", "rust", "go"], "responder": ["node", "rust", "go"]},
       "rationale": "Cada SDK construye y lee el sobre por su cuenta, y la spec fija cada byte (`cross-sdk-rpc-envelope`), pero lo que ocurre cuando uno lee lo que escribió el otro solo se ve con los dos conectados al mismo broker. Aquí quien llama y quien responde son SDKs distintos (y también los mismos, de control), con tenants distintos —el dueño no filtra por el tenant de su `connect()` (§5.6)— bajo los permisos generados. Si la respuesta de un SDK no heredara `tenantid`, `correlationid` o `causationid` como el otro lo espera, quien llama daría RPC_INVALID_REPLY.",
-      "observed": {"server": "nats-server 2.14.5", "date": "2026-11-26", "result": "Las cuatro combinaciones pasan (node→node, node→rust, rust→node, rust→rust): el dueño (tenant acme) ve el de quien llama (globex, o initech/acme por llamada), el `aggregateId`, el UTF-8 literal y la correlación propia (`correlationid` = `id`); quien llama acepta la respuesta (las cinco comprobaciones de §4.3); 50 llamadas concurrentes contestadas en 32-65 ms, 0 violaciones en el log del servidor."},
+      "observed": {"server": "nats-server 2.14.5", "date": "2026-11-26", "result": "Las cuatro combinaciones pasan (node→node, node→rust, rust→node, rust→rust): el dueño (tenant acme) ve el de quien llama (globex, o initech/acme por llamada), el `aggregateId`, el UTF-8 literal y la correlación propia (`correlationid` = `id`); quien llama acepta la respuesta (las cinco comprobaciones de §4.3); 50 llamadas concurrentes contestadas en 32-65 ms, 0 violaciones en el log del servidor. Con el SDK de Go (las nueve combinaciones): pasan todas, también go→go de control; el participante de Go (`sdk-go/cmd/rpc-participant`) habla el mismo protocolo."},
       "steps": [
         {
           "op": "sdk_script",
@@ -44,10 +44,10 @@
       "spec": "11-request-reply.md §3.3, §5.3, §5.4",
       "plan": "PLAN Fase 3 (ola 2: interoperabilidad entre SDKs)",
       "covers": ["A-65", "A-145"],
-      "needs": ["sdk-node/dist", "cargo"],
-      "matrix": {"caller": ["node", "rust"], "responder": ["node", "rust"]},
+      "needs": ["sdk-node/dist", "cargo", "go"],
+      "matrix": {"caller": ["node", "rust", "go"], "responder": ["node", "rust", "go"]},
       "rationale": "El error es lo que hace que un handler de eventos que llama a una operación herede la clasificación sin hacer nada: si el otro SDK dice `retryable`, el evento se reentrega con su backoff; si dice `permanent`, va a la DLQ en la primera entrega. Por eso la clase, el `code` y el `retryAfterMs` tienen que cruzar de un SDK al otro sin perder nada. Un error desconocido es `permanent` con un mensaje GENÉRICO —la excepción puede llevar valores de `data`, rutas del servidor o datos personales—, y la respuesta que no cabe (la única que falla en silencio, A-65) tiene que llegar como RPC_MESSAGE_TOO_LARGE en milisegundos, no como un timeout de 5 s. El control final demuestra que la sonda ve un acierto cuando lo hay.",
-      "observed": {"server": "nats-server 2.14.5", "date": "2026-11-26", "result": "Las cuatro combinaciones pasan: un RETRYABLE (HTTP_503, retryAfterMs 5000) y un PERMANENT (PEDIDO_YA_CANCELADO) llegan con su clase, `code`, `message` y `retryAfterMs`; sin código, RETRYABLE y PERMANENT; un 503, un 404 y un ECONNRESET que reconoce el clasificador llegan con HTTP_503 / HTTP_404 / ECONNRESET y mensaje genérico, sin el texto de la excepción; una excepción desconocida da `permanent` UNKNOWN «error interno del servicio» sin el secreto, que queda en el log de quien responde con el `id` de la petición; la respuesta de 1,1 MB da RPC_MESSAGE_TOO_LARGE en ~40 ms con el límite (1048576), no un timeout; algo que no es un objeto, INVALID_SCHEMA. Divergencia menor, sin efecto en el contrato: el mensaje genérico de un PERMANENT que reconoce el clasificador es «una dependencia rechazó la operación» en Node y «la operación no se pudo completar» en Rust."},
+      "observed": {"server": "nats-server 2.14.5", "date": "2026-11-26", "result": "Las cuatro combinaciones pasan: un RETRYABLE (HTTP_503, retryAfterMs 5000) y un PERMANENT (PEDIDO_YA_CANCELADO) llegan con su clase, `code`, `message` y `retryAfterMs`; sin código, RETRYABLE y PERMANENT; un 503, un 404 y un ECONNRESET que reconoce el clasificador llegan con HTTP_503 / HTTP_404 / ECONNRESET y mensaje genérico, sin el texto de la excepción; una excepción desconocida da `permanent` UNKNOWN «error interno del servicio» sin el secreto, que queda en el log de quien responde con el `id` de la petición; la respuesta de 1,1 MB da RPC_MESSAGE_TOO_LARGE en ~40 ms con el límite (1048576), no un timeout; algo que no es un objeto, INVALID_SCHEMA. Divergencia menor, sin efecto en el contrato: el mensaje genérico de un PERMANENT que reconoce el clasificador es «una dependencia rechazó la operación» en Node y «la operación no se pudo completar» en Rust. Con el SDK de Go (las nueve combinaciones): pasan todas; el error de un handler, el 503, el ECONNRESET (envuelto con `%w`), la excepción desconocida, la respuesta de 1,1 MB y lo que no es un objeto llegan con la misma clase, el mismo `code` y un mensaje genérico."},
       "steps": [
         {
           "op": "sdk_script",
@@ -91,10 +91,10 @@
       "spec": "11-request-reply.md §7.4, §5.2; 07-signing.md §7",
       "plan": "PLAN Fase 3 (ola 2: interoperabilidad entre SDKs)",
       "covers": ["A-146"],
-      "needs": ["sdk-node/dist", "cargo"],
-      "matrix": {"caller": ["node", "rust"], "responder": ["node", "rust"]},
+      "needs": ["sdk-node/dist", "cargo", "go"],
+      "matrix": {"caller": ["node", "rust", "go"], "responder": ["node", "rust", "go"]},
       "rationale": "La firma cubre los bytes que cada SDK serializa, y esos bytes tienen que ser los mismos para que el otro SDK la verifique: aquí un SDK firma la petición y verifica la respuesta del otro con claves Ed25519 reales (PEM, el formato que aceptan los dos). En `require` los tres fallos —firma ausente, clave desconocida, firma que no corresponde— llegan como un error permanente con SU código, no como un RPC_INVALID_REPLY ni un timeout. Cada subescenario usa su propio dueño y lo para antes del siguiente: un grupo de cola reparte entre todos los que escuchan.",
-      "observed": {"server": "nats-server 2.14.5", "date": "2026-11-26", "result": "Las cuatro combinaciones pasan: con `require` en los dos lados, ida y vuelta firmadas y verificadas con claves Ed25519 PEM; sin firma de quien llama, el dueño responde MISSING_SIGNATURE (permanent) y NO ejecuta el handler; con el dueño sin firmar y quien llama en `require`, MISSING_SIGNATURE en quien llama; sin la clave pública de quien llama, UNKNOWN_SIGNING_KEY; con una clave equivocada, INVALID_SIGNATURE."},
+      "observed": {"server": "nats-server 2.14.5", "date": "2026-11-26", "result": "Las cuatro combinaciones pasan: con `require` en los dos lados, ida y vuelta firmadas y verificadas con claves Ed25519 PEM; sin firma de quien llama, el dueño responde MISSING_SIGNATURE (permanent) y NO ejecuta el handler; con el dueño sin firmar y quien llama en `require`, MISSING_SIGNATURE en quien llama; sin la clave pública de quien llama, UNKNOWN_SIGNING_KEY; con una clave equivocada, INVALID_SIGNATURE. Con el SDK de Go (las nueve combinaciones): pasan todas; la firma Ed25519 y la ventana de 300 s cruzan igual con Node y con Rust."},
       "steps": [
         {
           "op": "sdk_script",
@@ -137,10 +137,10 @@
       "spec": "11-request-reply.md §4.3, §5.5, §12.9",
       "plan": "PLAN Fase 3 (ola 2: interoperabilidad entre SDKs)",
       "covers": ["A-56", "A-59", "A-147"],
-      "needs": ["sdk-node/dist", "cargo"],
-      "matrix": {"caller": ["node", "rust"], "responder": ["node", "rust"]},
+      "needs": ["sdk-node/dist", "cargo", "go"],
+      "matrix": {"caller": ["node", "rust", "go"], "responder": ["node", "rust", "go"]},
       "rationale": "El ciclo de aceptación de cada SDK (S30, S31) para y llama con el MISMO SDK. Aquí el que para y el que llama son distintos: la suscripción de uno al subject exacto y el `no responders` que espera el otro (conexión con `headers` y `no_responders` en CONNECT) tienen que encajar entre implementaciones.",
-      "observed": {"server": "nats-server 2.14.5", "date": "2026-11-26", "result": "Las cuatro combinaciones pasan: tras `Responder.stop()` del dueño, 7 de 7 llamadas dan RPC_UNAVAILABLE (retryable) con mediana de pocos ms, venga el SDK que venga."},
+      "observed": {"server": "nats-server 2.14.5", "date": "2026-11-26", "result": "Las cuatro combinaciones pasan: tras `Responder.stop()` del dueño, 7 de 7 llamadas dan RPC_UNAVAILABLE (retryable) con mediana de pocos ms, venga el SDK que venga. Con el SDK de Go (las nueve combinaciones): pasan todas; `RPC_UNAVAILABLE` en milisegundos con cualquiera de los tres al otro lado."},
       "steps": [
         {
           "op": "sdk_script",
@@ -163,10 +163,10 @@
       "spec": "11-request-reply.md §4.5",
       "plan": "PLAN Fase 3 (ola 2: interoperabilidad entre SDKs)",
       "covers": ["A-61", "A-147"],
-      "needs": ["sdk-node/dist", "cargo"],
-      "matrix": {"caller": ["node", "rust"], "responder": ["node", "rust"]},
+      "needs": ["sdk-node/dist", "cargo", "go"],
+      "matrix": {"caller": ["node", "rust", "go"], "responder": ["node", "rust", "go"]},
       "rationale": "`RPC_TIMEOUT` es ambiguo: la operación pudo ejecutarse. Por eso quien responde deduplica por el `id` de la petición y un reintento DEBE reutilizarlo, con los mismos bytes. Un SDK que generara un `id` nuevo por intento no se notaría hasta que una orden se ejecutara dos veces: aquí se mide, con un responder lento y un timeout corto, que los tres intentos llegan con el mismo `id`.",
-      "observed": {"server": "nats-server 2.14.5", "date": "2026-11-26", "result": "Las cuatro combinaciones pasan: con `timeoutMs: 250, retries: 2` contra un dueño de 900 ms, quien llama acaba con RPC_TIMEOUT (retryable) y el dueño recibió TRES intentos con el MISMO `id` (`uniqueRequestIds` = 1)."},
+      "observed": {"server": "nats-server 2.14.5", "date": "2026-11-26", "result": "Las cuatro combinaciones pasan: con `timeoutMs: 250, retries: 2` contra un dueño de 900 ms, quien llama acaba con RPC_TIMEOUT (retryable) y el dueño recibió TRES intentos con el MISMO `id` (`uniqueRequestIds` = 1). Con el SDK de Go (las nueve combinaciones): pasan todas; el reintento llega con el mismo `id`."},
       "steps": [
         {
           "op": "sdk_script",

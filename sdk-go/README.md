@@ -152,6 +152,84 @@ Para que el clasificador reconozca un status HTTP, envuelve el fallo con
 
 ---
 
+## Seguridad: permisos, inbox, TLS y credenciales
+
+Con la capacidad **`security`** el SDK funciona bajo la configuración segura de
+[`06-security.md`](../specification/06-security.md): los permisos exactos que genera
+[`scripts/gen-acl.mjs`](../scripts/gen-acl.mjs), sin ningún permiso de suscripción sobre subjects de
+dominio y con un inbox privado por servicio. Sin esta capacidad, el broker le deniega al SDK la suscripción a su
+propio inbox (`_INBOX.<aleatorio>`) y su primera petición falla.
+
+```go
+bus, err := flux.Connect(ctx, flux.ConnectOptions{
+    Servers: "nats://nats.interno:4222", Service: "facturacion-api", Environment: "produccion", Version: "3.4.1",
+
+    // UN método: .creds (el recomendado), semilla nkey, token, o usuario y contraseña.
+    Credentials: flux.CredentialsFromFile("/run/secrets/facturacion-api.creds"),
+    // `&flux.TLSOptions{}` EXIGE TLS con las CA del sistema; con CAFile, contra una CA propia. No hay forma de
+    // desactivar la verificación.
+    TLS: &flux.TLSOptions{CAFile: "/etc/flux/ca.pem"}, // + CertFile y KeyFile para mTLS
+
+    // ⚠️ CONFIGÚRALO. Un `ack` denegado por la ACL no falla en ningún sitio (es una publicación sin respuesta):
+    // el evento se procesa y se reentrega cada ack_wait, para siempre. La única salida es este logger.
+    Logger: slog.Default(),
+})
+```
+
+| Qué | Cómo lo cumple el SDK de Go |
+|---|---|
+| **Inbox privado** | Fija `nats.CustomInboxPrefix("_INBOX.<servicio>")` a partir de `Service`. **No es una opción**, y el nombre de servicio no admite puntos, así que el prefijo de un servicio nunca es prefijo de otro. |
+| **TLS** | `TLSOptions{CAFile, CertFile, KeyFile}`: CA propia y mTLS. `ConnectOptions.TLS == nil` no pide TLS; `&TLSOptions{}` lo exige. |
+| **Credenciales** | `.creds` por ruta (se **relee en cada reconexión**: rotar no exige reiniciar) o por contenido, semilla nkey de usuario, token y usuario+contraseña. Todo lo mal formado falla en `Connect()` **antes de abrir ningún socket**. |
+| **La primera conexión** | Espera a un broker que aún no ha arrancado (con jitter) y **falla de inmediato** ante lo que esperar no arregla. Ver abajo: no usa `RetryOnFailedConnect`. |
+| **`subscribe`** | *Info antes de crear*: pregunta por el consumidor (`CONSUMER.INFO`) y solo lo crea si no existe, así que en producción no necesita `CONSUMER.CREATE`. **Falla** con `PERMISSION_DENIED` si se deniega `$JS.API.CONSUMER.MSG.NEXT.…` (`06-security.md §3.7`: un pull denegado deja un consumidor inerte que parece sano). |
+| **Denegaciones** | Una petición a la API de JetStream, o un `publish`, a un subject denegado falla en milisegundos con `PERMISSION_DENIED` y el subject **completo**, no por timeout. Un `ack` o un WIP denegados se registran en el `Logger`, una vez por subject. |
+
+### Los cinco códigos
+
+Todos **PERMANENT** (reintentar da lo mismo), con un `code` fijo que la aplicación no puede sustituir. Implementan
+`ClassifiedError` y se reconocen con `errors.As`:
+
+| Código | Tipo | Se emite cuando |
+|---|---|---|
+| `CONNECTION_REJECTED` | `*ConnectionRejectedError` (`Reason`: `auth` o `tls`) | El broker **contestó** y rechazó la primera conexión: credencial equivocada, certificado que no verifica (CA ausente o equivocada, host fuera de los SAN), TLS exigido y no ofrecido, o mTLS sin certificado de cliente |
+| `INVALID_CREDENTIALS` | `*InvalidCredentialsError` | Opciones mal formadas, **sin hablar con el broker**: vacías (una variable de entorno sin definir), `User` sin `Password`, más de un método, un `.creds` ilegible o sin JWT y semilla, una semilla que no es de usuario |
+| `INVALID_TLS_OPTIONS` | `*InvalidTLSOptionsError` | Una CA que no existe o no es un PEM, un certificado de cliente sin su clave (o al revés) o un par que no casa |
+| `NOT_PROVISIONED` | `*NotProvisionedError` | Falta un stream o un consumidor **y** el broker deniega crearlo. Apunta a `flux provision` |
+| `PERMISSION_DENIED` | `*PermissionDeniedError` | El broker deniega una operación y no se sabe que el recurso falte (ni siquiera se puede consultar), un `publish` o una suscripción |
+
+La frontera importa y está probada **en los dos sentidos**: una credencial bien formada pero equivocada es `CONNECTION_REJECTED`
+(`auth`), nunca `INVALID_CREDENTIALS`; un certificado que el broker no acepta es `CONNECTION_REJECTED` (`tls`), nunca
+`INVALID_TLS_OPTIONS`; y un broker que aún no ha arrancado no es ninguno de los tres (se espera).
+
+> **Divergencia con Node, por el cero de Go.** El cero de un `string` es «no lo he puesto» y no se distingue de «lo puse vacío»:
+> `Credentials{CredsFile: os.Getenv("NATS_CREDS")}` con la variable sin definir conectaría **sin credenciales**. Para que falle con
+> `INVALID_CREDENTIALS`, usa los constructores (`CredentialsFromFile`, `CredentialsFromNKeySeed`, `CredentialsFromToken`,
+> `CredentialsFromUserPass`, `CredentialsFromContent`): recuerdan qué método se pidió. Con `TLSOptions` el equivalente es
+> inocuo (una CA vacía verifica contra las CA del sistema y, si el broker usa una propia, falla con `CONNECTION_REJECTED`).
+
+### Lo que se midió de `nats.go`
+
+Medido contra `nats-server` 2.14.5 con `nats.go` v1.37.0 (Apéndice A del plan, A-190 a A-199). Es lo que justifica cada línea de
+`security.go` y `denials.go`:
+
+- **`RetryOnFailedConnect(true)` no sirve para la primera conexión.** `Connect()` vuelve en 0–2 ms **sin error** y con la
+  conexión en `RECONNECTING` ante una credencial rechazada, una CA que no firmó el certificado, un host fuera de los SAN, TLS
+  exigido sin TLS en el broker y un mTLS sin certificado de cliente. Solo la credencial rechazada acaba cerrándose, tras dos
+  intentos y sin avisar; las demás reintentan **para siempre**, con la causa solo en `nc.LastError()`: un servicio arrancado y mudo.
+  Con `RetryOnFailedConnect(false)` los mismos cinco fallos son un error en 1–3 ms con su causa (`ErrAuthorization`,
+  `*tls.CertificateVerificationError`, `ErrSecureConnWanted`…) y un broker caído es `ErrNoServers`. Por eso el bucle de la primera
+  conexión es del SDK (`connectWhenAvailable`); las reconexiones posteriores siguen siendo de la librería.
+- **`nats.go` no entrega las denegaciones a la operación.** Una petición a un subject denegado es un `ErrTimeout`; una suscripción
+  denegada devuelve `nil`. El `-ERR 'Permissions Violation…'` llega **solo** al `ErrorHandler` de la conexión. El SDK lo escucha y
+  lo **compite con la respuesta** (`guard`): `PERMISSION_DENIED` en milisegundos en vez de un timeout de 5 s.
+- **Detectar una suscripción denegada**: tras un `Flush()` (PING/PONG), `nc.LastError()` ya tiene la denegación (0 fallos en
+  2 000 intentos), mientras que el `ErrorHandler` —una goroutine aparte— aún no se había ejecutado en 180 de 2 000. Por eso se mira
+  `LastError()` y no se «espera un poco».
+- **El pull denegado** se detecta con una petición propia sobre el **mismo subject** (`CONSUMER.MSG.NEXT.<stream>.<durable>`)
+  con un cuerpo `{` que el servidor contesta `400` sin sacar ningún mensaje: se compite su respuesta con la denegación. No depende
+  de ningún temporizador.
+
 ## Aislamiento entre tenants
 
 ```go
@@ -326,6 +404,106 @@ mencionar el tipo. No compensa para 1 MB.
 > tiene `Draft2020` como default; hay un test que comprueba que el bundle lo declara.
 
 ---
+
+## Estado replicado: `State()` — capacidad `state`
+
+Un valor por clave, replicado por el broker y leído por quien lo necesita sin preguntar al dueño
+([`10-state.md`](../specification/10-state.md)). El dueño escribe con `Put` y `Delete`; los demás servicios lo observan con
+`Watch` (la copia local) o lo leen con `Get`.
+
+```go
+st := bus.State()
+
+// El DUEÑO. `aggregateVersion` es suyo (su contador monotónico): el SDK ni lo inventa ni lo incrementa.
+res, err := st.Put(ctx, "clientes.cliente.v1", "cli-1",
+    map[string]any{"clienteId": "cli-1", "nombre": "Ana", "aggregateVersion": 7},
+    flux.WithStateTenant("acme"))
+// res.Outcome: "ok", o "stale" si la versión no avanza (NO es un error: otro escribió una más nueva).
+
+_, err = st.Delete(ctx, "clientes.cliente.v1", "cli-1", 8, flux.WithStateTenant("acme")) // lápida: lleva su versión
+
+// El OBSERVADOR: la copia local. `WithOnSynced` avisa UNA vez, cuando ya tiene el último valor de cada clave.
+sub, err := st.Watch(ctx, "clientes.cliente.v1", func(ctx context.Context, e flux.StateEntry, d flux.StateDelivery) error {
+    // e.Deleted: una lápida. Un error devuelto se clasifica como el de un evento (reintento, DLQ).
+    return nil
+}, flux.WithOnSynced(func() { /* ya se puede servir lecturas */ }))
+defer sub.Unsubscribe()
+```
+
+| Qué | Cómo lo cumple el SDK de Go |
+|---|---|
+| **Escritura condicional** | `Put` y `Delete` siguen el algoritmo de §3.2: leer la clave, **reconocer la propia escritura por su `id`** (un acuse perdido no se convierte en `stale`), descartar una versión que no avanza, y publicar por JetStream con `Nats-Expected-Last-Subject-Sequence`. Ante un conflicto de secuencia vuelve a leer, hasta **3 intentos**, y agotados da `STATE_CONFLICT` (RETRYABLE). El conflicto se reconoce por el **código** de la API de JetStream —**10071 y 10164**, no por el texto—. |
+| **Identidad** | El tenant va en el subject (`state.<dominio>.<agregado>.v<major>.<tenant>.<clave>`) y **no hay tenant por defecto** ni `system` implícito: sin tenant, `INVALID_TENANT_FOR_STATE`. La clave se valida (`^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$`): el broker acepta `*`, `a.b` y 2000 caracteres, y una clave sin validar es un subject fantasma. |
+| **Clasificación** | Sin `WithStateClassification`, `confidential` (no la de la conexión). `restricted` se rechaza al publicar y es **POISON** al consumir. La lápida es siempre `internal`. |
+| **L3** | Con `Validation` activa, `data` se valida contra el esquema que resuelve el índice `state` del bundle —sin red— **antes de leer ni escribir**, y el mensaje cita la **ruta y la regla, nunca el valor** (un estado es donde vive el dato personal). |
+| **Un observador** | Un durable `<servicio>__state_<contrato>` con `DeliverLastPerSubject`: un observador nuevo recibe solo el último valor de cada clave, no el historial. Si el durable se **borra** bajo el `Watch` (`flux state resync`), la librería para el consumo en ~1 ms y el SDK lo **reabre**. |
+| **Lo que miente** | Una entrada cuyo `tenantid`, `subject` o `type` no coinciden con el subject de NATS es **POISON** (`STATE_SUBJECT_MISMATCH`) y no se aplica. La DLQ de estado guarda `{ key, revision }`: nunca el `data` (90 días de retención) ni la firma. |
+| **Permisos** | `Put` y `Delete` fallan con `PERMISSION_DENIED` (no por timeout) si falta publicar en el subject del estado; un stream sin aprovisionar es `NOT_PROVISIONED` con las dos causas posibles (stream o `allow_direct` ausentes). |
+
+Los siete códigos de §6 son `INVALID_TENANT_FOR_STATE`, `INVALID_STATE_CONTRACT`, `INVALID_STATE_KEY`,
+`MISSING_AGGREGATE_VERSION`, `STATE_SUBJECT_MISMATCH`, `STATE_CONFLICT` y `RESERVED_DOMAIN`; cada uno es un tipo propio con
+su clase y su código **fijos** y se reconoce con `errors.As`. `INVALID_DATACLASSIFICATION` y `INVALID_SCHEMA` (L3) completan
+los de la capacidad.
+
+### Lo que se midió de `nats.go` para el estado
+
+`PublishMsg` con `WithExpectLastSequencePerSubject` devuelve un `*jetstream.APIError` con `ErrorCode` 10071 (239 de 239
+rechazos con 8 escritores sobre una clave); un `DIRECT.GET` de una clave ausente contesta con la cabecera `Status: 404` y sin
+error, y el de un stream que no existe da `ErrNoResponders`; y un durable borrado bajo un `Consume` vivo entrega
+`jetstream.ErrConsumerDeleted` y la librería **para ella misma** el consumo en ~1 ms (en Node son 43 s). PLAN.md, A-196 y A-197.
+
+## Petición/respuesta: `Request` y `Respond` — capacidad `rpc`
+
+Una **orden** o un **cálculo** que necesita respuesta ya, a otro servicio ([`11-request-reply.md`](../specification/11-request-reply.md)).
+Core NATS, sin stream ni DLQ: si nadie escucha, quien llama lo sabe en milisegundos. **No** es para publicar un hecho (eso es un evento)
+ni para leer un dato que otro posee (eso es el estado).
+
+```go
+// QUIEN RESPONDE (el dueño del dominio `clientes`): una suscripción al subject EXACTO, con el nombre del servicio como grupo de cola.
+r, err := bus.Respond(ctx, "clientes.cliente.v1.calcular-descuento",
+    func(ctx context.Context, req flux.RPCRequest) (any, error) {
+        entrada, err := flux.UnmarshalRPCData[PeticionDescuento](req)
+        if err != nil { return nil, err }
+        if entrada.ClienteID == "" {
+            return nil, flux.NewPermanentError("falta clienteId", flux.WithCode("CLIENTE_REQUERIDO")) // viaja con su clase y su código
+        }
+        return map[string]any{"descuentoCents": 500, "moneda": "EUR"}, nil // la respuesta es un OBJETO
+    })
+defer r.Stop(ctx) // parada ordenada: deja de escuchar, espera a lo que está en vuelo
+
+// QUIEN LLAMA: UN intento, con un timeout (5 s por defecto, de 1 ms a 25 s).
+data, err := bus.Request(ctx, "clientes.cliente.v1.calcular-descuento",
+    map[string]any{"clienteId": "cli-1", "totalCents": 9990, "moneda": "EUR"},
+    flux.WithRPCTimeout(2*time.Second), flux.WithRPCAggregateID("cli-1"))
+descuento, err := flux.RequestAs[Descuento](ctx, bus, "clientes.cliente.v1.calcular-descuento", peticion) // tipada
+```
+
+| Qué | Cómo lo cumple el SDK de Go |
+|---|---|
+| **El sobre** | Un CloudEvent normal (`type` `com.flux.rpc.<dominio>.<agregado>.<operacion>.request.v<M>`, `dataschema` `…/rpc/…/request/<M>.0.0.json` o el del bundle), **sin cabeceras de NATS**. La respuesta **hereda** `correlationid`, `tenantid` y `subject` de la petición y su `causationid` es el `id` de la petición. Los cuatro ejemplos de §3.5 salen **byte a byte** (668, 703, 677 y 791 bytes). |
+| **Antes de la red** | RESERVED_DOMAIN → INVALID_RPC_CALL (operación, timeout, `data` que no es un objeto, reintentos) → INVALID_DATACLASSIFICATION → L3 → tamaño (RPC_MESSAGE_TOO_LARGE). El primero que falla gana, y **ninguno abre una petición**. |
+| **`no responders`** | RPC_UNAVAILABLE en **milisegundos**, RETRYABLE, también con un `Subscribe` de eventos vivo en la misma conexión: el SDK usa **una sola** suscripción de respuestas por conexión (la de `nats.go`) y no abre una segunda a su propio inbox. |
+| **Permisos** | Un `publish` a una operación no concedida, o una suscripción denegada a su inbox, es **PERMISSION_DENIED** en milisegundos con el subject completo —`nats.go` no entrega la denegación a la petición, que esperaría su timeout—. `Respond` **falla al arrancar** si falta la suscripción del dueño (`rpc.<dominio>.>`); sin `allow_responses` el handler se ejecuta pero no puede contestar: quien llama ve RPC_TIMEOUT y el dueño lo dice **una vez** en su `Logger`. |
+| **Quien llama verifica** | Las cinco comprobaciones de §4.3: ¿es un CloudEvent?, ¿su `type`?, ¿su `causationid`?, ¿`correlationid` y `tenantid`?, ¿el `data` del error cumple su esquema? Si no, **RPC_INVALID_REPLY** (PERMANENT: es un incidente, no un dato). La única excepción es el error de una petición que quien responde no pudo leer. |
+| **Errores del handler** | `NewPermanentError` / `NewRetryableError` viajan con su clase, **su código y su mensaje**; un error que el clasificador reconoce (un 503), con un mensaje **genérico**; cualquier otro, `permanent` `UNKNOWN` «error interno del servicio» —su texto puede llevar `data`—, y su detalle va al `Logger`. `retryAfterMs` es una sugerencia para el primer reintento. Un pánico es una respuesta, no un timeout. |
+| **Reintentos** | `WithRPCRetries(n)`, solo ante RPC_UNAVAILABLE y RPC_TIMEOUT, **con el mismo `id` y los mismos bytes**: quien responde puede reconocer la orden repetida (RPC_TIMEOUT **no** dice que no se ejecutó). Hay que deduplicar por `req.ID`. |
+| **Parada ordenada** | `Responder.Stop` y `Bus.Close` hacen `Drain` **de cada suscripción** —no `nc.Drain()` de la conexión, que pierde las respuestas de lo que está en vuelo—, esperan a los handlers (hasta 25 s) y dejan un margen de 25 ms para la propagación del interés en un cluster. |
+| **Concurrencia** | Cada petición corre en su goroutine, con un **semáforo de 256 handlers** por operación (`WithMaxConcurrent`); el exceso espera en la cola de la suscripción. |
+| **Firma** | Con `Verify: VerifyRequire` a los dos lados: la ida y la vuelta van firmadas, y quien responde rechaza una petición con `time` fuera de ±300 s (**STALE_REQUEST**). |
+| **L3** | La petición se valida **antes de salir** y la respuesta al recibirla (con el índice `rpc` del bundle, sin red); quien responde valida lo que recibe y lo que devuelve. El mensaje cita **ruta y regla, nunca el valor**, y dice de quién es el fallo. |
+| **Tenant** | Opción (`WithRPCTenant`) > el del evento en curso > el de `ConnectOptions` > `system` (a diferencia del estado, una petición no es un dato guardado). **Es del handler autorizar el tenant**: quien responde no filtra por el suyo. |
+
+Los códigos de §7 de [`04-errors.md`](../specification/04-errors.md): `RPC_UNAVAILABLE`, `RPC_TIMEOUT`, `RPC_INVALID_REPLY`,
+`RPC_MESSAGE_TOO_LARGE`, `STALE_REQUEST`, `INVALID_RPC_CALL` (más `RESERVED_DOMAIN`, `INVALID_SCHEMA`, `PERMISSION_DENIED`). Un error que
+manda quien responde es un `*RPCRemoteError`, con **su** clase y **su** código, y se reconoce con `errors.As` como cualquier otro.
+Las métricas `flux_rpc_client_requests_total`, `flux_rpc_server_requests_total` y `flux_rpc_duration_seconds` son una extensión opcional
+de `MetricsSink` (`RPCMetricsSink`), que `InMemoryMetrics` implementa.
+
+### Lo que se midió de `nats.go` para la petición/respuesta
+
+`nc.Request` a un subject denegado da `ErrTimeout`: la denegación llega por el `ErrorHandler` ~1 ms después y por nada más, así que el SDK
+la **compite** con la respuesta. `no responders` llega en 0 ms (la librería lo anuncia en CONNECT sin opción para quitarlo). Con
+`sub.Drain()` las 3 respuestas en vuelo llegan; con `nc.Drain()` se pierden las 3. PLAN.md, A-192, A-193, A-194 y A-198.
 
 ## Métricas
 
@@ -605,6 +783,15 @@ servidor**, no solo sobre la solicitada.
 | `metrics.go` | `MetricsSink`, `NoMetrics`, `InMemoryMetrics`, `DurationBuckets` |
 | `tenant.go` | `TenantIsolation`, `TenantIsolationError`, resolución del filtro de tenant |
 | `client.go` | `Connect`, `Bus.Publish`, `Bus.Subscribe`, `Bus.Close` |
+| `security.go` | `Credentials`, `TLSOptions`, `ConnectionRejectedError`, `InvalidCredentialsError`, `InvalidTLSOptionsError`, `NotProvisionedError`, `PermissionDeniedError`, y la traducción de las opciones a `nats.go` |
+| `denials.go` | Las denegaciones de permisos que `nats.go` solo entrega de forma asíncrona, y `guard` (competirlas con la respuesta) |
+| `text.go`, `canonical.go` | UTF-8 literal y la forma canónica de `data` (`01-envelope.md §4.1`) |
+| `state.go`, `state_pure.go` | `State()`: `Put`, `Delete`, `Get`, `Watch` (`10-state.md`); la parte pura —subject, contrato, clave, `aggregateVersion`, sobre de estado y de DLQ— es lo que ejerce el arnés cruzado |
+| `validation.go` | también el mensaje de L3 **sin valores** de un estado |
+| `rpc.go`, `rpc_pure.go`, `errors_rpc.go` | `Bus.Request`, `Bus.Respond`, `Responder.Stop` (`11-request-reply.md`); la parte pura —operación, timeout, sobre de la petición, de la respuesta y del error— es lo que ejerce el arnés cruzado |
+| `cmd/conformance-harness` | El arnés de la conformidad cruzada (`conformance/harness/README.md`): `build`, `dlq`, `sign`, `verify`, `parse`, `state-*`, `rpc-*` y `external-id` |
+| `cmd/rpc-participant` | El participante del SDK de Go en `conformance/interop-rpc.mjs`: un proceso que el orquestador gobierna por stdin y que habla con el broker solo por la API pública |
+| `external_id.go` | `WithExternalKey`: el `id` determinista de un hecho importado (`01-envelope.md §2.6.1`) |
 
 ## Desarrollo
 
@@ -614,7 +801,18 @@ go test -race ./...
 gofmt -l .          # sin salida
 ```
 
-Los tests no requieren un broker: cubren naming, envelope, clasificación, firma, métricas,
+Las **pruebas de integración** (`security_*_test.go`) levantan un `nats-server` **real** con TLS, la ACL que genera
+`scripts/gen-acl.mjs` y `flux provision` (`testenv_test.go`): un broker abierto no prueba nada de seguridad. Necesitan
+`nats-server` (`NATS_SERVER=…`), `node` y `(cd cli && npm install)`; sin ellos **se saltan con un aviso**, salvo con
+`FLUX_REQUIRE_BROKER=1`, que lo convierte en un fallo (CI lo pone: un salto no es un pase). Los puertos salen de
+`FLUX_TEST_PORTS=desde-hasta` (por defecto 7300-7399).
+
+```bash
+NATS_SERVER=/ruta/a/nats-server FLUX_REQUIRE_BROKER=1 go test -race ./...
+node sdk-go/tools/mutantes.mjs      # rompe a propósito cada garantía: las pruebas DEBEN fallar
+```
+
+Los demás tests no requieren un broker: cubren naming, envelope, clasificación, firma, métricas,
 validación L3 y aislamiento de tenant, que es donde vive la semántica del protocolo. Los de
 métricas leen `../protocol.json` —incluido el intervalo por defecto del sondeo de
 `num_pending`— y los de validación leen `../schemas/bundle.json`, para que una divergencia

@@ -23,6 +23,7 @@ import (
 	"strings"
 
 	"github.com/santhosh-tekuri/jsonschema/v6"
+	"github.com/santhosh-tekuri/jsonschema/v6/kind"
 )
 
 // ValidationMode gobierna qué pasa cuando un payload no cumple su esquema.
@@ -42,7 +43,7 @@ const (
 
 // Códigos estables de la validación, para métricas y alertas — 08-observability.md §2.2.
 const (
-	CodeSchemaInvalid  = "SCHEMA_INVALID"
+	CodeSchemaInvalid  = "INVALID_SCHEMA"
 	CodeSchemaNotFound = "SCHEMA_NOT_FOUND"
 )
 
@@ -65,8 +66,21 @@ type SchemaBundle struct {
 	// Dentro de un mayor todo es BACKWARD-compatible, así que el más alto acepta lo
 	// que aceptan los anteriores — 05-compatibility.md §2.
 	Subjects map[string]string `json:"subjects"`
+	// State mapea contrato de estado (`clientes.cliente.v1`) → URI del esquema de versión más alta de su mayor, igual
+	// que Subjects hace con los eventos. La lápida NO está aquí —su URI es constante—, pero sí en Schemas
+	// (10-state.md §10).
+	State map[string]string `json:"state"`
+	// RPC mapea operación (`clientes.cliente.v1.obtener`) → las URI de los esquemas de su petición y de su respuesta
+	// (11-request-reply.md §11).
+	RPC map[string]RPCSchemas `json:"rpc"`
 	// Schemas mapea URI → JSON Schema sin interpretar.
 	Schemas map[string]json.RawMessage `json:"schemas"`
+}
+
+// RPCSchemas son los esquemas de una operación de petición/respuesta.
+type RPCSchemas struct {
+	Request string `json:"request"`
+	Reply   string `json:"reply"`
 }
 
 // ParseSchemaBundle interpreta el JSON del bundle.
@@ -110,6 +124,31 @@ func SchemaURIFor(b *SchemaBundle, subject string) string {
 		return ""
 	}
 	return b.Subjects[subject]
+}
+
+// StateSchemaURIFor resuelve el `dataschema` de un contrato de estado desde el índice `state` del bundle —sin red—. Devuelve ""
+// si el bundle no lo conoce.
+func StateSchemaURIFor(b *SchemaBundle, contract string) string {
+	if b == nil {
+		return ""
+	}
+	return b.State[contract]
+}
+
+// RPCSchemaURIFor resuelve el `dataschema` de la petición (`side` = "request") o de la respuesta (`side` = "reply") de una
+// operación desde el índice `rpc` del bundle —sin red—. Devuelve "" si el bundle no la conoce.
+func RPCSchemaURIFor(b *SchemaBundle, operation, side string) string {
+	if b == nil {
+		return ""
+	}
+	op, ok := b.RPC[operation]
+	if !ok {
+		return ""
+	}
+	if side == "reply" {
+		return op.Reply
+	}
+	return op.Request
 }
 
 // ValidationOptions configura la validación L3. El cero del struct no valida nada, que
@@ -277,6 +316,18 @@ func newSchemaValidator(opts ValidationOptions, logger *slog.Logger) (*schemaVal
 // Devuelve error solo en modo strict; en warn registra y devuelve nil, igual que hace
 // Verifier.Check con la firma.
 func (v *schemaValidator) check(event Event, subject string) error {
+	return v.run(event, subject, false)
+}
+
+// checkRedacted es check para una entrada de ESTADO o una petición/respuesta: el mensaje de cada incumplimiento cita la RUTA del
+// campo y la REGLA, nunca el valor. En un evento el valor es inofensivo; en un estado `data` es dato personal, y un mensaje como
+// `'ana@example.com' no cumple el formato` acabaría en los logs, en la excepción de quien llama y, al consumir, en `dlqerror`
+// durante 90 días — 10-state.md §3.6, 11-request-reply.md §5.2.
+func (v *schemaValidator) checkRedacted(event Event, subject string) error {
+	return v.run(event, subject, true)
+}
+
+func (v *schemaValidator) run(event Event, subject string, redact bool) error {
 	sch, ok := v.schemas[event.DataSchema]
 	if !ok {
 		err := &SchemaNotFoundError{Subject: subject, DataSchema: event.DataSchema}
@@ -306,7 +357,7 @@ func (v *schemaValidator) check(event Event, subject string) error {
 				subject, event.DataSchema, err)
 		}
 		e := &SchemaValidationError{
-			Subject: subject, DataSchema: event.DataSchema, Errors: leafErrors(verr),
+			Subject: subject, DataSchema: event.DataSchema, Errors: leafErrors(verr, redact),
 		}
 		if v.mode == ValidationStrict {
 			return e
@@ -330,12 +381,16 @@ func (v *schemaValidator) warn(message string) {
 // que es ruido para quien tiene que arreglar el payload. Y todas las hojas, no la
 // primera, porque de una en una arreglar un payload con tres campos mal cuesta tres
 // despliegues (00-protocol.md §5).
-func leafErrors(e *jsonschema.ValidationError) []string {
+func leafErrors(e *jsonschema.ValidationError, redact bool) []string {
 	var out []string
 	var walk func(*jsonschema.ValidationError)
 	walk = func(n *jsonschema.ValidationError) {
 		if len(n.Causes) == 0 {
-			out = append(out, n.Error())
+			if redact {
+				out = append(out, redactedError(n))
+			} else {
+				out = append(out, n.Error())
+			}
 			return
 		}
 		for _, c := range n.Causes {
@@ -347,4 +402,29 @@ func leafErrors(e *jsonschema.ValidationError) []string {
 	// un mensaje que cambia de orden es un diff inútil en los logs y en los tests.
 	sort.Strings(out)
 	return out
+}
+
+// redactedError es el mensaje de un incumplimiento SIN el valor que lo causó: ruta y regla.
+//
+// `required` es la excepción razonable: nombra la propiedad que falta, que sale del ESQUEMA y no del dato.
+// `additionalProperties` y `unevaluatedProperties` NO nombran las sobrantes: esas sí salen del dato.
+func redactedError(n *jsonschema.ValidationError) string {
+	donde := "(raíz)"
+	if len(n.InstanceLocation) > 0 {
+		donde = "/" + strings.Join(n.InstanceLocation, "/")
+	}
+	switch k := n.ErrorKind.(type) {
+	case *kind.Required:
+		return fmt.Sprintf("%s no tiene la propiedad obligatoria `%s`", donde, strings.Join(k.Missing, "`, `"))
+	case *kind.AdditionalProperties:
+		return donde + " lleva propiedades que el esquema no declara"
+	}
+	regla := "?"
+	if kp := n.ErrorKind.KeywordPath(); len(kp) > 0 {
+		regla = kp[len(kp)-1]
+	}
+	if regla == "unevaluatedProperties" {
+		return donde + " lleva propiedades que el esquema no declara"
+	}
+	return fmt.Sprintf("%s incumple la regla `%s`", donde, regla)
 }

@@ -5,6 +5,8 @@ go 1.22
 require (
 	github.com/google/uuid v1.6.0
 	github.com/nats-io/nats.go v1.37.0
+	// Credenciales nkey y `.creds` (security.go): se valida la semilla y el JWT ANTES de abrir ningún socket.
+	github.com/nats-io/nkeys v0.4.7
 	// Validación L3 — 00-protocol.md §5. Soporta draft 2020-12, que es el que declaran
 	// los esquemas de flux.
 	//
@@ -18,7 +20,6 @@ require (
 
 require (
 	github.com/klauspost/compress v1.17.2 // indirect
-	github.com/nats-io/nkeys v0.4.7 // indirect
 	github.com/nats-io/nuid v1.0.1 // indirect
 	golang.org/x/crypto v0.18.0 // indirect
 	golang.org/x/sys v0.16.0 // indirect

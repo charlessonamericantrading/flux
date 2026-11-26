@@ -12,7 +12,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"os"
+	"strings"
 	"time"
 
 	flux "github.com/charlessonamericantrading/flux/sdk-go"
@@ -54,7 +56,59 @@ type dlqEntrada struct {
 	DLQTime  string `json:"dlqtime"`
 }
 
+// estadoEntrada es la entrada PLANA de `state-build`, `state-tombstone` y `state-subject` (la misma que el `input` de los fixtures de
+// cross-sdk-state-envelope.json, más el `op`), y el `original` de `state-dlq`.
+//
+// `Data` y `AggregateVersion` son json.RawMessage por lo mismo que el `data` de los eventos: decodificarlos a un tipo de Go
+// reordenaría las claves, y el orden forma parte de los bytes que el runner compara.
+type estadoEntrada struct {
+	Contract         string          `json:"contract"`
+	TenantID         string          `json:"tenantId"`
+	Key              string          `json:"key"`
+	ID               string          `json:"id"`
+	Source           string          `json:"source"`
+	Time             string          `json:"time"`
+	CorrelationID    string          `json:"correlationid"`
+	ProducerVersion  string          `json:"producerversion"`
+	Classification   string          `json:"classification"`
+	CausationID      string          `json:"causationid"`
+	TraceParent      string          `json:"traceparent"`
+	TraceState       string          `json:"tracestate"`
+	Data             json.RawMessage `json:"data"`
+	AggregateVersion json.RawMessage `json:"aggregateVersion"`
+}
+
+// rpcReferencia es el `request` de `rpc-reply` y `rpc-error`: lo que el SDK sacaría del sobre recibido.
+type rpcReferencia struct {
+	Operation     string `json:"operation"`
+	ID            string `json:"id"`
+	CorrelationID string `json:"correlationid"`
+	TenantID      string `json:"tenantid"`
+	Subject       string `json:"subject"`
+	PartitionKey  string `json:"partitionkey"`
+}
+
+// rpcErrorEntrada es el `error` de `rpc-error`. `retryAfterMs` es RawMessage: `null` NO es «ausente» (es inválido), y un entero
+// escrito con `.0` o con exponente es un entero para JavaScript.
+type rpcErrorEntrada struct {
+	Class        string          `json:"class"`
+	Code         string          `json:"code"`
+	Message      string          `json:"message"`
+	RetryAfterMs json.RawMessage `json:"retryAfterMs"`
+}
+
 type entrada struct {
+	estadoEntrada
+	// Las operaciones de petición/respuesta: la entrada es plana, como la de estado.
+	Operation   string           `json:"operation"`
+	AggregateID string           `json:"aggregateId"`
+	Request     *rpcReferencia   `json:"request"`
+	Error       *rpcErrorEntrada `json:"error"`
+	TimeoutMs   json.RawMessage  `json:"timeoutMs"`
+
+	Original *estadoEntrada `json:"original"`
+	Revision uint64         `json:"revision"`
+
 	Op         string            `json:"op"`
 	Event      eventoEntrada     `json:"event"`
 	DLQ        dlqEntrada        `json:"dlq"`
@@ -63,13 +117,17 @@ type entrada struct {
 	Bytes      string            `json:"bytes"`
 	PublicKeys map[string]string `json:"publicKeys"`
 	Mode       string            `json:"mode"`
+	Input      externalIDEntrada `json:"input"`
 }
 
 type salida struct {
-	OK     bool   `json:"ok"`
-	Bytes  string `json:"bytes,omitempty"`
-	Code   string `json:"code,omitempty"`
-	Detail string `json:"detail,omitempty"`
+	OK        bool   `json:"ok"`
+	Bytes     string `json:"bytes,omitempty"`
+	Subject   string `json:"subject,omitempty"`
+	ID        string `json:"id,omitempty"`
+	Effective int64  `json:"effectiveMs,omitempty"`
+	Code      string `json:"code,omitempty"`
+	Detail    string `json:"detail,omitempty"`
 }
 
 // construir monta el evento. El arnés NO rellena nada: todos los atributos vienen del
@@ -79,9 +137,14 @@ type salida struct {
 // BuildEvent pide un time.Time. Se interpreta aquí y el SDK vuelve a formatearlo con
 // flux.FormatTime, que es quien fija los 3 decimales del protocolo.
 func construir(e eventoEntrada) (flux.Event, error) {
-	t, err := time.Parse(time.RFC3339, e.Time)
+	canon, ok := flux.CanonicalTime(e.Time)
+	if !ok {
+		return flux.Event{}, flux.NewPermanentError("`time` debe ser un instante RFC 3339 (01-envelope.md §2.2)",
+			flux.WithCode("WRONG_ATTRIBUTE_TYPE"))
+	}
+	t, err := time.Parse(time.RFC3339, canon)
 	if err != nil {
-		return flux.Event{}, fmt.Errorf("`time` %q no es RFC 3339: %w", e.Time, err)
+		return flux.Event{}, fmt.Errorf("`time` %q no es RFC 3339: %w", canon, err)
 	}
 	return flux.BuildEvent(flux.BuildEventInput{
 		Subject:            e.Subject,
@@ -133,6 +196,76 @@ func fallo(err error) salida {
 		code = clasificado.FluxCode()
 	}
 	return salida{OK: false, Code: code, Detail: err.Error()}
+}
+
+// estadoAEntrada pasa la entrada plana del arnés a la del SDK. No rellena NADA: todo viene del vector.
+func estadoAEntrada(e estadoEntrada) flux.StateEventInput {
+	return flux.StateEventInput{
+		Contract: e.Contract, TenantID: e.TenantID, Key: e.Key, ID: e.ID, Source: e.Source, Time: e.Time,
+		CorrelationID: e.CorrelationID, ProducerVersion: e.ProducerVersion,
+		Classification: flux.DataClassification(e.Classification), Data: e.Data,
+		CausationID: e.CausationID, TraceParent: e.TraceParent, TraceState: e.TraceState,
+	}
+}
+
+func referencia(r rpcReferencia) flux.RPCRequestRef {
+	return flux.RPCRequestRef{Operation: r.Operation, ID: r.ID, CorrelationID: r.CorrelationID, TenantID: r.TenantID,
+		Subject: r.Subject, PartitionKey: r.PartitionKey}
+}
+
+// enteroJS interpreta un número JSON como lo haría JavaScript: `5000`, `5000.0` y `5e3` son el mismo entero. Una cadena, `null`,
+// un booleano, un array, un objeto o un decimal no lo son.
+func enteroJS(raw json.RawMessage) (int64, bool) {
+	var v any
+	d := json.NewDecoder(strings.NewReader(string(raw)))
+	d.UseNumber()
+	if d.Decode(&v) != nil {
+		return 0, false
+	}
+	n, ok := v.(json.Number)
+	if !ok {
+		return 0, false
+	}
+	f, err := n.Float64()
+	if err != nil || f != math.Trunc(f) || math.Abs(f) > 1<<53 {
+		return 0, false
+	}
+	return int64(f), true
+}
+
+// externalIDEntrada es la entrada de `external-id`: `{ source, externalKey, time }`, o bajo `input`. `externalKey` puede ser
+// `{ repeat, times }`, que se expande para no pegar 513 caracteres en el caso.
+type externalIDEntrada struct {
+	Source      string          `json:"source"`
+	ExternalKey json.RawMessage `json:"externalKey"`
+	Time        string          `json:"time"`
+}
+
+func externalID(e externalIDEntrada) salida {
+	var clave string
+	var expandida struct {
+		Repeat string `json:"repeat"`
+		Times  int    `json:"times"`
+	}
+	if json.Unmarshal(e.ExternalKey, &clave) != nil {
+		if json.Unmarshal(e.ExternalKey, &expandida) != nil || expandida.Times < 0 || expandida.Times > 1<<20 {
+			return salida{OK: false}
+		}
+		clave = strings.Repeat(expandida.Repeat, expandida.Times)
+	}
+	canon, ok := flux.CanonicalTime(e.Time)
+	if !ok {
+		return salida{OK: false}
+	}
+	t, err := time.Parse(time.RFC3339, canon)
+	if err != nil {
+		return salida{OK: false}
+	}
+	id, err := flux.ExternalEventID(e.Source, clave, t)
+	if err != nil {
+		return salida{OK: false}
+	}
+	return salida{OK: true, ID: id}
 }
 
 func ejecutar(in entrada) salida {
@@ -214,6 +347,125 @@ func ejecutar(in entrada) salida {
 			return fallo(err)
 		}
 		return salida{OK: true}
+
+	case "state-build":
+		e, err := flux.BuildStateEvent(estadoAEntrada(in.estadoEntrada))
+		if err != nil {
+			return fallo(err)
+		}
+		return serializar(e)
+
+	case "state-tombstone":
+		version, err := flux.AggregateVersionFromJSON(in.AggregateVersion)
+		if err != nil {
+			// El orden de §3.6: contrato, clave y tenant van ANTES que la versión.
+			if _, errSubj := flux.StateSubject(in.Contract, in.TenantID, in.Key); errSubj != nil {
+				return fallo(errSubj)
+			}
+			return fallo(err)
+		}
+		e, err := flux.BuildStateTombstone(flux.StateTombstoneInput{
+			Contract: in.Contract, TenantID: in.TenantID, Key: in.Key, ID: in.ID, Source: in.Source, Time: in.Time,
+			CorrelationID: in.CorrelationID, ProducerVersion: in.ProducerVersion, AggregateVersion: version,
+			CausationID: in.CausationID, TraceParent: in.TraceParent, TraceState: in.TraceState,
+		})
+		if err != nil {
+			return fallo(err)
+		}
+		return serializar(e)
+
+	case "state-subject":
+		subject, err := flux.StateSubject(in.Contract, in.TenantID, in.Key)
+		if err != nil {
+			return fallo(err)
+		}
+		return salida{OK: true, Subject: subject}
+
+	case "state-dlq":
+		if in.Original == nil {
+			return fallo(errors.New("`state-dlq` requiere `original`"))
+		}
+		e, err := flux.BuildStateDLQEvent(flux.StateDLQBuildInput{
+			Original: estadoAEntrada(*in.Original), Revision: in.Revision,
+			DLQ: flux.StateDLQInfo{
+				Reason: flux.DLQReason(in.DLQ.Reason), Attempts: in.DLQ.Attempts, Consumer: in.DLQ.Consumer,
+				Error: in.DLQ.Error, DLQTime: in.DLQ.DLQTime,
+			},
+		})
+		if err != nil {
+			return fallo(err)
+		}
+		return serializar(e)
+
+	case "rpc-request":
+		e, err := flux.BuildRPCRequest(flux.RPCRequestInput{
+			Operation: in.Operation, TenantID: in.TenantID, AggregateID: in.AggregateID, ID: in.ID, Source: in.Source, Time: in.Time,
+			CorrelationID: in.CorrelationID, CausationID: in.CausationID, ProducerVersion: in.ProducerVersion,
+			Classification: flux.DataClassification(in.Classification), Data: in.Data,
+			TraceParent: in.TraceParent, TraceState: in.TraceState,
+		})
+		if err != nil {
+			return fallo(err)
+		}
+		return serializar(e)
+
+	case "rpc-reply":
+		if in.Request == nil {
+			return fallo(errors.New("`rpc-reply` requiere `request`"))
+		}
+		e, err := flux.BuildRPCReply(flux.NewRPCReplyInput(referencia(*in.Request), in.ID, in.Source, in.Time, in.ProducerVersion,
+			in.TraceParent, flux.DataClassification(in.Classification), in.Data, ""))
+		if err != nil {
+			return fallo(err)
+		}
+		return serializar(e)
+
+	case "rpc-error":
+		if in.Request == nil || in.Error == nil {
+			return fallo(errors.New("`rpc-error` requiere `request` y `error`"))
+		}
+		datos := flux.RPCErrorData{Class: in.Error.Class, Code: in.Error.Code, Message: in.Error.Message}
+		if in.Error.RetryAfterMs != nil {
+			ms, ok := enteroJS(in.Error.RetryAfterMs)
+			if !ok {
+				ms = -1 // `null`, una cadena, un decimal…: no es un entero ≥ 0 y el SDK lo rechaza con su código
+			}
+			datos.RetryAfterMs = &ms
+		}
+		e, err := flux.BuildRPCError(flux.NewRPCErrorInput(referencia(*in.Request), in.ID, in.Source, in.Time, in.ProducerVersion,
+			in.TraceParent, datos))
+		if err != nil {
+			return fallo(err)
+		}
+		return serializar(e)
+
+	case "rpc-operation":
+		subject, err := flux.RPCSubject(in.Operation)
+		if err != nil {
+			return fallo(err)
+		}
+		return salida{OK: true, Subject: subject}
+
+	case "rpc-timeout":
+		// Ausente es el valor por defecto; `null` NO es «ausente».
+		efectivo := flux.RPCTimeoutDefault
+		if in.TimeoutMs != nil {
+			ms, ok := enteroJS(in.TimeoutMs)
+			if !ok || ms < flux.RPCTimeoutMin.Milliseconds() || ms > flux.RPCTimeoutMax.Milliseconds() {
+				_, err := flux.ResolveRPCTimeout(0) // fuera de rango: el SDK lo rechaza con su código, sin recortar
+				return fallo(err)
+			}
+			efectivo = time.Duration(ms) * time.Millisecond
+		}
+		d, err := flux.ResolveRPCTimeout(efectivo)
+		if err != nil {
+			return fallo(err)
+		}
+		return salida{OK: true, Effective: d.Milliseconds()}
+
+	// El `id` determinista de un hecho importado (01-envelope.md §2.6.1; conformance/cases/cross-sdk-external-id.json).
+	case "external-id":
+		return externalID(in.Input)
 	}
 
 	return salida{OK: false, Code: "UNSUPPORTED_OP", Detail: in.Op}
@@ -228,6 +480,14 @@ func main() {
 	}
 	var in entrada
 	if err := json.Unmarshal(bruto, &in); err != nil {
+		var tipo *json.UnmarshalTypeError
+		if errors.As(err, &tipo) {
+			// Un valor de otro tipo JSON del que pide la operación (`time: 5`, una clave que no es una cadena): la entrada del
+			// arnés está mal formada, no la operación. Tipos cerrados, como el arnés de Rust (`HARNESS_INPUT`).
+			out, _ := json.Marshal(salida{OK: false, Code: "HARNESS_INPUT", Detail: err.Error()})
+			os.Stdout.Write(out)
+			return
+		}
 		fmt.Fprintln(os.Stderr, "la entrada del arnés no es JSON válido:", err)
 		os.Exit(1)
 	}

@@ -40,7 +40,7 @@ import { generateKeyPairSync } from "node:crypto";
 import http from "node:http";
 
 import { dec } from "../../scripts/lib/nats-harness.mjs";
-import { Agente, binarioDeRust } from "./agentes.mjs";
+import { Agente, binarioDeGo, binarioDeRust } from "./agentes.mjs";
 
 export const CMDS_AGENTE = ["respond", "behavior", "stop", "call", "call_repeat", "call_many", "consume", "watch", "publish", "state_put", "stats", "close"];
 export const CMDS_ORQUESTADOR = ["sleep", "stats", "broker_subs", "acl", "kill"];
@@ -58,7 +58,7 @@ export function validarEscenario(paso, donde) {
   for (const a of paso.agents) {
     for (const k of Object.keys(a)) if (!CAMPOS_AGENTE.includes(k)) throw new Error(`${donde}: campo de agente desconocido «${k}». Admite: ${CAMPOS_AGENTE.join(", ")}`);
     for (const k of ["id", "sdk", "as"]) if (a[k] === undefined) throw new Error(`${donde}: un agente sin \`${k}\``);
-    if (!["node", "rust"].includes(a.sdk) && !/^\{\w+\}$/.test(a.sdk)) throw new Error(`${donde}: sdk «${a.sdk}» desconocido (node | rust)`);
+    if (!["node", "rust", "go"].includes(a.sdk) && !/^\{\w+\}$/.test(a.sdk)) throw new Error(`${donde}: sdk «${a.sdk}» desconocido (node | rust | go)`);
     if (ids.has(a.id)) throw new Error(`${donde}: dos agentes con el id «${a.id}»`);
     ids.add(a.id);
   }
@@ -192,6 +192,7 @@ export class EscenarioSdk {
     this.logAlEmpezar = this.ctx.srv?.salida?.length ?? 0;
     // La compilación del participante de Rust (la primera vez, segundos) no debe contarse en el tiempo de un paso.
     if (paso.agents.some((d) => d.sdk === "rust")) binarioDeRust();
+    if (paso.agents.some((d) => d.sdk === "go")) binarioDeGo();
     const pasos = [];
     try {
       for (const s of paso.script) pasos.push(await this.#paso(s, { marker, evaluar }));

@@ -261,7 +261,7 @@ de límites, UTF-8 literal, versión, orden de validación (§3.6) y un **contro
 bytes). Reglas del runner:
 
 - Las operaciones de estado se ejecutan **solo en los SDKs que declaran `state`** en `protocol.json` →
-  `capabilities` (hoy, Node y Rust). Para los demás imprime **`N/A: no declara state`** en el resumen y
+  `capabilities` (hoy, Node, Rust y Go). Para los demás imprime **`N/A: no declara state`** en el resumen y
   una `–` en cada fila: nunca un salto silencioso.
 - Un SDK que **declara** `state` y no tiene la operación en su arnés **falla** (`UNSUPPORTED_OP`), y también
   si no tiene arnés registrado.
@@ -272,7 +272,7 @@ bytes). Reglas del runner:
 operaciones `rpc-request`, `rpc-reply`, `rpc-error`, `rpc-operation` y `rpc-timeout`: con los **cuatro ejemplos de §3.5**
 (su SHA-256 y su longitud), los 20 vectores de operación y los 14 de timeout de
 [`cross-sdk-rpc-envelope.json`](cases/cross-sdk-rpc-envelope.json), y 62 más (`rpcVectors` en `vectors.json`).
-Las mismas reglas, con `rpc` en lugar de `state`: la ejecuta **quien la declara** (hoy, Node y Rust), los demás salen
+Las mismas reglas, con `rpc` en lugar de `state`: la ejecuta **quien la declara** (hoy, Node, Rust y Go), los demás salen
 **`N/A: no declara rpc`**, y quien la declara y no la cumple **falla**. El runner además **aborta** si la spec
 (§3.5), el caso, los vectores y `protocol.json` → `rpc` dejan de decir lo mismo.
 

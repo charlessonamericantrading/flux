@@ -206,9 +206,9 @@ jobs:
             echo "✓ el mutante $m fue detectado"
           done
 
-  # Petición/respuesta entre los SDKs REALES de Node y de Rust (conformance/interop-rpc.mjs): el mismo entorno que la suite de
+  # Petición/respuesta entre los SDKs REALES de Node, de Rust y de Go (conformance/interop-rpc.mjs): el mismo entorno que la suite de
   # seguridad —nats-server con TLS, la ACL que genera gen-acl.mjs, `flux provision`— y cada instancia, un PROCESO con un SDK de
-  # verdad: Node llama a Rust y al revés (y los dos de control), con tenants distintos, firma `require`, errores retryable y
+  # verdad: cada uno llama a cada uno (nueve combinaciones, con las tres de control), con tenants distintos, firma `require`, errores retryable y
   # permanent, una respuesta que no cabe y un handler que lanza lo desconocido. Va en su propio job para no alargar el de seguridad
   # (~12 min): corre en paralelo. Los S30 a S34 (el ciclo de §12.9 y A-101 con cada SDK) corren en el de seguridad.
   interop-rpc:
@@ -227,7 +227,8 @@ jobs:
         run: |
           GOBIN="$PWD/bin" go install github.com/nats-io/nats-server/v2@v2.14.5
           echo "NATS_SERVER=$PWD/bin/nats-server" >> "$GITHUB_ENV"
-      # El participante de Rust (`--example rpc_participant --features signing`) lo compila el propio runner.
+      # Los participantes de Rust (`--example rpc_participant --features signing`) y de Go (`go build ./cmd/rpc-participant`) los compila el
+      # propio runner.
       - uses: dtolnay/rust-toolchain@stable
       - run: npm install --no-audit --no-fund
         working-directory: conformance
@@ -245,7 +246,7 @@ jobs:
       # Una prueba que solo se ha visto en verde no demuestra nada: se estropea el SDK a propósito —que abra una suscripción a su
       # inbox por la conexión con la que pide (A-101: `RPC_UNAVAILABLE` pasa a ser un timeout) en `connect()`, en el pull o en el
       # `watch`; una respuesta que no hereda el tenant; que reenvíe el texto de una excepción desconocida; un reintento con otro
-      # `id`; un responder que no verifica la firma— y los casos DEBEN fallar con cada uno de los 11 mutantes. Sin mutar, pasan.
+      # `id`; un responder que no verifica la firma— y los casos DEBEN fallar con cada uno de los 15 mutantes (11 de Node y Rust y 4 de Go). Sin mutar, pasan.
       - name: Los casos detectan un SDK estropeado (deben FALLAR)
         env:
           FLUX_REQUIRE_BROKER: '1'
@@ -475,20 +476,52 @@ jobs:
           python -m pytest sdk-python/tests -q
 
   sdk-go:
-    name: SDK Go — vet, test y gofmt
+    name: SDK Go — vet, test, gofmt y NATS real con los permisos que genera gen-acl.mjs
     runs-on: ubuntu-latest
     defaults:
       run:
         working-directory: sdk-go
     steps:
       - uses: actions/checkout@v4
+      # Las pruebas de integración montan el entorno de la suite de seguridad (testenv_test.go): un nats-server con TLS, los
+      # permisos que genera `scripts/gen-acl.mjs` y `flux provision` (CLI de Node). Un broker abierto no prueba nada de seguridad.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - run: npm install --no-audit --no-fund
+        working-directory: cli
+      # nats-server 2.14.5 exige Go 1.25 (su go.mod): se compila la versión exacta que la spec dice haber medido, igual que en
+      # `acl-verify` y `security`. Las pruebas del SDK corren después con Go 1.22, el mínimo que declara su go.mod.
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+          cache: false
+      - name: Compilar nats-server 2.14.5
+        working-directory: .
+        run: |
+          GOBIN="$PWD/bin" go install github.com/nats-io/nats-server/v2@v2.14.5
+          echo "NATS_SERVER=$PWD/bin/nats-server" >> "$GITHUB_ENV"
       - uses: actions/setup-go@v5
         with:
           go-version: '1.22'
+          cache: false
       - run: go vet ./...
-      - run: go test -race ./...
+      # FLUX_REQUIRE_BROKER=1: que falte nats-server, node o la CLI es un FALLO y no un salto con aviso. Sin ella, las pruebas de
+      # seguridad se saltarían en silencio y el job quedaría verde sin haber ejecutado nunca los permisos contra un broker.
+      - name: Pruebas (con un nats-server real, TLS y los permisos generados)
+        env:
+          FLUX_REQUIRE_BROKER: '1'
+        run: go test -race -count=1 ./...
       - name: gofmt sin cambios pendientes
         run: test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
+      # En los dos sentidos también aquí: sin nats-server, las pruebas con broker DEBEN fallar y no saltarse.
+      - name: Sin nats-server, las pruebas con broker FALLAN (no se saltan)
+        run: |
+          if NATS_SERVER=/no/existe/nats-server FLUX_REQUIRE_BROKER=1 go test -count=1 -run 'TestSeguridad' ./... > /dev/null 2>&1; then
+            echo "✗ las pruebas de seguridad pasaron SIN nats-server con FLUX_REQUIRE_BROKER=1: la comprobación no vigila nada"
+            exit 1
+          fi
+          echo "✓ sin nats-server las pruebas con broker fallan"
 
   sdk-java:
     name: SDK Java — tests
@@ -686,13 +719,13 @@ jobs:
       # Los 93 vectores de «Ajustes» (conformance/harness/vectors.json → ajustesVectors): lo que se decidió donde la
       # spec callaba o discrepaba (dlqerror en bytes, `maxLength` en puntos de código, versión mayor de 1 a 4
       # dígitos, `id`/`source` vacíos, `time` canónico, `data` canónico). Son de CUALQUIER operación de estado o de
-      # rpc y de dos SDKs (`ajustesSdks`), por eso los ejecuta su propio runner y no cross-sdk.mjs.
-      - name: Los ajustes (93 vectores) dan lo decidido en Node y Rust
+      # rpc y de tres SDKs (`ajustesSdks`), por eso los ejecuta su propio runner y no cross-sdk.mjs.
+      - name: Los ajustes (93 vectores) dan lo decidido en Node, Rust y Go
         run: node conformance/ajustes.mjs
 
       # Las operaciones de estado (state-build, state-tombstone, state-subject, state-dlq) y de petición/respuesta
       # (rpc-request, rpc-reply, rpc-error, rpc-operation, rpc-timeout) las ejecutan SOLO los SDKs que declaran
-      # `state` o `rpc` en protocol.json (Node y Rust): los otros cinco salen «N/A: no declara …» en el paso de
+      # `state` o `rpc` en protocol.json (Node, Rust y Go): los otros cuatro salen «N/A: no declara …» en el paso de
       # arriba. Un runner que solo se ha visto en verde no demuestra que detecte nada: cada mutante estropea a
       # propósito lo que un SDK entrega o declara (un byte, un tenant, un timeout fuera de rango aceptado, un
       # dominio reservado que no se rechaza, un `correlationid` que no se hereda, una operación ausente, un arnés
