@@ -393,7 +393,7 @@ async function paso(ctx, st, mem) {
       const tareas = [...Array(a.instances).keys()].map(async (inst) => {
         for (let v = a.from; v <= a.to; v++) {
           if (!(v % a.instances === inst || Math.random() < 0.3)) continue;
-          await sleep(Math.random() * 4);
+          if (a.pauseMs !== 0) await sleep(Math.random() * (a.pauseMs ?? 4));
           const r = await escribe(actor, "put", { contract: a.contract, tenant: a.tenant, key: a.key, version: v });
           if (r.outcome === "ok") res.ok++; else if (r.outcome === "stale") res.stale++; else if (r.errCode === "STATE_CONFLICT") res.conflict++; else res.other++;
         }
@@ -446,8 +446,18 @@ async function vigila(ctx, a) {
 }
 
 // ─── Ejecución de casos ──────────────────────────────────────────────────────────────────────────
+// Vacía el broker ENTRE casos y lo COMPRUEBA: un listado o un borrado que falla no puede dar por limpio un broker que no
+// lo está —con la máquina cargada, el caso siguiente heredaba los mensajes del anterior y «stream_add» (idempotente) los
+// devolvía como si fueran suyos—. Se repite hasta que `streams.list()` devuelve vacío; si no se consigue, el runner falla.
 async function limpia(ctx) {
-  for (const n of await ctx.jsm.streams.list().next().then((l) => l.map((s) => s.config.name)).catch(() => [])) { try { await ctx.jsm.streams.delete(n); } catch { /* ya no está */ } }
+  for (let intento = 1; intento <= 20; intento++) {
+    let nombres = null;
+    try { nombres = []; for await (const s of ctx.jsm.streams.list()) nombres.push(s.config.name); } catch { nombres = null; }
+    if (nombres && nombres.length === 0) return;
+    for (const n of nombres ?? []) { try { await ctx.jsm.streams.delete(n); } catch { /* se comprueba en la vuelta siguiente */ } }
+    await sleep(50 * intento);
+  }
+  throw new Error("limpia(): no se pudo vaciar el broker entre casos tras 20 intentos; los resultados no serían fiables");
 }
 
 async function ejecutaCaso(c, ctx) {
