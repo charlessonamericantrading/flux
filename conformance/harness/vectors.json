@@ -324,6 +324,1516 @@
     }
   ],
   "$commentVerify": "Los vectores de verify cruzan de verdad: el runner FIRMA con el SDK de referencia y pide a cada uno de los demas que VERIFIQUE esa firma. Es la unica prueba que demuestra interoperabilidad; que cada SDK verifique su propia firma solo demuestra consistencia consigo mismo.",
+  "rpcVectors": [
+    {
+      "id": "rpc-request-spec-3-5",
+      "spec": "11-request-reply.md §3.1, §3.5",
+      "why": "La petición de la spec, con UTF-8 literal (`Otoño`) y su SHA-256: el patrón no es «lo que dice Node» sino la spec. `subject` y `partitionkey` son el `aggregateId`, y `correlationid` es el `id` propio porque la llamada no nace de otro evento. Es el fixture `rpc-request` de cross-sdk-rpc-envelope.json.",
+      "op": "rpc-request",
+      "input": {
+        "operation": "clientes.cliente.v1.calcular-descuento",
+        "tenantId": "acme",
+        "aggregateId": "cli-1",
+        "id": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+        "source": "/produccion/facturacion-api",
+        "time": "2026-08-20T10:41:07.318Z",
+        "correlationid": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+        "producerversion": "3.4.1",
+        "classification": "internal",
+        "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+        "data": {
+          "clienteId": "cli-1",
+          "totalCents": 9990,
+          "moneda": "EUR",
+          "campana": "Otoño"
+        }
+      },
+      "caseFixture": "rpc-request",
+      "sha256": "43ea71ade9fb6ff81ccb7c1f93047ffebd604d602492229e452b1c97dadf83f5",
+      "length": 668
+    },
+    {
+      "id": "rpc-reply-spec-3-5",
+      "spec": "11-request-reply.md §3.2, §3.5",
+      "why": "La respuesta de la spec: hereda `correlationid`, `tenantid`, `subject` y `partitionkey` de la petición y su `causationid` es el `id` de la petición. Es el fixture `rpc-reply`.",
+      "op": "rpc-reply",
+      "input": {
+        "request": {
+          "operation": "clientes.cliente.v1.calcular-descuento",
+          "id": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+          "correlationid": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+          "tenantid": "acme",
+          "subject": "cli-1"
+        },
+        "id": "01924f91-5d0f-7e03-9b6a-1c2d3e4f5a67",
+        "source": "/produccion/crm-api",
+        "time": "2026-08-20T10:41:07.329Z",
+        "correlationid": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+        "producerversion": "2.1.0",
+        "classification": "internal",
+        "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-b7ad6b7169203331-01",
+        "data": {
+          "descuentoCents": 500,
+          "moneda": "EUR",
+          "motivo": "Campaña de otoño"
+        }
+      },
+      "caseFixture": "rpc-reply",
+      "sha256": "b164fa71fa3e2943f3cb160f1a7cf3c520b09c2d93a0a1da81eef7f17da1f01c",
+      "length": 703
+    },
+    {
+      "id": "rpc-error-handler-spec-3-5",
+      "spec": "11-request-reply.md §3.3, §3.5",
+      "why": "El error de un handler que lanzó `RetryableError` con `retryAfterMs`: `type` y `dataschema` fijos, `dataclassification` `internal`, y las claves de `data` en el orden `class, code, message, retryAfterMs`. Es el fixture `rpc-error-handler`.",
+      "op": "rpc-error",
+      "input": {
+        "request": {
+          "operation": "clientes.cliente.v1.calcular-descuento",
+          "id": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+          "correlationid": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+          "tenantid": "acme",
+          "subject": "cli-1"
+        },
+        "id": "01924f91-5d11-7a62-8f0d-4e5f6a7b8c91",
+        "source": "/produccion/crm-api",
+        "time": "2026-08-20T10:41:07.331Z",
+        "correlationid": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+        "producerversion": "2.1.0",
+        "classification": "internal",
+        "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-b7ad6b7169203331-01",
+        "error": {
+          "class": "retryable",
+          "code": "HTTP_503",
+          "message": "el servicio de tarifas no responde",
+          "retryAfterMs": 5000
+        }
+      },
+      "caseFixture": "rpc-error-handler",
+      "sha256": "fdff124948254dfa3263971aec86bf4d0184db77babe44da5e0714f28fc427f8",
+      "length": 677
+    },
+    {
+      "id": "rpc-error-sdk-spec-3-5",
+      "spec": "11-request-reply.md §3.3, §3.5, §5.2",
+      "why": "El error que fabrica el SDK de quien responde al rechazar la petición por su esquema: el mensaje cita RUTAS (`/totalCents`), nunca valores, y lleva UTF-8 literal (`petición`). Es el fixture `rpc-error-sdk`.",
+      "op": "rpc-error",
+      "input": {
+        "request": {
+          "operation": "clientes.cliente.v1.calcular-descuento",
+          "id": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+          "correlationid": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+          "tenantid": "acme",
+          "subject": "cli-1"
+        },
+        "id": "01924f91-5d13-7b85-a3e1-6a7b8c9d0e22",
+        "source": "/produccion/crm-api",
+        "time": "2026-08-20T10:41:07.333Z",
+        "correlationid": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+        "producerversion": "2.1.0",
+        "classification": "internal",
+        "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-b7ad6b7169203331-01",
+        "error": {
+          "class": "permanent",
+          "code": "INVALID_SCHEMA",
+          "message": "la petición no cumple https://schemas.internal/rpc/clientes/cliente/calcular-descuento/request/1.0.0.json: /totalCents debe ser un entero, /moneda es obligatoria"
+        }
+      },
+      "caseFixture": "rpc-error-sdk",
+      "sha256": "c6f80891c94a6c64defa825288f9f98201bed5824d7c6e94c58362dccbfc446d",
+      "length": 791
+    },
+    {
+      "id": "rpc-request-sin-aggregate-id",
+      "spec": "11-request-reply.md §3.1",
+      "why": "Sin `aggregateId` NO hay `subject` ni `partitionkey` (la tabla de §3.1: «si se da»). Un SDK que escriba `\"subject\":null` o una cadena vacía rompe el sobre, y uno que ponga `partitionkey` por su cuenta también.",
+      "op": "rpc-request",
+      "input": {
+        "operation": "clientes.cliente.v1.calcular-descuento",
+        "tenantId": "acme",
+        "id": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+        "source": "/produccion/facturacion-api",
+        "time": "2026-08-20T10:41:07.318Z",
+        "correlationid": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+        "producerversion": "3.4.1",
+        "classification": "internal",
+        "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+        "data": {
+          "clienteId": "cli-1",
+          "totalCents": 9990,
+          "moneda": "EUR",
+          "campana": "Otoño"
+        }
+      }
+    },
+    {
+      "id": "rpc-request-nace-de-otro-evento",
+      "spec": "11-request-reply.md §3.1, 01-envelope.md §6",
+      "why": "Una llamada hecha dentro de un handler continúa la cadena: `correlationid` es el del evento en curso (NO el `id` propio, que es lo único que fija el ejemplo de la spec), `causationid` es el `id` de lo que está en curso y va entre `dataclassification` y `partitionkey`, y `tracestate` va justo después de `traceparent`. Con `restricted`: la clasificación se refleja tal cual.",
+      "op": "rpc-request",
+      "input": {
+        "operation": "clientes.cliente.v1.calcular-descuento",
+        "tenantId": "acme",
+        "aggregateId": "cli-1",
+        "id": "01924f91-6a10-7d2e-9c33-5b4c3d2e1f20",
+        "source": "/produccion/facturacion-api",
+        "time": "2026-08-20T10:41:07.318Z",
+        "correlationid": "01924f90-1111-7222-8333-444455556666",
+        "producerversion": "3.4.1",
+        "classification": "restricted",
+        "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+        "data": {
+          "clienteId": "cli-1",
+          "totalCents": 9990,
+          "moneda": "EUR",
+          "campana": "Otoño"
+        },
+        "causationid": "01924f90-7777-7888-8999-aaaabbbbcccc",
+        "tracestate": "vendor=valor"
+      }
+    },
+    {
+      "id": "rpc-request-major-2",
+      "spec": "11-request-reply.md §2.2, §3.1",
+      "why": "Una operación de `v2` con agregado de dos palabras: `type` termina en `.request.v2`, el agregado conserva su guion y el `dataschema` es `…/request/2.0.0.json` (sin bundle, `<major>.0.0`). Un SDK con `v1`/`1.0.0` escritos a mano en alguna parte lo delata aquí. Con `public`.",
+      "op": "rpc-request",
+      "input": {
+        "operation": "logistica.linea-envio.v2.reservar-stock",
+        "tenantId": "acme",
+        "aggregateId": "env-7",
+        "id": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+        "source": "/produccion/facturacion-api",
+        "time": "2026-08-20T10:41:07.318Z",
+        "correlationid": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+        "producerversion": "3.4.1",
+        "classification": "public",
+        "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+        "data": {
+          "envioId": "env-7",
+          "lineas": [
+            {
+              "sku": "A-1",
+              "cantidad": 2
+            },
+            {
+              "sku": "B-9",
+              "cantidad": 1
+            }
+          ]
+        }
+      }
+    },
+    {
+      "id": "rpc-request-utf8-literal",
+      "spec": "01-envelope.md §1.1, 11-request-reply.md §3.5",
+      "why": "Acentos, eñes, euro, emoji (par sustituto) y <>&'+ LITERALES en `data`, y las claves en el orden en que se escribieron (no el alfabético). Un serializador que escape el no-ASCII (`json_encode` de PHP, System.Text.Json, un `ensure_ascii` olvidado) da otros bytes, y con ellos otra firma y otro hash de deduplicación. Con `confidential`.",
+      "op": "rpc-request",
+      "input": {
+        "operation": "clientes.cliente.v1.calcular-descuento",
+        "tenantId": "acme",
+        "aggregateId": "cli-2",
+        "id": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+        "source": "/produccion/facturacion-api",
+        "time": "2026-08-20T10:41:07.318Z",
+        "correlationid": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+        "producerversion": "3.4.1",
+        "classification": "confidential",
+        "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+        "data": {
+          "clienteId": "cli-2",
+          "nota": "Café con leche & pan <tostado>, para el señor Muñoz — 5€",
+          "emoji": "✅ 🚀",
+          "pais": "España",
+          "ruta": "https://ejemplo.test/a/b?x=1&y=2",
+          "anidado": {
+            "z": 1,
+            "a": [
+              true,
+              null,
+              2.5
+            ],
+            "ñ": "ü"
+          }
+        }
+      }
+    },
+    {
+      "id": "rpc-request-escapes-obligatorios",
+      "spec": "01-envelope.md §1.1",
+      "why": "Solo se escapa lo que JSON OBLIGA a escapar: comillas, barra, \\n, \\t y los de control. U+007F y U+2028 van LITERALES (`json_encode` de PHP escapa U+2028 aunque se le pida UTF-8 sin escapes). Es el reverso de `rpc-request-utf8-literal`.",
+      "op": "rpc-request",
+      "input": {
+        "operation": "clientes.cliente.v1.calcular-descuento",
+        "tenantId": "acme",
+        "aggregateId": "cli-3",
+        "id": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+        "source": "/produccion/facturacion-api",
+        "time": "2026-08-20T10:41:07.318Z",
+        "correlationid": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+        "producerversion": "3.4.1",
+        "classification": "internal",
+        "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+        "data": {
+          "clienteId": "cli-3",
+          "cita": "dijo \"hola\"",
+          "ruta": "C:\\temp\\x",
+          "lineas": "a\nb\tc",
+          "control": "\u0001",
+          "del": "\u007f",
+          "separador": "a\u2028b"
+        }
+      }
+    },
+    {
+      "id": "rpc-request-data-vacio",
+      "spec": "11-request-reply.md §3.1, 01-envelope.md §4",
+      "why": "`data` es un OBJETO, y `{}` lo es: no se omite ni se convierte en `null`. Una operación sin parámetros (`obtener-hora`) es legal.",
+      "op": "rpc-request",
+      "input": {
+        "operation": "clientes.cliente.v1.calcular-descuento",
+        "tenantId": "acme",
+        "aggregateId": "cli-1",
+        "id": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+        "source": "/produccion/facturacion-api",
+        "time": "2026-08-20T10:41:07.318Z",
+        "correlationid": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+        "producerversion": "3.4.1",
+        "classification": "internal",
+        "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+        "data": {}
+      }
+    },
+    {
+      "id": "rpc-request-control-tenant",
+      "spec": "11-request-reply.md §3.1, 09-multitenancy.md §5",
+      "why": "CONTROL: el mismo `tenantId` en `globex` en lugar de `acme` DEBE dar otros bytes. Un SDK que ignorase el tenant que se le pide escribiría siempre el de su `connect()`.",
+      "op": "rpc-request",
+      "input": {
+        "operation": "clientes.cliente.v1.calcular-descuento",
+        "tenantId": "globex",
+        "aggregateId": "cli-1",
+        "id": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+        "source": "/produccion/facturacion-api",
+        "time": "2026-08-20T10:41:07.318Z",
+        "correlationid": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+        "producerversion": "3.4.1",
+        "classification": "internal",
+        "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+        "data": {
+          "clienteId": "cli-1",
+          "totalCents": 9990,
+          "moneda": "EUR",
+          "campana": "Otoño"
+        }
+      },
+      "differsFrom": "rpc-request-spec-3-5"
+    },
+    {
+      "id": "rpc-request-dominio-reservado",
+      "spec": "11-request-reply.md §2.6, §4.1",
+      "why": "`request` rechaza un dominio reservado con RESERVED_DOMAIN antes de tocar la red, igual que `publish`.",
+      "op": "rpc-request",
+      "input": {
+        "operation": "state.cliente.v1.obtener",
+        "tenantId": "acme",
+        "aggregateId": "cli-1",
+        "id": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+        "source": "/produccion/facturacion-api",
+        "time": "2026-08-20T10:41:07.318Z",
+        "correlationid": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+        "producerversion": "3.4.1",
+        "classification": "internal",
+        "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+        "data": {
+          "clienteId": "cli-1",
+          "totalCents": 9990,
+          "moneda": "EUR",
+          "campana": "Otoño"
+        }
+      },
+      "expect": "RESERVED_DOMAIN"
+    },
+    {
+      "id": "rpc-request-prefijo-rpc",
+      "spec": "11-request-reply.md §2.2, §2.6",
+      "why": "Un nombre que lleva el prefijo `rpc.` tiene `rpc` por dominio: RESERVED_DOMAIN (el prefijo lo pone el SDK), no INVALID_RPC_CALL.",
+      "op": "rpc-request",
+      "input": {
+        "operation": "rpc.clientes.cliente.v1.obtener",
+        "tenantId": "acme",
+        "aggregateId": "cli-1",
+        "id": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+        "source": "/produccion/facturacion-api",
+        "time": "2026-08-20T10:41:07.318Z",
+        "correlationid": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+        "producerversion": "3.4.1",
+        "classification": "internal",
+        "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+        "data": {
+          "clienteId": "cli-1",
+          "totalCents": 9990,
+          "moneda": "EUR",
+          "campana": "Otoño"
+        }
+      },
+      "expect": "RESERVED_DOMAIN"
+    },
+    {
+      "id": "rpc-request-operacion-malformada",
+      "spec": "11-request-reply.md §2.2, §4.1",
+      "why": "Una operación que no cumple el patrón es INVALID_RPC_CALL, también en el sobre de la petición.",
+      "op": "rpc-request",
+      "input": {
+        "operation": "clientes.cliente.v1.Obtener",
+        "tenantId": "acme",
+        "aggregateId": "cli-1",
+        "id": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+        "source": "/produccion/facturacion-api",
+        "time": "2026-08-20T10:41:07.318Z",
+        "correlationid": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+        "producerversion": "3.4.1",
+        "classification": "internal",
+        "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+        "data": {
+          "clienteId": "cli-1",
+          "totalCents": 9990,
+          "moneda": "EUR",
+          "campana": "Otoño"
+        }
+      },
+      "expect": "INVALID_RPC_CALL"
+    },
+    {
+      "id": "rpc-request-data-array",
+      "spec": "11-request-reply.md §4.1, §6, 01-envelope.md §4",
+      "why": "`data` es un OBJETO: un array es INVALID_RPC_CALL (§6: «`data` que no es un objeto»).",
+      "op": "rpc-request",
+      "input": {
+        "operation": "clientes.cliente.v1.calcular-descuento",
+        "tenantId": "acme",
+        "aggregateId": "cli-1",
+        "id": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+        "source": "/produccion/facturacion-api",
+        "time": "2026-08-20T10:41:07.318Z",
+        "correlationid": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+        "producerversion": "3.4.1",
+        "classification": "internal",
+        "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+        "data": [
+          1,
+          2
+        ]
+      },
+      "expect": "INVALID_RPC_CALL"
+    },
+    {
+      "id": "rpc-request-data-escalar",
+      "spec": "11-request-reply.md §4.1, §6, 01-envelope.md §4",
+      "why": "Un escalar en `data` es INVALID_RPC_CALL.",
+      "op": "rpc-request",
+      "input": {
+        "operation": "clientes.cliente.v1.calcular-descuento",
+        "tenantId": "acme",
+        "aggregateId": "cli-1",
+        "id": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+        "source": "/produccion/facturacion-api",
+        "time": "2026-08-20T10:41:07.318Z",
+        "correlationid": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+        "producerversion": "3.4.1",
+        "classification": "internal",
+        "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+        "data": 5
+      },
+      "expect": "INVALID_RPC_CALL"
+    },
+    {
+      "id": "rpc-request-data-null",
+      "spec": "11-request-reply.md §4.1, §6, 01-envelope.md §4",
+      "why": "`null` en `data` es INVALID_RPC_CALL: no es un objeto, y un SDK que lo trate como «sin datos» fabricaría una petición que el esquema no admite.",
+      "op": "rpc-request",
+      "input": {
+        "operation": "clientes.cliente.v1.calcular-descuento",
+        "tenantId": "acme",
+        "aggregateId": "cli-1",
+        "id": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+        "source": "/produccion/facturacion-api",
+        "time": "2026-08-20T10:41:07.318Z",
+        "correlationid": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+        "producerversion": "3.4.1",
+        "classification": "internal",
+        "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+        "data": null
+      },
+      "expect": "INVALID_RPC_CALL"
+    },
+    {
+      "id": "rpc-request-clasificacion-invalida",
+      "spec": "11-request-reply.md §4.1, 01-envelope.md §3",
+      "why": "Una clasificación fuera del enum es INVALID_DATACLASSIFICATION, no se corrige ni se baja a `internal`.",
+      "op": "rpc-request",
+      "input": {
+        "operation": "clientes.cliente.v1.calcular-descuento",
+        "tenantId": "acme",
+        "aggregateId": "cli-1",
+        "id": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+        "source": "/produccion/facturacion-api",
+        "time": "2026-08-20T10:41:07.318Z",
+        "correlationid": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+        "producerversion": "3.4.1",
+        "classification": "secreto",
+        "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+        "data": {
+          "clienteId": "cli-1",
+          "totalCents": 9990,
+          "moneda": "EUR",
+          "campana": "Otoño"
+        }
+      },
+      "expect": "INVALID_DATACLASSIFICATION"
+    },
+    {
+      "id": "rpc-request-orden-reservado-gana",
+      "spec": "11-request-reply.md §4.1",
+      "why": "El ORDEN de §4.1 paso 0 («el primero que falla gana»): esta petición rompe cuatro cosas a la vez —dominio reservado, operación mal formada, clasificación y `data`— y se contesta la primera: RESERVED_DOMAIN. Dos SDKs que validan en otro orden dan el mismo código ante cada defecto suelto y distinto ante varios.",
+      "op": "rpc-request",
+      "input": {
+        "operation": "state.Cliente.v1.obtener_x",
+        "tenantId": "acme",
+        "aggregateId": "cli-1",
+        "id": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+        "source": "/produccion/facturacion-api",
+        "time": "2026-08-20T10:41:07.318Z",
+        "correlationid": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+        "producerversion": "3.4.1",
+        "classification": "secreto",
+        "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+        "data": [
+          1
+        ]
+      },
+      "expect": "RESERVED_DOMAIN"
+    },
+    {
+      "id": "rpc-request-orden-operacion-antes-que-clasificacion",
+      "spec": "11-request-reply.md §4.1",
+      "why": "Operación mal formada Y clasificación inválida: INVALID_RPC_CALL (la operación) va antes que INVALID_DATACLASSIFICATION.",
+      "op": "rpc-request",
+      "input": {
+        "operation": "clientes.cliente.v1.Obtener",
+        "tenantId": "acme",
+        "aggregateId": "cli-1",
+        "id": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+        "source": "/produccion/facturacion-api",
+        "time": "2026-08-20T10:41:07.318Z",
+        "correlationid": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+        "producerversion": "3.4.1",
+        "classification": "secreto",
+        "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+        "data": {
+          "clienteId": "cli-1",
+          "totalCents": 9990,
+          "moneda": "EUR",
+          "campana": "Otoño"
+        }
+      },
+      "expect": "INVALID_RPC_CALL"
+    },
+    {
+      "id": "rpc-reply-sin-subject",
+      "spec": "11-request-reply.md §3.2",
+      "why": "Si la petición no traía `subject` (no hubo `aggregateId`), la respuesta tampoco lo lleva ni lleva `partitionkey`: «los de la petición, si los traía». Un SDK que invente uno, o que escriba `null`, rompe el sobre.",
+      "op": "rpc-reply",
+      "input": {
+        "request": {
+          "operation": "clientes.cliente.v1.calcular-descuento",
+          "id": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+          "correlationid": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+          "tenantid": "acme"
+        },
+        "id": "01924f91-5d0f-7e03-9b6a-1c2d3e4f5a67",
+        "source": "/produccion/crm-api",
+        "time": "2026-08-20T10:41:07.329Z",
+        "correlationid": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+        "producerversion": "2.1.0",
+        "classification": "internal",
+        "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-b7ad6b7169203331-01",
+        "data": {
+          "descuentoCents": 500,
+          "moneda": "EUR",
+          "motivo": "Campaña de otoño"
+        }
+      }
+    },
+    {
+      "id": "rpc-reply-hereda-correlationid",
+      "spec": "11-request-reply.md §3.2",
+      "why": "La respuesta HEREDA el `correlationid` de la petición, que aquí NO es el `id` de la petición (la llamada nació de otro evento): en el ejemplo de la spec valen lo mismo y un SDK que escribiese el `id` en `correlationid` pasaría desapercibido. `causationid` sí es el `id` de la petición.",
+      "op": "rpc-reply",
+      "input": {
+        "request": {
+          "operation": "clientes.cliente.v1.calcular-descuento",
+          "id": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+          "correlationid": "01924f90-1111-7222-8333-444455556666",
+          "tenantid": "acme",
+          "subject": "cli-1"
+        },
+        "id": "01924f91-5d0f-7e03-9b6a-1c2d3e4f5a67",
+        "source": "/produccion/crm-api",
+        "time": "2026-08-20T10:41:07.329Z",
+        "correlationid": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+        "producerversion": "2.1.0",
+        "classification": "internal",
+        "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-b7ad6b7169203331-01",
+        "data": {
+          "descuentoCents": 500,
+          "moneda": "EUR",
+          "motivo": "Campaña de otoño"
+        }
+      }
+    },
+    {
+      "id": "rpc-reply-major-2",
+      "spec": "11-request-reply.md §2.2, §3.2",
+      "why": "La respuesta de una operación de `v2` con agregado de dos palabras: `type` termina en `.reply.v2` y el `dataschema` es `…/reply/2.0.0.json`. Con `confidential`: la clasificación de la respuesta es la de la operación.",
+      "op": "rpc-reply",
+      "input": {
+        "request": {
+          "operation": "logistica.linea-envio.v2.reservar-stock",
+          "id": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+          "correlationid": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+          "tenantid": "acme",
+          "subject": "env-7"
+        },
+        "id": "01924f91-5d0f-7e03-9b6a-1c2d3e4f5a67",
+        "source": "/produccion/crm-api",
+        "time": "2026-08-20T10:41:07.329Z",
+        "correlationid": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+        "producerversion": "2.1.0",
+        "classification": "confidential",
+        "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-b7ad6b7169203331-01",
+        "data": {
+          "reservado": true,
+          "lineas": []
+        }
+      }
+    },
+    {
+      "id": "rpc-reply-escapes-obligatorios",
+      "spec": "01-envelope.md §1.1",
+      "why": "La respuesta pasa por el mismo serializador que los eventos: comillas, barras, saltos, tabuladores y control escapados; U+007F, U+2028, acentos y emoji literales.",
+      "op": "rpc-reply",
+      "input": {
+        "request": {
+          "operation": "clientes.cliente.v1.calcular-descuento",
+          "id": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+          "correlationid": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+          "tenantid": "acme",
+          "subject": "cli-1"
+        },
+        "id": "01924f91-5d0f-7e03-9b6a-1c2d3e4f5a67",
+        "source": "/produccion/crm-api",
+        "time": "2026-08-20T10:41:07.329Z",
+        "correlationid": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+        "producerversion": "2.1.0",
+        "classification": "internal",
+        "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-b7ad6b7169203331-01",
+        "data": {
+          "cita": "dijo \"hola\"",
+          "ruta": "C:\\temp\\x",
+          "lineas": "a\nb\tc",
+          "control": "\u0001",
+          "del": "\u007f",
+          "separador": "a\u2028b",
+          "texto": "Café — 5€ ✅ 🚀"
+        }
+      }
+    },
+    {
+      "id": "rpc-reply-control-tenant",
+      "spec": "11-request-reply.md §3.2",
+      "why": "CONTROL: la respuesta lleva el `tenantid` de la PETICIÓN sin modificar. Con la petición en `globex` DEBE dar otros bytes: un SDK que escribiese el tenant de su propia conexión no se notaría en el ejemplo (los dos son `acme`).",
+      "op": "rpc-reply",
+      "input": {
+        "request": {
+          "operation": "clientes.cliente.v1.calcular-descuento",
+          "id": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+          "correlationid": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+          "tenantid": "globex",
+          "subject": "cli-1"
+        },
+        "id": "01924f91-5d0f-7e03-9b6a-1c2d3e4f5a67",
+        "source": "/produccion/crm-api",
+        "time": "2026-08-20T10:41:07.329Z",
+        "correlationid": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+        "producerversion": "2.1.0",
+        "classification": "internal",
+        "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-b7ad6b7169203331-01",
+        "data": {
+          "descuentoCents": 500,
+          "moneda": "EUR",
+          "motivo": "Campaña de otoño"
+        }
+      },
+      "differsFrom": "rpc-reply-spec-3-5"
+    },
+    {
+      "id": "rpc-error-sin-retryafter",
+      "spec": "11-request-reply.md §3.3",
+      "why": "`retryAfterMs` es opcional: un `retryable` sin él NO lleva la clave (ni `null`). Las claves de `data` siguen siendo `class, code, message`.",
+      "op": "rpc-error",
+      "input": {
+        "request": {
+          "operation": "clientes.cliente.v1.calcular-descuento",
+          "id": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+          "correlationid": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+          "tenantid": "acme",
+          "subject": "cli-1"
+        },
+        "id": "01924f91-5d11-7a62-8f0d-4e5f6a7b8c91",
+        "source": "/produccion/crm-api",
+        "time": "2026-08-20T10:41:07.331Z",
+        "correlationid": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+        "producerversion": "2.1.0",
+        "classification": "internal",
+        "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-b7ad6b7169203331-01",
+        "error": {
+          "class": "retryable",
+          "code": "HTTP_503",
+          "message": "el servicio de tarifas no responde"
+        }
+      }
+    },
+    {
+      "id": "rpc-error-retryafter-cero",
+      "spec": "11-request-reply.md §3.3",
+      "why": "`retryAfterMs: 0` es un entero ≥ 0 y SE ESCRIBE: «reintenta ya» no es «sin sugerencia». Un SDK que decida con `if (retryAfterMs)` (JavaScript) o con `if retry_after_ms` (Python) lo perdería.",
+      "op": "rpc-error",
+      "input": {
+        "request": {
+          "operation": "clientes.cliente.v1.calcular-descuento",
+          "id": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+          "correlationid": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+          "tenantid": "acme",
+          "subject": "cli-1"
+        },
+        "id": "01924f91-5d11-7a62-8f0d-4e5f6a7b8c91",
+        "source": "/produccion/crm-api",
+        "time": "2026-08-20T10:41:07.331Z",
+        "correlationid": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+        "producerversion": "2.1.0",
+        "classification": "internal",
+        "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-b7ad6b7169203331-01",
+        "error": {
+          "class": "retryable",
+          "code": "HTTP_503",
+          "message": "el servicio de tarifas no responde",
+          "retryAfterMs": 0
+        }
+      }
+    },
+    {
+      "id": "rpc-error-sin-subject",
+      "spec": "11-request-reply.md §3.2, §3.3",
+      "why": "El error de una petición sin `aggregateId`: tampoco lleva `subject` ni `partitionkey`, pero SÍ `causationid` (el `id` de la petición) y el `correlationid` y el `tenantid` heredados.",
+      "op": "rpc-error",
+      "input": {
+        "request": {
+          "operation": "clientes.cliente.v1.calcular-descuento",
+          "id": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+          "correlationid": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+          "tenantid": "acme"
+        },
+        "id": "01924f91-5d11-7a62-8f0d-4e5f6a7b8c91",
+        "source": "/produccion/crm-api",
+        "time": "2026-08-20T10:41:07.331Z",
+        "correlationid": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+        "producerversion": "2.1.0",
+        "classification": "internal",
+        "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-b7ad6b7169203331-01",
+        "error": {
+          "class": "retryable",
+          "code": "HTTP_503",
+          "message": "el servicio de tarifas no responde",
+          "retryAfterMs": 5000
+        }
+      }
+    },
+    {
+      "id": "rpc-error-hereda-correlationid",
+      "spec": "11-request-reply.md §3.2, §3.3",
+      "why": "El error hereda el `correlationid` de la petición (que aquí no es su `id`), como la respuesta: quien llama lo comprueba (§4.3, punto 4) y lo rechazaría como RPC_INVALID_REPLY.",
+      "op": "rpc-error",
+      "input": {
+        "request": {
+          "operation": "clientes.cliente.v1.calcular-descuento",
+          "id": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+          "correlationid": "01924f90-1111-7222-8333-444455556666",
+          "tenantid": "acme",
+          "subject": "cli-1"
+        },
+        "id": "01924f91-5d11-7a62-8f0d-4e5f6a7b8c91",
+        "source": "/produccion/crm-api",
+        "time": "2026-08-20T10:41:07.331Z",
+        "correlationid": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+        "producerversion": "2.1.0",
+        "classification": "internal",
+        "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-b7ad6b7169203331-01",
+        "error": {
+          "class": "retryable",
+          "code": "HTTP_503",
+          "message": "el servicio de tarifas no responde",
+          "retryAfterMs": 5000
+        }
+      }
+    },
+    {
+      "id": "rpc-error-message-escapes",
+      "spec": "01-envelope.md §1.1, 11-request-reply.md §3.3",
+      "why": "El `message` de un error con comillas, barra, salto de línea, tabulador y un carácter de control (escapados), y con U+2028, acentos y euro (literales). Un error que cita un fragmento de la excepción de una dependencia lo lleva todo.",
+      "op": "rpc-error",
+      "input": {
+        "request": {
+          "operation": "clientes.cliente.v1.calcular-descuento",
+          "id": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+          "correlationid": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+          "tenantid": "acme",
+          "subject": "cli-1"
+        },
+        "id": "01924f91-5d11-7a62-8f0d-4e5f6a7b8c91",
+        "source": "/produccion/crm-api",
+        "time": "2026-08-20T10:41:07.331Z",
+        "correlationid": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+        "producerversion": "2.1.0",
+        "classification": "internal",
+        "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-b7ad6b7169203331-01",
+        "error": {
+          "class": "permanent",
+          "code": "PEDIDO_YA_CANCELADO",
+          "message": "el pedido \"ped-1\" ya estaba cancelado\nC:\\temp\\x\tañadir — 5€ \u0001 a\u2028b"
+        }
+      }
+    },
+    {
+      "id": "rpc-error-control-tenant",
+      "spec": "11-request-reply.md §3.2, §3.3",
+      "why": "CONTROL: el error lleva el `tenantid` de la petición. Con la petición en `globex` DEBE dar otros bytes.",
+      "op": "rpc-error",
+      "input": {
+        "request": {
+          "operation": "clientes.cliente.v1.calcular-descuento",
+          "id": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+          "correlationid": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+          "tenantid": "globex",
+          "subject": "cli-1"
+        },
+        "id": "01924f91-5d11-7a62-8f0d-4e5f6a7b8c91",
+        "source": "/produccion/crm-api",
+        "time": "2026-08-20T10:41:07.331Z",
+        "correlationid": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+        "producerversion": "2.1.0",
+        "classification": "internal",
+        "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-b7ad6b7169203331-01",
+        "error": {
+          "class": "retryable",
+          "code": "HTTP_503",
+          "message": "el servicio de tarifas no responde",
+          "retryAfterMs": 5000
+        }
+      },
+      "differsFrom": "rpc-error-handler-spec-3-5"
+    },
+    {
+      "id": "rpc-operacion-valida-obtener",
+      "spec": "11-request-reply.md §2.2",
+      "why": "Una operación válida: el subject de NATS es `rpc.` + el nombre (5 tokens, 5).",
+      "op": "rpc-operation",
+      "input": {
+        "operation": "clientes.cliente.v1.obtener"
+      },
+      "expectSubject": "rpc.clientes.cliente.v1.obtener"
+    },
+    {
+      "id": "rpc-operacion-valida-calcular-descuento",
+      "spec": "11-request-reply.md §2.2",
+      "why": "Una operación válida: el subject de NATS es `rpc.` + el nombre (5 tokens, 5).",
+      "op": "rpc-operation",
+      "input": {
+        "operation": "clientes.cliente.v1.calcular-descuento"
+      },
+      "expectSubject": "rpc.clientes.cliente.v1.calcular-descuento"
+    },
+    {
+      "id": "rpc-operacion-valida-v2-con-guiones",
+      "spec": "11-request-reply.md §2.2",
+      "why": "Una operación válida: el subject de NATS es `rpc.` + el nombre (5 tokens, 5).",
+      "op": "rpc-operation",
+      "input": {
+        "operation": "logistica.linea-envio.v2.reservar-stock"
+      },
+      "expectSubject": "rpc.logistica.linea-envio.v2.reservar-stock"
+    },
+    {
+      "id": "rpc-operacion-valida-minima",
+      "spec": "11-request-reply.md §2.2",
+      "why": "Una operación válida: el subject de NATS es `rpc.` + el nombre (5 tokens, 5).",
+      "op": "rpc-operation",
+      "input": {
+        "operation": "a.b.v1.c"
+      },
+      "expectSubject": "rpc.a.b.v1.c"
+    },
+    {
+      "id": "rpc-operacion-tres-tokens",
+      "spec": "11-request-reply.md §2.2",
+      "why": "Faltan la operación.",
+      "op": "rpc-operation",
+      "input": {
+        "operation": "clientes.cliente.v1"
+      },
+      "expect": "INVALID_RPC_CALL"
+    },
+    {
+      "id": "rpc-operacion-cinco-tokens",
+      "spec": "11-request-reply.md §2.2",
+      "why": "Cinco tokens.",
+      "op": "rpc-operation",
+      "input": {
+        "operation": "clientes.cliente.v1.obtener.x"
+      },
+      "expect": "INVALID_RPC_CALL"
+    },
+    {
+      "id": "rpc-operacion-mayuscula-en-dominio",
+      "spec": "11-request-reply.md §2.2",
+      "why": "Mayúsculas: NATS distingue y crearía un subject fantasma.",
+      "op": "rpc-operation",
+      "input": {
+        "operation": "Clientes.cliente.v1.obtener"
+      },
+      "expect": "INVALID_RPC_CALL"
+    },
+    {
+      "id": "rpc-operacion-mayuscula-en-operacion",
+      "spec": "11-request-reply.md §2.2",
+      "why": "Mayúsculas en la operación.",
+      "op": "rpc-operation",
+      "input": {
+        "operation": "clientes.cliente.v1.Obtener"
+      },
+      "expect": "INVALID_RPC_CALL"
+    },
+    {
+      "id": "rpc-operacion-guion-bajo",
+      "spec": "11-request-reply.md §2.2",
+      "why": "Guion bajo.",
+      "op": "rpc-operation",
+      "input": {
+        "operation": "clientes.cliente.v1.obtener_cliente"
+      },
+      "expect": "INVALID_RPC_CALL"
+    },
+    {
+      "id": "rpc-operacion-espacio",
+      "spec": "11-request-reply.md §2.2",
+      "why": "Espacio.",
+      "op": "rpc-operation",
+      "input": {
+        "operation": "clientes.cliente.v1.obtener cliente"
+      },
+      "expect": "INVALID_RPC_CALL"
+    },
+    {
+      "id": "rpc-operacion-v0",
+      "spec": "11-request-reply.md §2.2",
+      "why": "V0.",
+      "op": "rpc-operation",
+      "input": {
+        "operation": "clientes.cliente.v0.obtener"
+      },
+      "expect": "INVALID_RPC_CALL"
+    },
+    {
+      "id": "rpc-operacion-token-final-vacio",
+      "spec": "11-request-reply.md §2.2",
+      "why": "Operación vacía.",
+      "op": "rpc-operation",
+      "input": {
+        "operation": "clientes.cliente.v1."
+      },
+      "expect": "INVALID_RPC_CALL"
+    },
+    {
+      "id": "rpc-operacion-comodin-asterisco",
+      "spec": "11-request-reply.md §2.2",
+      "why": "Comodín: el broker lo aceptaría.",
+      "op": "rpc-operation",
+      "input": {
+        "operation": "clientes.cliente.v1.*"
+      },
+      "expect": "INVALID_RPC_CALL"
+    },
+    {
+      "id": "rpc-operacion-comodin-mayor",
+      "spec": "11-request-reply.md §2.2",
+      "why": "Comodín.",
+      "op": "rpc-operation",
+      "input": {
+        "operation": "clientes.cliente.v1.>"
+      },
+      "expect": "INVALID_RPC_CALL"
+    },
+    {
+      "id": "rpc-operacion-salto-de-linea-final",
+      "spec": "11-request-reply.md §2.2",
+      "why": "Salto de línea final: coincidencia completa, no `$`.",
+      "op": "rpc-operation",
+      "input": {
+        "operation": "clientes.cliente.v1.obtener\n"
+      },
+      "expect": "INVALID_RPC_CALL"
+    },
+    {
+      "id": "rpc-operacion-vacia",
+      "spec": "11-request-reply.md §2.2",
+      "why": "Vacío.",
+      "op": "rpc-operation",
+      "input": {
+        "operation": ""
+      },
+      "expect": "INVALID_RPC_CALL"
+    },
+    {
+      "id": "rpc-operacion-con-prefijo-rpc",
+      "spec": "11-request-reply.md §2.6",
+      "why": "Con el prefijo rpc.: el dominio sería `rpc`.",
+      "op": "rpc-operation",
+      "input": {
+        "operation": "rpc.clientes.cliente.v1.obtener"
+      },
+      "expect": "RESERVED_DOMAIN"
+    },
+    {
+      "id": "rpc-operacion-dominio-reservado-state",
+      "spec": "11-request-reply.md §2.6",
+      "why": "Dominio reservado.",
+      "op": "rpc-operation",
+      "input": {
+        "operation": "state.cliente.v1.obtener"
+      },
+      "expect": "RESERVED_DOMAIN"
+    },
+    {
+      "id": "rpc-operacion-dominio-reservado-dlq",
+      "spec": "11-request-reply.md §2.6",
+      "why": "Dominio reservado.",
+      "op": "rpc-operation",
+      "input": {
+        "operation": "dlq.cliente.v1.obtener"
+      },
+      "expect": "RESERVED_DOMAIN"
+    },
+    {
+      "id": "rpc-operacion-dominio-reservado-system",
+      "spec": "11-request-reply.md §2.6",
+      "why": "Dominio reservado.",
+      "op": "rpc-operation",
+      "input": {
+        "operation": "system.cliente.v1.obtener"
+      },
+      "expect": "RESERVED_DOMAIN"
+    },
+    {
+      "id": "rpc-operacion-valida-major-diez",
+      "spec": "11-request-reply.md §2.2",
+      "why": "`v10` es una versión válida: el patrón es `v[1-9][0-9]*`, no un dígito.",
+      "op": "rpc-operation",
+      "input": {
+        "operation": "clientes.cliente.v10.obtener"
+      },
+      "expectSubject": "rpc.clientes.cliente.v10.obtener"
+    },
+    {
+      "id": "rpc-operacion-valida-guiones-en-todos-los-tokens",
+      "spec": "11-request-reply.md §2.2",
+      "why": "Guiones interiores en dominio, agregado y operación: kebab-case en los tres tokens que no son la versión.",
+      "op": "rpc-operation",
+      "input": {
+        "operation": "a-b.c-d.v1.e-f"
+      },
+      "expectSubject": "rpc.a-b.c-d.v1.e-f"
+    },
+    {
+      "id": "rpc-operacion-valida-agregado-llamado-state",
+      "spec": "11-request-reply.md §2.6",
+      "why": "Un dominio reservado lo es solo como PRIMER token: `state` de agregado es un agregado.",
+      "op": "rpc-operation",
+      "input": {
+        "operation": "clientes.state.v1.obtener"
+      },
+      "expectSubject": "rpc.clientes.state.v1.obtener"
+    },
+    {
+      "id": "rpc-operacion-valida-dominio-states",
+      "spec": "11-request-reply.md §2.6",
+      "why": "La coincidencia con un dominio reservado es EXACTA, no por prefijo: `states` no es `state`.",
+      "op": "rpc-operation",
+      "input": {
+        "operation": "states.estado.v1.obtener"
+      },
+      "expectSubject": "rpc.states.estado.v1.obtener"
+    },
+    {
+      "id": "rpc-operacion-valida-dominio-systems",
+      "spec": "11-request-reply.md §2.6",
+      "why": "Ídem: `systems` no es `system`.",
+      "op": "rpc-operation",
+      "input": {
+        "operation": "systems.sistema.v1.reiniciar"
+      },
+      "expectSubject": "rpc.systems.sistema.v1.reiniciar"
+    },
+    {
+      "id": "rpc-operacion-major-cero-a-la-izquierda",
+      "spec": "11-request-reply.md §2.2",
+      "why": "`v01` no es `v1`: el patrón es `v[1-9][0-9]*`. Dos subjects distintos para la misma versión serían dos operaciones.",
+      "op": "rpc-operation",
+      "input": {
+        "operation": "clientes.cliente.v01.obtener"
+      },
+      "expect": "INVALID_RPC_CALL"
+    },
+    {
+      "id": "rpc-operacion-v-mayuscula",
+      "spec": "11-request-reply.md §2.2",
+      "why": "`V1`: NATS distingue mayúsculas y la `V` crearía un subject al que nadie está suscrito, sin error.",
+      "op": "rpc-operation",
+      "input": {
+        "operation": "clientes.cliente.V1.obtener"
+      },
+      "expect": "INVALID_RPC_CALL"
+    },
+    {
+      "id": "rpc-operacion-guion-final",
+      "spec": "11-request-reply.md §2.2",
+      "why": "kebab-case no admite un guion al final de un token (`operationName.invalid` de protocol.json).",
+      "op": "rpc-operation",
+      "input": {
+        "operation": "clientes.cliente.v1.obtener-"
+      },
+      "expect": "INVALID_RPC_CALL"
+    },
+    {
+      "id": "rpc-operacion-guion-inicial",
+      "spec": "11-request-reply.md §2.2",
+      "why": "ni al principio (`operationName.invalid`).",
+      "op": "rpc-operation",
+      "input": {
+        "operation": "clientes.cliente.v1.-obtener"
+      },
+      "expect": "INVALID_RPC_CALL"
+    },
+    {
+      "id": "rpc-operacion-guion-doble",
+      "spec": "11-request-reply.md §2.2",
+      "why": "ni dos seguidos (`operationName.invalid`).",
+      "op": "rpc-operation",
+      "input": {
+        "operation": "clientes.cliente.v1.obtener--cliente"
+      },
+      "expect": "INVALID_RPC_CALL"
+    },
+    {
+      "id": "rpc-operacion-guion-inicial-en-dominio",
+      "spec": "11-request-reply.md §2.2",
+      "why": "El patrón es el mismo en los tres tokens: un guion inicial en el dominio también se rechaza.",
+      "op": "rpc-operation",
+      "input": {
+        "operation": "-clientes.cliente.v1.obtener"
+      },
+      "expect": "INVALID_RPC_CALL"
+    },
+    {
+      "id": "rpc-operacion-token-vacio-en-medio",
+      "spec": "11-request-reply.md §2.2",
+      "why": "Un token vacío en medio (dos puntos seguidos).",
+      "op": "rpc-operation",
+      "input": {
+        "operation": "clientes..v1.obtener"
+      },
+      "expect": "INVALID_RPC_CALL"
+    },
+    {
+      "id": "rpc-operacion-punto-inicial",
+      "spec": "11-request-reply.md §2.2",
+      "why": "Un punto al principio es un token vacío.",
+      "op": "rpc-operation",
+      "input": {
+        "operation": ".clientes.cliente.v1.obtener"
+      },
+      "expect": "INVALID_RPC_CALL"
+    },
+    {
+      "id": "rpc-operacion-letra-no-ascii",
+      "spec": "11-request-reply.md §2.2",
+      "why": "`obtén`: solo `[a-z0-9]`, no las letras de otros alfabetos ni las acentuadas.",
+      "op": "rpc-operation",
+      "input": {
+        "operation": "clientes.cliente.v1.obtén"
+      },
+      "expect": "INVALID_RPC_CALL"
+    },
+    {
+      "id": "rpc-operacion-digito-no-ascii",
+      "spec": "11-request-reply.md §2.2",
+      "why": "`v` + un dígito árabe-índico (U+0661): `\\d` en Python, Java, .NET o PHP con `/u` lo aceptaría; el patrón es `[0-9]`.",
+      "op": "rpc-operation",
+      "input": {
+        "operation": "clientes.cliente.v\u0661.obtener"
+      },
+      "expect": "INVALID_RPC_CALL"
+    },
+    {
+      "id": "rpc-operacion-ancho-completo",
+      "spec": "11-request-reply.md §2.2",
+      "why": "`\uff43` ancho completo (U+FF43) al principio: una normalización NFKC lo convertiría en una `c` válida. El nombre no se normaliza, se rechaza.",
+      "op": "rpc-operation",
+      "input": {
+        "operation": "\uff43lientes.cliente.v1.obtener"
+      },
+      "expect": "INVALID_RPC_CALL"
+    },
+    {
+      "id": "rpc-operacion-espacio-inicial",
+      "spec": "11-request-reply.md §2.2",
+      "why": "Un espacio al principio: el SDK no recorta (`trim`) lo que recibe.",
+      "op": "rpc-operation",
+      "input": {
+        "operation": " clientes.cliente.v1.obtener"
+      },
+      "expect": "INVALID_RPC_CALL"
+    },
+    {
+      "id": "rpc-operacion-espacio-no-separable-final",
+      "spec": "11-request-reply.md §2.2",
+      "why": "U+00A0 al final: `\\s` y `trim()` de varios lenguajes lo consideran un espacio; el nombre es `[a-z0-9-.]`.",
+      "op": "rpc-operation",
+      "input": {
+        "operation": "clientes.cliente.v1.obtener\u00a0"
+      },
+      "expect": "INVALID_RPC_CALL"
+    },
+    {
+      "id": "rpc-operacion-retorno-de-carro-y-salto",
+      "spec": "11-request-reply.md §2.2",
+      "why": "CR LF al final: coincidencia COMPLETA del patrón, no `$` (que en Python y PHP acepta un `\\n` final).",
+      "op": "rpc-operation",
+      "input": {
+        "operation": "clientes.cliente.v1.obtener\r\n"
+      },
+      "expect": "INVALID_RPC_CALL"
+    },
+    {
+      "id": "rpc-operacion-nul-en-medio",
+      "spec": "11-request-reply.md §2.2",
+      "why": "Un NUL en medio: una cadena de C o un `strlen` lo cortaría y daría por buena `clientes.cliente.v1.obt`.",
+      "op": "rpc-operation",
+      "input": {
+        "operation": "clientes.cliente.v1.obt\u0000ener"
+      },
+      "expect": "INVALID_RPC_CALL"
+    },
+    {
+      "id": "rpc-operacion-mayuscula-no-es-reservado",
+      "spec": "11-request-reply.md §2.6",
+      "why": "`State` no es el dominio reservado `state`: los reservados son minúsculas y la coincidencia exacta. Es una operación mal formada (mayúsculas): INVALID_RPC_CALL.",
+      "op": "rpc-operation",
+      "input": {
+        "operation": "State.cliente.v1.obtener"
+      },
+      "expect": "INVALID_RPC_CALL"
+    },
+    {
+      "id": "rpc-operacion-prefijo-rpc-en-mayusculas",
+      "spec": "11-request-reply.md §2.6",
+      "why": "Ídem con el prefijo: `RPC.` no es `rpc.`; es mayúscula en el dominio.",
+      "op": "rpc-operation",
+      "input": {
+        "operation": "RPC.clientes.cliente.v1.obtener"
+      },
+      "expect": "INVALID_RPC_CALL"
+    },
+    {
+      "id": "rpc-operacion-reservado-gana-un-solo-token",
+      "spec": "11-request-reply.md §2.6",
+      "why": "El dominio reservado se mira ANTES que la forma (§4.1 paso 0): `rpc` solo, sin más tokens, es RESERVED_DOMAIN y no INVALID_RPC_CALL.",
+      "op": "rpc-operation",
+      "input": {
+        "operation": "rpc"
+      },
+      "expect": "RESERVED_DOMAIN"
+    },
+    {
+      "id": "rpc-operacion-reservado-gana-dos-tokens",
+      "spec": "11-request-reply.md §2.6",
+      "why": "Ídem con `state.cliente` (dos tokens): RESERVED_DOMAIN, como en el contrato de estado `state.cliente` (`state-subject-dominio-reservado-state`).",
+      "op": "rpc-operation",
+      "input": {
+        "operation": "state.cliente"
+      },
+      "expect": "RESERVED_DOMAIN"
+    },
+    {
+      "id": "rpc-operacion-reservado-gana-sobre-mayusculas",
+      "spec": "11-request-reply.md §2.6",
+      "why": "`dlq` + mayúsculas en el resto: RESERVED_DOMAIN gana a INVALID_RPC_CALL.",
+      "op": "rpc-operation",
+      "input": {
+        "operation": "dlq.CLIENTES.v1.OBTENER"
+      },
+      "expect": "RESERVED_DOMAIN"
+    },
+    {
+      "id": "rpc-timeout-por-defecto",
+      "spec": "11-request-reply.md §4.2",
+      "why": "Sin `timeoutMs`: 5000 ms (§4.2).",
+      "op": "rpc-timeout",
+      "input": {},
+      "expectEffectiveMs": 5000
+    },
+    {
+      "id": "rpc-timeout-1",
+      "spec": "11-request-reply.md §4.2",
+      "why": "El mínimo: 1 ms es válido.",
+      "op": "rpc-timeout",
+      "input": {
+        "timeoutMs": 1
+      },
+      "expectEffectiveMs": 1
+    },
+    {
+      "id": "rpc-timeout-2000",
+      "spec": "11-request-reply.md §4.2",
+      "why": "Un valor intermedio, el de los ejemplos de la spec.",
+      "op": "rpc-timeout",
+      "input": {
+        "timeoutMs": 2000
+      },
+      "expectEffectiveMs": 2000
+    },
+    {
+      "id": "rpc-timeout-5000",
+      "spec": "11-request-reply.md §4.2",
+      "why": "El valor por defecto escrito a mano.",
+      "op": "rpc-timeout",
+      "input": {
+        "timeoutMs": 5000
+      },
+      "expectEffectiveMs": 5000
+    },
+    {
+      "id": "rpc-timeout-25000",
+      "spec": "11-request-reply.md §4.2",
+      "why": "El máximo: 25 s, por debajo del `ack_wait` de 30 s.",
+      "op": "rpc-timeout",
+      "input": {
+        "timeoutMs": 25000
+      },
+      "expectEffectiveMs": 25000
+    },
+    {
+      "id": "rpc-timeout-0",
+      "spec": "11-request-reply.md §4.2",
+      "why": "Cero: fuera de rango. NO se recorta a 1 ms en silencio.",
+      "op": "rpc-timeout",
+      "input": {
+        "timeoutMs": 0
+      },
+      "expect": "INVALID_RPC_CALL"
+    },
+    {
+      "id": "rpc-timeout-menos-1",
+      "spec": "11-request-reply.md §4.2",
+      "why": "Negativo: fuera de rango.",
+      "op": "rpc-timeout",
+      "input": {
+        "timeoutMs": -1
+      },
+      "expect": "INVALID_RPC_CALL"
+    },
+    {
+      "id": "rpc-timeout-25001",
+      "spec": "11-request-reply.md §4.2",
+      "why": "Un milisegundo por encima del máximo: INVALID_RPC_CALL, no se recorta a 25 000.",
+      "op": "rpc-timeout",
+      "input": {
+        "timeoutMs": 25001
+      },
+      "expect": "INVALID_RPC_CALL"
+    },
+    {
+      "id": "rpc-timeout-30000",
+      "spec": "11-request-reply.md §4.2",
+      "why": "30 s: el `ack_wait`. Con ese timeout una llamada desde un handler provocaría su reentrega.",
+      "op": "rpc-timeout",
+      "input": {
+        "timeoutMs": 30000
+      },
+      "expect": "INVALID_RPC_CALL"
+    },
+    {
+      "id": "rpc-timeout-60000",
+      "spec": "11-request-reply.md §4.2",
+      "why": "Un minuto: lo que un desarrollador pondría «para estar seguro».",
+      "op": "rpc-timeout",
+      "input": {
+        "timeoutMs": 60000
+      },
+      "expect": "INVALID_RPC_CALL"
+    },
+    {
+      "id": "rpc-timeout-1-5",
+      "spec": "11-request-reply.md §4.2",
+      "why": "Un número que no es entero.",
+      "op": "rpc-timeout",
+      "input": {
+        "timeoutMs": 1.5
+      },
+      "expect": "INVALID_RPC_CALL"
+    },
+    {
+      "id": "rpc-timeout-cadena-numerica",
+      "spec": "11-request-reply.md §4.2",
+      "why": "`\"5000\"` es una cadena, no un número: el SDK no convierte.",
+      "op": "rpc-timeout",
+      "input": {
+        "timeoutMs": "5000"
+      },
+      "expect": "INVALID_RPC_CALL"
+    },
+    {
+      "id": "rpc-timeout-null",
+      "spec": "11-request-reply.md §4.2",
+      "why": "`null` NO es «ausente»: solo `undefined`/no pasarlo da el 5000 por defecto.",
+      "op": "rpc-timeout",
+      "input": {
+        "timeoutMs": null
+      },
+      "expect": "INVALID_RPC_CALL"
+    },
+    {
+      "id": "rpc-timeout-cadena-nan",
+      "spec": "11-request-reply.md §4.2",
+      "why": "Una cadena que no es un número.",
+      "op": "rpc-timeout",
+      "input": {
+        "timeoutMs": "NaN"
+      },
+      "expect": "INVALID_RPC_CALL"
+    },
+    {
+      "id": "rpc-timeout-2",
+      "spec": "11-request-reply.md §4.2",
+      "why": "Un milisegundo por encima del mínimo.",
+      "op": "rpc-timeout",
+      "input": {
+        "timeoutMs": 2
+      },
+      "expectEffectiveMs": 2
+    },
+    {
+      "id": "rpc-timeout-24999",
+      "spec": "11-request-reply.md §4.2",
+      "why": "Un milisegundo por debajo del máximo.",
+      "op": "rpc-timeout",
+      "input": {
+        "timeoutMs": 24999
+      },
+      "expectEffectiveMs": 24999
+    },
+    {
+      "id": "rpc-timeout-24999-5",
+      "spec": "11-request-reply.md §4.2",
+      "why": "Medio milisegundo por debajo del máximo: no es entero, y no se redondea.",
+      "op": "rpc-timeout",
+      "input": {
+        "timeoutMs": 24999.5
+      },
+      "expect": "INVALID_RPC_CALL"
+    },
+    {
+      "id": "rpc-timeout-0-5",
+      "spec": "11-request-reply.md §4.2",
+      "why": "Medio milisegundo: ni entero ni ≥ 1; no se redondea a 1.",
+      "op": "rpc-timeout",
+      "input": {
+        "timeoutMs": 0.5
+      },
+      "expect": "INVALID_RPC_CALL"
+    },
+    {
+      "id": "rpc-timeout-true",
+      "spec": "11-request-reply.md §4.2",
+      "why": "Un booleano no es un número (en Python `True` es un `int`).",
+      "op": "rpc-timeout",
+      "input": {
+        "timeoutMs": true
+      },
+      "expect": "INVALID_RPC_CALL"
+    },
+    {
+      "id": "rpc-timeout-false",
+      "spec": "11-request-reply.md §4.2",
+      "why": "`false` tampoco: no es `0` ni «ausente».",
+      "op": "rpc-timeout",
+      "input": {
+        "timeoutMs": false
+      },
+      "expect": "INVALID_RPC_CALL"
+    },
+    {
+      "id": "rpc-timeout-cadena-vacia",
+      "spec": "11-request-reply.md §4.2",
+      "why": "Una cadena vacía no es «ausente».",
+      "op": "rpc-timeout",
+      "input": {
+        "timeoutMs": ""
+      },
+      "expect": "INVALID_RPC_CALL"
+    },
+    {
+      "id": "rpc-timeout-array",
+      "spec": "11-request-reply.md §4.2",
+      "why": "Un array con un número dentro no se desenvuelve (en JavaScript `[5000] == 5000`).",
+      "op": "rpc-timeout",
+      "input": {
+        "timeoutMs": [
+          5000
+        ]
+      },
+      "expect": "INVALID_RPC_CALL"
+    },
+    {
+      "id": "rpc-timeout-objeto",
+      "spec": "11-request-reply.md §4.2",
+      "why": "Un objeto vacío no es un número.",
+      "op": "rpc-timeout",
+      "input": {
+        "timeoutMs": {}
+      },
+      "expect": "INVALID_RPC_CALL"
+    },
+    {
+      "id": "rpc-timeout-1e21",
+      "spec": "11-request-reply.md §4.2",
+      "why": "Un número enorme (`1e+21` en JSON): fuera de rango y no representable como entero de 64 bits; se rechaza, no se desborda.",
+      "op": "rpc-timeout",
+      "input": {
+        "timeoutMs": 1e+21
+      },
+      "expect": "INVALID_RPC_CALL"
+    }
+  ],
+  "$commentRpc": "Los vectores de `rpcVectors` los ejecutan SOLO los SDKs que declaran la capacidad `rpc` en protocol.json → capabilities; para los demás el runner imprime «N/A: no declara rpc». `input` es la entrada del arnés SIN el `op` (que va aparte), plana como el `input` de los fixtures de cross-sdk-rpc-envelope.json. Cada vector dice QUÉ espera: `sha256` (los bytes son los de la spec) y `length` (su longitud en bytes), `expectSubject` (el subject de NATS de `rpc-operation`), `expectEffectiveMs` (los milisegundos de `rpc-timeout`), `expect` (el código estable del rechazo) o nada (los bytes los fija el SDK de referencia, y además el runner comprueba lo que la spec dice del sobre). `differsFrom` es un control: los bytes DEBEN ser distintos de los de ese otro vector. `caseFixture` enlaza con un fixture del caso, y el runner comprueba que siguen coincidiendo; los vectores de operación y de timeout del caso también están aquí, con las mismas entradas y los mismos resultados.",
   "stateVectors": [
     {
       "id": "state-put-minimo",
