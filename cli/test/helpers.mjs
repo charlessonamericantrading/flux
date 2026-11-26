@@ -12,7 +12,7 @@
  */
 
 import { spawn, spawnSync } from "node:child_process";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { createServer, createConnection } from "node:net";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -65,14 +65,21 @@ async function esperaPuerto(puerto, ms = 8000) {
 /**
  * Levanta un `nats-server` con JetStream en un puerto libre del rango y devuelve
  * `{ url, parar }`. Mata SOLO el proceso que lanzó (nunca `pkill`) y borra su directorio.
+ *
+ * `conf` (opcional): el texto de un fichero de configuración de NATS —usuarios y permisos— que se
+ * pasa con `-c`. Con él NO se activa JetStream: es para probar permisos de core NATS (la
+ * petición/respuesta). El texto no lleva puerto ni host: los pone la prueba.
  */
-export async function arrancaBroker() {
+export async function arrancaBroker({ conf } = {}) {
   let puerto = null;
   for (let p = P0; p <= P1 && puerto === null; p++) if (await libre(p)) puerto = p;
   if (puerto === null) throw new Error(`no queda ningún puerto libre en FLUX_TEST_PORTS (${P0}-${P1})`);
 
   const dir = mkdtempSync(join(tmpdir(), "flux-cli-"));
-  const hijo = spawn(BIN, ["-js", "-sd", join(dir, "js"), "-p", String(puerto), "-a", "127.0.0.1"], { stdio: "ignore" });
+  const args = conf === undefined
+    ? ["-js", "-sd", join(dir, "js"), "-p", String(puerto), "-a", "127.0.0.1"]
+    : ["-c", (writeFileSync(join(dir, "nats.conf"), conf), join(dir, "nats.conf")), "-p", String(puerto), "-a", "127.0.0.1"];
+  const hijo = spawn(BIN, args, { stdio: "ignore" });
   const limpiar = () => rmSync(dir, { recursive: true, force: true });
   try {
     await esperaPuerto(puerto);

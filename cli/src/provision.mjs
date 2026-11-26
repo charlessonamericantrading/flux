@@ -28,6 +28,12 @@
  * crea los durables de estado de cada `watches` (uno por tenant si confina) y el del dueño para
  * su DLQ de estado. Un dominio solo de eventos no cambia: 1.1 es aditiva.
  *
+ * Petición/respuesta (11-request-reply.md §8): NINGÚN stream que se cree captura una operación
+ * (`rpc.*.*.*.*`). Los suyos son `EVT_<DOM>` (`<dom>.>`; `rpc` es un dominio reservado), `DLQ_<DOM>`
+ * (`dlq.…`) y `STATE_<DOM>` (`state.…`): disjuntos por construcción, y además `recursosDeseados` lo
+ * COMPRUEBA antes de crear nada y se niega si no se cumple, en vez de fiarse de la construcción.
+ * `flux doctor` lo audita después en lo que ya existe.
+ *
  * Única excepción a «nunca sobrescribe»: si `DLQ_<DOM>` existe con SOLO `dlq.<dom>.>` (lo creó
  * un `flux provision` de la 1.0) y el dominio ha ganado estado, se AMPLÍA con `dlq.state.<dom>.>`.
  * Ampliar los subjects de un stream con mensajes no pierde ninguno (A-44) y es lo único que hace
@@ -49,6 +55,7 @@ import {
 } from "@nats-io/jetstream";
 
 import { c, OK, FAIL, WARN, fmtDuration } from "./ui.mjs";
+import { capturaOperaciones } from "./rpc-model.mjs";
 import {
   analizarManifiesto,
   dlqStreamName,
@@ -154,6 +161,17 @@ export function recursosDeseados(servicios, canonico, replicas) {
         ]
       : []),
   ]);
+
+  // Petición/respuesta: un stream que capturara una operación contestaría a cada petición con su acuse
+  // y guardaría sus datos personales (A-18, A-67). Ningún stream se crea con uno así.
+  const capturan = streams.filter((s) => s.config.subjects.some(capturaOperaciones));
+  if (capturan.length) {
+    throw new Error(
+      `el aprovisionamiento crearía ${capturan.map((s) => `${s.name} (${s.config.subjects.join(", ")})`).join("; ")}, ` +
+        "que captura operaciones de petición/respuesta (rpc.*.*.*.*): contestaría a cada petición con su acuse y guardaría sus datos personales. " +
+        "`rpc` es un dominio reservado: ningún servicio puede ser su dueño (11-request-reply.md §8).",
+    );
+  }
 
   const k = canonico.consumer;
   const consumers = servicios.flatMap((s) =>
