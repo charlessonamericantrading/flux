@@ -22,7 +22,7 @@ import { v7 as uuidv7 } from "uuid";
 
 import type { ConnectOptions } from "./client.js";
 import { contextFromEvent, currentContext, runWithContext, activeTraceparent } from "./context.js";
-import { parseEvent, type DataClassification, type FluxEvent } from "./envelope.js";
+import { exigirAtributos, parseEvent, tiempoCanonico, type DataClassification, type FluxEvent } from "./envelope.js";
 import {
   ErrorClass,
   PermanentError,
@@ -49,6 +49,7 @@ import {
 } from "./security.js";
 import type { Signer } from "./signing.js";
 import { InvalidDataClassificationError } from "./state-errors.js";
+import { codePointLength, truncateCodePoints } from "./text.js";
 import {
   SchemaNotFoundError,
   SchemaValidationError,
@@ -99,7 +100,7 @@ export const RPC_SCHEMA_BASE = "https://schemas.internal";
  * a diferencia de Python y PHP, donde `"…obtener\n"` pasaría el patrón (11-request-reply.md §2.2).
  */
 export const RPC_OPERATION_PATTERN =
-  /^[a-z0-9]+(-[a-z0-9]+)*\.[a-z0-9]+(-[a-z0-9]+)*\.v[1-9][0-9]*\.[a-z0-9]+(-[a-z0-9]+)*$/;
+  /^[a-z0-9]+(-[a-z0-9]+)*\.[a-z0-9]+(-[a-z0-9]+)*\.v[1-9][0-9]{0,3}\.[a-z0-9]+(-[a-z0-9]+)*$/;
 /** `errors.codePattern` y el `pattern` del esquema del error. */
 export const RPC_ERROR_CODE_PATTERN = /^[A-Z][A-Z0-9]*(_[A-Z0-9]+)*$/;
 const RPC_ERROR_CODE_MAX = 64;
@@ -142,7 +143,7 @@ export function parseRpcOperation(operation: unknown): ParsedRpcOperation {
           ? "no admite comodines (`*`, `>`): el broker los aceptaría, y es una operación concreta la que se llama o se atiende"
           : n !== 4
             ? `debe tener exactamente 4 tokens, tiene ${n}`
-            : "la versión es `v` y un entero ≥ 1, y cada token va en kebab-case (letras minúsculas, dígitos y guiones)";
+            : "la versión mayor es `v` y un entero de 1 a 4 dígitos sin ceros a la izquierda (`v1`…`v9999`), y cada token va en kebab-case (letras minúsculas, dígitos y guiones)";
     throw new InvalidRpcCallError(
       `la operación ${JSON.stringify(operation.length > 90 ? `${operation.slice(0, 87)}…` : operation)} no es válida: ` +
         `${porQue}. El nombre es \`<dominio>.<agregado>.v<major>.<operacion>\` —el subject sin \`rpc.\`—, con la ` +
@@ -222,6 +223,16 @@ export function rpcDataschema(operation: string, lado: "request" | "reply", base
 // 4. El sobre — funciones PURAS (11-request-reply.md §3)
 // ═════════════════════════════════════════════════════════════════════════════════════════
 
+/**
+ * Lo que comprueba todo constructor de petición/respuesta además de la operación y `data`: que los atributos que el SDK rellena no
+ * lleguen vacíos y que `time` sea un instante (se normaliza a la forma canónica). Todo es `INVALID_RPC_CALL`: el conjunto de
+ * códigos de rpc es cerrado (04-errors.md §7) y agrupa «las equivocaciones de quien programa». Devuelve `time` canónico.
+ */
+function entradaDelSobre(campos: Parameters<typeof exigirAtributos>[0], time: unknown): string {
+  exigirAtributos(campos, (m) => new InvalidRpcCallError(m));
+  return tiempoCanonico(time, (m) => new InvalidRpcCallError(m));
+}
+
 export interface RpcRequestInput<T extends object = Record<string, unknown>> {
   /** `clientes.cliente.v1.calcular-descuento`. */
   operation: string;
@@ -256,12 +267,22 @@ export function buildRpcRequest<T extends object>(input: RpcRequestInput<T>): Fl
   const p = parseRpcOperation(input.operation);
   assertObject(input.data, "`data`");
   const classification = assertClassification(input.classification);
+  const time = entradaDelSobre(
+    [
+      ["id", input.id],
+      ["source", input.source],
+      ["correlationid", input.correlationid, true],
+      ["tenantid", input.tenantId, true],
+      ["producerversion", input.producerversion, true],
+    ],
+    input.time,
+  );
   return {
     specversion: "1.0",
     id: input.id,
     source: input.source,
     type: rpcRequestType(p.operation),
-    time: input.time,
+    time,
     datacontenttype: "application/json",
     dataschema: input.dataschema ?? rpcDataschema(p.operation, "request"),
     ...(input.aggregateId !== undefined && { subject: input.aggregateId }),
@@ -317,13 +338,24 @@ export function buildRpcReply<T extends object>(input: RpcReplyInput<T>): FluxEv
   const p = parseRpcOperation(input.request.operation);
   assertObject(input.data, "la respuesta");
   const classification = assertClassification(input.classification);
+  const time = entradaDelSobre(
+    [
+      ["id", input.id],
+      ["source", input.source],
+      ["producerversion", input.producerversion, true],
+      ["request.id", input.request.id],
+      ["request.correlationid", input.request.correlationid, true],
+      ["request.tenantid", input.request.tenantid, true],
+    ],
+    input.time,
+  );
   const key = particion(input.request);
   return {
     specversion: "1.0",
     id: input.id,
     source: input.source,
     type: rpcReplyType(p.operation),
-    time: input.time,
+    time,
     datacontenttype: "application/json",
     dataschema: input.dataschema ?? rpcDataschema(p.operation, "reply"),
     ...(input.request.subject !== undefined && { subject: input.request.subject }),
@@ -367,7 +399,8 @@ export function rpcErrorDataProblem(d: unknown): string | null {
   if (typeof o.code !== "string" || o.code.length > RPC_ERROR_CODE_MAX || !RPC_ERROR_CODE_PATTERN.test(o.code)) {
     return "`code` del error debe ser un identificador estable en MAYÚSCULAS y guiones bajos (máx. 64)";
   }
-  if (typeof o.message !== "string" || o.message.length < 1 || o.message.length > RPC_ERROR_MESSAGE_MAX) {
+  // `maxLength` de JSON Schema cuenta caracteres Unicode (puntos de código), no unidades UTF-16: mil emojis caben (text.ts).
+  if (typeof o.message !== "string" || o.message.length < 1 || codePointLength(o.message) > RPC_ERROR_MESSAGE_MAX) {
     return "`message` del error debe ser un texto de 1 a 1000 caracteres";
   }
   if (o.retryAfterMs !== undefined) {
@@ -388,7 +421,19 @@ export function rpcErrorDataProblem(d: unknown): string | null {
 export function buildRpcError(input: RpcErrorInput): FluxEvent<RpcErrorData> {
   parseRpcOperation(input.request.operation);
   const problema = rpcErrorDataProblem(input.error);
-  if (problema) throw new TypeError(`error de petición/respuesta mal formado: ${problema}`);
+  // Un error que no cumple su esquema es `INVALID_RPC_CALL` (04-errors.md §7): un código estable, no un `TypeError` sin código.
+  if (problema) throw new InvalidRpcCallError(`el error que se iba a contestar no cumple su esquema: ${problema}`);
+  const time = entradaDelSobre(
+    [
+      ["id", input.id],
+      ["source", input.source],
+      ["producerversion", input.producerversion, true],
+      ["request.id", input.request.id],
+      ["request.correlationid", input.request.correlationid, true],
+      ["request.tenantid", input.request.tenantid, true],
+    ],
+    input.time,
+  );
   const key = particion(input.request);
   const { class: clase, code, message, retryAfterMs } = input.error;
   return {
@@ -396,7 +441,7 @@ export function buildRpcError(input: RpcErrorInput): FluxEvent<RpcErrorData> {
     id: input.id,
     source: input.source,
     type: RPC_ERROR_TYPE,
-    time: input.time,
+    time,
     datacontenttype: "application/json",
     dataschema: RPC_ERROR_DATASCHEMA,
     ...(input.request.subject !== undefined && { subject: input.request.subject }),
@@ -522,12 +567,11 @@ export interface RpcHost {
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 const aIso = (ms: number) => new Date(ms).toISOString();
 
-/** Corta a `max` UTF-16 sin partir un par sustituto: una mitad se serializaría como `\ud83d`. */
-function truncar(s: string, max: number): string {
-  if (s.length <= max) return s;
-  const corte = /[\ud800-\udbff]/.test(s[max - 2] ?? "") ? max - 2 : max - 1;
-  return `${s.slice(0, corte)}…`;
-}
+/** Corta a `max` PUNTOS DE CÓDIGO (como `maxLength` de JSON Schema), sin partir un par sustituto: una mitad se serializaría como `\ud83d`. */
+const truncar = truncateCodePoints;
+
+/** Un texto que es solo espacio en blanco (`White_Space` de Unicode, no el `\s` de JavaScript, que incluye U+FEFF) no dice nada. */
+const SOLO_BLANCOS = /^[\t\n\v\f\r \u0085\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]*$/;
 
 /** Un semáforo: `acquire` espera si no quedan cupos, y `release` se lo pasa al siguiente que espera. */
 class Cupos {
@@ -572,11 +616,15 @@ function pareceAcuseDeStream(bytes: Uint8Array): boolean {
   }
 }
 
-/** El `id` de un mensaje que no se pudo leer como CloudEvent, **solo si es una cadena válida** (§5.2). */
+/**
+ * El `id` de un mensaje que no se pudo leer como CloudEvent, **solo si es una cadena válida** (§5.2): no vacía, de 128 caracteres
+ * como máximo (puntos de código) y sin caracteres de control (U+0000–U+001F ni U+007F–U+009F). Es lo que el error cita como
+ * `causationid`: un valor que quien llama no puede reconocer como suyo, o que llena un log, no se copia.
+ */
 function idLegible(bytes: Uint8Array): string | undefined {
   try {
     const id = (JSON.parse(DECODER.decode(bytes)) as { id?: unknown } | null)?.id;
-    return typeof id === "string" && id.length >= 1 && id.length <= 256 ? id : undefined;
+    return typeof id === "string" && id.length >= 1 && codePointLength(id) <= 128 && !/\p{Cc}/u.test(id) ? id : undefined;
   } catch {
     return undefined;
   }
@@ -1252,12 +1300,14 @@ export class RpcClient {
     const h = this.#h;
     const codigoValido = (c: unknown): c is string =>
       typeof c === "string" && c.length <= RPC_ERROR_CODE_MAX && RPC_ERROR_CODE_PATTERN.test(c);
-    const mensaje = (m: string, porDefecto: string) => truncar(m.length > 0 ? m : porDefecto, RPC_ERROR_MESSAGE_MAX);
+    const mensaje = (m: string, porDefecto: string) => truncar(SOLO_BLANCOS.test(m) ? porDefecto : m, RPC_ERROR_MESSAGE_MAX);
     const reservado = event.dataclassification === "confidential" || event.dataclassification === "restricted";
 
     if (e instanceof RetryableError || e instanceof PermanentError || e instanceof PoisonError) {
       const clase: "retryable" | "permanent" = e instanceof RetryableError ? "retryable" : "permanent";
-      const porDefecto = clase === "retryable" ? "RETRYABLE" : e instanceof PoisonError ? "POISON" : "PERMANENT";
+      // §5.3: sin código propio, `RETRYABLE` o `PERMANENT`. Un `PoisonError` es `permanent` (`poison` no viaja): su código por defecto
+      // es el de la clase con la que viaja, no el de la clase que no viaja.
+      const porDefecto = clase === "retryable" ? "RETRYABLE" : "PERMANENT";
       const dado = (e.opts as { code?: unknown }).code;
       let code = porDefecto;
       if (dado !== undefined) {
@@ -1326,7 +1376,7 @@ export class RpcClient {
     const truncado: RpcErrorData = {
       ...error,
       code: error.code,
-      message: truncar(error.message || "el servicio rechazó la petición", RPC_ERROR_MESSAGE_MAX),
+      message: truncar(SOLO_BLANCOS.test(error.message) ? "el servicio rechazó la petición" : error.message, RPC_ERROR_MESSAGE_MAX),
     };
     // Sin sobre que leer no hay nada que heredar (§5.2): `correlationid` propio, `system`, y el `id` de la petición solo si es válido.
     const ref: RpcRequestRef = request

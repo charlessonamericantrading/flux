@@ -5,6 +5,9 @@
 
 import { PoisonError } from "./errors.js";
 import { MAX_MESSAGE_BYTES, subjectToType } from "./protocol.js";
+import { InvalidDataClassificationError } from "./state-errors.js";
+import { truncateUtf8Bytes } from "./text.js";
+import { canonicalTime } from "./time.js";
 
 export type DataClassification =
   | "public"
@@ -88,6 +91,63 @@ export class EnvelopeError extends Error {
   }
 }
 
+/**
+ * Un constructor se niega a construir un sobre: falta (o está vacío) un atributo que el SDK rellena, o `time` no es un
+ * instante. Lleva el **mismo código estable** que daría el parser ante el mismo defecto (01-envelope.md §3.1): un atributo
+ * obligatorio vacío es `MISSING_REQUIRED_ATTRIBUTE`; una extensión obligatoria vacía, `MISSING_REQUIRED_EXTENSION`; un `time`
+ * que no es un instante RFC 3339, `WRONG_ATTRIBUTE_TYPE` (CloudEvents lo tipa `Timestamp`). El arnés de conformidad compara ese
+ * código entre SDKs.
+ */
+export class InvalidEnvelopeInputError extends EnvelopeError {
+  readonly code: string;
+  readonly opts: { readonly code: string };
+  constructor(message: string, code: "MISSING_REQUIRED_ATTRIBUTE" | "MISSING_REQUIRED_EXTENSION" | "WRONG_ATTRIBUTE_TYPE") {
+    super(message);
+    this.name = "InvalidEnvelopeInputError";
+    this.code = code;
+    this.opts = { code };
+  }
+}
+
+/** `[nombre, valor, esExtension]`: lo que un constructor comprueba que no llegó vacío. */
+export type AtributoObligatorio = readonly [nombre: string, valor: unknown, extension?: boolean];
+
+/**
+ * Los atributos que el SDK rellena NO pueden llegar vacíos a un constructor: una cadena vacía y una ausente son lo mismo
+ * (01-envelope.md §3.1, §3.3), y un evento que su propio parser rechazaría no se construye. `rechaza` decide el error: el de
+ * eventos y estado lleva el código del parser; el de petición/respuesta, `INVALID_RPC_CALL` (su conjunto de códigos es cerrado).
+ */
+export function exigirAtributos(
+  campos: readonly AtributoObligatorio[],
+  rechaza: (mensaje: string, code: "MISSING_REQUIRED_ATTRIBUTE" | "MISSING_REQUIRED_EXTENSION") => Error,
+): void {
+  for (const [nombre, valor, extension] of campos) {
+    if (typeof valor !== "string" || valor === "") {
+      throw rechaza(
+        `\`${nombre}\` es obligatorio y llegó ${valor === undefined || valor === null ? "ausente" : typeof valor === "string" ? "vacío" : `como ${typeof valor}`}. ` +
+          `Lo rellena el SDK a partir de connect() y del evento en curso; si estás llamando a un constructor a mano, rellénalo ` +
+          `con una cadena no vacía (01-envelope.md §5).`,
+        extension ? "MISSING_REQUIRED_EXTENSION" : "MISSING_REQUIRED_ATTRIBUTE",
+      );
+    }
+  }
+}
+
+/**
+ * `time` en su forma canónica (3 decimales y `Z`, UTC), o el error de `rechaza` si no es un instante RFC 3339 válido.
+ * Ver time.ts: se admite lo mismo que el SDK de Rust.
+ */
+export function tiempoCanonico(time: unknown, rechaza: (mensaje: string) => Error): string {
+  const c = canonicalTime(time);
+  if (c === null) {
+    throw rechaza(
+      `\`time\` debe ser un instante RFC 3339 (\`2026-08-20T10:41:07.318Z\`; se normaliza a 3 decimales y \`Z\`) y llegó ` +
+        `${typeof time === "string" ? "un texto que no lo es" : `un valor de tipo ${time === null ? "null" : typeof time}`} (01-envelope.md §2.2).`,
+    );
+  }
+  return c;
+}
+
 // ─── Construcción ────────────────────────────────────────────────────────────
 
 export interface BuildEventInput<T> {
@@ -116,6 +176,26 @@ export function buildEvent<T>(input: BuildEventInput<T>): FluxEvent<T> {
       "`data` debe ser un objeto JSON en la raíz (ni array ni escalar), para poder añadir campos sin romper el contrato",
     );
   }
+  const type = subjectToType(input.subject);
+  if (!VALID_CLASSIFICATIONS.has(input.dataclassification)) {
+    throw new InvalidDataClassificationError(input.dataclassification, "rpc");
+  }
+  exigirAtributos(
+    [
+      ["id", input.id],
+      ["source", input.source],
+      ["dataschema", input.dataschema],
+      ["correlationid", input.correlationid, true],
+      ["tenantid", input.tenantid, true],
+      ["producerversion", input.producerversion, true],
+    ],
+    (m, c) => new InvalidEnvelopeInputError(m, c),
+  );
+  // `time` de quien llama se normaliza a la forma canónica o se rechaza; sin él, el reloj del sistema.
+  const time =
+    input.time !== undefined
+      ? tiempoCanonico(input.time, (m) => new InvalidEnvelopeInputError(m, "WRONG_ATTRIBUTE_TYPE"))
+      : new Date().toISOString();
 
   const partitionkey = input.partitionkey ?? input.aggregateId;
 
@@ -123,8 +203,8 @@ export function buildEvent<T>(input: BuildEventInput<T>): FluxEvent<T> {
     specversion: "1.0",
     id: input.id,
     source: input.source,
-    type: subjectToType(input.subject),
-    time: input.time ?? new Date().toISOString(),
+    type,
+    time,
     datacontenttype: "application/json",
     dataschema: input.dataschema,
     ...(input.aggregateId !== undefined && { subject: input.aggregateId }),
@@ -159,7 +239,13 @@ export function serialize(event: FluxEvent): Uint8Array {
 
 // ─── Parseo ──────────────────────────────────────────────────────────────────
 
-const decoder = new TextDecoder();
+/**
+ * UTF-8 ESTRICTO. `new TextDecoder()` por defecto sustituye cada byte inválido por U+FFFD y se COME un BOM inicial, así que un
+ * mensaje que no es UTF-8 —o que empieza por una marca de orden de bytes— se interpretaba como JSON válido, y el SDK de Rust
+ * (que no lo es) lo rechazaba: el mismo mensaje, dos veredictos. Un cuerpo que no es UTF-8 no es JSON (RFC 8259 §8.1) y un BOM
+ * tampoco (§8.1: «las implementaciones NO DEBEN añadir una marca»): ambos son `MALFORMED_JSON`.
+ */
+const decoder = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
 
 /**
  * Un fallo aquí es POISON: el mensaje ni siquiera es interpretable, así que nunca
@@ -251,7 +337,37 @@ export function parseEvent(bytes: Uint8Array): FluxEvent {
     );
   }
 
+  // Los tipos son exactos TAMBIÉN en lo no obligatorio: `{"subject": 5}` o `{"dlqattempts": "seis"}` no se propagan. Es el último
+  // código de `parseEvent` (el orden es parte del contrato entre SDKs) y el mismo de Rust, Java y .NET.
+  const mal = atributoConTipoIncompatible(e);
+  if (mal !== undefined) {
+    throw new PoisonError(
+      `${mal} tiene un tipo incompatible con el contrato (01-envelope.md §2.4): ${JSON.stringify(typeof e[mal] === "object" ? "un objeto o un array" : e[mal]).slice(0, 60)}`,
+      { code: "INVALID_ATTRIBUTE_TYPE" },
+    );
+  }
+
   return e as unknown as FluxEvent;
+}
+
+const CADENAS_NO_OBLIGATORIAS = [
+  "dataschema", "subject", "causationid", "partitionkey", "traceparent", "tracestate",
+  "dlqconsumer", "dlqerror", "dlqtime", "signkeyid", "signature",
+] as const;
+
+/**
+ * El primer atributo conocido —ni de los siete cadena obligatorios— con un tipo incompatible, o `undefined`. `null` es «ausente»
+ * en un opcional (como en Rust). `dlqattempts` es un entero de 0 a 2^32−1 (`u32`) y `dlqreason`, una de las tres clases.
+ */
+function atributoConTipoIncompatible(e: Record<string, unknown>): string | undefined {
+  for (const a of CADENAS_NO_OBLIGATORIAS) {
+    if (e[a] !== undefined && e[a] !== null && typeof e[a] !== "string") return a;
+  }
+  const r = e.dlqreason;
+  if (r !== undefined && r !== null && r !== "retryable" && r !== "permanent" && r !== "poison") return "dlqreason";
+  const n = e.dlqattempts;
+  if (n !== undefined && n !== null && (typeof n !== "number" || !Number.isInteger(n) || n < 0 || n > 4294967295)) return "dlqattempts";
+  return undefined;
 }
 
 /**
@@ -266,6 +382,8 @@ export function toDlqEvent(
     consumer: string;
     error: string;
   },
+  /** El instante de la muerte, si no es «ahora» (lo fija el arnés de conformidad). Se normaliza a la forma canónica o se rechaza. */
+  dlqtime?: string,
 ): FluxEvent {
   // `data` va SIEMPRE al final, también aquí — 01-envelope.md §7.
   //
@@ -279,8 +397,12 @@ export function toDlqEvent(
     dlqreason: info.reason,
     dlqattempts: info.attempts,
     dlqconsumer: info.consumer,
-    dlqerror: info.error.slice(0, 1024),
-    dlqtime: new Date().toISOString(),
+    // 1024 BYTES UTF-8 sin partir un carácter (04-errors.md §3): no unidades UTF-16, que cortarían un emoji por la mitad.
+    dlqerror: truncateUtf8Bytes(info.error, 1024),
+    dlqtime:
+      dlqtime !== undefined
+        ? tiempoCanonico(dlqtime, (m) => new InvalidEnvelopeInputError(m, "WRONG_ATTRIBUTE_TYPE"))
+        : new Date().toISOString(),
     data,
   };
 }

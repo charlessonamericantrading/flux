@@ -256,10 +256,12 @@ describe("bytes exactos — conformance/cases/cross-sdk-rpc-envelope.json y 11-r
   test("`retryAfterMs` solo va con `retryable`, y `poison` no viaja: el constructor del error los rechaza", () => {
     const i = fixture("rpc-error-handler").input;
     const e = (error: Record<string, unknown>) => () => buildRpcError({ ...i, error } as never);
-    assert.throws(e({ class: "poison", code: "X", message: "m" }), TypeError);
-    assert.throws(e({ class: "permanent", code: "X", message: "m", retryAfterMs: 5 }), TypeError);
-    assert.throws(e({ class: "retryable", code: "x_minuscula", message: "m" }), TypeError);
-    assert.throws(e({ class: "retryable", code: "X", message: "" }), TypeError);
+    // Un código estable (INVALID_RPC_CALL, 04-errors.md §7), no un `TypeError` sin código: el arnés cruzado lo compara entre SDKs.
+    const invalida = (x: unknown) => x instanceof InvalidRpcCallError && x.code === "INVALID_RPC_CALL" && x.fluxClass === ErrorClass.PERMANENT;
+    assert.throws(e({ class: "poison", code: "X", message: "m" }), invalida);
+    assert.throws(e({ class: "permanent", code: "X", message: "m", retryAfterMs: 5 }), invalida);
+    assert.throws(e({ class: "retryable", code: "x_minuscula", message: "m" }), invalida);
+    assert.throws(e({ class: "retryable", code: "X", message: "" }), invalida);
     assert.doesNotThrow(e({ class: "retryable", code: "X", message: "m", retryAfterMs: 0 }));
   });
 });
@@ -1418,6 +1420,26 @@ describe("respond() — los errores del handler (§5.3)", () => {
     const { data } = await lanza(new PoisonError("no me puedo leer", { code: "MALFORMED_JSON" }));
     assert.equal(data.class, "permanent");
     assert.equal(data.code, "MALFORMED_JSON");
+    // Sin código propio, `PERMANENT` (§5.3): el código por defecto es el de la clase con la que viaja, no el de la que no viaja. Node
+    // contestaba `POISON`, que Rust no.
+    assert.deepEqual((await lanza(new PoisonError("no me puedo leer"))).data, { class: "permanent", code: "PERMANENT", message: "no me puedo leer" });
+  });
+
+  test("un mensaje solo de espacios es como uno vacío: se sustituye (§5.3); los espacios Unicode cuentan, U+FEFF no", async () => {
+    const porDefecto = "el servicio rechazó la petición";
+    for (const m of ["", " ", "  \t\n", "\u00a0\u2003\u3000"]) {
+      assert.equal((await lanza(new PermanentError(m, { code: "VACIO" }))).data.message, porDefecto, JSON.stringify(m));
+    }
+    assert.equal((await lanza(new PermanentError(" a ", { code: "X" }))).data.message, " a ");
+  });
+
+  test("`message` se acota en PUNTOS DE CÓDIGO (como `maxLength` de JSON Schema), no en unidades UTF-16: 1000 emojis caben, 1001 se truncan a 999 + «…»", async () => {
+    const caben = (await lanza(new PermanentError("😀".repeat(1000), { code: "X" }))).data.message;
+    assert.equal([...caben].length, 1000);
+    assert.equal(caben, "😀".repeat(1000), "no se recorta nada");
+    const largo = (await lanza(new PermanentError("😀".repeat(1001), { code: "X" }))).data.message;
+    assert.equal([...largo].length, 1000);
+    assert.equal(largo, `${"😀".repeat(999)}…`);
   });
 
   test("un error que el CLASIFICADOR reconoce (un 503, ECONNRESET) → su clase y su código, con mensaje GENÉRICO: el texto de la excepción no viaja", async () => {
@@ -1506,7 +1528,13 @@ describe("respond() — lo que no cumple (§5.2): SIEMPRE se contesta con un err
     const conId = await servir({ nc: s.nc } as Servicio, JSON.stringify({ id: "abc-123", specversion: "1.0" }), "_INBOX.llama.a");
     assert.equal(conId?.causationid, "abc-123");
     assert.equal((conId?.data as RpcErrorData).code, "MISSING_REQUIRED_ATTRIBUTE");
-    for (const [n, id] of [["b", 42], ["c", ""], ["d", "x".repeat(300)], ["e", null], ["f", { a: 1 }]] as const) {
+    // Una cadena válida: no vacía, de 128 caracteres (puntos de código) como máximo y sin caracteres de control. Los DOS SDKs aplican
+    // la misma regla (Node aceptaba hasta 256 y controles; Rust, hasta 128 y sin controles).
+    for (const [n, id] of [["g", "x".repeat(128)], ["h", "😀".repeat(128)]] as const) {
+      const ev = await servir({ nc: s.nc } as Servicio, JSON.stringify({ id, specversion: "1.0" }), `_INBOX.llama.${n}`);
+      assert.equal(ev?.causationid, id, `el id de ${n} sí es válido`);
+    }
+    for (const [n, id] of [["b", 42], ["c", ""], ["d", "x".repeat(300)], ["e", null], ["f", { a: 1 }], ["i", "x".repeat(129)], ["j", "😀".repeat(129)], ["k", "a\u0001b"], ["l", "a\u007fb"], ["m", "a\nb"]] as const) {
       const ev = await servir({ nc: s.nc } as Servicio, JSON.stringify({ id, specversion: "1.0" }), `_INBOX.llama.${n}`);
       assert.ok(ev, `id ${JSON.stringify(id).slice(0, 10)}`);
       assert.ok(!("causationid" in ev), `el id ${JSON.stringify(id).slice(0, 10)} no es una cadena válida`);
@@ -1836,7 +1864,14 @@ describe("firma — la petición y la respuesta van firmadas; con `require`, la 
 
   test("un `time` ilegible se trata como fuera de ventana con `require` (NaN no es «dentro»)", async () => {
     const s = await atiende(undefined, requireCrm());
-    const ev = await servir({ nc: s.nc } as Servicio, firmada(llamante, "facturacion-api-1", 0, { time: "ayer por la tarde" }));
+    // Un `time` que ni siquiera es un instante no sale de un SDK (el constructor lo rechaza): lo escribe quien firma a mano.
+    const base = buildRpcRequest({
+      operation: OP, tenantId: "acme", aggregateId: "cli-1", id: ID_PETICION, source: "/produccion/facturacion-api",
+      time: new Date().toISOString(), correlationid: ID_PETICION, producerversion: "3.4.1",
+      classification: "internal", data: PETICION, dataschema: rpcDataschema(OP, "request"),
+    });
+    const ilegible = encodeRpcMessage(createSigner({ privateKeyPem: llamante.privateKeyPem, keyId: "facturacion-api-1" })!.sign({ ...base, time: "ayer por la tarde" } as FluxEvent));
+    const ev = await servir({ nc: s.nc } as Servicio, ilegible);
     assert.equal((ev?.data as RpcErrorData).code, "STALE_REQUEST");
   });
 
