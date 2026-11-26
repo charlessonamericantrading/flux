@@ -949,6 +949,36 @@ describe("put — el algoritmo de 10-state.md §3.2", () => {
     await assert.rejects((await b.bus()).state.put(CONTRATO, "cli-1", dato(1)), (e: Error) => e.name === "TimeoutError");
   });
 
+  test("firma (07-signing.md): un put se firma UNA vez; `get` verifica, y una entrada manipulada o sin firma es POISON", async () => {
+    const { privateKeyPem, publicKeyPem } = generateKeyPair();
+    const firma = { privateKeyPem, keyId: "crm-api-1", publicKeys: { "crm-api-1": publicKeyPem }, verify: "require" as const };
+    const b = new BrokerEnMemoria();
+    const bus = await b.bus({ signing: firma });
+    await bus.state.put(CONTRATO, "cli-1", dato(1));
+    const guardado = JSON.parse(texto(b.datos.get(SUBJECT)!.bytes));
+    assert.equal(guardado.signkeyid, "crm-api-1");
+    assert.ok(guardado.signature);
+    assert.equal(Object.keys(guardado).at(-1), "data", "`data` sigue siendo el último con la firma");
+    assert.equal((await bus.state.get(CONTRATO, "cli-1"))!.aggregateVersion, 1, "firmada y verificada");
+
+    // manipulada: el dato cambia y la firma ya no verifica
+    const manipulada = { ...guardado, data: { ...guardado.data, nombre: "Otra Persona" } };
+    b.datos.set(SUBJECT, { ...b.datos.get(SUBJECT)!, bytes: new TextEncoder().encode(JSON.stringify(manipulada)) });
+    await assert.rejects(bus.state.get(CONTRATO, "cli-1"), (e: { opts?: { code?: string }; fluxClass?: string }) => e.opts?.code === "INVALID_SIGNATURE" && e.fluxClass === ErrorClass.POISON);
+
+    // sin firma, con `require`
+    const { signature: _s, signkeyid: _k, ...sinFirma } = guardado;
+    b.datos.set(SUBJECT, { ...b.datos.get(SUBJECT)!, bytes: new TextEncoder().encode(JSON.stringify(sinFirma)) });
+    await assert.rejects(bus.state.get(CONTRATO, "cli-1"), (e: { opts?: { code?: string } }) => e.opts?.code === "MISSING_SIGNATURE");
+
+    // CONTROL: sin verificación, la misma entrada sin firma se lee
+    const sinVerificar = await b.bus({});
+    assert.equal((await sinVerificar.state.get(CONTRATO, "cli-1"))!.key, "cli-1");
+    // y la lápida también va firmada
+    await bus.state.delete(CONTRATO, "cli-1", { aggregateVersion: 2 });
+    assert.ok(JSON.parse(texto(b.datos.get(SUBJECT)!.bytes)).signature);
+  });
+
   test("hereda el contexto del evento en curso: tenant, correlationid y causationid", async () => {
     const b = new BrokerEnMemoria();
     const sinTenant = await b.bus({ tenantId: undefined });
