@@ -1217,8 +1217,16 @@
       },
       "php": {
         "capabilities": [
-          "signing"
-        ]
+          "signing",
+          "security"
+        ],
+        "evidence": {
+          "security": [
+            "sdk-php/tests/Integration/SecurityIntegrationTest.php",
+            "sdk-php/tests/Integration/NotProvisionedIntegrationTest.php",
+            "sdk-php/tests/NatsClientTest.php"
+          ]
+        }
       }
     },
     "$commentSdks": "Solo Node y Rust declaran `security`, `state` y `rpc`: el resto usa el inbox por defecto y no acepta CA propia (plan v1.1, fase 6), no replica estado y no hace ni atiende peticiones (en el job `cross-sdk` sus vectores de estado y de rpc salen N/A). `signing` la declaran los siete: los siete tienen su arnes en conformance/harnesses.json y el job `cross-sdk` compara sus operaciones sign y verify byte a byte."

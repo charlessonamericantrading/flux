@@ -67,6 +67,19 @@ final readonly class ConnectOptions
      *
      *        ⚠️ En PHP el sondeo solo corre **dentro de `run()`**, en el worker CLI. Ver la
      *        sección "El modelo de ejecución de PHP" del README.
+     * @param string|list<string> $servers Dirección(es) del broker: `nats://host:4222`, `tls://host:4222` o `host:4222`. Solo la usa
+     *        el transporte por defecto (`SocketTransport`); con un transporte propio no se mira.
+     * @param Nats\Credentials|array<string,string>|null $credentials Credenciales NATS — 06-security.md §2. Se admite UN método:
+     *        `['creds' => '/ruta/servicio.creds']` (JWT + nkey, el recomendado), `['credsContent' => …]`, `['nkeySeed' => 'SU…']`,
+     *        `['token' => …]` o `['user' => …, 'pass' => …]`. Un valor mal formado es `INVALID_CREDENTIALS` **antes de abrir ningún
+     *        socket**; uno bien formado que el broker rechaza, `CONNECTION_REJECTED` (`auth`).
+     * @param Nats\TlsOptions|array<string,string>|null $tls `['caFile' => …]` (CA propia), más `certFile` y `keyFile` para mTLS. `[]`
+     *        exige TLS con las CA del sistema; `null` no pide TLS (aunque el servidor lo exija: se verifica igual). La verificación es
+     *        siempre completa —cadena y host— y no hay forma de desactivarla.
+     * @param int $connectTimeoutMs Cuánto esperar a cada intento de conexión (TCP, INFO, TLS y la respuesta al CONNECT).
+     * @param int|null $waitForBrokerMs Cuánto esperar a un broker que aún no ha arrancado (conexión rechazada, DNS, timeout): `null`
+     *        = sin límite, que es lo que quiere un worker. Un script web debería fijarlo. Solo cubre «aún no está»: las credenciales
+     *        rechazadas o un TLS que no encaja fallan **al instante** (03-delivery.md §6.1).
      */
     public function __construct(
         public string $service,
@@ -86,6 +99,11 @@ final readonly class ConnectOptions
         public ?LoggerInterface $logger = null,
         public ?ValidationOptions $validation = null,
         public int $pendingPollMs = 15_000,
+        public string|array $servers = 'nats://127.0.0.1:4222',
+        public Nats\Credentials|array|null $credentials = null,
+        public Nats\TlsOptions|array|null $tls = null,
+        public int $connectTimeoutMs = 2_000,
+        public ?int $waitForBrokerMs = null,
     ) {
     }
 }

@@ -140,17 +140,15 @@ protocolo a v2.
 | [Java](sdk-java/) | **L3** | 144 | ✅ (Maven en el runner) | `signing` |
 | [.NET](sdk-dotnet/) | **L3** | 189 | ✅ | `signing` |
 | [Rust](sdk-rust/) | L2 | 175 | ✅ (incl. 14 contra NATS real) | `signing` `security` `state` `rpc` |
-| [PHP](sdk-php/) | **L3** | 304 | ✅ incl. 3 de integración contra NATS real | `signing` |
-| [PHP](sdk-php/) | L2 | 201 | ✅ (transporte no — ver abajo) | `signing` |
+| [PHP](sdk-php/) | **L3** | 640 | ✅ incl. 53 de integración contra un NATS real con TLS, nkeys y las ACLs generadas | `signing` `security` |
 
 Los cinco primeros se compilan y ejecutan en CI en cada push. La suite de conformidad corre
 aparte, contra un NATS real: **14/14**.
 
-> **PHP.** Su adaptador de transporte sobre `basis-company/nats` **no está verificado
-> contra un broker real**: el ecosistema PHP de NATS no está consolidado y el SDK aísla esa
-> incertidumbre tras un puerto (`Flux\Transport\NatsTransport`), probado con un cliente
-> falso. Todo lo demás —envelope, naming, clasificación y el runtime del consumidor— se
-> prueba sin broker y está en verde. Ver [`sdk-php/README.md`](sdk-php/).
+> **PHP.** Es **síncrono y sin bucle de eventos**: `publish`, firmar, un `get` de estado y una petición puntual sirven en un script
+> corriente; `watch` y `respond` piden un **worker de larga vida**, y en hosting compartido el camino es el
+> [gateway](gateway/) (`12-edge.md`). Trae su **propio cliente de NATS** (`Flux\Nats\Connection`, sin dependencias): el adaptador de
+> `basis-company/nats` **no puede cumplir la configuración segura** (medido: A-220 a A-227). Ver [`sdk-php/README.md`](sdk-php/).
 
 **Capacidades** son extensiones opcionales que un SDK declara **sin cambiar de nivel**
 ([`00-protocol.md` §5](specification/00-protocol.md)). La fuente es `protocol.json` →

@@ -110,7 +110,7 @@ final class FluxBus
      *
      * @throws \InvalidArgumentException si el nombre de servicio no es kebab-case
      */
-    public static function connect(ConnectOptions $options, NatsTransport $transport): self
+    public static function connect(ConnectOptions $options, ?NatsTransport $transport = null): self
     {
         Protocol::assertServiceName($options->service);
 
@@ -121,7 +121,9 @@ final class FluxBus
             );
         }
 
-        return new self($transport, $options);
+        // Sin transporte, el de por defecto: `SocketTransport` (el protocolo de NATS sobre un socket, sin dependencias). Valida
+        // `credentials` y `tls` SIN abrir ningún socket y falla pronto ante lo que reintentar no arregla (03-delivery.md §6.1).
+        return new self($transport ?? Transport\SocketTransport::connect($options), $options);
     }
 
     /**
@@ -349,6 +351,12 @@ final class FluxBus
 
         $effective = $this->transport->createDurableConsumer($stream, $durable, $requested);
         $this->assertConfigHonored($durable, $requested, $effective);
+
+        // Un pull denegado no da error y deja un consumidor inerte que parece sano: `subscribe()` DEBE fallar con PERMISSION_DENIED
+        // antes de devolver (06-security.md §3.7). No se registra nada si falla.
+        if ($this->transport instanceof Transport\ProbesPull) {
+            $this->transport->assertPullAllowed($stream, $durable);
+        }
 
         $subscription = new Subscription(
             subject: $subject,

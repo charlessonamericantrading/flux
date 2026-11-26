@@ -52,6 +52,8 @@ final class Classifier
         'Symfony\\Component\\HttpClient\\Exception\\TransportException',
         'Symfony\\Contracts\\HttpClient\\Exception\\TransportExceptionInterface',
         'Amp\\Socket\\SocketException',
+        // Nuestro cliente de NATS: se perdió la conexión con el broker, o una petición no obtuvo respuesta a tiempo.
+        'Flux\\Nats\\ConnectionException',
         'React\\Socket\\ConnectionException',
     ];
 

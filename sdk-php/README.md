@@ -16,41 +16,39 @@ composer require flux/sdk        # requiere PHP >= 8.2
 
 > ### Estado de verificación
 >
-> ✅ **Suite ejecutada y en verde: 301 tests, 567 assertions** (PHP 8.3.30, PHPUnit
-> 10.5.64, sin `ext-sodium`: 38 saltados). Cubre naming, envelope, serialización byte a
-> byte, clasificación de errores, firma Ed25519, validación L3 contra el bundle real del
-> repositorio, métricas, aislamiento de tenant y todo el runtime del consumidor.
-> **Ninguno necesita broker.**
+> ✅ **Suite ejecutada y en verde: 639 tests sin broker + 53 de integración** (PHP 8.3, PHPUnit 10.5).
+> Cubre naming, envelope, serialización byte a byte, clasificación, firma Ed25519, validación L3, métricas,
+> aislamiento de tenant, el runtime del consumidor y **los vectores de conformidad cruzada** (87 de estado, 100 de
+> petición/respuesta y 93 de «Ajustes», idénticos a los de Node).
 >
-> Sin `ext-sodium` la suite sigue en verde con los tests de firma saltados, que es
-> exactamente el comportamiento que se quiere: la firma es una extensión **opcional** del
-> protocolo y no debe impedir usar el resto del SDK. Lo mismo vale para
-> `opis/json-schema` y la validación L3.
+> ✅ **La capacidad `security` se ejecuta contra un `nats-server` 2.14.5 real con TLS, una nkey por servicio y las ACLs
+> que genera `gen-acl.mjs`** —aprovisionado con `flux provision`—, no contra un broker abierto:
+> `tests/Integration/SecurityIntegrationTest.php`, `NotProvisionedIntegrationTest.php` y
+> `BasisCompanyNatsMeasurementsTest.php`. Cada código se prueba **en los dos sentidos** y la suite se comprobó con
+> **19 mutantes** (inbox común, host sin verificar, sin sonda de pull, baja a texto plano, credencial rechazada que se
+> reintenta, ack denegado en silencio, contexto TLS global…): todos detectados.
 >
-> ✅ `Flux\Transport\BasisNatsTransport` **está verificado contra un servidor NATS real**
-> (2.14.5) con `basis-company/nats` 1.2.3 —
-> `tests/Integration/BasisNatsTransportIntegrationTest.php`.
+> **Capacidades de este SDK**, con lo que NO cumple escrito (un SDK no anuncia lo que no ha ejecutado):
 >
-> Lo estuvo sin verificar y escondía un bug de raíz. `fetch()` usaba `Client::request()`,
-> que registra el handler en un inbox `_REQS.n`; pero JetStream entrega el mensaje extraído
-> **en su subject original**, con `reply-to` de `$JS.ACK…`. La librería no sabía enrutarlo:
-> el servidor entregaba el mensaje —quedaba en `num_ack_pending`— y **nunca llegaba al
-> handler ni se confirmaba**. Un consumidor que consume sin procesar.
+> | | Estado |
+> |---|---|
+> | `signing` | ✅ |
+> | `security` | ✅ con el transporte por defecto (`SocketTransport`). **No** con `BasisNatsTransport` (ver [Seguridad](#seguridad-permisos-inbox-tls-y-credenciales)) |
+> | `state` | ⏳ el sobre, el subject y los vectores sí; `put`/`get`/`watch` contra el broker, en el siguiente paso |
+> | `rpc` | ⏳ ídem |
 >
-> Los tests con cliente falso no podían verlo: devolvían obedientemente lo que el adaptador
-> esperaba. Es el argumento entero a favor de probar los adaptadores contra el sistema real,
-> y no solo contra la idea que uno tiene de él.
+> `BasisNatsTransport` (sobre `basis-company/nats`) sigue verificado contra un broker **abierto**
+> (`tests/Integration/BasisNatsTransportIntegrationTest.php`): hace eventos, **no** la configuración segura.
 >
-> Ejecutar la suite de integración:
+> Ejecutar las pruebas de integración:
 >
 > ```bash
-> docker compose up -d          # desde la raíz del repo
-> composer require --dev basis-company/nats
-> vendor/bin/phpunit --group integration
+> (cd conformance && npm install) && (cd cli && npm install)      # las usa el entorno seguro
+> NATS_SERVER=/ruta/a/nats-server FLUX_REQUIRE_BROKER=1 vendor/bin/phpunit --group integration
 > ```
 >
-> Se **salta sola** si no hay broker o falta `ext-sockets`: "no hay NATS aquí" no debe
-> parecerse a "el SDK está roto".
+> Se **saltan solas** sin broker, `node` u `openssl` —salvo con `FLUX_REQUIRE_BROKER=1`, donde **fallan**: "no hay
+> NATS aquí" no debe parecerse a "el SDK está roto", pero tampoco un CI verde a un CI que no ejecutó nada.
 
 ---
 
@@ -573,9 +571,17 @@ reposo **invalida la firma** (§4).
 esa frontera** — si lo hiciera, sustituir el broker dejaría de ser un cambio de capa 0-1 y
 pasaría a tocar las aplicaciones, que es lo que flux existe para evitar.
 
-Vienen dos implementaciones:
+Vienen tres implementaciones:
 
-- `BasisNatsTransport` — sobre `basis-company/nats`. Sin verificar (ver el aviso de arriba).
+- **`SocketTransport`** — **el de por defecto** (`FluxBus::connect($options)` sin segundo argumento).
+  El protocolo de NATS sobre un socket de PHP, **sin dependencias de Composer** (`ext-openssl` para
+  TLS y `ext-sodium` para las nkeys). Es el único que cumple la capacidad `security` y el que usan
+  `state` y `rpc`: ver [Seguridad](#seguridad-permisos-inbox-tls-y-credenciales) y por qué no
+  `basis-company/nats`.
+- `BasisNatsTransport` — sobre `basis-company/nats`, para quien ya tiene un `Client`. Sirve para
+  **eventos con un broker sin ACLs de inbox**; **no puede cumplir la configuración segura** (medido:
+  [A-220](../docs/plan-v1.1/PLAN.md#apéndice-a--evidencia) a A-227) y **no es el camino** para `security`,
+  `state` ni `rpc`. Se conserva por compatibilidad.
 - `InMemoryTransport` — para tus tests. Inyéctalo y comprueba qué publica tu handler sin
   levantar nada:
 
@@ -589,6 +595,105 @@ $bus->run(stopWhenIdle: true);
 
 assert($transport->ackTokens() === ['+ACK']);
 ```
+
+---
+
+## Seguridad: permisos, inbox, TLS y credenciales
+
+Capacidad **`security`** ([06-security.md](../specification/06-security.md) §2 y §3,
+[04-errors.md §5](../specification/04-errors.md)). **Con el transporte por defecto**
+(`SocketTransport`): lo que sigue **no** vale para `BasisNatsTransport`.
+
+```php
+use Flux\ConnectOptions;
+use Flux\FluxBus;
+
+$bus = FluxBus::connect(new ConnectOptions(
+    service: 'facturacion-api',
+    environment: 'produccion',
+    version: '3.4.1',
+    servers: 'tls://nats.interno:4222',
+    credentials: ['creds' => '/run/secrets/facturacion-api.creds'],   // o ['nkeySeed' => 'SU…']
+    tls: ['caFile' => '/etc/flux/ca.pem'],                            // CA propia; con certFile + keyFile, mTLS
+    logger: $logger,                                                  // PSR-3: sin él, un ack denegado no deja rastro
+));
+```
+
+| Qué | Cómo lo cumple |
+|---|---|
+| **Inbox privado** | Siempre `_INBOX.<servicio>`, derivado del nombre de servicio y **no configurable**: una opción es una forma de olvidarlo. Una sola suscripción por conexión (`_INBOX.<servicio>.<nuid>.*`), que es la que la ACL concede. Se comprueba contra `/connz` del servidor |
+| **TLS con CA propia** | `tls.caFile` (y solo esa: no se mezcla con las del sistema). `tls: []` verifica contra las del sistema; `tls: null` no lo pide, **pero si el servidor lo exige se hace igual y se verifica**. La verificación es **siempre completa**: cadena **y host** contra los SAN. No hay una opción para desactivarla |
+| **Credenciales** | Un `.creds` (JWT + nkey; **se relee en cada reconexión**: rotar no exige reiniciar), un `credsContent`, una semilla `nkeySeed` (`SU…`), un `token` o `user` + `pass`. **Un solo método** |
+| **`NOT_PROVISIONED`** | Falta un stream o un durable **y** el servicio no puede crearlo (pareja medida: crear → denegado **y** consultar → no existe). Nombra el recurso, el subject denegado y `flux provision`. **No se crea nada en producción**: con la ACL de `--dev` solo el durable propio, y los streams nunca |
+| **`PERMISSION_DENIED`** | Una petición a la API de JetStream o un `publish` denegados fallan **en milisegundos**, nombrando el subject. El SDK no espera al timeout: escucha los `-ERR` de la conexión y los compite con la respuesta |
+| **`subscribe()` y el pull** | Un pull denegado **no da error** y deja un consumidor inerte que parece sano. `subscribe()` **falla con `PERMISSION_DENIED`** (subject completo) antes de devolver. Determinista: una petición propia al mismo subject con un cuerpo truncado y un `PING`/`PONG`; el protocolo es ordenado, así que el `-ERR` llega antes que el `PONG`. Sin temporizador |
+| **`ack` denegado** | Es una publicación sin respuesta: el evento se procesa y se **reentrega cada `ack_wait`, para siempre**. Solo tiene el `logger`: se registra **una vez por subject**, con esa consecuencia |
+
+### Los tres códigos de `connect()`
+
+| Código | Cuándo | Ejemplo medido |
+|---|---|---|
+| `CONNECTION_REJECTED` (`auth`) | El broker **contestó** y rechazó la credencial. **Nunca** `INVALID_CREDENTIALS` | `Authorization Violation`, ~10 ms |
+| `CONNECTION_REJECTED` (`tls`) | La CA no firmó el certificado; el host no está entre los SAN; se pidió TLS y el servidor no lo ofrece (y **no baja a texto plano**); el broker exige certificado de cliente y no se presentó ninguno | ~25 ms |
+| `INVALID_CREDENTIALS` | Opciones mal formadas, **sin abrir ningún socket**: un valor vacío (una variable de entorno sin definir), una clave desconocida (`password` por `pass`: no degrada a «sin credenciales»), `user` sin `pass`, más de un método, una semilla que no es de usuario o está truncada, un `.creds` ilegible o sin semilla | < 1 ms |
+| `INVALID_TLS_OPTIONS` | Lo mismo con `tls`: una ruta vacía, ilegible o que no es un PEM, una clave desconocida, `certFile` sin `keyFile` | < 1 ms |
+
+Todos son **PERMANENT** (`FluxError::fluxClass()`), llevan `errorCode` fijo y **ninguna credencial** en el
+mensaje, que dice que reintentar no lo arregla. Un broker que **aún no ha arrancado** no es ninguno de los
+tres: se **espera** con jitter hasta `waitForBrokerMs` (sin límite por defecto, que es lo que quiere un
+worker; **un script web debería fijarlo**).
+
+```php
+try {
+    $bus = FluxBus::connect($opciones);
+} catch (\Flux\ConnectionRejectedException $e) {
+    $e->reason;      // 'auth' | 'tls'
+    $e->errorCode;   // 'CONNECTION_REJECTED'
+}
+```
+
+### Por qué el SDK trae su propio cliente de NATS (y no `basis-company/nats`)
+
+El plan v1.1 pidió medir si la primera conexión de cada librería se cuelga, falla rápido o se queda muda.
+**Se midió** contra un `nats-server` 2.14.5 con TLS, nkeys y las ACLs de `gen-acl.mjs`
+([`tests/Integration/BasisCompanyNatsMeasurementsTest.php`](tests/Integration/BasisCompanyNatsMeasurementsTest.php),
+[`conformance/cases/php-nats-client.json`](../conformance/cases/php-nats-client.json), A-220 a A-227). La
+librería (1.2.9) **falla rápido** ante una credencial rechazada y una CA ajena (en ms, sin colgarse), y sabe de
+cabeceras, `DIRECT.GET` y `Nats-Expected-Last-Subject-Sequence`. Pero:
+
+- **No puede usar el inbox privado**: `request()` se suscribe a `_REQS.<hex>.*`, escrito a fuego (la opción
+  `inboxPrefix` no lo toca). Con `_INBOX.<servicio>.>` como única suscripción permitida **toda petición falla**
+  —también la confirmación de un `publish` por JetStream y cada llamada a la API—.
+- **No verifica el host** (`verify_peer_name` a `false`), **no verifica nada sin `tlsCaFile`** y **baja a texto
+  plano** si se pide TLS y el servidor no lo ofrece.
+- No anuncia `no_responders` en CONNECT, así que `RPC_UNAVAILABLE` sería un timeout.
+- Entrega una denegación como `LogicException` **en la siguiente lectura**, sin decir de qué operación.
+
+Todo eso se escribe en `Flux\Nats\Connection` sobre el protocolo, y se mide. Es un cliente **mínimo**, síncrono
+y sin bucle de eventos: **solo lee del socket cuando se le pide** (`run()`, una petición, un `flush`). Un proceso
+que no llama no recibe nada, y el broker lo desconecta si no contesta a sus `PING` (≈ 4 min): un handler más
+largo que eso reconecta. **No reconecta en silencio dentro de un handler**: la siguiente operación reabre la
+conexión (con la misma espera con jitter) y vuelve a suscribirse.
+
+> ⚠️ **Dos trampas de PHP, medidas** (A-228, A-229), que el cliente ya esquiva: `stream_context_set_option()` sobre
+> un socket sin contexto propio escribe en el **contexto global del proceso**, así que la `cafile` de una conexión
+> se heredaba en las siguientes (una con `tls: []` conectaba verificando contra la CA de otra); y con TLS 1.3 el
+> handshake «termina» en el cliente **antes** de que el servidor compruebe el certificado de cliente: un mTLS sin
+> certificado se ve como una conexión cerrada tras el CONNECT, no como un error de TLS.
+
+### Provisionar y probar
+
+`flux provision` crea los streams y durables que las ACLs presuponen; `gen-acl.mjs` genera los permisos. Las
+pruebas de integración de este SDK arrancan un `nats-server` **con TLS, una nkey por servicio y esas ACLs**
+(`tests/Integration/entorno.mjs`, que reutiliza lo que usa la suite de seguridad del repo), no un broker abierto:
+
+```bash
+NATS_SERVER=/ruta/a/nats-server FLUX_REQUIRE_BROKER=1 FLUX_TEST_PORTS=7600-7699 \
+  vendor/bin/phpunit --group integration
+```
+
+Necesitan `node`, `openssl`, `(cd conformance && npm install)` y `(cd cli && npm install)`. Con
+`FLUX_REQUIRE_BROKER=1` su ausencia **falla** (un salto no es un pase).
 
 ---
 
