@@ -487,7 +487,6 @@
             { "caso": "reintento", "calls": 2, "data": { "pedidoId": "ped-{marker}-3" } }
           ],
           "title": "pedidos-api publica 3 eventos; facturacion-api los consume (ok, PERMANENT → DLQ, RETRYABLE → reintento)",
-          "knownDeviation": "el SDK de Rust intenta CONSUMER.CREATE ANTES de preguntar por el consumidor (CONSUMER.INFO), así que cada subscribe() deja UNA `Publish Violation` en el log del servidor aunque el ciclo funcione. El plan decide «info antes de crear» (§1.1) y Node lo hace (S10: cero violaciones). Cuando Rust lo haga, `serverViolations` pasa a 0 y este caso fallará hasta que se ajuste.",
           "expect": {
             "outcome": "ok",
             "published": 3,
@@ -501,8 +500,7 @@
             "dlqAttempts": 1,
             "dlqIdPreserved": true,
             "dlqDataLast": true,
-            "serverViolations": 1,
-            "serverViolationText": { "match": "^Subject \"\\$JS\\.API\\.CONSUMER\\.CREATE\\.EVT_PEDIDOS\\.facturacion-api__pedidos_pedido_v1_creado\\.pedidos\\.pedido\\.v1\\.creado\"$" }
+            "serverViolations": 0
           }
         }
       ]

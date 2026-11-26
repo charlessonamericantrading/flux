@@ -418,13 +418,13 @@ vocabulario de operaciones y, por caso, `spec`, `rationale`, `observed` y `count
 >   servidor cierra sin contestar en cuanto llegan bytes que no son un ClientHello.
 > - **`flux provision` por TLS.** La CLI no tiene `--ca`: la CA de la PKI efímera le llega por
 >   `NODE_EXTRA_CA_CERTS`. Un operador con una CA privada tendría que hacer lo mismo.
-> - **S11: «info antes de crear» no se cumple en Rust.** §1.1 decide que los SDKs preguntan por el
->   consumidor (`CONSUMER.INFO`) antes de crearlo, y Node lo hace (S10: cero violaciones en el log
->   del servidor). El SDK de Rust intenta `CONSUMER.CREATE` primero: bajo la ACL generada, que no
->   lo concede, cada `subscribe()` deja **una `Publish Violation`** en el log del servidor aunque el
->   ciclo funcione. Una violación de permiso es una señal de alerta: una por arranque la vuelve
->   ruido y tapa las reales. S11 lo fija como desviación conocida (`serverViolations: 1`, con el
->   subject exacto); cuando Rust pregunte antes de crear, el caso fallará hasta pasarlo a 0.
+> - **S11 destapó que Rust no cumplía «info antes de crear», y ya está corregido.** §1.1 decide que
+>   los SDKs preguntan por el consumidor (`CONSUMER.INFO`) antes de crearlo, y Node lo hacía (S10:
+>   cero violaciones en el log del servidor). El SDK de Rust intentaba `CONSUMER.CREATE` primero:
+>   bajo la ACL generada, que no lo concede, cada `subscribe()` dejaba **una `Publish Violation`**
+>   en el log del servidor aunque el ciclo funcionase. Una violación de permiso es una señal de
+>   alerta: una por arranque la vuelve ruido y tapa las reales. La alineación de Rust lo corrigió, y
+>   S11 exige ahora `serverViolations: 0`, igual que S10.
 > - **Los jobs de integración de Rust y PHP siguen contra un NATS abierto.** Pasarlos a la
 >   configuración segura queda para la Fase 6, junto a la paridad de los SDKs.
 
