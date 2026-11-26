@@ -28,6 +28,15 @@ export type ConsumeOutcome =
 export type ConnectionState = 0 | 1 | 2; // desconectado | conectado | reconectando
 
 /**
+ * `outcome` de `flux_state_writes_total` — 08-observability.md §2.4.
+ *
+ * `ok` (applied: true) · `stale` (la versión no avanzaba: NO es un error) · `conflict`
+ * (`STATE_CONFLICT`: el chequeo de secuencia agotó sus 3 intentos) · `invalid_schema`
+ * (`MISSING_AGGREGATE_VERSION`, o `data` no cumple su esquema).
+ */
+export type StateWriteOutcome = "ok" | "stale" | "conflict" | "invalid_schema";
+
+/**
  * Destino de las métricas. Impleméntalo para enchufar el backend que uses.
  *
  * Las firmas fuerzan las etiquetas del protocolo: no hay un `labels: object` genérico
@@ -47,6 +56,16 @@ export interface MetricsSink {
   eventRetried(subject: string, consumer: string, attempt: number): void;
   consumerPending(subject: string, consumer: string, pending: number): void;
   connectionState(state: ConnectionState): void;
+  /**
+   * `flux_state_writes_total{contract, outcome}` — la capacidad `state` (08-observability.md
+   * §2.4). Cuenta cada `put` y cada `delete`, sin distinguirlos.
+   *
+   * OPCIONAL a propósito: un `MetricsSink` escrito antes de la capacidad `state` sigue
+   * compilando y funcionando. Y `contract` es lo ÚNICO que el estado añade como etiqueta:
+   * **nunca** la clave (una serie por cada agregado del dominio) ni el tenant (una por cada
+   * cliente de la plataforma) — la firma no deja pasarlas, que es por donde se cuelan.
+   */
+  stateWrite?(contract: string, outcome: StateWriteOutcome): void;
 }
 
 /** No-op. El default: un SDK no debe imponer un backend de métricas. */
@@ -58,6 +77,7 @@ export const NO_METRICS: MetricsSink = {
   eventRetried() {},
   consumerPending() {},
   connectionState() {},
+  stateWrite() {},
 };
 
 // ─── Recolector en memoria ───────────────────────────────────────────────────
@@ -145,6 +165,10 @@ export class InMemoryMetrics implements MetricsSink {
     this.#set("flux_connection_state", {}, state);
   }
 
+  stateWrite(contract: string, outcome: StateWriteOutcome): void {
+    this.#inc("flux_state_writes_total", { contract, outcome });
+  }
+
   /** Formato de exposición de Prometheus. Sírvelo en `/metrics`. */
   render(): string {
     const out: string[] = [];
@@ -153,6 +177,7 @@ export class InMemoryMetrics implements MetricsSink {
     out.push("# TYPE flux_events_consumed_total counter");
     out.push("# TYPE flux_events_dlq_total counter");
     out.push("# TYPE flux_events_retried_total counter");
+    out.push("# TYPE flux_state_writes_total counter");
     for (const [k, v] of [...this.#counters].sort()) out.push(`${k} ${v}`);
 
     out.push("# TYPE flux_consumer_pending gauge");
