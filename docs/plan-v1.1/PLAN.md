@@ -241,8 +241,16 @@ Reglas nuevas. Todas tienen evidencia en el Apéndice A.
   $JS.ACK.<STREAM>.<durable>.>
   ```
 
-  Más `$JS.API.INFO` y `$JS.API.STREAM.INFO.<STREAM>` de los streams propios y consumidos.
-  *(A-3, A-4)*
+  Más `$JS.API.INFO`, `$JS.API.STREAM.INFO.EVT_<DOM>` de los streams propios y consumidos y
+  **`$JS.API.STREAM.INFO.DLQ_<DOM>` de cada dominio consumido** *(A-3, A-4, A-26)*.
+
+  > **Corregido tras medir en el SDK de Node.** (1) `STREAM.INFO.DLQ_<DOM>` no estaba en
+  > `candidata.conf`: `subscribe()` comprueba que la DLQ existe **al arrancar** (descubrirlo
+  > cuando llega el primer evento envenenado es el peor momento) y sin el permiso lanza
+  > `PermissionDeniedError`. (2) `CONSUMER.CREATE` **solo** lo usa un SDK cuyo consumidor no esté
+  > aprovisionado: el de Node pregunta `CONSUMER.INFO` antes de crear *(A-27)*. Con
+  > `flux provision` no lo necesita; concederlo o no es decisión de la ACL, no del SDK.
+  > Cada permiso de la lista se probó **quitándolo** (`sdk-node/test/integration/acl.test.ts`).
 - **Nunca a un servicio:** `$JS.API.CONSUMER.DURABLE.CREATE.*` (el filtro va en el cuerpo
   y ninguna ACL lo ve), `$JS.API.STREAM.MSG.GET.*`, y crear, modificar, borrar o purgar
   streams. *(A-5, A-6)*
@@ -263,6 +271,9 @@ Añade a `AGENTS.md` §8 dos trampas: «los permisos de subject no gobiernan Jet
   dentro de un token; hay que conocer el subject exacto.
 - Emite los permisos de 1.1. La forma objetivo está escrita a mano en
   [`evidencia/candidata.conf`](evidencia/candidata.conf).
+- **Nunca emite `allow: []`**: en NATS una lista vacía significa «sin restricción», no «nada»
+  *(A-25)*. Con el inbox privado todo servicio tiene al menos `_INBOX.<servicio>.>`, así que no
+  debería ocurrir; si ocurre, el usuario queda con todos los permisos de suscripción.
 - `--nkeys <mapa.json>`: sustituye cada `<NKEY_DE_*>` por la clave pública real.
 - Actualiza también la rama `--tenants` (Modelo B).
 - `examples/services.json`: cada subject consumido debe existir en `schemas/`. Añade los
@@ -282,10 +293,12 @@ inbox `_INBOX.>` común y el broker se lo denegaría). La tabla de capacidades d
 
 | Cambio | Detalle |
 |---|---|
-| Prefijo de inbox | `_INBOX.<service>`, siempre. Opción del cliente NATS: `inboxPrefix` (Node), `inbox_prefix` (Python), `CustomInboxPrefix` (Go), `inboxPrefix` (Java), `InboxPrefix` (.NET), `custom_inbox_prefix` (Rust). **PHP usa inboxes `_REQS.n`: verifica cómo se configura en `basis-company/nats`.** Nombres por confirmar en cada librería. |
+| Prefijo de inbox | `_INBOX.<service>`, siempre. Opción del cliente NATS: `inboxPrefix` (Node; confirmado en `@nats-io/transport-node` 3.4.0 y comprobado que rige también las peticiones de la API de JetStream y las entregas del pull), `inbox_prefix` (Python), `CustomInboxPrefix` (Go), `inboxPrefix` (Java), `InboxPrefix` (.NET), `custom_inbox_prefix` (Rust). **PHP usa inboxes `_REQS.n`: verifica cómo se configura en `basis-company/nats`.** Nombres por confirmar en cada librería. |
 | TLS | Opción `tls: { caFile, certFile?, keyFile? }` que pasa al cliente. |
-| Credenciales | Node: cablear `.creds` y semilla nkey con los autenticadores del cliente (H4). Los demás ya aceptan `.creds`; añade nkey donde falte. |
-| `NOT_PROVISIONED` | Si falta el stream o el consumidor y crear está denegado. |
+| Credenciales | Node: cablear `.creds` y semilla nkey con los autenticadores del cliente (H4). Los demás ya aceptan `.creds`; añade nkey donde falte. **Hecho en Node:** `creds` es una **ruta** (como `CredsFile` en Go y Rust), más `credsContent`, `nkeySeed`, `token` y `user`+`pass`; un solo método, y todo lo mal formado lanza en `connect()`. |
+| `NOT_PROVISIONED` | Si falta el stream o el consumidor y crear está denegado. **Node:** `NotProvisionedError`, PERMANENT. Una petición de la API denegada llega en ~1 ms como `RequestError` con `cause: PermissionViolationError` *(A-21)*: reconócela por la `cause`, no por el texto. |
+| Primera conexión | **Añadido tras medir *(A-24)*.** Con `waitOnFirstConnect` el cliente NATS reintenta **cualquier** error sin límite: un certificado que no verifica deja `connect()` esperando para siempre, sin error. El SDK debe esperar a un broker caído y **fallar** ante lo que no se arregla esperando (TLS que no verifica, credenciales rechazadas, TLS pedido y no ofrecido). Node: `ConnectionRejectedError`. |
+| Denegaciones asíncronas | **Añadido tras medir *(A-19, A-20)*.** `ack` y el pull son publicaciones sueltas: si se deniegan no hay excepción. Sin vigilarlas, un ack denegado reentrega para siempre y un pull denegado deja un consumidor inerte «sano». Node: `subscribe()` lanza si el pull se deniega; el ack solo puede avisar por `logger`. |
 
 #### 1.5 Suite de seguridad — `conformance/security.mjs` + `conformance/cases/security-acl.json`
 
@@ -745,3 +758,16 @@ Reproducible: [`evidencia/ejecutar.sh`](evidencia/ejecutar.sh).
 | A-16 | Petición atendida por un servicio con `allow_responses: true` y sin permiso de publicación sobre inboxes | Respuesta correcta en ~0,7 ms (local) |
 | A-17 | Llamar a una operación no concedida | `Permissions Violation` |
 | A-18 | Petición a un subject que captura un stream | La «respuesta» recibida es el acuse de JetStream: `{"stream":"TRAMPA","seq":1}` |
+| A-19 | Pull consumer con permisos exactos **sin** `$JS.ACK.<S>.<D>.>` | Se entrega y se procesa; nunca se confirma: `ack_floor=0`, el evento se **reentrega cada `ack_wait`, sin fin**. Ninguna excepción: solo un evento de estado `PermissionViolationError` en `nc.status()` |
+| A-20 | Pull consumer **sin** `$JS.API.CONSUMER.MSG.NEXT.<S>.<D>` | `consume()` no lanza y el consumidor queda inerte, parece sano. Solo el evento de estado. **El primer pull no se publica hasta que alguien itera** el consumidor |
+| A-21 | Petición de la API de JetStream denegada; suscripción denegada | Petición: `RequestError` con `cause: PermissionViolationError`, en ~1 ms (no timeout). Suscripción denegada: el **iterador** de esa suscripción lanza `PermissionViolationError`. «Stream no existe» es `code 10059` y «consumidor no existe» `10014`, distintos de la denegación |
+| A-22 | Espía con `_INBOX.>` mientras un servicio consume por pull con inbox privado | El espía recibe **el evento completo**. Las entregas de un pull llegan con el **subject original** del evento aunque viajen por el inbox: así funciona la fuga H2, y por eso solo la ACL la evita, no el SDK |
+| A-23 | `.creds` contra un broker en modo operador/JWT (JWT firmados a mano con `nkeys`, sin `nsc`) | `.creds` válido conecta; con la semilla de otra clave y sin credenciales: `AuthorizationError`. Ruta y contenido se comportan igual |
+| A-24 | `connect()` con `waitOnFirstConnect: true` y un certificado de servidor que no verifica | **No falla: se cuelga.** Con `false`, falla en ~5 ms con `UNABLE_TO_VERIFY_LEAF_SIGNATURE` (CA que falta o equivocada) o `ERR_TLS_CERT_ALTNAME_INVALID` (host fuera de los SAN). Un servidor sin TLS ante `tls` pedido: `ConnectionError "server does not support 'tls'"` (no baja a texto plano). mTLS sin certificado de cliente: solo `TimeoutError`; el motivo está en el log del servidor |
+| A-25 | Usuario con `subscribe: { allow: [] }` | **Sin restricción**: una lista vacía no deniega. La variante «sin inbox propio» de la matriz de tests no fallaba hasta sustituir la lista vacía por el inbox de otro servicio |
+| A-26 | SDK de Node con la candidata exacta | `subscribe()` falla con `Permissions Violation for Publish to "$JS.API.STREAM.INFO.DLQ_PEDIDOS"`: falta ese permiso en `candidata.conf` |
+| A-27 | Consumidor aprovisionado por `ops`, servicio **sin** `CONSUMER.CREATE` | Funciona si el SDK pregunta antes de crear (`CONSUMER.INFO`); sin consumidor y sin ese permiso: `NotProvisionedError`, en milisegundos y no tras un timeout |
+
+A-19 a A-27 los reproduce `sdk-node/test/integration/` (`acl.test.ts`, `auth.test.ts`,
+`tls.test.ts`), contra nats-server 2.14.5 y `@nats-io/*` 3.4.0. Les falta su caso en
+`conformance/cases/` (Fase 1.5): son observaciones del broker, no solo del SDK de Node.
