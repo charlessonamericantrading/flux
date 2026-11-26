@@ -525,37 +525,50 @@ jobs:
           # va el JSON del arnés. Se sacan de en medio aquí.
           dotnet build sdk-dotnet/Flux.sln -v quiet
 
-      # No necesita broker: esto ejercita envelope, firma y parseo, no NATS. Compara
-      # las salidas de los siete SDKs BYTE A BYTE con los mismos vectores.
+      # No necesita broker: esto ejercita envelope, firma, parseo, estado y petición/respuesta, no NATS.
+      # Compara las salidas de los siete SDKs BYTE A BYTE con los mismos vectores. Las operaciones de una
+      # CAPACIDAD (state-*, rpc-*) las ejecuta cada SDK que la declara en protocol.json → capabilities, y
+      # FALLA el que la declara y no las cumple (bytes distintos, un código distinto, una operación que su
+      # arnés no implementa, un arnés sin registrar). `--exigir state,rpc` añade que el job no pueda quedar
+      # verde con un «N/A» en todos: si ningún SDK ejecutó la capacidad, falla.
       - name: Vectores idénticos en todos los SDKs
-        run: node conformance/cross-sdk.mjs --verbose
+        run: node conformance/cross-sdk.mjs --verbose --exigir state,rpc
 
-      # Las operaciones de estado (state-build, state-tombstone, state-subject, state-dlq) las ejecutan
-      # SOLO los SDKs que declaran `state` en protocol.json (Node y Rust): los otros cinco salen
-      # «N/A: no declara state» en el paso de arriba. Un runner que solo se ha visto en verde no demuestra
-      # que detecte nada: cada mutante estropea a propósito lo que un SDK entrega o declara (un byte, un
-      # tenant, una operación ausente, un arnés sin registrar) y el runner DEBE fallar. Con `--only` para no
-      # recompilar ni invocar lo que el mutante no toca.
-      - name: El runner detecta un byte, un tenant o una operación ausente (debe FALLAR)
+      # Las operaciones de estado (state-build, state-tombstone, state-subject, state-dlq) y de petición/respuesta
+      # (rpc-request, rpc-reply, rpc-error, rpc-operation, rpc-timeout) las ejecutan SOLO los SDKs que declaran
+      # `state` o `rpc` en protocol.json (Node y Rust): los otros cinco salen «N/A: no declara …» en el paso de
+      # arriba. Un runner que solo se ha visto en verde no demuestra que detecte nada: cada mutante estropea a
+      # propósito lo que un SDK entrega o declara (un byte, un tenant, un timeout fuera de rango aceptado, un
+      # dominio reservado que no se rechaza, un `correlationid` que no se hereda, una operación ausente, un arnés
+      # sin registrar) y el runner DEBE fallar. Con `--only` para no recompilar ni invocar lo que el mutante no toca.
+      - name: El runner detecta un byte, un tenant, un timeout, un dominio reservado o una operación ausente (debe FALLAR)
         run: |
           for par in rust-un-byte:node,rust rust-tenant-cambiado:node,rust rust-ignora-tenant:node,rust \
                      rust-sin-state-subject:node,rust rust-sin-arnes-registrado:node,rust \
-                     python-declara-state:node,python; do
+                     python-declara-state:node,python \
+                     rust-rpc-un-byte:node,rust rust-rpc-timeout-recortado:node,rust \
+                     rust-rpc-dominio-reservado-aceptado:node,rust rust-rpc-correlationid-de-la-peticion:node,rust \
+                     rust-sin-rpc-operation:node,rust python-declara-rpc:node,python; do
             mutante="${par%%:*}"
             solo="${par#*:}"
-            if node conformance/cross-sdk.mjs --only "$solo" --mutant "$mutante" > /dev/null 2>&1; then
-              echo "✗ el mutante $mutante NO hizo fallar el runner: no vigila lo que dice vigilar"
+            # Debe terminar con 1 (una divergencia detectada), no con 2: un mutante mal escrito, o unos vectores
+            # que ni siquiera se cargan, también «fallan», y no demuestran que el runner vigile nada.
+            node conformance/cross-sdk.mjs --only "$solo" --mutant "$mutante" > /dev/null 2>&1 && codigo=0 || codigo=$?
+            if [ "$codigo" -ne 1 ]; then
+              echo "✗ el mutante $mutante terminó con $codigo y debía fallar con 1: el runner no vigila lo que dice vigilar"
               exit 1
             fi
             echo "✓ $mutante detectado"
           done
 
-      # El reverso: un SDK que NO declara `state` no es un fallo, pero tampoco un salto silencioso.
-      - name: Un SDK que no declara state sale N/A y NO falla
+      # El reverso: un SDK que NO declara una capacidad no es un fallo, pero tampoco un salto silencioso.
+      - name: Un SDK que no declara state ni rpc sale N/A y NO falla
         run: |
-          salida=$(node conformance/cross-sdk.mjs --only node,rust --mutant rust-no-declara-state)
-          echo "$salida" | grep -q "N/A: no declara state — rust" || { echo "✗ no imprimió el N/A"; exit 1; }
-          echo "✓ N/A visible y sin fallo"
+          for cap in state rpc; do
+            salida=$(node conformance/cross-sdk.mjs --only node,rust --mutant "rust-no-declara-$cap")
+            echo "$salida" | grep -q "N/A: no declara $cap — rust" || { echo "✗ no imprimió el N/A de $cap"; exit 1; }
+            echo "✓ $cap: N/A visible y sin fallo"
+          done
 
   conformance:
     name: Conformidad contra NATS real
