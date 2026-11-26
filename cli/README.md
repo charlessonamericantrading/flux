@@ -1,6 +1,7 @@
 # flux CLI
 
-Herramienta operativa del [Event Protocol v1](../README.md). Cuatro comandos.
+Herramienta operativa del [Event Protocol v1](../README.md): `doctor`, `tail`, `dlq`, `validate`
+y `provision`.
 
 ```bash
 cd cli && npm install && npm link     # o: node cli/src/index.mjs <cmd>
@@ -127,15 +128,96 @@ $ flux validate Pedidos.pedido.v1.actualizado
 
 ---
 
+## `flux provision` — crea lo que las ACLs presuponen
+
+```bash
+flux provision examples/services.json --dry-run --creds ops.creds      # qué crearía
+flux provision examples/services.json --creds ops.creds                # lo crea
+flux provision examples/services.json --replicas 3 --creds ops.creds   # producción
+```
+
+**Por qué existe.** En producción los servicios **no crean** streams ni consumidores: no
+tienen permiso, y es deliberado ([06-security.md §3.6](../specification/06-security.md)).
+Un stream es un recurso compartido de todo el dominio, y dejar que el primer servicio que
+arranque lo cree con la configuración que le apetezca convierte la retención, las réplicas
+y la ventana de duplicados en una carrera. Alguien tiene que crearlos, y ese alguien es esto,
+con credenciales de **operación** —no las de un servicio—.
+
+Lee el mismo manifiesto que [`scripts/gen-acl.mjs`](../scripts/gen-acl.mjs) y crea, por cada
+dominio, `EVT_<DOM>` y `DLQ_<DOM>` ([02-naming.md §3.3](../specification/02-naming.md)), y,
+por cada subject consumido tras expandir los patrones de `consumes` contra el bundle, el
+durable `<servicio>__<subject>` con la configuración canónica de
+[03-delivery.md §2](../specification/03-delivery.md). Más, por cada dueño, el durable con el
+que lee su propia DLQ (`<servicio>__dlq_<dominio>`).
+
+```
+$ flux provision examples/services.json --dry-run
+flux provision --dry-run  examples/services.json · 8 stream(s), 12 consumidor(es) · réplicas 1
+  Simulación: no se crea nada.
+
+  SE CREARÍA  EVT_FACTURACION                                                   facturacion.>
+  SE CREARÍA  DLQ_FACTURACION                                                   dlq.facturacion.>
+  …
+  SE CREARÍA  EVT_PEDIDOS / facturacion-api__pedidos_pedido_v1_creado           filtro pedidos.pedido.v1.creado
+  …
+  20 se crearía(n)
+
+$ flux provision examples/services.json        # y otra vez
+  …
+  20 sin cambios
+
+✓ Sin cambios: el broker ya tiene todo lo que el manifiesto exige.
+```
+
+| Garantía | Por qué |
+|---|---|
+| **Idempotente** | Una segunda ejecución no cambia nada y lo dice. Es lo que permite llamarla en cada despliegue sin miedo |
+| **Nunca borra** | Un stream borrado es el historial de un dominio. Lo que el manifiesto no menciona se ignora; auditarlo es trabajo de `flux doctor` |
+| **Nunca sobrescribe** | Si un stream o un consumidor existe con otra configuración, **informa de la diferencia** y lo deja como está. Cambiar la retención de un stream vivo, o `max_ack_pending` de un consumidor con mensajes en vuelo, es una decisión de una persona |
+| **`--dry-run` no crea nada** | Pero sí consulta el broker, así que distingue «se crearía» de «ya existe» |
+| **Una sola fuente** | Los nombres y la expansión de `consumes` salen del mismo módulo que usa el generador de ACL ([`scripts/lib/manifest.mjs`](../scripts/lib/manifest.mjs)), y las configuraciones, de `protocol.json`. Si cada uno calculase el nombre de un durable por su cuenta, el servicio arrancaría y el broker le denegaría su propio consumidor |
+
+```
+  DIFIERE     EVT_PEDIDOS
+      max_age: existente 7d, deseado 30d
+  DIFIERE     EVT_PEDIDOS / facturacion-api__pedidos_pedido_v1_creado
+      max_ack_pending: existente 10, deseado 256
+```
+
+**Código de salida:** `0` si todo está creado o sin cambios; `1` si algún recurso **difiere** o
+dio error (sirve en CI para detectar deriva, igual que `flux doctor`); `2` si el manifiesto o el
+bundle no se pueden leer.
+
+`--replicas` (por defecto **1**, para que arranque contra un NATS de un solo nodo) es de los
+streams; en producción, `--replicas 3`. Ejecutado con el valor por defecto contra un clúster
+que ya tiene 3, informará de la diferencia y no tocará nada.
+
+Con el **Modelo B** (`gen-acl.mjs --tenants`) cada tenant es una account con sus propios
+streams: se ejecuta **una vez por account**, con las credenciales de operación de cada una.
+
+**Credenciales de operación.** `--creds` es un fichero `.creds`. El usuario de operación **no**
+lo genera `gen-acl.mjs`: vive fuera del manifiesto y fuera de la config de los servicios.
+
+---
+
 ## Opciones globales
 
 | | |
 |---|---|
 | `-s, --server <url>` | Por defecto `$NATS_URL` o `nats://127.0.0.1:4222` |
-| `--creds <fichero>` | Credenciales NATS |
+| `--creds <fichero>` | Credenciales NATS (`.creds`). Hasta la Fase 1 se pasaba a una opción que el cliente NATS **ignora**: la conexión se abría sin credenciales y fallaba con *Authorization Violation* sin decir que el fichero nunca se leyó |
 | `-v, --verbose` | Incluye las notas informativas |
 
 ## Sobre las dependencias
 
 La CLI **no usa el SDK de flux**, igual que la suite de conformidad: una herramienta
 de diagnóstico construida sobre el SDK no puede diagnosticar los fallos del SDK.
+
+`flux provision` es la excepción a «la CLI no sale de `cli/`»: importa
+[`scripts/lib/manifest.mjs`](../scripts/lib/manifest.mjs) (nombres, expansión de `consumes` y
+permisos por servicio) y lee `protocol.json`, los dos de la raíz del repositorio. Es deliberado:
+duplicarlos haría que el aprovisionador y el generador de ACL pudieran discrepar en el nombre
+de un durable, y esa discrepancia no da error en ningún sitio salvo un `Permissions Violation`
+en el log de un servicio. La CLI es `private` y se usa desde un checkout del repositorio
+(`npm link` o `node cli/src/index.mjs`), así que la ruta relativa siempre resuelve; si algún
+día se publica como paquete, ese módulo y `protocol.json` tendrán que viajar con ella.
