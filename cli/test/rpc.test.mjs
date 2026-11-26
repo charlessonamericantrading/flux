@@ -362,7 +362,8 @@ conBroker("flux call: una petición a mano, con el sobre de un SDK y los código
     assert.ok(j.ms >= 190 && j.ms < 1500, `tardó su timeout: ${j.ms} ms`);
     assert.match(j.error.message, /no llegó respuesta en 200 ms.*PUEDE haberse ejecutado.*deduplique por el `id` de la petición \([0-9a-f-]{36}\)/s);
     assert.equal(j.error.message.includes(j.request.id), true, "el mensaje da el id de la petición, para buscarlo en el log del responder");
-    await dormir(800);
+    // Se espera a que ocurra (con tope), no un tiempo fijo: una máquina cargada retrasa al responder.
+    for (let i = 0; i < 100 && ejecuciones === 0; i++) await dormir(50);
     assert.equal(ejecuciones, 1, "el responder ejecutó la orden aunque quien llamó ya no esperaba");
   });
 
@@ -413,7 +414,7 @@ conBroker("flux call: una petición a mano, con el sobre de un SDK y los código
     (async () => { for await (const m of sub) { try { m.respond(new Uint8Array(1048577)); } catch (e) { lanzo = e; } } })();
     const j = json(await llama([DESCUENTO, ...BASE, "--data", PETICION, "--timeout", "400", "--json", "--no-validate"]));
     assert.equal(j.error.code, "RPC_TIMEOUT");
-    await dormir(50);
+    for (let i = 0; i < 100 && lanzo === null; i++) await dormir(20);
     assert.match(lanzo?.message ?? "", /max_payload/, "el error de la librería lo recibe el que responde");
     sub.unsubscribe();
   });
