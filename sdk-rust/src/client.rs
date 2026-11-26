@@ -641,27 +641,32 @@ impl Subscription {
 
 // ─── Bus ─────────────────────────────────────────────────────────────────────
 
-struct BusInner {
-    client: async_nats::Client,
-    js: async_nats::jetstream::Context,
-    opts: ConnectOptions,
-    classifier: Classifier,
-    source: String,
-    metrics: Arc<dyn MetricsSink>,
+// Los campos son `pub(crate)` porque el estado replicado ([`crate::state`]) es un módulo
+// hermano que opera sobre el mismo bus —su conexión, sus denegaciones, su clasificador y sus
+// métricas—; nada de esto es API pública.
+pub(crate) struct BusInner {
+    pub(crate) client: async_nats::Client,
+    pub(crate) js: async_nats::jetstream::Context,
+    pub(crate) opts: ConnectOptions,
+    pub(crate) classifier: Classifier,
+    pub(crate) source: String,
+    pub(crate) metrics: Arc<dyn MetricsSink>,
     #[cfg(feature = "signing")]
-    signer: Option<crate::signing::Signer>,
+    pub(crate) signer: Option<crate::signing::Signer>,
     #[cfg(feature = "signing")]
-    verifier: Option<crate::signing::Verifier>,
+    pub(crate) verifier: Option<crate::signing::Verifier>,
     /// `None` cuando el modo es `Off`: en L2 no se compila ni un esquema.
     #[cfg(feature = "validation")]
-    validator: Option<crate::validation::Validator>,
+    pub(crate) validator: Option<crate::validation::Validator>,
     ensured: Mutex<HashSet<String>>,
-    stops: Mutex<Vec<watch::Sender<bool>>>,
+    pub(crate) stops: Mutex<Vec<watch::Sender<bool>>>,
     /// Denegaciones de permisos que el broker comunica por la conexión. Ver
     /// [`crate::security`]: sin esto, un permiso que falta es un timeout mudo.
-    denials: Arc<DenialLog>,
+    pub(crate) denials: Arc<DenialLog>,
     /// `_INBOX.<servicio>`. Siempre; no es una opción — 06-security.md §3.
-    inbox_prefix: String,
+    pub(crate) inbox_prefix: String,
+    /// `flux_consumer_pending` de los `watch` de estado: la suma de sus durables — 10-state.md §9.
+    pub(crate) state_pending: crate::state::PendingSum,
 }
 
 /// El cliente de flux: publica y consume eventos.
@@ -670,7 +675,7 @@ struct BusInner {
 /// se pasa por valor a los handlers que necesiten publicar.
 #[derive(Clone)]
 pub struct Bus {
-    inner: Arc<BusInner>,
+    pub(crate) inner: Arc<BusInner>,
 }
 
 impl fmt::Debug for Bus {
@@ -689,11 +694,11 @@ impl fmt::Debug for Bus {
 /// de este fichero son un `HashSet::insert` y un `Vec::take` —no pueden entrar en
 /// pánico— así que recuperar el valor es siempre correcto y evita que un bug en otro
 /// sitio del proceso tumbe el bus entero.
-fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+pub(crate) fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-fn transport(context: impl Into<String>, source: impl Into<HandlerError>) -> FluxError {
+pub(crate) fn transport(context: impl Into<String>, source: impl Into<HandlerError>) -> FluxError {
     FluxError::Transport {
         context: context.into(),
         source: source.into(),
@@ -850,6 +855,7 @@ pub async fn connect(mut opts: ConnectOptions) -> Result<Bus, FluxError> {
             stops: Mutex::new(Vec::new()),
             denials,
             inbox_prefix: inbox,
+            state_pending: crate::state::PendingSum::default(),
         }),
     })
 }
@@ -1041,7 +1047,16 @@ impl Bus {
         &self.inner.metrics
     }
 
-    fn log(&self, level: LogLevel, msg: &str) {
+    /// El **estado replicado**: `put`, `delete`, `get` y `watch` — extensión opcional de v1.1,
+    /// [`crate::state`] y `specification/10-state.md`.
+    ///
+    /// Es barato (un `Arc` clonado) y no abre nada: la conexión es la del bus.
+    #[must_use]
+    pub fn state(&self) -> crate::state::State {
+        crate::state::State::new(self.clone())
+    }
+
+    pub(crate) fn log(&self, level: LogLevel, msg: &str) {
         if let Some(logger) = &self.inner.opts.logger {
             logger(level, &format!("[flux] {msg}"));
         }
@@ -1083,6 +1098,11 @@ impl Bus {
         data: &T,
         opts: PublishOptions,
     ) -> Result<Event, FluxError> {
+        // Los dominios reservados van ANTES que el formato: `dlq.pedidos.pedido.v1.creado` tiene
+        // 5 tokens y diría «debe tener 4», que es cierto y no ayuda. Y un `publish()` a `state.…`
+        // no es un subject mal formado sino uno que llegaría al stream de estado SIN el chequeo
+        // de secuencia y sobrescribiría sin condición (A-45) — 10-state.md §2.7.
+        crate::state::reject_reserved_domain(subject)?;
         // Falla temprano y con un mensaje útil: un subject con una mayúscula es un
         // subject fantasma — 02-naming.md §1.1.
         let parsed = parse_subject(subject)?;
@@ -1211,7 +1231,7 @@ impl Bus {
     /// broker por un corte de red y se reintenta no deja dos copias en el stream. **NO**
     /// deduplica reentregas de consumo: un `nak` reentrega el mismo mensaje con el mismo
     /// `Nats-Msg-Id` y eso es correcto y deseado — 03-delivery.md §3.
-    async fn publish_raw(
+    pub(crate) async fn publish_raw(
         &self,
         subject: &str,
         payload: Vec<u8>,
@@ -1338,6 +1358,10 @@ impl Bus {
         handler: H,
         opts: SubscribeOptions,
     ) -> Result<Subscription, FluxError> {
+        // `subscribe` también: un `EVT_STATE` no puede existir junto a `STATE_CLIENTES`
+        // (A-43), y suscribirse a `state.…` por la vía de los eventos se saltaría la foto, la
+        // lápida y la comprobación de identidad del `watch` — 10-state.md §2.7.
+        crate::state::reject_reserved_domain(subject)?;
         let parsed = parse_subject(subject)?;
 
         // El filtro efectivo se resuelve ANTES de crear nada: si `strict` no encuentra
@@ -2022,7 +2046,7 @@ impl Bus {
     ///
     /// `num_replicas` se deja sin fijar: la spec pide 3, pero un cluster de un solo nodo
     /// —el docker-compose de desarrollo— rechazaría la creación.
-    async fn ensure(&self, name: &str, cfg: stream::Config) -> Result<(), FluxError> {
+    pub(crate) async fn ensure(&self, name: &str, cfg: stream::Config) -> Result<(), FluxError> {
         if lock(&self.inner.ensured).contains(name) {
             return Ok(());
         }
@@ -2107,7 +2131,11 @@ impl Bus {
     /// inesperado) **no** se falla: se avisa por el `logger` y se sigue. No poder comprobarlo
     /// no es lo mismo que estar denegado, y una denegación posterior sigue llegando al
     /// `logger` por su cauce de siempre.
-    async fn ensure_pull_allowed(&self, stream_name: &str, durable: &str) -> Result<(), FluxError> {
+    pub(crate) async fn ensure_pull_allowed(
+        &self,
+        stream_name: &str,
+        durable: &str,
+    ) -> Result<(), FluxError> {
         let subject = format!("$JS.API.CONSUMER.MSG.NEXT.{stream_name}.{durable}");
         let probe = tokio::time::timeout(
             PULL_PROBE_TIMEOUT,
@@ -2148,7 +2176,7 @@ impl Bus {
     ///
     /// `subjects` son los subjects **exactos** a los que publica la petición: una
     /// denegación de cualquier otro no es culpa de esta operación.
-    async fn guarded<T, F>(&self, subjects: &[String], fut: F) -> Result<T, Denial>
+    pub(crate) async fn guarded<T, F>(&self, subjects: &[String], fut: F) -> Result<T, Denial>
     where
         F: Future<Output = T>,
     {
@@ -2279,7 +2307,7 @@ fn is_stream_not_found(e: &async_nats::jetstream::context::GetStreamError) -> bo
     )
 }
 
-fn permission_denied(operation: String, denial: &Denial) -> FluxError {
+pub(crate) fn permission_denied(operation: String, denial: &Denial) -> FluxError {
     FluxError::PermissionDenied {
         operation,
         denied: denial.describe(),
@@ -2323,7 +2351,7 @@ impl Bus {
 /// los 6 intentos de un `ECONNRESET` reconocido, que es exactamente lo que pasaría si el
 /// presupuesto se configurase en `max_deliver` — que es por consumidor, no por mensaje
 /// — 04-errors.md §2.1.
-fn effective_budget(max_attempts: Option<u32>) -> u32 {
+pub(crate) fn effective_budget(max_attempts: Option<u32>) -> u32 {
     max_attempts.map_or(DEFAULT_MAX_DELIVER, |m| m.min(DEFAULT_MAX_DELIVER))
 }
 
@@ -2367,7 +2395,7 @@ fn is_signature_code(code: &str) -> bool {
 }
 
 /// Los dos códigos de la validación L3 — 00-protocol.md §5.
-fn is_schema_code(code: &str) -> bool {
+pub(crate) fn is_schema_code(code: &str) -> bool {
     code == crate::errors::INVALID_SCHEMA_CODE || code == crate::errors::SCHEMA_NOT_FOUND_CODE
 }
 
@@ -2407,7 +2435,7 @@ impl From<DlqReason> for ConsumeOutcome {
 /// no hay divergencia entre ellos — lo que había que arreglar era la documentación. **Un
 /// SDK NO DEBE construir lógica que dependa de que el delay se respete más allá de la
 /// primera vez.** Ver `conformance/cases/nak-delay-ignored-with-backoff.json`.
-fn retry_delay(attempt: u32, retry_after: Option<Duration>) -> Duration {
+pub(crate) fn retry_delay(attempt: u32, retry_after: Option<Duration>) -> Duration {
     retry_after.unwrap_or_else(|| {
         // `attempt` empieza en 1, así que el primer reintento usa backoff[0]. Se satura
         // en la última entrada por si algún día max_deliver crece por encima del backoff.
@@ -2421,7 +2449,7 @@ fn retry_delay(attempt: u32, retry_after: Option<Duration>) -> Duration {
 /// Requisito **L2** y única defensa contra sobrescrituras silenciosas — 03-delivery.md
 /// §2.1. Se comprueban solo los campos que el SDK pide explícitamente: el resto lo rellena
 /// el servidor con sus defaults y compararlos daría falsos positivos.
-fn assert_config_honored(
+pub(crate) fn assert_config_honored(
     durable: &str,
     requested: &consumer::pull::Config,
     effective: &consumer::Config,
@@ -2492,7 +2520,7 @@ fn assert_config_honored(
 /// Solo se usa para guardar el cuerpo de un POISON, que es material forense y se lee una
 /// vez al año. Añadir el crate `base64` al árbol de dependencias de todo servicio del
 /// ecosistema por esto no sale a cuenta.
-fn base64(input: &[u8]) -> String {
+pub(crate) fn base64(input: &[u8]) -> String {
     const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
     for chunk in input.chunks(3) {
