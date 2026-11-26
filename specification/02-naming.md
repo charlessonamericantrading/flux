@@ -70,7 +70,7 @@ nombres del protocolo, y un dominio con su nombre colisionaría con él.
 |---|---|
 | `dlq` | Los subjects de la DLQ: `dlq.<subject original>` (§3.1) y `dlq.state.<dominio>.…` |
 | `state` | El estado replicado: `state.<dominio>.<agregado>.v<major>.<tenant>.<clave>` ([10-state.md](10-state.md)), y `schemas/state/` |
-| `rpc` | La petición/respuesta (`rpc.<dominio>.…`, fase 3), y `schemas/rpc/` |
+| `rpc` | La petición/respuesta: `rpc.<dominio>.<agregado>.v<major>.<operacion>` ([11-request-reply.md](11-request-reply.md)), y `schemas/rpc/`. **No hay stream**: es core NATS |
 | `system` | Lo de la plataforma: `schemas/system/…` y el tenant `"system"` ([09-multitenancy.md §5](09-multitenancy.md)) |
 
 **La colisión es del broker, no solo de estilo.** Medido contra NATS 2.14.5 (A-43): con
@@ -111,6 +111,17 @@ type:            com.flux.state.clientes.cliente.v1
 lápida:          com.flux.state.clientes.cliente.deleted.v1
 ```
 
+Y la petición/respuesta, el suyo ([11-request-reply.md §3](11-request-reply.md)): el subject de la operación lleva
+**cinco** tokens, y su nombre —lo que reciben `request` y `respond`, el subject sin `rpc.`— **cuatro**, con la
+misma forma sintáctica que el subject de un evento. La operación va en **infinitivo**; el evento, en pasado.
+
+```
+subject (NATS):  rpc.clientes.cliente.v1.calcular-descuento
+type:            com.flux.rpc.clientes.cliente.calcular-descuento.request.v1
+                 com.flux.rpc.clientes.cliente.calcular-descuento.reply.v1
+error:           com.flux.rpc.error.v1                              (el mismo para toda operación)
+```
+
 ## 3. Streams de JetStream
 
 ```
@@ -128,6 +139,11 @@ DLQ_CLIENTES         dlq.clientes.>  y  dlq.state.clientes.>
 
 - `STATE_<DOMINIO>` guarda **un valor por clave** y no caduca; su configuración está en
   [10-state.md §2.1](10-state.md). Solo existe si el dominio tiene contratos de estado.
+- **La petición/respuesta NO tiene stream.** `rpc.<dominio>.…` es core NATS: una petición no se persiste y, si
+  nadie responde, quien llama lo sabe al instante ([11-request-reply.md §2.1](11-request-reply.md)). **Ningún stream
+  DEBE capturar `rpc.>`**: si uno lo hace, quien llama recibe el acuse de JetStream como si fuera la respuesta (A-18) y el
+  stream guarda cada petición. Los streams de este documento no lo hacen —`EVT_<DOM>` es `<dom>.>` y `rpc` es un dominio
+  reservado— y `flux doctor` comprueba que ningún otro lo haga ([11-request-reply.md §8](11-request-reply.md)).
 - **El stream `DLQ_<DOMINIO>` de un dominio con estado captura además `dlq.state.<dominio>.>`**:
   la DLQ de estado ([10-state.md §6](10-state.md)). Un dominio sin estado conserva el
   `DLQ_<DOMINIO>` de siempre, sin tocarlo.
@@ -244,6 +260,7 @@ estado se limita a 64.
 | `pedidos.pedido.v1.OrderCreated` | Mayúsculas + idioma mezclado. | `pedidos.pedido.v1.creado` |
 | `core.entidad.v1.cambiado` | Dominio genérico = ningún dominio. | Nombra el bounded context real |
 | `state.cliente.v1.creado`, `dlq.pedido.v1.creado` | Un dominio reservado: choca con un stream del protocolo, y el SDK lo rechaza (`RESERVED_DOMAIN`). | Nombra el bounded context real — [§1.3](#13-dominios-reservados) |
+| `rpc.clientes.cliente.v1.creado`, `rpc.clientes.cliente.v1.obtener-por-email` | Un **evento** (pasado) donde va una orden, y una consulta a un almacén donde va una operación | Infinitivo para la orden (`crear`); un dato guardado es **estado** — [11-request-reply.md §2.2](11-request-reply.md) |
 
 > **Sobre `actualizado`:** es el antipatrón más caro de los siete. Obliga a cada
 > consumidor a comparar contra su propia copia para averiguar qué pasó, lo que

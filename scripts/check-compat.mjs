@@ -9,19 +9,33 @@
  * "Sin (1) y (2) automatizados, el resto de 05-compatibility.md es una sugerencia
  * amable." Esto es (1) y (2).
  *
- * Recorre los tres árboles de scripts/schema-rules.mjs: eventos
- * (`schemas/<dominio>/<agregado>/<evento>/…`), estado (`schemas/state/<dominio>/<agregado>/…`) y
- * plataforma (`schemas/system/…`). Las reglas de compatibilidad (05-compatibility.md §2) valen igual
- * en los tres. Un esquema de estado debe además declarar `aggregateVersion` como entero `required`
- * (≥ 1) y llevar un objeto en la raíz — 10-state.md §3.4, §10 —, y un dominio reservado (`dlq`,
- * `rpc`, y el propio `state` o `system` como dominio de evento) es un error.
+ * Recorre los cuatro árboles de scripts/schema-rules.mjs: eventos
+ * (`schemas/<dominio>/<agregado>/<evento>/…`), estado (`schemas/state/<dominio>/<agregado>/…`),
+ * petición/respuesta (`schemas/rpc/<dominio>/<agregado>/<operacion>/{request,reply}/…`) y plataforma
+ * (`schemas/system/…`). Las reglas de compatibilidad (05-compatibility.md §2) valen igual en todos. Un
+ * esquema de estado debe además declarar `aggregateVersion` como entero `required` (≥ 1) y llevar un
+ * objeto en la raíz — 10-state.md §3.4, §10 —, y un dominio reservado (`dlq`, `rpc`, y el propio `state` o
+ * `system` como dominio de evento) es un error.
+ *
+ * Petición/respuesta (11-request-reply.md §11): una operación es un PAR —su petición y su respuesta, del mismo
+ * mayor— y un esquema sin su par es un error; y la compatibilidad vale igual **con la dirección invertida
+ * donde corresponde**. Un esquema describe datos que fluyen de quien ESCRIBE a quien LEE. En la RESPUESTA
+ * escribe el dueño y leen los llamantes —muchos, independientes, como los consumidores de un evento—: rige
+ * todo, incluido que un valor nuevo en un enum exija `x-extensible-enum`. En la PETICIÓN escriben los
+ * llamantes y lee el dueño —un solo lector, que es quien publica el esquema y lo despliega—: añadir un valor
+ * a un enum cerrado NO rompe a nadie, así que ahí no se exige la marca; lo demás (quitar un campo, cambiar un
+ * tipo, un requerido nuevo, endurecer una restricción) rompe a los llamantes que no se han actualizado, y
+ * sigue prohibido. El orden de despliegue que esto presupone: primero quien responde, después quien llama.
  */
 
 import { readFile, readdir } from "node:fs/promises";
 import { join, dirname, relative } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { clasifica, nombresDeEstadoValidos, problemasDeEstado, LAPIDA } from "./schema-rules.mjs";
+import {
+  clasifica, nombresDeEstadoValidos, problemasDeEstado, LAPIDA,
+  nombresDeRpcValidos, problemasDeRpc, problemasDelError, ERROR_RPC, LADOS_RPC,
+} from "./schema-rules.mjs";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 const SCHEMAS = join(ROOT, "schemas");
@@ -76,8 +90,12 @@ function flatten(schema, path = "", out = new Map()) {
   return out;
 }
 
-/** Reglas de 05-compatibility.md §2. */
-function checkBackward(viejo, nuevo, file) {
+/**
+ * Reglas de 05-compatibility.md §2. `lado` es `"request"` o `"reply"` en un esquema rpc (11-request-reply.md §11):
+ * en una PETICIÓN el lector es el dueño, que se despliega con el esquema, así que añadir un valor a un enum cerrado
+ * no exige `x-extensible-enum`. Cualquier otro esquema (`undefined`) y toda RESPUESTA lo exigen.
+ */
+function checkBackward(viejo, nuevo, file, lado) {
   const a = flatten(viejo);
   const b = flatten(nuevo);
 
@@ -127,7 +145,7 @@ function checkBackward(viejo, nuevo, file) {
         err(file, `valores de enum eliminados en ${campo}: ${quitados.join(", ")}`,
           "Requiere MAYOR nuevo");
       }
-      if (añadidos.length && !nu.extensibleEnum) {
+      if (añadidos.length && !nu.extensibleEnum && lado !== "request") {
         err(file, `valores añadidos a un enum CERRADO en ${campo}: ${añadidos.join(", ")}`,
           "Un consumidor con switch exhaustivo se rompe. Marca \"x-extensible-enum\": true o sube el MAYOR — 05-compatibility.md §2.3");
       }
@@ -156,8 +174,14 @@ for (const abs of files) {
   const meta = parsePath(abs);
   if (!meta) {
     err(relative(ROOT, abs).replace(/\\/g, "/"), "ruta fuera de convención",
-      "Formato: schemas/<dominio>/<agregado>/<evento>/<major>.<minor>.<patch>.json (evento) o " +
-      "schemas/state/<dominio>/<agregado>/<major>.<minor>.<patch>.json (estado)");
+      "Formato: schemas/<dominio>/<agregado>/<evento>/<major>.<minor>.<patch>.json (evento), " +
+      "schemas/state/<dominio>/<agregado>/<major>.<minor>.<patch>.json (estado) o " +
+      "schemas/rpc/<dominio>/<agregado>/<operacion>/{request,reply}/<major>.<minor>.<patch>.json (petición/respuesta)");
+    continue;
+  }
+  if (meta.tipo === "rpc-mal-ubicado") {
+    err(meta.rel, meta.motivo,
+      "Una operación de petición/respuesta son DOS esquemas —su petición y su respuesta—: schemas/rpc/<dominio>/<agregado>/<operacion>/{request,reply}/<major>.<minor>.<patch>.json (11-request-reply.md §11)");
     continue;
   }
   if (meta.tipo === "reservado") {
@@ -177,8 +201,13 @@ for (const abs of files) {
   // Un esquema de ESTADO: los nombres van en un subject y `data` lleva la versión (10-state.md §10).
   if (meta.tipo === "estado") {
     for (const p of [...nombresDeEstadoValidos(meta), ...problemasDeEstado(schema)]) err(meta.rel, p.msg, p.hint);
+  } else if (meta.tipo === "rpc") {
+    // Los nombres van en un subject y `data` es un objeto (11-request-reply.md §11).
+    for (const p of [...nombresDeRpcValidos(meta), ...problemasDeRpc(schema, meta.lado)]) err(meta.rel, p.msg, p.hint);
   } else if (meta.rel === LAPIDA.ruta) {
     for (const p of problemasDeEstado(schema)) err(meta.rel, `la lápida: ${p.msg}`, p.hint);
+  } else if (meta.rel === ERROR_RPC.ruta) {
+    for (const p of problemasDelError(schema)) err(meta.rel, `el error de rpc: ${p.msg}`, p.hint);
   }
 
   if (schema.$id !== meta.expectedId) {
@@ -220,12 +249,44 @@ if (hayEstado && !files.some((f) => relative(SCHEMAS, f).replace(/\\/g, "/") ===
     "Hay contratos de estado y `delete` valida contra esta URI fija — 10-state.md §4");
 }
 
-// Compatibilidad entre versiones consecutivas del mismo mayor.
+// Con alguna operación rpc, el esquema del error es obligatorio: toda respuesta de error valida contra su URI fija
+// (11-request-reply.md §3.3). `bundle-schemas.mjs` lo comprueba también, pero este paso corre antes en CI.
+const hayRpc = [...porMajor.values()].some((l) => l[0].meta.tipo === "rpc");
+if (hayRpc && !files.some((f) => relative(SCHEMAS, f).replace(/\\/g, "/") === ERROR_RPC.ruta)) {
+  err(`schemas/${ERROR_RPC.ruta}`, "falta el esquema del error de rpc",
+    "Hay operaciones rpc y toda respuesta de error valida contra esta URI fija — 11-request-reply.md §3.3");
+}
+
+// Una operación rpc es un PAR: su petición y su respuesta, del mismo mayor. Un lado sin el otro deja a quien llama sin
+// contrato para lo que recibe, o a quien atiende sin contrato para lo que debe rechazar.
+{
+  const lados = new Map();   // `<dominio>.<agregado>.v<major>.<operacion>` → { request?, reply?, rel }
+  for (const lista of porMajor.values()) {
+    const { meta } = lista[0];
+    if (meta.tipo !== "rpc") continue;
+    const e = lados.get(meta.operation) ?? { rel: meta.rel };
+    e[meta.lado] = true;
+    lados.set(meta.operation, e);
+  }
+  const nombre = (l) => (l === "request" ? "petición" : "respuesta");
+  for (const [operation, e] of lados) {
+    for (const lado of LADOS_RPC) {
+      if (e[lado]) continue;
+      const otro = LADOS_RPC.find((l) => l !== lado);
+      const [dom, agr, v, op] = operation.split(".");
+      err(e.rel, `la operación ${operation} tiene esquema de ${nombre(otro)} pero no de ${nombre(lado)}`,
+        `Una operación de petición/respuesta es un PAR del mismo mayor: añade schemas/rpc/${dom}/${agr}/${op}/${lado}/${v.slice(1)}.<minor>.<patch>.json — 11-request-reply.md §11`);
+    }
+  }
+}
+
+// Compatibilidad entre versiones consecutivas del mismo mayor (y, en rpc, del mismo lado: la petición y la respuesta
+// de una operación evolucionan por separado y en direcciones opuestas).
 for (const [key, versiones] of porMajor) {
   versiones.sort((a, b) =>
     a.meta.minor - b.meta.minor || a.meta.patch - b.meta.patch);
   for (let i = 1; i < versiones.length; i++) {
-    checkBackward(versiones[i - 1].schema, versiones[i].schema, versiones[i].meta.rel);
+    checkBackward(versiones[i - 1].schema, versiones[i].schema, versiones[i].meta.rel, versiones[i].meta.lado);
   }
   if (versiones.length > 1) {
     notas.push(

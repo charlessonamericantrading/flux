@@ -14,7 +14,9 @@ conformance/
 │   ├── security-acl.json        ← los permisos generados, ejecutados contra un broker con TLS (S1–S20)
 │   ├── state-broker.json        ← estado replicado: lo que hace el BROKER (A-31 … A-49), con ACL y cluster
 │   ├── state-semantics.json     ← estado replicado: el algoritmo de put/delete/get y la foto de watch (A-50)
-│   └── cross-sdk-state-envelope.json ← la entrada de estado, la lápida y la DLQ de estado, byte a byte
+│   ├── cross-sdk-state-envelope.json ← la entrada de estado, la lápida y la DLQ de estado, byte a byte
+│   ├── rpc-semantics.json       ← petición/respuesta: lo que hace el BROKER (A-56 … A-76), con ACL, cluster y async-nats
+│   └── cross-sdk-rpc-envelope.json ← la petición, la respuesta y los errores de rpc, byte a byte; vectores de operación y timeout
 ├── fixtures/
 │   └── acl-v1.conf              ← la ACL v1 de gen-acl.mjs, congelada y rota a propósito (caso S9)
 ├── security.mjs                 ← runner de security-acl.json: los casos son DATOS
@@ -23,6 +25,8 @@ conformance/
 ├── cross-sdk.mjs                ← runner de la conformidad cruzada: los siete SDKs, byte a byte
 ├── harness/                     ← su contrato (README.md), los vectores y la clave de prueba
 ├── harnesses.json               ← cómo se invoca el arnés de cada SDK
+├── rpc-broker.mjs               ← runner de los dos ficheros de rpc: los casos son DATOS; con --mutant
+├── probes/rpc-async-nats/       ← la sonda de Rust (async-nats) que ejecuta rpc-broker.mjs
 └── README.md
 ```
 
@@ -214,3 +218,21 @@ Un caso **DEBE** llevar:
   nadie ha visto nunca es otra hipótesis.
 - `counterExample` cuando el caso nace de un bug real: la forma incorrecta, y qué
   provocaba. Es lo que impide que vuelva.
+
+## La suite de petición/respuesta
+
+```bash
+(cd conformance && npm install)
+NATS_SERVER=/ruta/a/nats-server node conformance/rpc-broker.mjs                       # 27 casos + los ejemplos byte a byte
+node conformance/rpc-broker.mjs --list                                                 # los casos y lo que cubren (A-n)
+node conformance/rpc-broker.mjs --mutant no-queue-group                                # DEBE fallar (también: wildcard-subscription,
+                                                                                       #   no-allow-responses, stream-captures-rpc)
+```
+
+Como la de estado, **los casos son datos** ([`cases/rpc-semantics.json`](cases/rpc-semantics.json)): el runner solo ejecuta su
+vocabulario contra un `nats-server` real —uno suelto, uno con la ACL de cada caso y un cluster de tres nodos— y compara lo
+observado con `expect`. Mide el reparto por grupo de cola, `no responders`, qué ve quien llama si el que responde tarda más que el
+timeout o muere, `allow_responses`, el tamaño máximo, la petición **denegada** con las dos librerías de NATS de los SDKs (Node, y
+`async-nats` de Rust por [`probes/rpc-async-nats`](probes/rpc-async-nats), que compila con `cargo`) y la trampa del stream que
+captura `rpc.>`. `FLUX_TEST_PORTS=6000-6049` fija el rango de puertos (usa hasta 8), `--no-rust` salta la sonda y `--no-cluster` el
+cluster; `FLUX_REQUIRE_BROKER=1` convierte la falta de `nats-server` o de `cargo` en un fallo.

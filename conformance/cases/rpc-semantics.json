@@ -1,0 +1,3079 @@
+{
+  "suite": "rpc-semantics",
+  "title": "Petición/respuesta: lo que hace el BROKER",
+  "spec": "specification/11-request-reply.md",
+  "plan": "docs/plan-v1.1/PLAN.md, Fase 3",
+  "runner": "conformance/rpc-broker.mjs",
+  "verifiedAgainst": "nats-server 2.14.5; @nats-io/transport-node 3.4.0; async-nats 0.50.0 (conformance/probes/rpc-async-nats)",
+  "verifiedOn": "2026-11-26",
+  "$comment": "Estos casos son DATOS: conformance/rpc-broker.mjs no sabe qué es «un grupo de cola», solo ejecuta las operaciones de `vocabulary` y compara lo observado con `expect`. Un caso DEBE llevar `spec`, `rationale` (qué se rompe si deja de ser cierto), `observed` (versión del servidor, fecha y resultado) y, si nace de un bug, `counterExample`. Los pasos marcados `control` demuestran que la sonda puede fallar: su resultado esperado es lo MALO. Cada observación A-n es la del Apéndice A de docs/plan-v1.1/PLAN.md. NO cubren (necesitan el SDK o otra infraestructura): la propagación de `time` y la firma de una petición (STALE_REQUEST: son de la capa del SDK, 11-request-reply.md §7.4), la latencia sobre una red real entre nodos, el límite de suscripciones pendientes de core NATS (slow consumer) ni el rendimiento. Los tiempos están medidos en local: los márgenes de `expect` son amplios a propósito, no son un contrato de latencia.",
+  "vocabulary": {
+    "$comment": "`expect` compara con lo que la operación observa: valor exacto, o { match: regex }, { includes }, { gte }, { lte }, { between: [a, b] }, { not }, { present: bool }, { oneOf: [...] }; una clave con puntos entra en objetos (`byFrom.a`, `errors.0`). `control: true` marca un paso cuyo resultado esperado es lo MALO: demuestra que la sonda puede fallar. `as` es un actor conectado antes con `connect` (o `ops`, que no tiene restricciones y siempre existe). En una topología con ACL, `connect.user` es un usuario de `acls.<nombre>` y conecta con SU inbox privado `_INBOX.<usuario>`. `denied` se observa por el aviso del broker (-ERR 'Permissions Violation', A-28) o por la excepción que lanza la librería. Un campo desconocido en un caso, o una expectativa sobre algo que la operación no observa, es un ERROR al cargar: una errata no puede degradarse a «no se comprueba nada».",
+    "ops": {
+      "sleep": {
+        "doc": "Espera.",
+        "args": [
+          "ms"
+        ],
+        "observes": [
+          "outcome"
+        ]
+      },
+      "connect": {
+        "doc": "Conecta un actor con nombre. `node` elige el nodo de un cluster. Con ACL, `user` es el usuario y su inbox es `_INBOX.<usuario>`.",
+        "args": [
+          "name"
+        ],
+        "optional": [
+          "user",
+          "node"
+        ],
+        "observes": [
+          "outcome",
+          "maxPayload",
+          "headers",
+          "serverVersion"
+        ]
+      },
+      "serve": {
+        "doc": "El cuerpo de `respond()` de un SDK, reducido a lo que se mide: se suscribe (con `queue` si se da) y atiende según `mode`: `echo` (responde `{\"from\": name}`), `silent` (recibe y no responde), `die` (recibe y cierra su conexión), `multi` (responde `replies` veces), `big` (responde `replyBytes` bytes), `headers` (responde con cabeceras), `foreign-inbox` (publica antes a `otherSubject`). `delayMs` retrasa la respuesta.",
+        "args": [
+          "as",
+          "name",
+          "subject"
+        ],
+        "optional": [
+          "queue",
+          "mode",
+          "delayMs",
+          "replies",
+          "replyBytes",
+          "otherSubject"
+        ],
+        "observes": [
+          "outcome",
+          "received",
+          "replied",
+          "errors",
+          "errorCount",
+          "headersSeen",
+          "noReply",
+          "violations",
+          "violationText"
+        ]
+      },
+      "served": {
+        "doc": "Lo que ha visto un `serve` hasta ahora.",
+        "args": [
+          "name"
+        ],
+        "observes": [
+          "received",
+          "replied",
+          "errors",
+          "errorCount",
+          "headersSeen",
+          "noReply",
+          "violations",
+          "violationText"
+        ]
+      },
+      "unserve": {
+        "doc": "Para un `serve`: `unsubscribe` (deja de escuchar), `close` (cierra la conexión de golpe), `graceful` (deja de escuchar, espera a lo que está en vuelo y cierra) o `destroy` (un cliente en bruto).",
+        "args": [
+          "name",
+          "how"
+        ],
+        "observes": [
+          "outcome"
+        ]
+      },
+      "raw_zombie": {
+        "doc": "Un cliente EN BRUTO conectado y suscrito (con `queue`) que nunca responde: un proceso colgado cuya conexión sigue abierta.",
+        "args": [
+          "name",
+          "subject"
+        ],
+        "optional": [
+          "queue",
+          "user"
+        ],
+        "observes": [
+          "outcome"
+        ]
+      },
+      "request": {
+        "doc": "Una petición con la librería de NATS (Node). `bytes` envía ese número de bytes (`max` y `max+1` son el max_payload del broker y uno más).",
+        "args": [
+          "as",
+          "subject"
+        ],
+        "optional": [
+          "data",
+          "bytes",
+          "headers",
+          "timeoutMs"
+        ],
+        "observes": [
+          "outcome",
+          "ms",
+          "reply",
+          "from",
+          "replyHeaders",
+          "isJetstreamAck",
+          "stream",
+          "text"
+        ]
+      },
+      "request_async": {
+        "doc": "Como `request`, sin esperar: se recoge con `await_request`.",
+        "args": [
+          "id",
+          "as",
+          "subject"
+        ],
+        "optional": [
+          "data",
+          "bytes",
+          "headers",
+          "timeoutMs"
+        ],
+        "observes": [
+          "outcome"
+        ]
+      },
+      "await_request": {
+        "doc": "El resultado de un `request_async`.",
+        "args": [
+          "id"
+        ],
+        "observes": [
+          "outcome",
+          "ms",
+          "reply",
+          "from",
+          "replyHeaders",
+          "isJetstreamAck",
+          "stream",
+          "text"
+        ]
+      },
+      "burst": {
+        "doc": "`count` peticiones seguidas. `byFrom` cuenta quién respondió (el `from` del cuerpo); `acks`, las «respuestas» que eran un acuse de JetStream.",
+        "args": [
+          "as",
+          "subject",
+          "count"
+        ],
+        "optional": [
+          "timeoutMs"
+        ],
+        "observes": [
+          "ok",
+          "acks",
+          "timeouts",
+          "noResponders",
+          "other",
+          "byFrom"
+        ]
+      },
+      "publish_no_reply": {
+        "doc": "Publica sin subject de respuesta: lo que haría `nats pub`.",
+        "args": [
+          "as",
+          "subject"
+        ],
+        "observes": [
+          "outcome"
+        ]
+      },
+      "publish_reply_to": {
+        "doc": "Publica con un subject de respuesta dado (`reply`): para contar TODAS las respuestas, no solo la primera.",
+        "args": [
+          "as",
+          "subject",
+          "reply"
+        ],
+        "observes": [
+          "outcome"
+        ]
+      },
+      "listen": {
+        "doc": "Se suscribe (como `as`) a un subject y guarda lo que llega.",
+        "args": [
+          "name",
+          "as",
+          "subject"
+        ],
+        "observes": [
+          "outcome"
+        ]
+      },
+      "heard": {
+        "doc": "Lo que ha oído un `listen`; `error` es lo que lanza su iterador si la ACL denegó la suscripción.",
+        "args": [
+          "name"
+        ],
+        "observes": [
+          "count",
+          "bodies",
+          "subjects",
+          "error"
+        ]
+      },
+      "violations": {
+        "doc": "Los avisos `-ERR 'Permissions Violation'` de la conexión de un actor.",
+        "args": [
+          "as"
+        ],
+        "observes": [
+          "count",
+          "text"
+        ]
+      },
+      "raw_request": {
+        "doc": "Una petición por un socket EN BRUTO, sin librería: sin timeout propio, para ver QUÉ llega y CUÁNDO. `flags` son las banderas de CONNECT (`headers`, `no_responders`).",
+        "args": [
+          "subject"
+        ],
+        "optional": [
+          "user",
+          "flags",
+          "waitMs"
+        ],
+        "observes": [
+          "first",
+          "firstMs",
+          "firstStatus",
+          "msgCount",
+          "bodies"
+        ]
+      },
+      "raw_oversize": {
+        "doc": "Un `PUB` de max_payload + 1 bytes por un socket en bruto: qué hace el servidor.",
+        "args": [
+          "subject"
+        ],
+        "optional": [
+          "user"
+        ],
+        "observes": [
+          "serverError",
+          "closed"
+        ]
+      },
+      "stream_add": {
+        "doc": "Lo hace ops: crea un stream de JetStream (`noAck`: sin acuse).",
+        "args": [
+          "name",
+          "subjects"
+        ],
+        "optional": [
+          "noAck"
+        ],
+        "observes": [
+          "outcome",
+          "errCode",
+          "text",
+          "subjects"
+        ]
+      },
+      "stream_state": {
+        "doc": "Lo mira ops: los mensajes del stream.",
+        "args": [
+          "name"
+        ],
+        "observes": [
+          "messages"
+        ]
+      },
+      "stream_captures": {
+        "doc": "Crea un stream con UN subject `pattern` (sin acuse si JetStream lo exige: `needsNoAck`), hace una petición a `probe` y lo borra. `ack` = la «respuesta» fue su acuse; `capturesInterest` = el stream contó como interés (no hubo `no responders`); `predicted` = lo que dice el algoritmo de solape de `flux doctor` (11-request-reply.md §8) para ese subject; `overlapsRpc` = si el patrón se solapa con `rpc.*.*.*.*`, la forma de todo subject de operación (lo que marca `flux doctor`).",
+        "args": [
+          "index",
+          "pattern",
+          "probe"
+        ],
+        "observes": [
+          "created",
+          "needsNoAck",
+          "errCode",
+          "text",
+          "ack",
+          "capturesInterest",
+          "predicted",
+          "overlapsRpc",
+          "outcome",
+          "reply"
+        ]
+      },
+      "rust_probe": {
+        "doc": "Una línea de la sonda de `async-nats` (conformance/probes/rpc-async-nats): la compila y la ejecuta una vez contra este servidor. Se salta sin `cargo` o con `--no-rust`.",
+        "args": [
+          "probe"
+        ],
+        "observes": [
+          "probe",
+          "kind",
+          "ms",
+          "ok",
+          "maxPayload",
+          "serverErrors",
+          "sawPermissionsViolation",
+          "callerKind",
+          "callerMs",
+          "responderSaw",
+          "responderViolations"
+        ]
+      }
+    }
+  },
+  "acls": {
+    "rpc": {
+      "title": "quien llama (llama), el dueño de `clientes` y sus variantes de allow_responses, un servicio ajeno, uno con la ACL v1 (`_INBOX.>`) y un espía con inbox privado",
+      "users": [
+        {
+          "name": "llama",
+          "publish": [
+            "rpc.clientes.cliente.v1.obtener",
+            "rpc.clientes.cliente.v1.calcular-descuento"
+          ],
+          "subscribe": [
+            "_INBOX.llama.>"
+          ]
+        },
+        {
+          "name": "crm",
+          "publish": [
+            "clientes.>"
+          ],
+          "subscribe": [
+            "_INBOX.crm.>",
+            "rpc.clientes.>"
+          ],
+          "allowResponses": true
+        },
+        {
+          "name": "crm-exp",
+          "publish": [
+            "clientes.>"
+          ],
+          "subscribe": [
+            "_INBOX.crm-exp.>",
+            "rpc.clientes.>"
+          ],
+          "allowResponses": {
+            "max": 1,
+            "expires": "1s"
+          }
+        },
+        {
+          "name": "crm-max3",
+          "publish": [
+            "clientes.>"
+          ],
+          "subscribe": [
+            "_INBOX.crm-max3.>",
+            "rpc.clientes.>"
+          ],
+          "allowResponses": {
+            "max": 3
+          }
+        },
+        {
+          "name": "crm-sin-allow",
+          "publish": [
+            "clientes.>"
+          ],
+          "subscribe": [
+            "_INBOX.crm-sin-allow.>",
+            "rpc.clientes.>"
+          ]
+        },
+        {
+          "name": "crm-sin-sub",
+          "publish": [
+            "clientes.>"
+          ],
+          "subscribe": [
+            "_INBOX.crm-sin-sub.>"
+          ],
+          "allowResponses": true
+        },
+        {
+          "name": "ajeno",
+          "publish": [
+            "chismes.>"
+          ],
+          "subscribe": [
+            "_INBOX.ajeno.>"
+          ]
+        },
+        {
+          "name": "chismoso",
+          "publish": [
+            "chismes.>"
+          ],
+          "subscribe": [
+            "_INBOX.>"
+          ]
+        },
+        {
+          "name": "espia",
+          "publish": [
+            "chismes.>"
+          ],
+          "subscribe": [
+            "_INBOX.espia.>"
+          ]
+        }
+      ]
+    }
+  },
+  "cases": [
+    {
+      "id": "no-responders-is-instant",
+      "title": "Una petición a una operación sin nadie escuchando falla al instante con `no responders`, no al agotar el timeout",
+      "spec": "11-request-reply.md §2.1, §4.3",
+      "covers": [
+        "A-15",
+        "A-56"
+      ],
+      "rationale": "Es lo que hace que RPC_UNAVAILABLE sea RETRYABLE «inmediato» y que un despliegue a medias se vea como un error rápido y no como cinco segundos colgados. Si deja de ser cierto —un servidor que no contesta, o una conexión que no lo pide— toda llamada a un servicio caído cuesta su timeout entero y el handler de eventos que la hace se acerca a su `ack_wait`.",
+      "observed": {
+        "server": "nats-server 2.14.5",
+        "date": "2026-11-26",
+        "result": "Con un timeout de 5000 ms, la petición falla en 1-2 ms con `no responders: '<subject>'`. El servidor anuncia `headers: true` y `max_payload: 1048576`.",
+        "measures": "1-2 ms en local"
+      },
+      "steps": [
+        {
+          "op": "connect",
+          "name": "llama",
+          "expect": {
+            "outcome": "ok"
+          }
+        },
+        {
+          "op": "request",
+          "as": "llama",
+          "subject": "rpc.clientes.cliente.v1.obtener",
+          "timeoutMs": 5000,
+          "expect": {
+            "outcome": "no_responders",
+            "ms": {
+              "lte": 100
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "no-responders-needs-the-connect-flags",
+      "title": "El `no responders` solo llega si la conexión lo pidió en CONNECT (`headers` y `no_responders`): sin ello, silencio",
+      "spec": "11-request-reply.md §4.3",
+      "covers": [
+        "A-57"
+      ],
+      "rationale": "Un SDK nuevo —los cinco de la Fase 6— cuya librería no active la bandera convertiría RPC_UNAVAILABLE en un RPC_TIMEOUT de cinco segundos sin ningún error que lo explique. El servidor no avisa de que no va a contestar: se lo calla. El control lo demuestra con un cliente en bruto que no pide la bandera.",
+      "observed": {
+        "server": "nats-server 2.14.5",
+        "date": "2026-11-26",
+        "result": "Con `\"headers\":true,\"no_responders\":true` el servidor contesta en ~1 ms un mensaje HMSG con estado `NATS/1.0 503` y sin cuerpo. Con `\"no_responders\":false` no llega nada en 500 ms."
+      },
+      "counterExample": "Una conexión sin `no_responders`: la petición a una operación sin nadie queda esperando hasta su timeout.",
+      "steps": [
+        {
+          "op": "raw_request",
+          "subject": "rpc.clientes.cliente.v1.obtener",
+          "flags": {
+            "headers": true,
+            "no_responders": true
+          },
+          "waitMs": 500,
+          "expect": {
+            "first": "status_503",
+            "firstStatus": 503,
+            "firstMs": {
+              "lte": 100
+            },
+            "msgCount": 1
+          }
+        },
+        {
+          "op": "raw_request",
+          "subject": "rpc.clientes.cliente.v1.obtener",
+          "flags": {
+            "headers": true,
+            "no_responders": false
+          },
+          "waitMs": 500,
+          "title": "control: sin la bandera, nadie avisa",
+          "control": true,
+          "expect": {
+            "first": "silence",
+            "msgCount": 0
+          }
+        }
+      ]
+    },
+    {
+      "id": "queue-group-splits-requests",
+      "title": "Dos instancias en el mismo grupo de cola se reparten las peticiones; cada petición la atiende UNA",
+      "spec": "11-request-reply.md §2.3, §2.4",
+      "covers": [
+        "A-58"
+      ],
+      "rationale": "Es lo que permite escalar a quien responde sin que cada orden se ejecute dos veces. Sin el grupo de cola (control: el mutante `no-queue-group`) cada instancia recibe CADA petición y la orden se ejecuta dos veces. El reparto es aleatorio, no por turnos: el caso fija un margen amplio, no la igualdad.",
+      "observed": {
+        "server": "nats-server 2.14.5",
+        "date": "2026-11-26",
+        "result": "600 peticiones seguidas contra dos instancias del mismo grupo: todas respondidas, ninguna con timeout, repartidas 295 y 305 en una ejecución (siempre entre 270 y 330 en las que se repitieron). Con 2000 peticiones en la exploración previa: 979 y 1021."
+      },
+      "steps": [
+        {
+          "op": "connect",
+          "name": "llama",
+          "expect": {
+            "outcome": "ok"
+          }
+        },
+        {
+          "op": "connect",
+          "name": "inst-a",
+          "expect": {
+            "outcome": "ok"
+          }
+        },
+        {
+          "op": "connect",
+          "name": "inst-b",
+          "expect": {
+            "outcome": "ok"
+          }
+        },
+        {
+          "op": "serve",
+          "as": "inst-a",
+          "name": "a",
+          "subject": "rpc.x.y.v1.op",
+          "queue": "crm",
+          "expect": {
+            "outcome": "ok"
+          }
+        },
+        {
+          "op": "serve",
+          "as": "inst-b",
+          "name": "b",
+          "subject": "rpc.x.y.v1.op",
+          "queue": "crm",
+          "expect": {
+            "outcome": "ok"
+          }
+        },
+        {
+          "op": "burst",
+          "as": "llama",
+          "subject": "rpc.x.y.v1.op",
+          "count": 600,
+          "expect": {
+            "ok": 600,
+            "timeouts": 0,
+            "byFrom.a": {
+              "between": [
+                180,
+                420
+              ]
+            },
+            "byFrom.b": {
+              "between": [
+                180,
+                420
+              ]
+            }
+          }
+        },
+        {
+          "op": "served",
+          "name": "a",
+          "title": "cada petición la recibió UNA instancia: a + b = 600",
+          "expect": {
+            "received": {
+              "between": [
+                180,
+                420
+              ]
+            }
+          }
+        },
+        {
+          "op": "served",
+          "name": "b",
+          "expect": {
+            "received": {
+              "between": [
+                180,
+                420
+              ]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "queue-group-instance-leaving",
+      "title": "Si una instancia deja de escuchar, todo va a las que quedan; si se va la última, `no responders`",
+      "spec": "11-request-reply.md §2.4, §5.5",
+      "covers": [
+        "A-59"
+      ],
+      "rationale": "Define qué ve quien llama en un despliegue ordenado: nada, mientras quede una instancia. Y fija que dejar de escuchar quita el interés al instante, de modo que la ÚLTIMA instancia que se va produce `no responders` y no un timeout (con la salvedad de la ventana de A-70).",
+      "observed": {
+        "server": "nats-server 2.14.5",
+        "date": "2026-11-26",
+        "result": "Con dos instancias, 100 peticiones repartidas. Tras `unsubscribe` + cierre ordenado de una, 100 de 100 las atiende la otra. Tras irse la última y esperar 100 ms, la petición falla en ~1 ms con `no responders`."
+      },
+      "steps": [
+        {
+          "op": "connect",
+          "name": "llama",
+          "expect": {
+            "outcome": "ok"
+          }
+        },
+        {
+          "op": "connect",
+          "name": "inst-a",
+          "expect": {
+            "outcome": "ok"
+          }
+        },
+        {
+          "op": "connect",
+          "name": "inst-b",
+          "expect": {
+            "outcome": "ok"
+          }
+        },
+        {
+          "op": "serve",
+          "as": "inst-a",
+          "name": "a",
+          "subject": "rpc.x.y.v1.op",
+          "queue": "crm",
+          "expect": {
+            "outcome": "ok"
+          }
+        },
+        {
+          "op": "serve",
+          "as": "inst-b",
+          "name": "b",
+          "subject": "rpc.x.y.v1.op",
+          "queue": "crm",
+          "expect": {
+            "outcome": "ok"
+          }
+        },
+        {
+          "op": "burst",
+          "as": "llama",
+          "subject": "rpc.x.y.v1.op",
+          "count": 100,
+          "expect": {
+            "ok": 100
+          }
+        },
+        {
+          "op": "unserve",
+          "name": "a",
+          "how": "graceful",
+          "expect": {
+            "outcome": "ok"
+          }
+        },
+        {
+          "op": "sleep",
+          "ms": 100,
+          "expect": {
+            "outcome": "ok"
+          }
+        },
+        {
+          "op": "burst",
+          "as": "llama",
+          "subject": "rpc.x.y.v1.op",
+          "count": 100,
+          "title": "todo va a la instancia que queda",
+          "expect": {
+            "ok": 100,
+            "byFrom.b": 100,
+            "timeouts": 0
+          }
+        },
+        {
+          "op": "unserve",
+          "name": "b",
+          "how": "graceful",
+          "expect": {
+            "outcome": "ok"
+          }
+        },
+        {
+          "op": "sleep",
+          "ms": 100,
+          "expect": {
+            "outcome": "ok"
+          }
+        },
+        {
+          "op": "request",
+          "as": "llama",
+          "subject": "rpc.x.y.v1.op",
+          "timeoutMs": 1000,
+          "title": "se fue la última",
+          "expect": {
+            "outcome": "no_responders",
+            "ms": {
+              "lte": 100
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "two-services-on-one-operation-both-execute",
+      "title": "Dos SERVICIOS (dos grupos de cola) sobre la misma operación: cada uno ejecuta la petición, y quien llama ve una sola respuesta",
+      "spec": "11-request-reply.md §2.5",
+      "covers": [
+        "A-60"
+      ],
+      "rationale": "Un grupo de cola solo reparte DENTRO de su grupo: dos grupos reciben una copia cada uno. Es el modo de fallo de una operación con dos dueños (un renombrado de servicio a medias, o dos equipos que atienden lo mismo): la orden se ejecuta dos veces y solo una respuesta llega a quien llama, la que gane. Por eso solo el dueño responde: lo impone la ACL, y el generador rechaza un dominio con dos dueños.",
+      "observed": {
+        "server": "nats-server 2.14.5",
+        "date": "2026-11-26",
+        "result": "Una petición a la operación atendida por los grupos `svc-a` y `svc-b`: quien llama recibe UNA respuesta (la del servicio que conteste antes: `svc-a` en una ejecución, `svc-b` en otra) y cada servicio recibe y ejecuta la petición una vez."
+      },
+      "steps": [
+        {
+          "op": "connect",
+          "name": "llama",
+          "expect": {
+            "outcome": "ok"
+          }
+        },
+        {
+          "op": "connect",
+          "name": "inst-a",
+          "expect": {
+            "outcome": "ok"
+          }
+        },
+        {
+          "op": "connect",
+          "name": "inst-b",
+          "expect": {
+            "outcome": "ok"
+          }
+        },
+        {
+          "op": "serve",
+          "as": "inst-a",
+          "name": "a",
+          "subject": "rpc.x.y.v1.op",
+          "queue": "svc-a",
+          "expect": {
+            "outcome": "ok"
+          }
+        },
+        {
+          "op": "serve",
+          "as": "inst-b",
+          "name": "b",
+          "subject": "rpc.x.y.v1.op",
+          "queue": "svc-b",
+          "expect": {
+            "outcome": "ok"
+          }
+        },
+        {
+          "op": "request",
+          "as": "llama",
+          "subject": "rpc.x.y.v1.op",
+          "expect": {
+            "outcome": "ok"
+          }
+        },
+        {
+          "op": "sleep",
+          "ms": 150,
+          "expect": {
+            "outcome": "ok"
+          }
+        },
+        {
+          "op": "served",
+          "name": "a",
+          "expect": {
+            "received": 1
+          }
+        },
+        {
+          "op": "served",
+          "name": "b",
+          "title": "el otro servicio también la ejecutó",
+          "control": true,
+          "expect": {
+            "received": 1
+          }
+        }
+      ]
+    },
+    {
+      "id": "slow-responder-times-out-but-executes-and-the-late-reply-arrives",
+      "title": "Si el que responde tarda más que el timeout, quien llama ve un timeout, la operación SE EJECUTA y la respuesta tardía llega al inbox",
+      "spec": "11-request-reply.md §4.3, §4.5",
+      "covers": [
+        "A-61"
+      ],
+      "rationale": "Es por lo que RPC_TIMEOUT es ambiguo y por lo que el que responde deduplica por `id`: un timeout NO dice que la operación no ocurrió. Y la respuesta tardía no la descarta el broker: llega al inbox de quien llamó, que tiene que ignorarla (una petición por un cliente en bruto, sin timeout, la ve llegar).",
+      "observed": {
+        "server": "nats-server 2.14.5",
+        "date": "2026-11-26",
+        "result": "Un responder que tarda 600 ms con un timeout de 300 ms: quien llama ve `TimeoutError` a los ~301 ms; el responder recibió y respondió una vez. Un cliente en bruto que espera ve llegar la respuesta a los ~600 ms. La conexión del llamante sigue sana."
+      },
+      "steps": [
+        {
+          "op": "connect",
+          "name": "llama",
+          "expect": {
+            "outcome": "ok"
+          }
+        },
+        {
+          "op": "connect",
+          "name": "crm",
+          "expect": {
+            "outcome": "ok"
+          }
+        },
+        {
+          "op": "serve",
+          "as": "crm",
+          "name": "lento",
+          "subject": "rpc.x.y.v1.op",
+          "queue": "crm",
+          "delayMs": 600,
+          "expect": {
+            "outcome": "ok"
+          }
+        },
+        {
+          "op": "request",
+          "as": "llama",
+          "subject": "rpc.x.y.v1.op",
+          "timeoutMs": 300,
+          "expect": {
+            "outcome": "timeout",
+            "ms": {
+              "between": [
+                280,
+                600
+              ]
+            }
+          }
+        },
+        {
+          "op": "sleep",
+          "ms": 500,
+          "expect": {
+            "outcome": "ok"
+          }
+        },
+        {
+          "op": "served",
+          "name": "lento",
+          "title": "recibió y respondió: se ejecutó",
+          "expect": {
+            "received": 1,
+            "replied": 1
+          }
+        },
+        {
+          "op": "raw_request",
+          "subject": "rpc.x.y.v1.op",
+          "waitMs": 1200,
+          "title": "sin timeout, la respuesta tardía llega al inbox",
+          "expect": {
+            "first": "msg",
+            "firstMs": {
+              "between": [
+                550,
+                1000
+              ]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "responder-dies-mid-request-looks-like-a-timeout",
+      "title": "Si el que responde muere con la petición en la mano, quien llama ve un timeout; la siguiente petición ya da `no responders`",
+      "spec": "11-request-reply.md §4.3, §5.5",
+      "covers": [
+        "A-62"
+      ],
+      "rationale": "Core NATS no reentrega: una petición recibida por una instancia que muere se pierde, y quien llama no puede distinguirlo de una operación lenta. Es otra razón de la ambigüedad de RPC_TIMEOUT. La siguiente petición, ya sin instancia, sí da `no responders`.",
+      "observed": {
+        "server": "nats-server 2.14.5",
+        "date": "2026-11-26",
+        "result": "La única instancia recibe la petición y cierra su conexión sin responder: quien llama ve `TimeoutError` a los ~1000 ms. Una segunda petición falla en ~2 ms con `no responders`."
+      },
+      "steps": [
+        {
+          "op": "connect",
+          "name": "llama",
+          "expect": {
+            "outcome": "ok"
+          }
+        },
+        {
+          "op": "connect",
+          "name": "crm",
+          "expect": {
+            "outcome": "ok"
+          }
+        },
+        {
+          "op": "serve",
+          "as": "crm",
+          "name": "mortal",
+          "subject": "rpc.x.y.v1.op",
+          "queue": "crm",
+          "mode": "die",
+          "expect": {
+            "outcome": "ok"
+          }
+        },
+        {
+          "op": "request",
+          "as": "llama",
+          "subject": "rpc.x.y.v1.op",
+          "timeoutMs": 1000,
+          "expect": {
+            "outcome": "timeout",
+            "ms": {
+              "between": [
+                900,
+                1400
+              ]
+            }
+          }
+        },
+        {
+          "op": "served",
+          "name": "mortal",
+          "expect": {
+            "received": 1
+          }
+        },
+        {
+          "op": "request",
+          "as": "llama",
+          "subject": "rpc.x.y.v1.op",
+          "timeoutMs": 1000,
+          "title": "ya sin instancia",
+          "expect": {
+            "outcome": "no_responders",
+            "ms": {
+              "lte": 100
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "stopping-gracefully-does-not-lose-what-is-in-flight",
+      "title": "Parar un responder: cerrar la conexión de golpe pierde lo que atiende; dejar de escuchar primero, no",
+      "spec": "11-request-reply.md §5.5",
+      "covers": [
+        "A-62"
+      ],
+      "rationale": "Fija el apagado ordenado que un SDK `rpc` debe implementar: dejar de escuchar (`unsubscribe`), esperar a lo que está en vuelo y cerrar. El control cierra la conexión con una petición en vuelo y la pierde. Y dejar de escuchar antes tiene un efecto útil: las peticiones siguientes dan `no responders` al instante en vez de caer en una instancia que se está yendo.",
+      "observed": {
+        "server": "nats-server 2.14.5",
+        "date": "2026-11-26",
+        "result": "Con un handler de 400 ms: cerrar la conexión a los 100 ms deja la petición sin respuesta (timeout a los 2000 ms). Con `unsubscribe` a los 100 ms: una petición nueva falla en ~1 ms con `no responders`, y la que estaba en vuelo termina con su respuesta."
+      },
+      "steps": [
+        {
+          "op": "connect",
+          "name": "llama",
+          "expect": {
+            "outcome": "ok"
+          }
+        },
+        {
+          "op": "connect",
+          "name": "crm",
+          "expect": {
+            "outcome": "ok"
+          }
+        },
+        {
+          "op": "serve",
+          "as": "crm",
+          "name": "a",
+          "subject": "rpc.x.y.v1.op",
+          "queue": "crm",
+          "delayMs": 400,
+          "expect": {
+            "outcome": "ok"
+          }
+        },
+        {
+          "op": "request_async",
+          "id": "perdida",
+          "as": "llama",
+          "subject": "rpc.x.y.v1.op",
+          "timeoutMs": 1200,
+          "expect": {
+            "outcome": "started"
+          }
+        },
+        {
+          "op": "sleep",
+          "ms": 100,
+          "expect": {
+            "outcome": "ok"
+          }
+        },
+        {
+          "op": "unserve",
+          "name": "a",
+          "how": "close",
+          "expect": {
+            "outcome": "ok"
+          }
+        },
+        {
+          "op": "await_request",
+          "id": "perdida",
+          "title": "control: cerrar de golpe pierde la petición en vuelo",
+          "control": true,
+          "expect": {
+            "outcome": "timeout"
+          }
+        },
+        {
+          "op": "connect",
+          "name": "crm2",
+          "expect": {
+            "outcome": "ok"
+          }
+        },
+        {
+          "op": "serve",
+          "as": "crm2",
+          "name": "b",
+          "subject": "rpc.x.y.v1.op",
+          "queue": "crm",
+          "delayMs": 400,
+          "expect": {
+            "outcome": "ok"
+          }
+        },
+        {
+          "op": "request_async",
+          "id": "completa",
+          "as": "llama",
+          "subject": "rpc.x.y.v1.op",
+          "timeoutMs": 2000,
+          "expect": {
+            "outcome": "started"
+          }
+        },
+        {
+          "op": "sleep",
+          "ms": 100,
+          "expect": {
+            "outcome": "ok"
+          }
+        },
+        {
+          "op": "unserve",
+          "name": "b",
+          "how": "unsubscribe",
+          "expect": {
+            "outcome": "ok"
+          }
+        },
+        {
+          "op": "request",
+          "as": "llama",
+          "subject": "rpc.x.y.v1.op",
+          "timeoutMs": 1000,
+          "title": "dejó de escuchar: la nueva petición falla al instante",
+          "expect": {
+            "outcome": "no_responders",
+            "ms": {
+              "lte": 100
+            }
+          }
+        },
+        {
+          "op": "await_request",
+          "id": "completa",
+          "title": "la que estaba en vuelo termina",
+          "expect": {
+            "outcome": "ok",
+            "from": "b"
+          }
+        }
+      ]
+    },
+    {
+      "id": "a-hung-instance-takes-its-share-of-the-requests",
+      "title": "Una instancia colgada (conexión abierta, no responde) se lleva su parte de las peticiones hasta que el broker nota que murió",
+      "spec": "11-request-reply.md §2.4, §4.5",
+      "covers": [
+        "A-63"
+      ],
+      "rationale": "El grupo de cola reparte sin mirar la salud de nadie: una instancia colgada recibe 1/N de las peticiones y quien llama ve timeouts en esa fracción hasta que el servidor expira la conexión (su intervalo de PING, 2 minutos por defecto). No hay forma de evitarlo en core NATS: se compensa reintentando con el MISMO `id` —lo que de todos modos exige la ambigüedad del timeout— y, aguas abajo, la salud de la instancia es de quien despliega. Al cerrarse la conexión, el reparto se normaliza.",
+      "observed": {
+        "server": "nats-server 2.14.5",
+        "date": "2026-11-26",
+        "result": "Una instancia viva y un cliente en bruto suscrito al mismo grupo que no responde: de 40 peticiones con timeout de 150 ms, entre 19 y 22 respondidas y entre 18 y 21 con timeout (el reparto es aleatorio). Al destruir el socket, 20 de 20 respondidas."
+      },
+      "steps": [
+        {
+          "op": "connect",
+          "name": "llama",
+          "expect": {
+            "outcome": "ok"
+          }
+        },
+        {
+          "op": "connect",
+          "name": "viva",
+          "expect": {
+            "outcome": "ok"
+          }
+        },
+        {
+          "op": "serve",
+          "as": "viva",
+          "name": "viva",
+          "subject": "rpc.x.y.v1.op",
+          "queue": "crm",
+          "expect": {
+            "outcome": "ok"
+          }
+        },
+        {
+          "op": "raw_zombie",
+          "name": "zombi",
+          "subject": "rpc.x.y.v1.op",
+          "queue": "crm",
+          "expect": {
+            "outcome": "ok"
+          }
+        },
+        {
+          "op": "burst",
+          "as": "llama",
+          "subject": "rpc.x.y.v1.op",
+          "count": 40,
+          "timeoutMs": 150,
+          "title": "con el zombi dentro del grupo",
+          "expect": {
+            "ok": {
+              "between": [
+                8,
+                32
+              ]
+            },
+            "timeouts": {
+              "between": [
+                8,
+                32
+              ]
+            }
+          }
+        },
+        {
+          "op": "unserve",
+          "name": "zombi",
+          "how": "destroy",
+          "expect": {
+            "outcome": "ok"
+          }
+        },
+        {
+          "op": "sleep",
+          "ms": 250,
+          "expect": {
+            "outcome": "ok"
+          }
+        },
+        {
+          "op": "burst",
+          "as": "llama",
+          "subject": "rpc.x.y.v1.op",
+          "count": 20,
+          "timeoutMs": 600,
+          "title": "cerrada su conexión, vuelve la normalidad",
+          "expect": {
+            "ok": 20,
+            "timeouts": 0
+          }
+        }
+      ]
+    },
+    {
+      "id": "headers-travel-and-core-does-not-deduplicate",
+      "title": "Las cabeceras viajan en petición y respuesta; el core de NATS NO deduplica por `Nats-Msg-Id`; una publicación sin subject de respuesta llega igual",
+      "spec": "11-request-reply.md §3.4, §4.5, §5.2",
+      "covers": [
+        "A-74"
+      ],
+      "rationale": "Tres cosas que el diseño fija a partir de lo medido. (1) Las cabeceras SÍ viajan, así que `traceparent`/`correlationid`/`tenantid` PODRÍAN ir en ellas: se decide que NO (el sobre es la única fuente) y por eso se midió. (2) `duplicate_window` es de JetStream: dos peticiones core con el mismo `Nats-Msg-Id` se entregan DOS veces, de ahí que el que responde deduplique por el `id` del sobre. (3) Un `nats pub` a una operación llega sin `reply`: el que responde la recibe y no puede contestar, y decide no ejecutarla.",
+      "observed": {
+        "server": "nats-server 2.14.5",
+        "date": "2026-11-26",
+        "result": "Una petición con las cabeceras `traceparent` y `Nats-Msg-Id`: el que responde las ve, y quien llama recibe las que el otro puso (`traceparent`, `X-Visto`). Dos peticiones con el mismo `Nats-Msg-Id`: el responder las recibe las dos. Una publicación sin `reply`: llega, con `reply` ausente."
+      },
+      "steps": [
+        {
+          "op": "connect",
+          "name": "llama",
+          "expect": {
+            "outcome": "ok"
+          }
+        },
+        {
+          "op": "connect",
+          "name": "crm",
+          "expect": {
+            "outcome": "ok"
+          }
+        },
+        {
+          "op": "serve",
+          "as": "crm",
+          "name": "a",
+          "subject": "rpc.x.y.v1.op",
+          "queue": "crm",
+          "mode": "headers",
+          "expect": {
+            "outcome": "ok"
+          }
+        },
+        {
+          "op": "request",
+          "as": "llama",
+          "subject": "rpc.x.y.v1.op",
+          "headers": {
+            "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+            "Nats-Msg-Id": "mismo-id"
+          },
+          "expect": {
+            "outcome": "ok",
+            "replyHeaders": {
+              "includes": "traceparent"
+            }
+          }
+        },
+        {
+          "op": "served",
+          "name": "a",
+          "title": "el que responde vio las cabeceras",
+          "expect": {
+            "headersSeen.0": {
+              "includes": "traceparent"
+            }
+          }
+        },
+        {
+          "op": "request",
+          "as": "llama",
+          "subject": "rpc.x.y.v1.op",
+          "headers": {
+            "Nats-Msg-Id": "mismo-id"
+          },
+          "title": "mismo Nats-Msg-Id otra vez",
+          "expect": {
+            "outcome": "ok"
+          }
+        },
+        {
+          "op": "served",
+          "name": "a",
+          "title": "core NATS no deduplica: llegaron las dos",
+          "control": true,
+          "expect": {
+            "received": 2
+          }
+        },
+        {
+          "op": "publish_no_reply",
+          "as": "llama",
+          "subject": "rpc.x.y.v1.op",
+          "expect": {
+            "outcome": "sent"
+          }
+        },
+        {
+          "op": "sleep",
+          "ms": 100,
+          "expect": {
+            "outcome": "ok"
+          }
+        },
+        {
+          "op": "served",
+          "name": "a",
+          "title": "una publicación sin reply llega, sin subject al que contestar",
+          "expect": {
+            "received": 3,
+            "noReply": 1
+          }
+        }
+      ]
+    },
+    {
+      "id": "exact-subscription-gives-no-responders-for-an-unknown-operation",
+      "title": "Suscribirse al subject EXACTO de cada operación da `no responders` para lo que no se atiende; un comodín `rpc.<dominio>.>` lo convierte en un timeout",
+      "spec": "11-request-reply.md §2.3",
+      "covers": [
+        "A-64"
+      ],
+      "rationale": "Decide cómo se suscribe el SDK aunque el PERMISO del dueño sea `rpc.<dominio>.>`. Con el comodín, el servicio recibe interés sobre TODAS las operaciones del dominio: una operación sin handler (una errata, una versión aún no desplegada) llega al servicio, que no sabe contestarla, y quien llama espera al timeout en vez de recibir RPC_UNAVAILABLE al instante. El control es el comodín.",
+      "observed": {
+        "server": "nats-server 2.14.5",
+        "date": "2026-11-26",
+        "result": "Con la suscripción exacta a `…obtener`, una petición a `…no-implementada` falla en ~1 ms con `no responders`. Con una suscripción a `rpc.otros.>` que no sabe atender, una petición a `rpc.otros.cliente.v1.nada` agota su timeout."
+      },
+      "steps": [
+        {
+          "op": "connect",
+          "name": "llama",
+          "expect": {
+            "outcome": "ok"
+          }
+        },
+        {
+          "op": "connect",
+          "name": "crm",
+          "expect": {
+            "outcome": "ok"
+          }
+        },
+        {
+          "op": "connect",
+          "name": "otro",
+          "expect": {
+            "outcome": "ok"
+          }
+        },
+        {
+          "op": "serve",
+          "as": "crm",
+          "name": "a",
+          "subject": "rpc.clientes.cliente.v1.obtener",
+          "queue": "crm",
+          "expect": {
+            "outcome": "ok"
+          }
+        },
+        {
+          "op": "request",
+          "as": "llama",
+          "subject": "rpc.clientes.cliente.v1.no-implementada",
+          "timeoutMs": 800,
+          "title": "la operación que no se atiende",
+          "expect": {
+            "outcome": "no_responders",
+            "ms": {
+              "lte": 100
+            }
+          }
+        },
+        {
+          "op": "request",
+          "as": "llama",
+          "subject": "rpc.clientes.cliente.v1.obtener",
+          "expect": {
+            "outcome": "ok",
+            "from": "a"
+          }
+        },
+        {
+          "op": "serve",
+          "as": "otro",
+          "name": "comodin",
+          "subject": "rpc.otros.>",
+          "queue": "otro",
+          "mode": "silent",
+          "expect": {
+            "outcome": "ok"
+          }
+        },
+        {
+          "op": "request",
+          "as": "llama",
+          "subject": "rpc.otros.cliente.v1.nada",
+          "timeoutMs": 600,
+          "title": "control: con un comodín nadie contesta lo que no atiende",
+          "control": true,
+          "expect": {
+            "outcome": "timeout"
+          }
+        }
+      ]
+    },
+    {
+      "id": "max-payload-and-oversize",
+      "title": "max_payload es 1 MiB por defecto: justo eso pasa, uno más lo rechaza la librería al instante, el servidor cierra la conexión a quien lo envía en bruto, y una respuesta que no cabe deja a quien llama con un timeout",
+      "spec": "11-request-reply.md §4.4, §5.4",
+      "covers": [
+        "A-65"
+      ],
+      "rationale": "Fija el tamaño máximo en cada sentido y, sobre todo, el modo de fallo silencioso: si es la RESPUESTA la que excede, la librería lanza EN QUIEN RESPONDE y quien llama solo ve un timeout. Por eso el SDK de quien responde comprueba el tamaño antes de publicar y contesta con RPC_MESSAGE_TOO_LARGE. Y el servidor, ante un PUB mayor, no devuelve un error recuperable: manda `-ERR` y cierra la conexión.",
+      "observed": {
+        "server": "nats-server 2.14.5",
+        "date": "2026-11-26",
+        "result": "`max_payload` anunciado: 1048576. Una petición de EXACTAMENTE 1048576 bytes se entrega y se responde; con 1048577 la librería de Node lanza `InvalidArgumentError: 'payload' max_payload size exceeded` sin tocar la red, y con 1048576 de cuerpo más una cabecera, también: las cabeceras cuentan. Un cliente en bruto que anuncia 1048577: `-ERR 'Maximum Payload Violation'` y cierre. Una respuesta de 1048577 bytes: quien responde recibe `InvalidArgumentError` y quien llama, `TimeoutError`."
+      },
+      "steps": [
+        {
+          "op": "connect",
+          "name": "llama",
+          "expect": {
+            "outcome": "ok"
+          }
+        },
+        {
+          "op": "connect",
+          "name": "crm",
+          "expect": {
+            "outcome": "ok"
+          }
+        },
+        {
+          "op": "serve",
+          "as": "crm",
+          "name": "a",
+          "subject": "rpc.x.y.v1.op",
+          "queue": "crm",
+          "expect": {
+            "outcome": "ok"
+          }
+        },
+        {
+          "op": "serve",
+          "as": "crm",
+          "name": "grande",
+          "subject": "rpc.x.y.v1.grande",
+          "queue": "crm",
+          "mode": "big",
+          "replyBytes": "max+1",
+          "expect": {
+            "outcome": "ok"
+          }
+        },
+        {
+          "op": "connect",
+          "name": "mira",
+          "expect": {
+            "outcome": "ok",
+            "maxPayload": 1048576,
+            "headers": true
+          }
+        },
+        {
+          "op": "request",
+          "as": "llama",
+          "subject": "rpc.x.y.v1.op",
+          "bytes": "max",
+          "timeoutMs": 3000,
+          "title": "exactamente max_payload",
+          "expect": {
+            "outcome": "ok"
+          }
+        },
+        {
+          "op": "request",
+          "as": "llama",
+          "subject": "rpc.x.y.v1.op",
+          "bytes": "max+1",
+          "timeoutMs": 3000,
+          "title": "max_payload + 1",
+          "expect": {
+            "outcome": "too_large",
+            "ms": {
+              "lte": 200
+            }
+          }
+        },
+        {
+          "op": "request",
+          "as": "llama",
+          "subject": "rpc.x.y.v1.op",
+          "bytes": "max",
+          "headers": {
+            "x": "y"
+          },
+          "timeoutMs": 3000,
+          "title": "max_payload de cuerpo más una cabecera: las cabeceras cuentan",
+          "expect": {
+            "outcome": "too_large"
+          }
+        },
+        {
+          "op": "raw_oversize",
+          "subject": "rpc.x.y.v1.op",
+          "expect": {
+            "serverError": {
+              "match": "Maximum Payload Violation"
+            },
+            "closed": true
+          }
+        },
+        {
+          "op": "request",
+          "as": "llama",
+          "subject": "rpc.x.y.v1.grande",
+          "timeoutMs": 800,
+          "title": "la respuesta no cabe: quien llama solo ve un timeout",
+          "expect": {
+            "outcome": "timeout"
+          }
+        },
+        {
+          "op": "served",
+          "name": "grande",
+          "title": "y quien responde ve el error de la librería",
+          "expect": {
+            "errors.0": {
+              "match": "max_payload"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "stream-on-rpc-answers-with-its-ack",
+      "title": "La trampa: un stream que captura `rpc.>` contesta a cada petición con su acuse, el que responde ejecuta igualmente y el stream PERSISTE cada petición",
+      "spec": "11-request-reply.md §8",
+      "covers": [
+        "A-18",
+        "A-67"
+      ],
+      "rationale": "Es la razón de `flux doctor` y de que el aprovisionamiento no cree ningún stream con ese filtro. Quien llama recibe `{\"stream\":…,\"seq\":n}` como si fuera la respuesta y lo toma por válida si no comprueba que lo es (RPC_INVALID_REPLY); nada falla, ningún log lo dice, y la operación se ejecuta en silencio con una respuesta que no es suya. Y el stream guarda cada petición —sus datos personales incluidos— con la retención del stream. Y como es una carrera entre el acuse y la respuesta real —casi siempre gana el acuse, no siempre—, el síntoma es intermitente: peor de diagnosticar que un fallo constante. Es el mismo fallo que un `publish` de core sin stream, al revés.",
+      "observed": {
+        "server": "nats-server 2.14.5",
+        "date": "2026-11-26",
+        "result": "Un stream `rpc.x.>` y un responder que atiende `rpc.x.y.v1.op`: de 20 peticiones, entre 18 y 20 «respuestas» fueron el acuse del stream (en una exploración de 400 peticiones seguidas, 394 acuses y 6 reales; con 400 concurrentes, 341 y 59), y el responder ejecutó todas. El stream guardó 20 mensajes. Sin nadie escuchando, la petición también se «responde» con el acuse. Es una CARRERA: casi siempre gana el acuse, no siempre, de modo que el fallo es intermitente."
+      },
+      "counterExample": "Una petición a una operación cuyo subject lo captura un stream y que no valida la respuesta: recibe `{\"stream\":\"TRAMPA\",\"seq\":1}` como su resultado.",
+      "steps": [
+        {
+          "op": "stream_add",
+          "name": "TRAMPA",
+          "subjects": [
+            "rpc.x.>"
+          ],
+          "expect": {
+            "outcome": "ok"
+          }
+        },
+        {
+          "op": "connect",
+          "name": "llama",
+          "expect": {
+            "outcome": "ok"
+          }
+        },
+        {
+          "op": "connect",
+          "name": "crm",
+          "expect": {
+            "outcome": "ok"
+          }
+        },
+        {
+          "op": "serve",
+          "as": "crm",
+          "name": "a",
+          "subject": "rpc.x.y.v1.op",
+          "queue": "crm",
+          "expect": {
+            "outcome": "ok"
+          }
+        },
+        {
+          "op": "burst",
+          "as": "llama",
+          "subject": "rpc.x.y.v1.op",
+          "count": 20,
+          "timeoutMs": 1500,
+          "title": "con un responder real escuchando: casi siempre gana el acuse",
+          "expect": {
+            "acks": {
+              "gte": 14
+            }
+          }
+        },
+        {
+          "op": "served",
+          "name": "a",
+          "title": "el que responde ejecutó todas",
+          "expect": {
+            "received": {
+              "gte": 18
+            }
+          }
+        },
+        {
+          "op": "stream_state",
+          "name": "TRAMPA",
+          "title": "y el stream persistió las 20 peticiones",
+          "expect": {
+            "messages": 20
+          }
+        },
+        {
+          "op": "unserve",
+          "name": "a",
+          "how": "close",
+          "expect": {
+            "outcome": "ok"
+          }
+        },
+        {
+          "op": "request",
+          "as": "llama",
+          "subject": "rpc.x.y.v1.op",
+          "timeoutMs": 1500,
+          "title": "sin nadie escuchando también «responde» el stream",
+          "expect": {
+            "outcome": "ok",
+            "isJetstreamAck": true,
+            "stream": "TRAMPA"
+          }
+        }
+      ]
+    },
+    {
+      "id": "a-stream-without-acks-turns-no-responders-into-a-timeout",
+      "title": "Un stream que captura `rpc.>` SIN acuse (`no_ack`) tampoco deja ver `no responders`: quien llama espera su timeout",
+      "spec": "11-request-reply.md §8",
+      "covers": [
+        "A-67"
+      ],
+      "rationale": "El stream cuenta como interés sobre el subject: el broker ya no genera `no responders`. Es la otra cara de la trampa: aunque nadie confunda un acuse con una respuesta, un stream de auditoría mal puesto convierte RPC_UNAVAILABLE en RPC_TIMEOUT.",
+      "observed": {
+        "server": "nats-server 2.14.5",
+        "date": "2026-11-26",
+        "result": "Con un stream `no_ack` sobre `rpc.x.>` y nadie escuchando, la petición agota su timeout (801 ms con 800 de timeout) en lugar de fallar en ~1 ms."
+      },
+      "steps": [
+        {
+          "op": "stream_add",
+          "name": "AUDITORIA",
+          "subjects": [
+            "rpc.x.>"
+          ],
+          "noAck": true,
+          "expect": {
+            "outcome": "ok"
+          }
+        },
+        {
+          "op": "connect",
+          "name": "llama",
+          "expect": {
+            "outcome": "ok"
+          }
+        },
+        {
+          "op": "request",
+          "as": "llama",
+          "subject": "rpc.x.y.v1.op",
+          "timeoutMs": 800,
+          "expect": {
+            "outcome": "timeout",
+            "ms": {
+              "gte": 700
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "which-stream-subjects-capture-rpc",
+      "title": "Qué subjects de stream capturan una operación: el algoritmo de solape de `flux doctor` coincide con lo que hace el broker, y los filtros más anchos solo se pueden crear sin acuse",
+      "spec": "11-request-reply.md §8",
+      "covers": [
+        "A-69"
+      ],
+      "rationale": "`flux doctor` tiene que decir QUÉ streams capturan `rpc.>`, y un comodín en medio del filtro (`*.>`, `*.*.*.*.*`) es tan peligroso como `rpc.>` y menos evidente. El caso ejecuta el algoritmo de solape (token a token: `*` casa uno, `>` casa uno o más al final) contra el broker: para cada patrón, lo que PREDICE sobre la operación de prueba es lo que ocurre. Dos efectos distintos: un stream normal contesta con su ACUSE (la trampa de A-18); uno de los anchos (`>`, `*.>`, `*.*.*.*.*`) JetStream solo lo deja crear SIN acuse (`no_ack`), así que no contesta, pero SÍ cuenta como interés —quien llama ve un timeout en vez de `no responders`— y persiste cada petición. `overlapsRpc` es lo que marca el doctor, y se calcula contra la FORMA de toda operación (`rpc.*.*.*.*`, cinco tokens) y no contra `rpc.>`: así no marca un filtro de seis tokens que no puede capturar ninguna. Es conservador a propósito en lo demás (`rpc.otro.>` se marca aunque no capture esta operación).",
+      "observed": {
+        "server": "nats-server 2.14.5",
+        "date": "2026-11-26",
+        "result": "De 16 patrones, el broker captura la operación de prueba exactamente en los que predice el algoritmo. Con acuse (la «respuesta» es `{\"stream\":…}`): `rpc.>`, `rpc.*.>`, `rpc.clientes.>`, la propia operación, `rpc.*.*.*.*`, `rpc.*.cliente.v1.*`. Solo sin acuse —JetStream responde `capturing all subjects requires no-ack to be true` o `subjects that overlap with jetstream api require no-ack to be true`—: `>`, `*.>`, `*.*.*.*.*` (capturan: timeout) y `*.*.*.*`, `*.*.*.*.*.*` (no capturan: `no responders`). No capturan: `clientes.>`, `dlq.>`, `state.>`, `rpc.otro.>`, `rpc.clientes.cliente.v1.crear`."
+      },
+      "steps": [
+        {
+          "op": "stream_captures",
+          "index": 0,
+          "pattern": "rpc.>",
+          "probe": "rpc.clientes.cliente.v1.obtener",
+          "title": "rpc.>",
+          "expect": {
+            "created": true,
+            "needsNoAck": false,
+            "capturesInterest": true,
+            "predicted": true,
+            "ack": true,
+            "overlapsRpc": true
+          }
+        },
+        {
+          "op": "stream_captures",
+          "index": 1,
+          "pattern": "rpc.*.>",
+          "probe": "rpc.clientes.cliente.v1.obtener",
+          "title": "rpc.*.>",
+          "expect": {
+            "created": true,
+            "needsNoAck": false,
+            "capturesInterest": true,
+            "predicted": true,
+            "ack": true,
+            "overlapsRpc": true
+          }
+        },
+        {
+          "op": "stream_captures",
+          "index": 2,
+          "pattern": "rpc.clientes.>",
+          "probe": "rpc.clientes.cliente.v1.obtener",
+          "title": "rpc.clientes.>",
+          "expect": {
+            "created": true,
+            "needsNoAck": false,
+            "capturesInterest": true,
+            "predicted": true,
+            "ack": true,
+            "overlapsRpc": true
+          }
+        },
+        {
+          "op": "stream_captures",
+          "index": 3,
+          "pattern": "rpc.clientes.cliente.v1.obtener",
+          "probe": "rpc.clientes.cliente.v1.obtener",
+          "title": "rpc.clientes.cliente.v1.obtener",
+          "expect": {
+            "created": true,
+            "needsNoAck": false,
+            "capturesInterest": true,
+            "predicted": true,
+            "ack": true,
+            "overlapsRpc": true
+          }
+        },
+        {
+          "op": "stream_captures",
+          "index": 4,
+          "pattern": "rpc.*.*.*.*",
+          "probe": "rpc.clientes.cliente.v1.obtener",
+          "title": "rpc.*.*.*.*",
+          "expect": {
+            "created": true,
+            "needsNoAck": false,
+            "capturesInterest": true,
+            "predicted": true,
+            "ack": true,
+            "overlapsRpc": true
+          }
+        },
+        {
+          "op": "stream_captures",
+          "index": 5,
+          "pattern": "rpc.*.cliente.v1.*",
+          "probe": "rpc.clientes.cliente.v1.obtener",
+          "title": "rpc.*.cliente.v1.*",
+          "expect": {
+            "created": true,
+            "needsNoAck": false,
+            "capturesInterest": true,
+            "predicted": true,
+            "ack": true,
+            "overlapsRpc": true
+          }
+        },
+        {
+          "op": "stream_captures",
+          "index": 6,
+          "pattern": ">",
+          "probe": "rpc.clientes.cliente.v1.obtener",
+          "title": ">",
+          "expect": {
+            "created": true,
+            "needsNoAck": true,
+            "capturesInterest": true,
+            "predicted": true,
+            "ack": false,
+            "overlapsRpc": true
+          }
+        },
+        {
+          "op": "stream_captures",
+          "index": 7,
+          "pattern": "*.>",
+          "probe": "rpc.clientes.cliente.v1.obtener",
+          "title": "*.>",
+          "expect": {
+            "created": true,
+            "needsNoAck": true,
+            "capturesInterest": true,
+            "predicted": true,
+            "ack": false,
+            "overlapsRpc": true
+          }
+        },
+        {
+          "op": "stream_captures",
+          "index": 8,
+          "pattern": "*.*.*.*.*",
+          "probe": "rpc.clientes.cliente.v1.obtener",
+          "title": "*.*.*.*.*",
+          "expect": {
+            "created": true,
+            "needsNoAck": true,
+            "capturesInterest": true,
+            "predicted": true,
+            "ack": false,
+            "overlapsRpc": true
+          }
+        },
+        {
+          "op": "stream_captures",
+          "index": 9,
+          "pattern": "clientes.>",
+          "probe": "rpc.clientes.cliente.v1.obtener",
+          "title": "clientes.>",
+          "expect": {
+            "created": true,
+            "needsNoAck": false,
+            "capturesInterest": false,
+            "predicted": false,
+            "ack": false,
+            "overlapsRpc": false
+          }
+        },
+        {
+          "op": "stream_captures",
+          "index": 10,
+          "pattern": "dlq.>",
+          "probe": "rpc.clientes.cliente.v1.obtener",
+          "title": "dlq.>",
+          "expect": {
+            "created": true,
+            "needsNoAck": false,
+            "capturesInterest": false,
+            "predicted": false,
+            "ack": false,
+            "overlapsRpc": false
+          }
+        },
+        {
+          "op": "stream_captures",
+          "index": 11,
+          "pattern": "state.>",
+          "probe": "rpc.clientes.cliente.v1.obtener",
+          "title": "state.>",
+          "expect": {
+            "created": true,
+            "needsNoAck": false,
+            "capturesInterest": false,
+            "predicted": false,
+            "ack": false,
+            "overlapsRpc": false
+          }
+        },
+        {
+          "op": "stream_captures",
+          "index": 12,
+          "pattern": "rpc.otro.>",
+          "probe": "rpc.clientes.cliente.v1.obtener",
+          "title": "rpc.otro.>",
+          "expect": {
+            "created": true,
+            "needsNoAck": false,
+            "capturesInterest": false,
+            "predicted": false,
+            "ack": false,
+            "overlapsRpc": true
+          }
+        },
+        {
+          "op": "stream_captures",
+          "index": 13,
+          "pattern": "rpc.clientes.cliente.v1.crear",
+          "probe": "rpc.clientes.cliente.v1.obtener",
+          "title": "rpc.clientes.cliente.v1.crear",
+          "expect": {
+            "created": true,
+            "needsNoAck": false,
+            "capturesInterest": false,
+            "predicted": false,
+            "ack": false,
+            "overlapsRpc": true
+          }
+        },
+        {
+          "op": "stream_captures",
+          "index": 14,
+          "pattern": "*.*.*.*",
+          "probe": "rpc.clientes.cliente.v1.obtener",
+          "title": "*.*.*.*",
+          "expect": {
+            "created": true,
+            "needsNoAck": true,
+            "capturesInterest": false,
+            "predicted": false,
+            "ack": false,
+            "overlapsRpc": false
+          }
+        },
+        {
+          "op": "stream_captures",
+          "index": 15,
+          "pattern": "*.*.*.*.*.*",
+          "probe": "rpc.clientes.cliente.v1.obtener",
+          "title": "*.*.*.*.*.*",
+          "expect": {
+            "created": true,
+            "needsNoAck": true,
+            "capturesInterest": false,
+            "predicted": false,
+            "ack": false,
+            "overlapsRpc": false
+          }
+        }
+      ]
+    },
+    {
+      "id": "cluster-queue-group-spreads-across-nodes",
+      "title": "En un cluster de 3 nodos, un grupo de cola con una instancia por nodo reparte las peticiones entre los tres",
+      "spec": "11-request-reply.md §9",
+      "covers": [
+        "A-75"
+      ],
+      "topology": "cluster3",
+      "rationale": "Quien llama está conectado a un nodo y quien responde a otro: el reparto no se queda en el nodo local. Se mide porque una preferencia por el nodo local —cierta en otras versiones y configuraciones— concentraría toda la carga en una instancia y dejaría a las otras ociosas sin ningún error. No hay que suponerlo: en 2.14.5 reparte.",
+      "observed": {
+        "server": "nats-server 2.14.5",
+        "date": "2026-11-26",
+        "result": "Tres instancias del mismo grupo (nodos 0, 1 y 2) y quien llama en el nodo 0: 900 peticiones, repartidas 286 / 312 / 302 en la exploración y 180 / 221 / 199 con 600 en la ejecución del runner. Con un único responder en otro nodo: p50 0,55 ms, p99 1,14 ms."
+      },
+      "steps": [
+        {
+          "op": "connect",
+          "name": "llama",
+          "node": 0,
+          "expect": {
+            "outcome": "ok"
+          }
+        },
+        {
+          "op": "connect",
+          "name": "i0",
+          "node": 0,
+          "expect": {
+            "outcome": "ok"
+          }
+        },
+        {
+          "op": "connect",
+          "name": "i1",
+          "node": 1,
+          "expect": {
+            "outcome": "ok"
+          }
+        },
+        {
+          "op": "connect",
+          "name": "i2",
+          "node": 2,
+          "expect": {
+            "outcome": "ok"
+          }
+        },
+        {
+          "op": "serve",
+          "as": "i0",
+          "name": "n0",
+          "subject": "rpc.x.y.v1.op",
+          "queue": "crm",
+          "expect": {
+            "outcome": "ok"
+          }
+        },
+        {
+          "op": "serve",
+          "as": "i1",
+          "name": "n1",
+          "subject": "rpc.x.y.v1.op",
+          "queue": "crm",
+          "expect": {
+            "outcome": "ok"
+          }
+        },
+        {
+          "op": "serve",
+          "as": "i2",
+          "name": "n2",
+          "subject": "rpc.x.y.v1.op",
+          "queue": "crm",
+          "expect": {
+            "outcome": "ok"
+          }
+        },
+        {
+          "op": "sleep",
+          "ms": 500,
+          "expect": {
+            "outcome": "ok"
+          }
+        },
+        {
+          "op": "burst",
+          "as": "llama",
+          "subject": "rpc.x.y.v1.op",
+          "count": 600,
+          "expect": {
+            "ok": 600,
+            "timeouts": 0,
+            "byFrom.n0": {
+              "gte": 120
+            },
+            "byFrom.n1": {
+              "gte": 120
+            },
+            "byFrom.n2": {
+              "gte": 120
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "cluster-window-after-the-last-responder-leaves",
+      "title": "En un cluster, la petición que sale justo cuando el último responder se va puede agotar su timeout en vez de dar `no responders`; unos milisegundos después, ya da `no responders`",
+      "spec": "11-request-reply.md §5.5, §9",
+      "covers": [
+        "A-70"
+      ],
+      "topology": "cluster3",
+      "rationale": "El interés se propaga entre nodos de forma asíncrona: hay una ventana de unos milisegundos tras irse el último que responde en la que el nodo de quien llama aún reenvía la petición y el otro nodo, sin suscriptor, no contesta `no responders`. Para quien llama es un RPC_TIMEOUT donde esperaba RPC_UNAVAILABLE. Es la tercera razón (tras A-61 y A-62) por la que un timeout no dice que la operación no se ejecutó, y el motivo del apagado ordenado: dejar de escuchar, y dejar pasar ese margen, antes de cerrar.",
+      "observed": {
+        "server": "nats-server 2.14.5",
+        "date": "2026-11-26",
+        "result": "Con el responder en el nodo 2 y quien llama en el nodo 0, cerrar la conexión y pedir de inmediato: 4 de 10 peticiones agotan su timeout y 6 dan `no responders`; con 5 ms de espera, 0 de 10; con 20 y 100 ms, 0 de 10. En un nodo suelto, 1 de 10 con espera cero. Pasados 150 ms: `no responders` en ~1 ms."
+      },
+      "steps": [
+        {
+          "op": "connect",
+          "name": "llama",
+          "node": 0,
+          "expect": {
+            "outcome": "ok"
+          }
+        },
+        {
+          "op": "connect",
+          "name": "r",
+          "node": 2,
+          "expect": {
+            "outcome": "ok"
+          }
+        },
+        {
+          "op": "serve",
+          "as": "r",
+          "name": "remoto",
+          "subject": "rpc.x.y.v1.remoto",
+          "queue": "crm",
+          "expect": {
+            "outcome": "ok"
+          }
+        },
+        {
+          "op": "sleep",
+          "ms": 400,
+          "expect": {
+            "outcome": "ok"
+          }
+        },
+        {
+          "op": "request",
+          "as": "llama",
+          "subject": "rpc.x.y.v1.remoto",
+          "expect": {
+            "outcome": "ok",
+            "ms": {
+              "lte": 100
+            }
+          }
+        },
+        {
+          "op": "unserve",
+          "name": "remoto",
+          "how": "close",
+          "expect": {
+            "outcome": "ok"
+          }
+        },
+        {
+          "op": "request",
+          "as": "llama",
+          "subject": "rpc.x.y.v1.remoto",
+          "timeoutMs": 400,
+          "title": "en la ventana: o timeout o no responders",
+          "expect": {
+            "outcome": {
+              "oneOf": [
+                "timeout",
+                "no_responders"
+              ]
+            }
+          }
+        },
+        {
+          "op": "sleep",
+          "ms": 150,
+          "expect": {
+            "outcome": "ok"
+          }
+        },
+        {
+          "op": "request",
+          "as": "llama",
+          "subject": "rpc.x.y.v1.remoto",
+          "timeoutMs": 400,
+          "title": "pasada la ventana",
+          "expect": {
+            "outcome": "no_responders",
+            "ms": {
+              "lte": 100
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "denied-call-fails-fast-in-node",
+      "title": "Una petición a una operación no concedida falla en ~1 ms con `Permissions Violation` con la librería de Node; la concedida sin nadie da `no responders`",
+      "spec": "11-request-reply.md §4.3, §7",
+      "covers": [
+        "A-17",
+        "A-66"
+      ],
+      "acl": "rpc",
+      "rationale": "Reproduce A-17 y fija qué ve quien llama con `@nats-io/*`: un error rápido que NOMBRA el subject, no un timeout. Distingue «no concedido» de «concedido pero nadie escucha». El broker no contesta a lo que deniega (descarta y avisa aparte, A-28): es la librería la que traduce el aviso en una excepción, y por eso la otra librería (A-72) se comporta distinto.",
+      "observed": {
+        "server": "nats-server 2.14.5",
+        "date": "2026-11-26",
+        "result": "`ajeno` pide `rpc.clientes.cliente.v1.obtener` (no concedido): `RequestError` con causa `PermissionViolationError` en ~1 ms, `Permissions Violation for Publish to \"rpc.clientes.cliente.v1.obtener\"`. `llama` (concedido) a la misma operación sin nadie: `no responders` en ~1 ms."
+      },
+      "steps": [
+        {
+          "op": "connect",
+          "name": "ajeno",
+          "user": "ajeno",
+          "expect": {
+            "outcome": "ok"
+          }
+        },
+        {
+          "op": "connect",
+          "name": "llama",
+          "user": "llama",
+          "expect": {
+            "outcome": "ok"
+          }
+        },
+        {
+          "op": "request",
+          "as": "ajeno",
+          "subject": "rpc.clientes.cliente.v1.obtener",
+          "timeoutMs": 3000,
+          "title": "no concedida",
+          "expect": {
+            "outcome": "denied",
+            "ms": {
+              "lte": 200
+            },
+            "text": {
+              "match": "Permissions Violation for Publish to \"rpc\\.clientes\\.cliente\\.v1\\.obtener\""
+            }
+          }
+        },
+        {
+          "op": "request",
+          "as": "llama",
+          "subject": "rpc.clientes.cliente.v1.obtener",
+          "timeoutMs": 3000,
+          "title": "concedida, sin nadie escuchando",
+          "expect": {
+            "outcome": "no_responders",
+            "ms": {
+              "lte": 200
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "denied-call-times-out-in-async-nats",
+      "title": "Con `async-nats` (el SDK de Rust), la misma petición denegada NO falla rápido: agota su timeout, y el `-ERR` solo se ve en el evento de la conexión",
+      "spec": "11-request-reply.md §4.3, §7; 06-security.md §3.7",
+      "covers": [
+        "A-72",
+        "A-28"
+      ],
+      "acl": "rpc",
+      "rationale": "Es lo que obliga a la regla de 06-security.md §3.7 para rpc: el SDK DEBE escuchar el `-ERR` de la conexión y competirlo con la respuesta, y convertirlo en PERMISSION_DENIED. Sin ello, un permiso que falta se ve como RPC_TIMEOUT (RETRYABLE): el handler que hace la llamada reintenta durante 51 minutos algo que nunca va a funcionar. Con Node (A-66) el error ya es rápido; con `async-nats`, no.",
+      "observed": {
+        "server": "nats-server 2.14.5",
+        "date": "2026-11-26",
+        "result": "`async-nats` 0.50, usuario `ajeno`, petición a una operación no concedida con timeout de 2500 ms: `TimedOut` a los ~2500 ms; mientras, el evento `ServerError` de la conexión recibió `Permissions Violation for Publish to \"rpc.clientes.cliente.v1.obtener\"`.",
+        "library": "async-nats 0.50.0"
+      },
+      "steps": [
+        {
+          "op": "rust_probe",
+          "probe": "denied",
+          "expect": {
+            "kind": "Some(TimedOut)",
+            "ms": {
+              "gte": 2400
+            },
+            "sawPermissionsViolation": true
+          }
+        }
+      ]
+    },
+    {
+      "id": "async-nats-no-responders-timeout-and-oversize",
+      "title": "Con `async-nats`: `no responders` al instante, `TimedOut` si el responder es lento, `MaxPayloadExceeded` al pedir más de max_payload, y una respuesta que no cabe deja a quien llama con un timeout",
+      "spec": "11-request-reply.md §4.3, §4.4, §5.4",
+      "covers": [
+        "A-76"
+      ],
+      "acl": "rpc",
+      "rationale": "La otra librería de los SDKs de referencia: cada fila de §4.3 que el SDK debe traducir a un código estable se comprueba también aquí, para que los SDKs de Node y de Rust partan de lo medido y no de lo supuesto. Las cuatro coinciden con Node salvo el nombre del error.",
+      "observed": {
+        "server": "nats-server 2.14.5",
+        "date": "2026-11-26",
+        "result": "`async-nats` 0.50 contra la ACL `rpc`: sin nadie, `NoResponders` en 0-1 ms; un responder de 600 ms con timeout de 300 ms, `TimedOut` a los ~301 ms; una petición de max_payload + 1, `MaxPayloadExceeded` al instante; justo max_payload se publica; una respuesta de max_payload + 1 hace que quien responde reciba `MaxPayloadExceeded` y quien llama, `TimedOut`. Una petición atendida: ~0,7 ms.",
+        "library": "async-nats 0.50.0"
+      },
+      "steps": [
+        {
+          "op": "rust_probe",
+          "probe": "server-info",
+          "expect": {
+            "maxPayload": 1048576
+          }
+        },
+        {
+          "op": "rust_probe",
+          "probe": "no-responders",
+          "expect": {
+            "kind": "Some(NoResponders)",
+            "ms": {
+              "lte": 100
+            }
+          }
+        },
+        {
+          "op": "rust_probe",
+          "probe": "answered",
+          "expect": {
+            "ok": true,
+            "ms": {
+              "lte": 50
+            }
+          }
+        },
+        {
+          "op": "rust_probe",
+          "probe": "slow-responder",
+          "expect": {
+            "kind": "Some(TimedOut)",
+            "ms": {
+              "between": [
+                280,
+                700
+              ]
+            }
+          }
+        },
+        {
+          "op": "rust_probe",
+          "probe": "oversize-request",
+          "expect": {
+            "kind": "Some(MaxPayloadExceeded)",
+            "ms": {
+              "lte": 100
+            }
+          }
+        },
+        {
+          "op": "rust_probe",
+          "probe": "exact-max-payload-publishes",
+          "expect": {
+            "ok": true
+          }
+        },
+        {
+          "op": "rust_probe",
+          "probe": "oversize-reply",
+          "expect": {
+            "callerKind": "Some(TimedOut)",
+            "responderSaw.0": "MaxPayloadExceeded"
+          }
+        }
+      ]
+    },
+    {
+      "id": "allow-responses-true-admits-exactly-one-reply",
+      "title": "`allow_responses: true` admite UNA respuesta por petición: la segunda es una violación de permiso",
+      "spec": "11-request-reply.md §7.2",
+      "covers": [
+        "A-68"
+      ],
+      "acl": "rpc",
+      "rationale": "Fija «una petición, una respuesta» por la ACL y no por cortesía: no hay respuestas en flujo ni varias partes de una respuesta. Un handler que responda dos veces no rompe a quien llama (recibe la primera) pero deja una violación de permiso en el log del servidor por cada exceso: ruido que tapa las reales. La respuesta se envía a un subject de inbox sobre el que el dueño NO tiene permiso de publicación.",
+      "observed": {
+        "server": "nats-server 2.14.5",
+        "date": "2026-11-26",
+        "result": "`crm` (`allow_responses: true`, sin permiso de publicación en ningún inbox) responde tres veces a una petición: quien llama recibe solo `r1`, y el servidor registra 2 violaciones `Permissions Violation for Publish to \"_INBOX.llama.…\"` en la conexión de `crm`."
+      },
+      "steps": [
+        {
+          "op": "connect",
+          "name": "llama",
+          "user": "llama",
+          "expect": {
+            "outcome": "ok"
+          }
+        },
+        {
+          "op": "connect",
+          "name": "crm",
+          "user": "crm",
+          "expect": {
+            "outcome": "ok"
+          }
+        },
+        {
+          "op": "listen",
+          "name": "buzon",
+          "as": "llama",
+          "subject": "_INBOX.llama.buzon",
+          "expect": {
+            "outcome": "ok"
+          }
+        },
+        {
+          "op": "serve",
+          "as": "crm",
+          "name": "a",
+          "subject": "rpc.clientes.cliente.v1.obtener",
+          "queue": "crm",
+          "mode": "multi",
+          "replies": 3,
+          "expect": {
+            "outcome": "ok"
+          }
+        },
+        {
+          "op": "publish_reply_to",
+          "as": "llama",
+          "subject": "rpc.clientes.cliente.v1.obtener",
+          "reply": "_INBOX.llama.buzon",
+          "expect": {
+            "outcome": "sent"
+          }
+        },
+        {
+          "op": "sleep",
+          "ms": 500,
+          "expect": {
+            "outcome": "ok"
+          }
+        },
+        {
+          "op": "heard",
+          "name": "buzon",
+          "expect": {
+            "count": 1,
+            "bodies": [
+              "r1"
+            ]
+          }
+        },
+        {
+          "op": "served",
+          "name": "a",
+          "title": "el que responde envió 3 y se le denegaron 2",
+          "expect": {
+            "replied": 3,
+            "violations": 2,
+            "violationText": {
+              "match": "Permissions Violation for Publish to \"_INBOX\\.llama\\."
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "allow-responses-true-never-expires",
+      "title": "`allow_responses: true` NO caduca: una respuesta a los 2 s sigue admitida",
+      "spec": "11-request-reply.md §7.2",
+      "covers": [
+        "A-68"
+      ],
+      "acl": "rpc",
+      "rationale": "Dice qué NO protege el valor más corto de escribir: sin `expires`, un dueño comprometido puede responder a un inbox que recibió hace horas. El generador DEBERÍA acotarlo (`{ max: 1, expires }`): como el timeout máximo es 25 s, una respuesta legítima nunca llega después.",
+      "observed": {
+        "server": "nats-server 2.14.5",
+        "date": "2026-11-26",
+        "result": "Sin `expires`, una respuesta a los 2000 ms se entrega y no hay violaciones."
+      },
+      "steps": [
+        {
+          "op": "connect",
+          "name": "llama",
+          "user": "llama",
+          "expect": {
+            "outcome": "ok"
+          }
+        },
+        {
+          "op": "connect",
+          "name": "crm",
+          "user": "crm",
+          "expect": {
+            "outcome": "ok"
+          }
+        },
+        {
+          "op": "listen",
+          "name": "buzon",
+          "as": "llama",
+          "subject": "_INBOX.llama.buzon",
+          "expect": {
+            "outcome": "ok"
+          }
+        },
+        {
+          "op": "serve",
+          "as": "crm",
+          "name": "a",
+          "subject": "rpc.clientes.cliente.v1.obtener",
+          "queue": "crm",
+          "delayMs": 2000,
+          "expect": {
+            "outcome": "ok"
+          }
+        },
+        {
+          "op": "publish_reply_to",
+          "as": "llama",
+          "subject": "rpc.clientes.cliente.v1.obtener",
+          "reply": "_INBOX.llama.buzon",
+          "expect": {
+            "outcome": "sent"
+          }
+        },
+        {
+          "op": "sleep",
+          "ms": 2500,
+          "expect": {
+            "outcome": "ok"
+          }
+        },
+        {
+          "op": "heard",
+          "name": "buzon",
+          "expect": {
+            "count": 1
+          }
+        },
+        {
+          "op": "served",
+          "name": "a",
+          "expect": {
+            "violations": 0
+          }
+        }
+      ]
+    },
+    {
+      "id": "allow-responses-max-n-and-expires",
+      "title": "`allow_responses: { max: n }` admite n respuestas, y `{ expires }` deniega la que llega tarde",
+      "spec": "11-request-reply.md §7.2",
+      "covers": [
+        "A-68"
+      ],
+      "acl": "rpc",
+      "rationale": "Son las dos formas con las que el generador puede acotar el permiso del dueño. El control del `expires` demuestra que la respuesta A TIEMPO sí pasa: lo denegado es solo lo tardío, que de todos modos nadie esperaba.",
+      "observed": {
+        "server": "nats-server 2.14.5",
+        "date": "2026-11-26",
+        "result": "`{ max: 3 }`: de 4 respuestas se entregan 3 y se deniega 1. `{ max: 1, expires: \"1s\" }`: una respuesta a los 1500 ms no se entrega (1 violación); una a los 300 ms sí."
+      },
+      "steps": [
+        {
+          "op": "connect",
+          "name": "llama",
+          "user": "llama",
+          "expect": {
+            "outcome": "ok"
+          }
+        },
+        {
+          "op": "connect",
+          "name": "m3",
+          "user": "crm-max3",
+          "expect": {
+            "outcome": "ok"
+          }
+        },
+        {
+          "op": "connect",
+          "name": "ex",
+          "user": "crm-exp",
+          "expect": {
+            "outcome": "ok"
+          }
+        },
+        {
+          "op": "listen",
+          "name": "buzon-m3",
+          "as": "llama",
+          "subject": "_INBOX.llama.m3",
+          "expect": {
+            "outcome": "ok"
+          }
+        },
+        {
+          "op": "listen",
+          "name": "buzon-tarde",
+          "as": "llama",
+          "subject": "_INBOX.llama.tarde",
+          "expect": {
+            "outcome": "ok"
+          }
+        },
+        {
+          "op": "listen",
+          "name": "buzon-a-tiempo",
+          "as": "llama",
+          "subject": "_INBOX.llama.atiempo",
+          "expect": {
+            "outcome": "ok"
+          }
+        },
+        {
+          "op": "serve",
+          "as": "m3",
+          "name": "max3",
+          "subject": "rpc.clientes.cliente.v1.obtener",
+          "queue": "crm",
+          "mode": "multi",
+          "replies": 4,
+          "expect": {
+            "outcome": "ok"
+          }
+        },
+        {
+          "op": "publish_reply_to",
+          "as": "llama",
+          "subject": "rpc.clientes.cliente.v1.obtener",
+          "reply": "_INBOX.llama.m3",
+          "expect": {
+            "outcome": "sent"
+          }
+        },
+        {
+          "op": "sleep",
+          "ms": 500,
+          "expect": {
+            "outcome": "ok"
+          }
+        },
+        {
+          "op": "heard",
+          "name": "buzon-m3",
+          "expect": {
+            "count": 3
+          }
+        },
+        {
+          "op": "served",
+          "name": "max3",
+          "expect": {
+            "replied": 4,
+            "violations": 1
+          }
+        },
+        {
+          "op": "unserve",
+          "name": "max3",
+          "how": "close",
+          "expect": {
+            "outcome": "ok"
+          }
+        },
+        {
+          "op": "serve",
+          "as": "ex",
+          "name": "exp",
+          "subject": "rpc.clientes.cliente.v1.obtener",
+          "queue": "crm",
+          "delayMs": 1500,
+          "expect": {
+            "outcome": "ok"
+          }
+        },
+        {
+          "op": "publish_reply_to",
+          "as": "llama",
+          "subject": "rpc.clientes.cliente.v1.obtener",
+          "reply": "_INBOX.llama.tarde",
+          "expect": {
+            "outcome": "sent"
+          }
+        },
+        {
+          "op": "sleep",
+          "ms": 2000,
+          "expect": {
+            "outcome": "ok"
+          }
+        },
+        {
+          "op": "heard",
+          "name": "buzon-tarde",
+          "title": "con expires de 1 s, la de 1,5 s no llega",
+          "expect": {
+            "count": 0
+          }
+        },
+        {
+          "op": "served",
+          "name": "exp",
+          "expect": {
+            "violations": 1
+          }
+        },
+        {
+          "op": "unserve",
+          "name": "exp",
+          "how": "close",
+          "expect": {
+            "outcome": "ok"
+          }
+        },
+        {
+          "op": "connect",
+          "name": "ex2",
+          "user": "crm-exp",
+          "expect": {
+            "outcome": "ok"
+          }
+        },
+        {
+          "op": "serve",
+          "as": "ex2",
+          "name": "exp-rapida",
+          "subject": "rpc.clientes.cliente.v1.obtener",
+          "queue": "crm",
+          "delayMs": 300,
+          "expect": {
+            "outcome": "ok"
+          }
+        },
+        {
+          "op": "publish_reply_to",
+          "as": "llama",
+          "subject": "rpc.clientes.cliente.v1.obtener",
+          "reply": "_INBOX.llama.atiempo",
+          "expect": {
+            "outcome": "sent"
+          }
+        },
+        {
+          "op": "sleep",
+          "ms": 800,
+          "expect": {
+            "outcome": "ok"
+          }
+        },
+        {
+          "op": "heard",
+          "name": "buzon-a-tiempo",
+          "title": "control: la de 0,3 s sí llega",
+          "expect": {
+            "count": 1
+          }
+        }
+      ]
+    },
+    {
+      "id": "without-allow-responses-the-owner-cannot-reply",
+      "title": "Sin `allow_responses` (y sin permiso sobre inboxes) el dueño no puede responder: quien llama ve un timeout",
+      "spec": "11-request-reply.md §7.2",
+      "covers": [
+        "A-68",
+        "A-16"
+      ],
+      "acl": "rpc",
+      "rationale": "Es el fallo de una ACL que olvida `allow_responses` (el mutante `no-allow-responses`): el servicio arranca, recibe, ejecuta y no consigue contestar, y desde fuera solo se ve RPC_TIMEOUT. La señal está en el log del servidor y en los avisos de la conexión de quien responde, que el SDK DEBE registrar (06-security.md §3.7).",
+      "observed": {
+        "server": "nats-server 2.14.5",
+        "date": "2026-11-26",
+        "result": "`crm-sin-allow` recibe la petición y responde: se deniega con `Permissions Violation for Publish to \"_INBOX.llama.…\"`; quien llama ve `TimeoutError` a los 800 ms."
+      },
+      "steps": [
+        {
+          "op": "connect",
+          "name": "llama",
+          "user": "llama",
+          "expect": {
+            "outcome": "ok"
+          }
+        },
+        {
+          "op": "connect",
+          "name": "crm",
+          "user": "crm-sin-allow",
+          "expect": {
+            "outcome": "ok"
+          }
+        },
+        {
+          "op": "serve",
+          "as": "crm",
+          "name": "a",
+          "subject": "rpc.clientes.cliente.v1.obtener",
+          "queue": "crm",
+          "expect": {
+            "outcome": "ok"
+          }
+        },
+        {
+          "op": "request",
+          "as": "llama",
+          "subject": "rpc.clientes.cliente.v1.obtener",
+          "timeoutMs": 800,
+          "expect": {
+            "outcome": "timeout"
+          }
+        },
+        {
+          "op": "served",
+          "name": "a",
+          "expect": {
+            "received": 1,
+            "violations": 1,
+            "violationText": {
+              "match": "Permissions Violation for Publish to \"_INBOX\\.llama\\."
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "the-owner-can-only-reply-to-the-requests-reply-subject",
+      "title": "El dueño solo puede responder al `reply` de la petición que recibió: publicar en otro inbox se deniega",
+      "spec": "11-request-reply.md §7.2",
+      "covers": [
+        "A-68"
+      ],
+      "acl": "rpc",
+      "rationale": "Es lo que hace segura la ausencia de permiso de publicación sobre inboxes: `allow_responses` no abre `_INBOX.>`, abre exactamente el `reply` de lo recibido. Un dueño comprometido no puede escribir en el inbox de otro servicio.",
+      "observed": {
+        "server": "nats-server 2.14.5",
+        "date": "2026-11-26",
+        "result": "`crm` publica primero a `_INBOX.llama.otro` y luego responde bien: la primera se deniega (1 violación), la respuesta legítima llega."
+      },
+      "steps": [
+        {
+          "op": "connect",
+          "name": "llama",
+          "user": "llama",
+          "expect": {
+            "outcome": "ok"
+          }
+        },
+        {
+          "op": "connect",
+          "name": "crm",
+          "user": "crm",
+          "expect": {
+            "outcome": "ok"
+          }
+        },
+        {
+          "op": "listen",
+          "name": "otro",
+          "as": "llama",
+          "subject": "_INBOX.llama.otro",
+          "expect": {
+            "outcome": "ok"
+          }
+        },
+        {
+          "op": "serve",
+          "as": "crm",
+          "name": "a",
+          "subject": "rpc.clientes.cliente.v1.obtener",
+          "queue": "crm",
+          "mode": "foreign-inbox",
+          "otherSubject": "_INBOX.llama.otro",
+          "expect": {
+            "outcome": "ok"
+          }
+        },
+        {
+          "op": "request",
+          "as": "llama",
+          "subject": "rpc.clientes.cliente.v1.obtener",
+          "expect": {
+            "outcome": "ok",
+            "from": "a"
+          }
+        },
+        {
+          "op": "heard",
+          "name": "otro",
+          "title": "lo publicado a un inbox que no es el reply no llegó",
+          "expect": {
+            "count": 0
+          }
+        },
+        {
+          "op": "served",
+          "name": "a",
+          "expect": {
+            "violations": 1
+          }
+        }
+      ]
+    },
+    {
+      "id": "owner-without-subscribe-permission-looks-like-no-responders",
+      "title": "Un dueño al que la ACL deniega la suscripción parece un servicio CAÍDO: quien llama recibe `no responders`",
+      "spec": "11-request-reply.md §7.1",
+      "covers": [
+        "A-73"
+      ],
+      "acl": "rpc",
+      "rationale": "Un permiso de suscripción que falta no se ve desde fuera como un permiso: se ve como un servicio caído, y desde dentro el servicio arranca «sano». Por eso `respond()` DEBE fallar con PERMISSION_DENIED nombrando el subject (06-security.md §3.7), no arrancar mudo: la señal que hay es un aviso asíncrono de la conexión.",
+      "observed": {
+        "server": "nats-server 2.14.5",
+        "date": "2026-11-26",
+        "result": "`crm-sin-sub` se suscribe a `rpc.clientes.cliente.v1.obtener` sin permiso: el servidor registra `Permissions Violation for Subscription to \"…obtener\"` en su conexión, y `llama` recibe `no responders` en ~1 ms."
+      },
+      "steps": [
+        {
+          "op": "connect",
+          "name": "llama",
+          "user": "llama",
+          "expect": {
+            "outcome": "ok"
+          }
+        },
+        {
+          "op": "connect",
+          "name": "crm",
+          "user": "crm-sin-sub",
+          "expect": {
+            "outcome": "ok"
+          }
+        },
+        {
+          "op": "serve",
+          "as": "crm",
+          "name": "a",
+          "subject": "rpc.clientes.cliente.v1.obtener",
+          "queue": "crm",
+          "expect": {
+            "outcome": "ok"
+          }
+        },
+        {
+          "op": "sleep",
+          "ms": 200,
+          "expect": {
+            "outcome": "ok"
+          }
+        },
+        {
+          "op": "violations",
+          "as": "crm",
+          "expect": {
+            "count": {
+              "gte": 1
+            },
+            "text": {
+              "match": "Permissions Violation for Subscription to \"rpc\\.clientes\\.cliente\\.v1\\.obtener\""
+            }
+          }
+        },
+        {
+          "op": "request",
+          "as": "llama",
+          "subject": "rpc.clientes.cliente.v1.obtener",
+          "timeoutMs": 800,
+          "expect": {
+            "outcome": "no_responders",
+            "ms": {
+              "lte": 100
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "shared-inbox-leaks-replies-and-a-private-inbox-does-not",
+      "title": "Con un `_INBOX.>` común, un servicio ajeno lee las respuestas de los demás; con el inbox privado, no puede suscribirse al de otro",
+      "spec": "11-request-reply.md §7.3; 06-security.md §3.3",
+      "covers": [
+        "A-71",
+        "A-22"
+      ],
+      "acl": "rpc",
+      "rationale": "Sin el inbox privado de la Fase 1, cualquiera leería las respuestas ajenas —que en rpc pueden llevar datos personales—. Es el mismo H2 de los eventos, ahora con respuestas: el control es un usuario con la ACL v1 (`_INBOX.>`), que lee la respuesta completa dirigida a otro; el espía con inbox privado ve denegada la suscripción al inbox de `llama`.",
+      "observed": {
+        "server": "nats-server 2.14.5",
+        "date": "2026-11-26",
+        "result": "`llama` pide algo a `crm` y obtiene la respuesta. `chismoso` (suscrito a `_INBOX.>`) oye ese mismo mensaje. `espia` (solo `_INBOX.espia.>`) intenta suscribirse a `_INBOX.llama.>`: se deniega, no oye nada, y su iterador lanza `PermissionViolationError`."
+      },
+      "steps": [
+        {
+          "op": "connect",
+          "name": "llama",
+          "user": "llama",
+          "expect": {
+            "outcome": "ok"
+          }
+        },
+        {
+          "op": "connect",
+          "name": "crm",
+          "user": "crm",
+          "expect": {
+            "outcome": "ok"
+          }
+        },
+        {
+          "op": "connect",
+          "name": "chismoso",
+          "user": "chismoso",
+          "expect": {
+            "outcome": "ok"
+          }
+        },
+        {
+          "op": "connect",
+          "name": "espia",
+          "user": "espia",
+          "expect": {
+            "outcome": "ok"
+          }
+        },
+        {
+          "op": "serve",
+          "as": "crm",
+          "name": "a",
+          "subject": "rpc.clientes.cliente.v1.obtener",
+          "queue": "crm",
+          "expect": {
+            "outcome": "ok"
+          }
+        },
+        {
+          "op": "listen",
+          "name": "lee-todo",
+          "as": "chismoso",
+          "subject": "_INBOX.>",
+          "expect": {
+            "outcome": "ok"
+          }
+        },
+        {
+          "op": "listen",
+          "name": "lee-ajeno",
+          "as": "espia",
+          "subject": "_INBOX.llama.>",
+          "expect": {
+            "outcome": "ok"
+          }
+        },
+        {
+          "op": "request",
+          "as": "llama",
+          "subject": "rpc.clientes.cliente.v1.obtener",
+          "expect": {
+            "outcome": "ok",
+            "from": "a"
+          }
+        },
+        {
+          "op": "heard",
+          "name": "lee-todo",
+          "title": "control: con `_INBOX.>` se lee la respuesta de otro",
+          "control": true,
+          "expect": {
+            "count": 1,
+            "bodies.0": {
+              "match": "\"from\":\"a\""
+            }
+          }
+        },
+        {
+          "op": "heard",
+          "name": "lee-ajeno",
+          "title": "con el inbox privado, no",
+          "expect": {
+            "count": 0,
+            "error": {
+              "match": "ermission"
+            }
+          }
+        },
+        {
+          "op": "violations",
+          "as": "espia",
+          "expect": {
+            "count": {
+              "gte": 1
+            }
+          }
+        }
+      ]
+    }
+  ]
+}
