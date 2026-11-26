@@ -195,6 +195,10 @@ que ya tiene 3, informará de la diferencia y no tocará nada.
 Con el **Modelo B** (`gen-acl.mjs --tenants`) cada tenant es una account con sus propios
 streams: se ejecuta **una vez por account**, con las credenciales de operación de cada una.
 
+**Es obligatorio en producción**: con las ACLs generadas por defecto un servicio no tiene
+`CONSUMER.CREATE`, así que un durable que no exista no se recrea solo —el servicio falla con
+`NOT_PROVISIONED`—. Solo con `gen-acl.mjs --dev` el SDK puede crearlo (desarrollo).
+
 **Credenciales de operación.** `--creds` es un fichero `.creds`. El usuario de operación **no**
 lo genera `gen-acl.mjs`: vive fuera del manifiesto y fuera de la config de los servicios.
 
