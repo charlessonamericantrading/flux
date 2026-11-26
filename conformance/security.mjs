@@ -514,7 +514,8 @@ async function main() {
   nota(`nats-server con TLS en ${l.url}; ${prod.length} servicios${generada ? `, ${[...variantes.values()].filter((v) => !v.error).length} variante(s) de prueba` : ""} + ops`);
 
   const durables = prod.reduce((n, s) => n + s.durables.length, 0);
-  const streams = 2 * new Set(prod.flatMap((s) => s.owns)).size;
+  // EVT_ y DLQ_ por dominio, y STATE_ por cada dominio con estado.
+  const streams = 2 * new Set(prod.flatMap((s) => s.owns)).size + new Set(prod.flatMap((s) => s.stateOwns)).size;
   const creados = /(\d+) creado/.exec(l.provision.salida)?.[1];
   const provisionOk = l.provision.codigo === 0 && Number(creados) === streams + durables;
   console.log(`  ${provisionOk ? "✓" : "✗"} flux provision por TLS con credenciales de operación: ${creados ?? "0"} recursos creados (esperados: ${streams} streams + ${durables} durables)`);

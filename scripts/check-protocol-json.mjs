@@ -15,7 +15,14 @@ import { readFile } from "node:fs/promises";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { permisosDe } from "./lib/manifest.mjs";
+import {
+  RESERVED_DOMAINS,
+  SERVICE_KEYS,
+  STATE_CONTRACT_RE,
+  STATE_TENANT_MAX,
+  STATE_TENANT_RE,
+  permisosDe,
+} from "./lib/manifest.mjs";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 const p = JSON.parse(await readFile(join(ROOT, "protocol.json"), "utf8"));
@@ -275,6 +282,163 @@ const CASES = [
      "$JS.API.CONSUMER.CREATE.DLQ_CLIENTES.crm-api__dlq_clientes.dlq.state.clientes.>",
      "$JS.API.CONSUMER.CREATE.EVT_CLIENTES.crm-api__dlq_state_clientes.dlq.state.clientes.>"]],
 ];
+
+// ─── La ACL de ESTADO y su generador — 06-security.md §3.8 ───────────────────────────────────────
+// Se escriben como función PURA sobre el documento y sobre un EMISOR de permisos (por defecto, el
+// generador real) para probarlas en los dos sentidos: sobre el protocol.json y el generador reales
+// deben dar cero fallos, y sobre copias estropeadas a propósito —un documento con una excepción de
+// más o de menos, un generador que concede `state.>` o la forma de cuerpo de DIRECT.GET— cada una
+// debe dar al menos uno. Una invariante que solo se ha visto en verde no demuestra nada.
+
+/** Los servicios de prueba: el dueño, un observador confinado, uno sin confinar y uno mixto. */
+const SERVICIOS_DE_ESTADO = [
+  { name: "crm-api", owns: ["clientes"], subjects: [], stateOwns: ["clientes"], watches: [] },
+  { name: "tienda-web", owns: [], subjects: [], stateOwns: [], watches: [{ contract: "clientes.cliente.v1", domain: "clientes", tenants: ["acme"] }] },
+  { name: "informes-api", owns: [], subjects: [], stateOwns: [], watches: [{ contract: "clientes.cliente.v1", domain: "clientes", tenants: null }] },
+  {
+    name: "mixto-api",
+    owns: ["pedidos"],
+    subjects: ["inventario.stock.v1.ajustado"],
+    stateOwns: [],
+    watches: [
+      { contract: "clientes.cliente.v1", domain: "clientes", tenants: ["acme-corp", "globex"] },
+      { contract: "logistica.linea-envio.v2", domain: "logistica", tenants: null },
+    ],
+  },
+];
+
+/** @returns {string[]} */
+function fallosDeAclDeEstado(doc, emitir = permisosDe) {
+  const f = [];
+  const eq = (a, b) => JSON.stringify(a) === JSON.stringify(b);
+  const re = (src) => { try { return new RegExp(src); } catch { return /(?!)/; } };
+  const acl = doc.security.acl;
+  const st = doc.state.acl;
+  const resolver = (ruta) => ruta.split(".").reduce((o, k) => o?.[k], doc);
+
+  // ── Las excepciones de lo denegable: exactamente las dos formas de DIRECT.GET de estado ──────
+  const rutas = acl.neverGrantedExceptions;
+  if (!eq(rutas, ["state.acl.ownerDirectGet", "state.acl.observerDirectGet"])) {
+    f.push(`security.acl.neverGrantedExceptions debe ser exactamente [state.acl.ownerDirectGet, state.acl.observerDirectGet]; es ${JSON.stringify(rutas)}`);
+  }
+  const excepciones = [];
+  for (const ruta of rutas ?? []) {
+    const v = resolver(ruta);
+    if (typeof v !== "string") f.push(`security.acl.neverGrantedExceptions: «${ruta}» no existe o no es un patrón`);
+    else excepciones.push(re(v));
+  }
+  const caza = re(acl.neverGrantedPattern);
+  const denegable = (x) => caza.test(x) && !excepciones.some((r) => r.test(x));
+
+  // Lo que sigue denegado AUNQUE haya excepciones: la forma de cuerpo, los comodines por encima del
+  // tenant, una clave suelta, el stream de otro dominio, y el resto de lo que ya lo era.
+  for (const x of [
+    "$JS.API.DIRECT.GET.>", "$JS.API.DIRECT.GET.EVT_PEDIDOS", "$JS.API.DIRECT.GET.EVT_PEDIDOS.pedidos.pedido.v1.*.*",
+    "$JS.API.DIRECT.GET.STATE_CLIENTES", "$JS.API.DIRECT.GET.STATE_CLIENTES.>", "$JS.API.DIRECT.GET.STATE_CLIENTES.state.>",
+    "$JS.API.DIRECT.GET.STATE_CLIENTES.state.clientes.cliente.v1.>", "$JS.API.DIRECT.GET.STATE_CLIENTES.state.clientes.cliente.v1.*",
+    "$JS.API.DIRECT.GET.STATE_CLIENTES.state.clientes.cliente.v1.acme.>", "$JS.API.DIRECT.GET.STATE_CLIENTES.state.clientes.cliente.v1.acme.cli-1",
+    "$JS.API.STREAM.MSG.GET.STATE_CLIENTES", ">", "$JS.API.>",
+  ]) {
+    if (!denegable(x)) f.push(`«${x}» debe seguir siendo denegable (las excepciones de neverGrantedExceptions son solo las dos formas por subject de un estado)`);
+  }
+  // Las dos formas concedibles: las caza neverGrantedPattern (si no, sobraría la excepción) y NO son denegables.
+  for (const x of [
+    "$JS.API.DIRECT.GET.STATE_CLIENTES.state.clientes.>",
+    "$JS.API.DIRECT.GET.STATE_LINEA_ENVIO.state.linea-envio.>",
+    "$JS.API.DIRECT.GET.STATE_CLIENTES.state.clientes.cliente.v1.acme.*",
+    "$JS.API.DIRECT.GET.STATE_CLIENTES.state.clientes.cliente.v1.*.*",
+  ]) {
+    if (!caza.test(x)) f.push(`«${x}» ni siquiera lo caza neverGrantedPattern: la excepción sobra o el patrón se ha estropeado`);
+    if (denegable(x)) f.push(`«${x}» es una forma de estado concedible y sale como denegable: falta su excepción`);
+  }
+  // STREAM.INFO.STATE_<DOM> no lo concede ningún patrón de eventos ni de estado (A-39): lista claves y tenants.
+  const patronesEventos = Object.entries(acl.permissionPatterns).filter(([k]) => !k.startsWith("$")).map(([k, v]) => [`security.acl.permissionPatterns.${k}`, re(v)]);
+  const CLAVES_ESTADO = ["ownerPublish", "ownerDirectGet", "observerDirectGet", "consumerInfo", "consumerNext", "ack", "consumerCreate", "dlqPublish", "dlqReaderCreate"];
+  const patronesEstado = CLAVES_ESTADO.map((k) => [`state.acl.${k}`, re(st[k] ?? "(?!)")]);
+  for (const [k, r] of [...patronesEventos, ...patronesEstado]) {
+    if (r.test("$JS.API.STREAM.INFO.STATE_CLIENTES")) f.push(`${k} concede STREAM.INFO.STATE_CLIENTES: con subjects_filter lista todas las claves y todos los tenants (A-39)`);
+    if (r.test("$JS.API.DIRECT.GET.STATE_CLIENTES") || r.test("$JS.API.DIRECT.GET.>")) f.push(`${k} concede la forma de CUERPO de DIRECT.GET: lee cualquier mensaje y ninguna ACL ve el cuerpo (A-38)`);
+    // `ownDomain` casa con `state.>` (es un patrón de dominio): lo impide el generador, que rechaza los
+    // dominios reservados (comprobado abajo), no el patrón.
+    if (k !== "state.acl.ownerPublish" && k !== "security.acl.permissionPatterns.ownDomain" && r.test("state.>")) f.push(`${k} concede state.>: escribir el estado de todos los dominios`);
+  }
+  // El dueño escribe en SU dominio de estado, no en todos: `state.clientes.>` sí, `state.>` y `state.*.>` no.
+  const owp = re(st.ownerPublish ?? "(?!)");
+  if (!owp.test("state.clientes.>") || ["state.>", "state.*.>", ">", "state.clientes.cliente.>"].some((x) => owp.test(x))) f.push("state.acl.ownerPublish debe aceptar state.<dominio>.> y rechazar state.>, state.*.> y lo más estrecho que un dominio");
+  if (re(acl.permissionPatterns.ownDomain).test("state.clientes.>")) f.push("security.acl.permissionPatterns.ownDomain concede state.clientes.>: los de estado van en state.acl");
+  // …y ese «dueño» de un dominio reservado no puede existir: el generador se niega a emitir sus permisos.
+  for (const d of doc.naming.reservedDomains.names) {
+    let lanzo = false;
+    try {
+      emitir({ name: "x-api", owns: [d], subjects: [], stateOwns: [], watches: [] });
+    } catch {
+      lanzo = true;
+    }
+    if (!lanzo) f.push(`el generador emite permisos para el dueño del dominio RESERVADO «${d}» (recibiría ${d}.>): ${d === "state" ? "escribiría el estado de todos los dominios" : "publicaría en el espacio de nombres del protocolo"}`);
+  }
+
+  // ── El generador: cada permiso que emite, y la forma exacta de cada rol ───────────────────────
+  const devSolo = new Set([...(acl.devOnlyPatterns ?? []).map((k) => `security.acl.permissionPatterns.${k}`), ...(st.devOnlyPatterns ?? []).map((k) => `state.acl.${k}`)]);
+  const categoriasDe = (x) => [...patronesEventos, ...patronesEstado].filter(([, r]) => r.test(x)).map(([k]) => k);
+  const durableEstado = re(doc.state.watch.durable.pattern);
+  const durableDlqEstado = re(doc.state.dlq.readerDurable.pattern);
+  for (const dev of [false, true]) {
+    const modo = dev ? "--dev" : "por defecto";
+    for (const svc of SERVICIOS_DE_ESTADO) {
+      const e = dev ? emitir(svc, { dev }) : emitir(svc);
+      const donde = `${svc.name} (${modo})`;
+      for (const x of e.publish) {
+        const cats = categoriasDe(x);
+        if (cats.length !== 1) f.push(`${donde} emite «${x}», que encaja con ${cats.length} categoría(s): [${cats.join(", ")}]`);
+        if (denegable(x)) f.push(`${donde} emite «${x}», que neverGrantedPattern declara denegable (y ninguna excepción lo cubre)`);
+        if (!dev && cats.some((k) => devSolo.has(k))) f.push(`${donde} emite «${x}», que solo debe concederse con --dev`);
+      }
+      const creates = e.publish.filter((x) => categoriasDe(x).some((k) => devSolo.has(k)));
+      if (creates.length !== (dev ? e.durables.length : 0)) f.push(`${donde} emite ${creates.length} CONSUMER.CREATE y debería emitir ${dev ? e.durables.length : 0}`);
+      if (e.publish.some((x) => /^\$JS\.API\.STREAM\.INFO\.STATE_/.test(x))) f.push(`${donde} emite STREAM.INFO.STATE_<DOM>: lista todas las claves y todos los tenants (A-39)`);
+      if (!eq(e.subscribe, [`_INBOX.${svc.name}.>`])) f.push(`${donde} no se suscribe SOLO a su inbox: ${JSON.stringify(e.subscribe)}`);
+
+      // Escribir estado: solo el dueño, y solo en los dominios con estado que posee.
+      const escribe = e.publish.filter((x) => /^state\./.test(x));
+      if (!eq(escribe, svc.stateOwns.map((d) => `state.${d}.>`))) f.push(`${donde} concede para escribir estado ${JSON.stringify(escribe)}; debería ser ${JSON.stringify(svc.stateOwns.map((d) => `state.${d}.>`))}`);
+
+      // Leer estado por DIRECT.GET: el dueño, su dominio; el observador, cada contrato con el tenant FIJADO.
+      const esperadosGet = [
+        ...svc.stateOwns.map((d) => `$JS.API.DIRECT.GET.STATE_${d.replace(/-/g, "_").toUpperCase()}.state.${d}.>`),
+        ...svc.watches.flatMap((w) => (w.tenants ?? ["*"]).map((t) => `$JS.API.DIRECT.GET.STATE_${w.domain.replace(/-/g, "_").toUpperCase()}.state.${w.contract}.${t}.*`)),
+      ].sort();
+      const get = e.publish.filter((x) => x.includes("DIRECT.GET")).sort();
+      if (!eq(get, esperadosGet)) f.push(`${donde} concede DIRECT.GET ${JSON.stringify(get)}; debería ser ${JSON.stringify(esperadosGet)}`);
+
+      // Los durables de estado: uno por (contrato, tenant), con el nombre y el filtro de 10-state.md.
+      const deEstado = e.durables.filter((d) => d.kind === "state");
+      const esperadosDur = svc.watches.flatMap((w) => (w.tenants ?? [null]).map((t) => ({ contract: w.contract, tenant: t, filter: `state.${w.contract}.${t ?? "*"}.*` })));
+      if (deEstado.length !== esperadosDur.length) f.push(`${donde} declara ${deEstado.length} durable(s) de estado y debería declarar ${esperadosDur.length}`);
+      for (const d of deEstado) {
+        if (!durableEstado.test(d.durable)) f.push(`${donde}: el durable de estado «${d.durable}» no cumple state.watch.durable.pattern`);
+        if (d.stream !== `STATE_${d.contract.split(".")[0].replace(/-/g, "_").toUpperCase()}`) f.push(`${donde}: el durable «${d.durable}» va sobre ${d.stream}`);
+        if (!esperadosDur.some((x) => x.contract === d.contract && x.tenant === d.tenant && x.filter === d.filter)) f.push(`${donde}: el durable «${d.durable}» tiene un filtro (${d.filter}) que no es el del contrato y su tenant`);
+        // El nombre, derivado AQUÍ y no con manifest.mjs: un durable compartido reparte los mensajes
+        // entre quienes lo usan (A-47), así que el tenant tiene que ir en el nombre y solo si confina.
+        const nombre = `${svc.name}__state_${d.contract.replace(/[.-]/g, "_")}${d.tenant ? `__${d.tenant.replace(/-/g, "_")}` : ""}`;
+        if (d.durable !== nombre) f.push(`${donde}: el durable «${d.durable}» debería llamarse «${nombre}» (el tenant va en el nombre si confina, y solo entonces: A-47)`);
+      }
+      for (const d of e.durables.filter((x) => x.kind === "dlq-state")) {
+        if (!durableDlqEstado.test(d.durable)) f.push(`${donde}: el durable de DLQ de estado «${d.durable}» no cumple state.dlq.readerDurable.pattern`);
+        if (!svc.stateOwns.includes(d.stream.replace(/^DLQ_/, "").toLowerCase().replace(/_/g, "-"))) f.push(`${donde}: lee la DLQ de estado de un dominio que no es suyo (${d.stream})`);
+      }
+      if (e.durables.filter((x) => x.kind === "dlq-state").length !== svc.stateOwns.length) f.push(`${donde}: debe leer la DLQ de estado de cada dominio con estado que posee`);
+
+      // La DLQ de estado: un `dlq.state.<contrato>` por contrato observado (no por tenant) y la DLQ del dominio.
+      const dlq = e.publish.filter((x) => /^dlq\.state\./.test(x)).sort();
+      if (!eq(dlq, svc.watches.map((w) => `dlq.state.${w.contract}`).sort())) f.push(`${donde} concede publicar en ${JSON.stringify(dlq)}; debería ser un dlq.state.<contrato> por contrato observado`);
+      for (const w of svc.watches) {
+        if (!e.publish.includes(`$JS.API.STREAM.INFO.DLQ_${w.domain.replace(/-/g, "_").toUpperCase()}`)) f.push(`${donde}: falta STREAM.INFO.DLQ_<DOM> de ${w.domain}: el SDK comprueba la DLQ al abrir`);
+      }
+    }
+  }
+  return f;
+}
 
 // ─── Los tres códigos de connect() — 04-errors.md §5.3 ───────────────────────────────────────
 // Se escriben como función PURA sobre el documento para poder probarla en los dos sentidos: la
@@ -601,6 +765,7 @@ for (const codigo of ["NOT_PROVISIONED", "PERMISSION_DENIED", ...CODIGOS_CONNECT
 }
 fallos.push(...fallosDeConnect(p));
 fallos.push(...fallosDeEstado(p));
+fallos.push(...fallosDeAclDeEstado(p));
 if (!Object.hasOwn(p.errors.codes, p.security.provisioning.notProvisionedErrorCode)) fallos.push("security.provisioning.notProvisionedErrorCode no está en errors.codes");
 if (!Object.hasOwn(capDefs, p.security.sdk.capability)) fallos.push(`security.sdk.capability "${p.security.sdk.capability}" no está en capabilities.definitions`);
 
@@ -651,6 +816,27 @@ const emitido = permisosDe(servicioDePrueba);
 // …y el nombre del durable de DLQ que emite cumple el patrón que protocol.json le da.
 const dlqDurables = emitido.durables.filter((d) => d.kind === "dlq").map((d) => d.durable);
 if (!dlqDurables.length || !dlqDurables.every((d) => new RegExp(acl.dlqReaderDurable.pattern).test(d))) fallos.push(`los durables de DLQ que emite el generador (${dlqDurables.join(", ")}) no cumplen security.acl.dlqReaderDurable.pattern`);
+
+// El manifiesto y protocol.json dicen lo mismo: los dominios reservados, las claves de un servicio y los
+// patrones de contrato y de tenant que el generador aplica a `watches` son los del documento.
+{
+  const eqj = (a, b) => JSON.stringify(a) === JSON.stringify(b);
+  if (!eqj(RESERVED_DOMAINS, p.naming.reservedDomains.names)) fallos.push(`manifest.mjs RESERVED_DOMAINS ${JSON.stringify(RESERVED_DOMAINS)} != naming.reservedDomains.names ${JSON.stringify(p.naming.reservedDomains.names)}`);
+  if (!eqj(SERVICE_KEYS, p.security.manifest.serviceKeys)) fallos.push(`manifest.mjs SERVICE_KEYS ${JSON.stringify(SERVICE_KEYS)} != security.manifest.serviceKeys ${JSON.stringify(p.security.manifest.serviceKeys)}`);
+  if (STATE_TENANT_MAX !== p.state.tenant.maxLength || STATE_TENANT_MAX !== p.security.manifest.watches.tenantMaxLength) fallos.push("manifest.mjs STATE_TENANT_MAX != state.tenant.maxLength / security.manifest.watches.tenantMaxLength");
+  for (const [nombre, regex, def] of [["state.contract", STATE_CONTRACT_RE, p.state.contract], ["state.tenant", STATE_TENANT_RE, p.state.tenant]]) {
+    if (regex.source !== def.pattern) fallos.push(`manifest.mjs: el patrón de ${nombre} (${regex.source}) no es el de protocol.json (${def.pattern})`);
+    for (const v of def.valid ?? []) if (!regex.test(v)) fallos.push(`manifest.mjs: el patrón de ${nombre} debería aceptar ${JSON.stringify(v)}`);
+    for (const v of def.invalid ?? []) if (regex.test(v)) fallos.push(`manifest.mjs: el patrón de ${nombre} debería rechazar ${JSON.stringify(v)}`);
+  }
+  const w = p.security.manifest.watches;
+  if (w.contractPattern !== "state.contract.pattern" || w.tenantPattern !== "state.tenant.pattern" || w.durable !== "state.watch.durable.pattern") fallos.push("security.manifest.watches debe referir los patrones de state.* (una sola fuente)");
+  if (w.emptyTenantsListRejected !== true || w.unknownEntryKeysRejected !== true || w.ownDomainRejected !== true || w.stateInConsumesRejected !== true) fallos.push("security.manifest.watches: la lista de tenants vacía, las claves desconocidas, observar el propio dominio y el estado en `consumes` se rechazan");
+  if (w.confinementEnforcedBy !== "broker" || w.durablePerTenant !== true) fallos.push("security.manifest.watches: el confinamiento por tenant lo aplica el broker, con un durable por tenant");
+  const so = p.security.manifest.stateOwnership;
+  if (so.ownerStreamInfoState !== "never" || so.observerStreamInfoState !== "never") fallos.push('security.manifest.stateOwnership: STREAM.INFO.STATE_<DOM> no se concede a ningún rol ("never")');
+  if (p.security.provisioning.state?.widensExistingDlqStream !== true || p.security.provisioning.state?.stateDurableDeliverPolicy !== "last_per_subject") fallos.push("security.provisioning.state: provision amplía el DLQ_<DOM> existente y crea el durable de estado con last_per_subject");
+}
 
 // Autocomprobación de `fallosDeConnect`: cada copia estropeada DEBE dar un fallo, o la invariante
 // no vigila nada.
@@ -752,10 +938,72 @@ let mutacionesEstado = 0;
   mutacionesEstado = Object.keys(mutaciones).length;
 }
 
+// Autocomprobación de `fallosDeAclDeEstado`: la misma disciplina, sobre el documento Y sobre el generador.
+let mutacionesAcl = 0;
+{
+  const base = fallosDeAclDeEstado(p);
+  if (base.length) fallos.push(`autocomprobación: fallosDeAclDeEstado ya falla sobre el protocol.json y el generador reales (${base.length}); no se puede autocomprobar`);
+  const delDocumento = {
+    "sin la excepción de DIRECT.GET de estado": (d) => { d.security.acl.neverGrantedExceptions = []; },
+    "solo la excepción del dueño": (d) => { d.security.acl.neverGrantedExceptions = ["state.acl.ownerDirectGet"]; },
+    "solo la excepción del observador": (d) => { d.security.acl.neverGrantedExceptions = ["state.acl.observerDirectGet"]; },
+    "una tercera excepción": (d) => { d.security.acl.neverGrantedExceptions.push("state.acl.dlqPublish"); },
+    "una excepción que no existe": (d) => { d.security.acl.neverGrantedExceptions.push("state.acl.noExiste"); },
+    "la excepción del dueño admite DIRECT.GET.>": (d) => { d.state.acl.ownerDirectGet = "^\\$JS\\.API\\.DIRECT\\.GET\\.>$"; },
+    "la excepción del dueño admite la forma de cuerpo": (d) => { d.state.acl.ownerDirectGet = "^\\$JS\\.API\\.DIRECT\\.GET\\.STATE_[A-Z0-9_]+(\\..*)?$"; },
+    "la excepción del observador sin el tenant fijado": (d) => { d.state.acl.observerDirectGet = "^\\$JS\\.API\\.DIRECT\\.GET\\.STATE_[A-Z0-9_]+\\.state\\.[a-z0-9]+(-[a-z0-9]+)*\\.[a-z0-9]+(-[a-z0-9]+)*\\.v[1-9][0-9]*\\.>$"; },
+    "neverGrantedPattern ya no caza DIRECT.GET": (d) => { d.security.acl.neverGrantedPattern = d.security.acl.neverGrantedPattern.replace("|\\$JS\\.API\\.DIRECT\\.GET(\\..*)?", ""); },
+    "streamInfo admite STATE_": (d) => { d.security.acl.permissionPatterns.streamInfo = "^\\$JS\\.API\\.STREAM\\.INFO\\.(EVT|DLQ|STATE)_[A-Z0-9_]+$"; },
+    "ownerPublish admite state.>": (d) => { d.state.acl.ownerPublish = "^state\\.([a-z0-9]+(-[a-z0-9]+)*\\.)?>$"; },
+    "el patrón de estado casa con el de dominio propio": (d) => { d.state.acl.ownerPublish = d.security.acl.permissionPatterns.ownDomain; },
+  };
+  for (const [nombre, estropea] of Object.entries(delDocumento)) {
+    const copia = structuredClone(p);
+    estropea(copia);
+    if (!fallosDeAclDeEstado(copia).length) fallos.push(`autocomprobación: la mutación del documento «${nombre}» NO la detecta fallosDeAclDeEstado`);
+  }
+  // Generadores estropeados: lo que haría un `permisosDe` que concede de más o de menos.
+  const sobre = (modifica) => (svc, opts) => {
+    const e = permisosDe(svc, opts);
+    const r = { ...e, publish: [...e.publish], durables: e.durables.map((x) => ({ ...x })) };
+    modifica(r, svc, opts);
+    return r;
+  };
+  const delGenerador = {
+    "un observador que ESCRIBE (state.<dom>.>)": sobre((r, s) => { if (s.name === "tienda-web") r.publish.push("state.clientes.>"); }),
+    "el dueño que escribe TODO el estado (state.>)": sobre((r, s) => { if (s.name === "crm-api") r.publish.push("state.>"); }),
+    "un observador con STREAM.INFO.STATE_<DOM>": sobre((r, s) => { if (s.name === "tienda-web") r.publish.push("$JS.API.STREAM.INFO.STATE_CLIENTES"); }),
+    "el dueño con STREAM.INFO.STATE_<DOM>": sobre((r, s) => { if (s.name === "crm-api") r.publish.push("$JS.API.STREAM.INFO.STATE_CLIENTES"); }),
+    "un observador confinado con DIRECT.GET de TODOS los tenants": sobre((r, s) => { if (s.name === "tienda-web") r.publish = r.publish.map((x) => x.replace(".acme.*", ".*.*")); }),
+    "un observador con la forma de CUERPO de DIRECT.GET": sobre((r, s) => { if (s.name === "tienda-web") r.publish.push("$JS.API.DIRECT.GET.STATE_CLIENTES"); }),
+    "un observador con DIRECT.GET.> «para arreglarlo»": sobre((r, s) => { if (s.name === "tienda-web") r.publish.push("$JS.API.DIRECT.GET.>"); }),
+    "un observador sin DIRECT.GET": sobre((r, s) => { r.publish = r.publish.filter((x) => !(s.name === "tienda-web" && x.includes("DIRECT.GET"))); }),
+    "el dueño con DIRECT.GET de TODO su stream de estado": sobre((r, s) => { if (s.name === "crm-api") r.publish = r.publish.map((x) => x.replace("STATE_CLIENTES.state.clientes.>", "STATE_CLIENTES.state.>")); }),
+    "CONSUMER.CREATE de estado por defecto": (svc, opts) => {
+      const e = permisosDe(svc, opts);
+      return opts?.dev ? e : { ...e, publish: [...e.publish, ...e.durables.filter((d) => d.kind === "state").map((d) => `$JS.API.CONSUMER.CREATE.${d.stream}.${d.durable}.${d.filter}`)] };
+    },
+    "un durable por tenant sin el tenant en el nombre": sobre((r) => { for (const d of r.durables) if (d.kind === "state" && d.tenant) d.durable = d.durable.replace(/__[a-z0-9_]+$/, ""); }),
+    "un durable que observa todos con sufijo de tenant": sobre((r) => { for (const d of r.durables) if (d.kind === "state" && !d.tenant) d.durable += "__acme"; }),
+    "un dlq.state.<contrato> por tenant": sobre((r, s) => { if (s.name === "mixto-api") r.publish.push("dlq.state.clientes.cliente.v1.globex"); }),
+    "el observador sin STREAM.INFO.DLQ_<DOM>": sobre((r, s) => { r.publish = r.publish.filter((x) => !(s.name === "tienda-web" && x === "$JS.API.STREAM.INFO.DLQ_CLIENTES")); }),
+    "el dueño que no lee su DLQ de estado": sobre((r, s) => { r.durables = r.durables.filter((d) => !(s.name === "crm-api" && d.kind === "dlq-state")); }),
+    "el dueño de un dominio reservado, sin guarda": (svc, opts) => {
+      if (svc.owns.some((d) => RESERVED_DOMAINS.includes(d))) return { publish: svc.owns.map((d) => `${d}.>`), subscribe: [`_INBOX.${svc.name}.>`], durables: [], grupos: [] };
+      return permisosDe(svc, opts);
+    },
+    "una suscripción a state.>": sobre((r, s) => { if (s.name === "tienda-web") r.subscribe = [...r.subscribe, "state.>"]; }),
+  };
+  for (const [nombre, emisor] of Object.entries(delGenerador)) {
+    if (!fallosDeAclDeEstado(p, emisor).length) fallos.push(`autocomprobación: el generador estropeado «${nombre}» NO lo detecta fallosDeAclDeEstado`);
+  }
+  mutacionesAcl = Object.keys(delDocumento).length + Object.keys(delGenerador).length;
+}
+
 if (fallos.length) {
   console.error(`\n✗ ${fallos.length} problema(s) en protocol.json\n`);
   for (const f of fallos) console.error(`  ✗ ${f}`);
   process.exit(1);
 }
 
-console.log(`✓ protocol.json coherente (${CASES.length} patrones + invariantes numéricas, de códigos, de capacidades y de estado · autocomprobación de estado: ${mutacionesEstado} mutaciones, todas detectadas)`);
+console.log(`✓ protocol.json coherente (${CASES.length} patrones + invariantes numéricas, de códigos, de capacidades y de estado · autocomprobación de estado: ${mutacionesEstado} mutaciones del documento y ${mutacionesAcl} de la ACL y su generador, todas detectadas)`);

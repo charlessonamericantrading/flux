@@ -129,7 +129,9 @@ servicio, un grupo por cada subject consumido y ni un comodín donde no toca—,
 justo lo que un humano no mantiene.
 
 El manifiesto de ownership ([`examples/services.json`](../examples/services.json)) es
-la fuente, y [`scripts/gen-acl.mjs`](../scripts/gen-acl.mjs) deriva la configuración.
+la fuente, y [`scripts/gen-acl.mjs`](../scripts/gen-acl.mjs) deriva la configuración. Cada servicio
+declara `name`, `owns`, `consumes` y, si observa estado replicado, `watches`
+([§3.8](#38-estado-replicado-watches-y-sus-permisos)).
 
 ```bash
 node scripts/gen-acl.mjs examples/services.json                       # genera (bloque `accounts`, incluible con `include`)
@@ -157,6 +159,7 @@ El generador rechaza los manifiestos que rompen el modelo, no solo los mal forma
 | Un servicio suscrito a su propio dominio | Suele indicar que ese flujo debería ser una llamada interna, no un evento |
 | Nombre de servicio fuera de `[a-z0-9-]`, o repetido | Alimenta los nombres de durable consumer y el prefijo del inbox — [02-naming.md §4](02-naming.md) |
 | Dos subjects que dan el mismo durable | Los puntos y los guiones del subject pasan a `_`: el segundo `consumers.add` reutilizaría el durable del primero con otro filtro, sin error |
+| Una clave desconocida en un servicio, o ser dueño (o consumir, u observar) un dominio reservado (`dlq`, `state`, `rpc`, `system`) | Una errata no puede ser «un servicio sin permisos», y el «dueño» de `state` recibiría `state.>` — y las reglas de `watches`, en [§3.8](#38-estado-replicado-watches-y-sus-permisos) |
 | Con `--nkeys`: un servicio sin clave, una clave repetida, o una semilla | Sin clave no hay identidad; repetida es una credencial compartida (§2); una semilla es un secreto y nunca va a una config |
 
 Con `--tenants` (Modelo B, [09-multitenancy.md](09-multitenancy.md)) los permisos de cada
@@ -288,7 +291,7 @@ Por omisión, y verificado uno a uno contra el broker:
 | Nunca a un servicio | Por qué |
 |---|---|
 | `$JS.API.CONSUMER.DURABLE.CREATE.*` | La API antigua: el filtro va solo en el cuerpo y **ninguna ACL lo ve**. Concederla permite crear un consumidor sobre cualquier cosa (A-5) |
-| `$JS.API.STREAM.MSG.GET.*` y `$JS.API.DIRECT.GET.*` | Leen cualquier mensaje del stream por secuencia, sin consumidor ni filtro: saltan todo lo anterior (A-6) |
+| `$JS.API.STREAM.MSG.GET.*` y `$JS.API.DIRECT.GET.*` | Leen cualquier mensaje del stream por secuencia, sin consumidor ni filtro: saltan todo lo anterior (A-6). **Una única excepción acotada**: la forma *por subject* de un contrato de estado y un tenant fijado, o de su dominio para el dueño ([§3.8](#38-estado-replicado-watches-y-sus-permisos)); la forma de cuerpo sigue denegada |
 | Crear, modificar, borrar o purgar streams; borrar consumidores; listar | Un stream es un recurso compartido de todo el dominio ([02-naming.md §3.2](02-naming.md)) |
 | `$JS.API.>`, `$JS.API.*.>`, `>` | Es la forma de «arreglar» una denegación y la que anula el modelo entero: con `$JS.API.>` un servicio crea un consumidor sobre el stream de otro dominio, lee con `STREAM.MSG.GET` y pide mensajes de durables ajenos (reproducido en `verify-acl` con un usuario mutante) |
 
@@ -302,7 +305,9 @@ cuenta. Un servicio ve eso de los streams que consume; de ningún otro.
 ([02-naming.md §3.2](02-naming.md)), con [`flux provision`](../cli/README.md) y credenciales
 de **operación**, que no son las de ningún servicio. `flux provision <services.json>` lee el
 mismo manifiesto que el generador de ACL y crea, de forma idempotente, lo que esas ACLs
-presuponen: `EVT_<DOM>` y `DLQ_<DOM>` por dominio y un durable por subject consumido. Si algo
+presuponen: `EVT_<DOM>` y `DLQ_<DOM>` por dominio y un durable por subject consumido; y, para
+los dominios con estado, `STATE_<DOM>`, la DLQ de estado y los durables de cada `watches`
+([§3.8](#38-estado-replicado-watches-y-sus-permisos)). Si algo
 existe con otra configuración, informa de la diferencia y **no lo sobrescribe**; no borra
 nunca.
 
@@ -371,6 +376,141 @@ cada operación, medido contra nats-server 2.14.5, y lo que el SDK **DEBE** hace
 
 Se comprueba **de extremo a extremo** y **en los dos sentidos** ([§3.4](#34-permisos-exactos-por-consumidor-durable)):
 con el permiso quitado, la denegación se *nota* por el canal que corresponde a su fila.
+
+### 3.8 Estado replicado: `watches` y sus permisos
+
+El estado ([10-state.md](10-state.md)) añade dos roles al manifiesto: el **dueño** de un dominio que tiene
+estado y el **observador** de un contrato. Los permisos de cada uno los fija `protocol.json` → `state.acl`
+(derivados de A-38 a A-40 y A-48, medidos a mano contra un broker) y los **genera**
+[`gen-acl.mjs`](../scripts/gen-acl.mjs); [`verify-acl.mjs`](../scripts/verify-acl.mjs) y los casos S15 a S20 de
+la suite de seguridad los **ejecutan** contra un nats-server real —con los dos sentidos: lo concedido
+funciona, y lo no concedido se deniega—. Todo lo de [§3.1 a §3.7](#31-dlq) rige igual: ningún permiso de
+suscripción, inbox privado, `CONSUMER.CREATE` solo con `--dev`, y las denegaciones se ven.
+
+#### El manifiesto
+
+```jsonc
+{ "services": [
+  { "name": "crm-api",      "owns": ["clientes"] },                       // dueño: del estado de clientes también
+  { "name": "tienda-web",   "watches": [ { "contract": "clientes.cliente.v1", "tenants": ["acme"] } ] },
+  { "name": "informes-api", "watches": ["clientes.cliente.v1"] }          // todos los tenants
+] }
+```
+
+- **Un dominio *tiene* estado si el bundle de esquemas tiene un contrato suyo**
+  (`schemas/state/<dominio>/…`, índice `state` de `schemas/bundle.json`: [10-state.md §10](10-state.md)).
+  El dueño no declara nada más que `owns`; sin contratos de estado en el bundle, no recibe ningún permiso de
+  estado.
+- **`watches`** es una lista de **contratos** (`<dominio>.<agregado>.v<major>`, sin evento ni tenant ni clave:
+  `clientes.cliente.v1`). Cada entrada es el contrato a secas —observa **todos** los tenants— o un objeto
+  `{ "contract": …, "tenants": ["acme", …] }`, que **confina** al servicio a esos tenants. Un contrato
+  observado necesita dueño declarado y esquema en el bundle.
+- **El confinamiento lo aplica el broker, no el SDK.** Con `tenants`, el generador concede un durable y un
+  `DIRECT.GET` **por tenant**, con el tenant fijado en el subject del permiso; sin `tenants`, el tenant es
+  `*`. Con el tenant solo en el sobre, ningún permiso podría confinar a nadie ([10-state.md §2.2](10-state.md)).
+- **El durable lleva el tenant en el nombre si confina, y solo entonces**:
+  `tienda-web__state_clientes_cliente_v1__acme` frente a `informes-api__state_clientes_cliente_v1`. Un durable
+  compartido reparte los mensajes entre quienes lo usan (A-47): sin el tenant, dos instancias de un servicio
+  —una por tenant— se quitarían la mitad de la foto.
+
+| El generador rechaza | Por qué |
+|---|---|
+| `tenants` vacío (`[]`) | Leído como «ninguno» y aplicado como «todos» es la trampa de `allow: []` (A-25): para todos los tenants, el contrato a secas |
+| Un `tenant` en singular, o cualquier clave desconocida en una entrada o en un servicio (`watch` por `watches`) | Una errata no puede degradarse a «todos los tenants» ni a «un servicio sin permisos» |
+| Un tenant que no cumple `state.tenant.pattern` (mayúsculas, `*`, más de 64 caracteres) | El de un estado es más estricto que el de un evento ([10-state.md §2.4](10-state.md)); un comodín ampliaría el permiso |
+| Un contrato que no existe en el bundle, o un subject de **evento** en `watches` | Sin esquema de estado no hay stream ni durable; un evento va en `consumes` |
+| El estado en `consumes` (`state.clientes.cliente.v1.acme`) | `state` es un dominio reservado: el estado no se consume como un evento |
+| Observar un dominio sin dueño, o el **propio** | Como con los eventos ([§3.0](#30-las-acls-se-generan-no-se-escriben)): el dueño ya lo escribe y lo lee con `get` |
+| El mismo contrato dos veces en un servicio, o dos contratos que dan el mismo durable | Los puntos y los guiones pasan a `_`: el segundo `consumers.add` reutilizaría el durable del primero con otro filtro |
+| Ser dueño de un dominio **reservado** (`dlq`, `state`, `rpc`, `system`: [02-naming.md §1.3](02-naming.md)) | `ownDomain` casa con `state.>`: el «dueño» de `state` recibiría permiso para escribir el estado de **todos** los dominios (`RESERVED_DOMAIN`) |
+
+#### Qué recibe cada rol
+
+Con el ejemplo de arriba (`gen-acl.mjs examples/services.json`), y solo los permisos **de estado**; el resto
+—`$JS.API.INFO`, el inbox, los permisos de eventos— es el de §3.4:
+
+```jsonc
+// crm-api — dueño del estado de clientes
+"state.clientes.>",                                                                   // escribe CUALQUIER clave de CUALQUIER tenant
+"$JS.API.DIRECT.GET.STATE_CLIENTES.state.clientes.>",                                 // el paso 1 de `put` y su `get`
+"$JS.API.CONSUMER.INFO.DLQ_CLIENTES.crm-api__dlq_state_clientes",                     // lee su DLQ de estado con un pull consumer
+"$JS.API.CONSUMER.MSG.NEXT.DLQ_CLIENTES.crm-api__dlq_state_clientes",
+"$JS.ACK.DLQ_CLIENTES.crm-api__dlq_state_clientes.>",
+
+// tienda-web — observa clientes.cliente.v1 confinada a acme
+"$JS.API.CONSUMER.INFO.STATE_CLIENTES.tienda-web__state_clientes_cliente_v1__acme",   // los permisos de SU durable
+"$JS.API.CONSUMER.MSG.NEXT.STATE_CLIENTES.tienda-web__state_clientes_cliente_v1__acme",
+"$JS.ACK.STATE_CLIENTES.tienda-web__state_clientes_cliente_v1__acme.>",
+"$JS.API.DIRECT.GET.STATE_CLIENTES.state.clientes.cliente.v1.acme.*",                 // `get`, con el tenant FIJADO
+"$JS.API.STREAM.INFO.DLQ_CLIENTES",                                                   // el SDK comprueba la DLQ al abrir…
+"dlq.state.clientes.cliente.v1",                                                      // …y manda ahí lo que no puede aplicar
+
+// informes-api — observa clientes.cliente.v1 sin confinar: mismo patrón, tenant `*`
+"$JS.API.CONSUMER.INFO.STATE_CLIENTES.informes-api__state_clientes_cliente_v1", …
+"$JS.API.DIRECT.GET.STATE_CLIENTES.state.clientes.cliente.v1.*.*",
+```
+
+y, **solo con `--dev`**, `CONSUMER.CREATE.STATE_CLIENTES.<durable>.state.clientes.cliente.v1.<tenant|*>.*`
+sobre el durable propio (con el filtro exacto) y `CONSUMER.CREATE.DLQ_CLIENTES.<durable>.dlq.state.clientes.>` el
+dueño, por la misma razón que en §3.4.
+
+**Cada permiso, y por qué es esa forma exacta** (lo medido, en la suite como S15 a S20):
+
+| Permiso | Para qué | Lo que impide la forma |
+|---|---|---|
+| `state.<dom>.>` (solo el dueño) | `put` y `delete`, que son publicaciones condicionales por JetStream ([10-state.md §3](10-state.md)) | Un observador, un servicio sin estado y el dueño de **otro** dominio no escriben estado ajeno. Un `publish` de **core** a un subject de estado lo captura el stream **sin acuse y sin chequeo de secuencia** y sobrescribe (A-45): la ACL es lo único que lo impide (S16) |
+| `DIRECT.GET.STATE_<DOM>.state.<dom>.>` (dueño) | El paso 1 de `put` (leer la secuencia y la versión) y su `get` | Solo su stream y solo su dominio |
+| `DIRECT.GET.STATE_<DOM>.<contrato>.<tenant\|*>.*` (observador) | `get` de lo que observa | **El tenant fijado**: con el permiso de `…acme.*`, una clave de `acme` se lee; `…globex.*`, `…v1.*.*` y `state.<dom>.>` se deniegan (A-14, A-38; S17). Un comodín **en la clave** (`…acme.>`) sí pasa: sigue siendo su tenant |
+| `CONSUMER.INFO`, `MSG.NEXT` y `$JS.ACK…>` de **su** durable | `watch`: lo primero que pregunta, pedir la foto y confirmar | Los del durable de **otro** servicio (A-8); quitar uno rompe el `watch` de la forma de siempre (§3.7: S20) |
+| `STREAM.INFO.DLQ_<DOM>` y `dlq.state.<contrato>` (observador) | El SDK comprueba la DLQ al abrir y le manda lo que no puede aplicar | Un solo subject de DLQ **por contrato** (cinco tokens, sin tenant ni clave): no `dlq.state.>`, ni la de otro contrato, ni la forma con clave (S19) |
+| Durable `<servicio>__dlq_state_<dom>` (dueño) | Leer su DLQ de estado como la de eventos (§3.1) | Un observador no la lee, aunque no lleve el dato: sí lleva claves y errores |
+
+**Nunca, a ningún rol, ni siquiera al dueño:**
+
+- **`STREAM.INFO.STATE_<DOM>`.** Con `subjects_filter` en el cuerpo devuelve **todas las claves y todos los
+  tenants** del stream con su recuento (A-39): con ese único permiso un servicio confinado a `acme` conoce los
+  clientes de `globex`. El SDK no lo usa —`put`, `get` y `watch` funcionan sin él, porque `CONSUMER.INFO`
+  distingue «no existe el consumidor» de «no existe el stream» (A-48)— y ningún patrón de `protocol.json` lo
+  casa. [10-state.md §8](10-state.md) dice que el dueño **PUEDE** tenerlo, y el generador **no se lo
+  concede**: si un día hace falta, es un permiso más del dueño y nunca del observador (S18).
+- **La forma de cuerpo de `DIRECT.GET`** (`$JS.API.DIRECT.GET.<stream>` + `{"seq": n}` o `{"last_by_subj": …}`)
+  lee cualquier mensaje, y ninguna ACL ve el cuerpo. No casa con el permiso por subject, y el broker rechaza un
+  cuerpo en la forma por subject (`408`, A-38): no se puede colar la lectura de otro mensaje por un permiso de
+  contrato y tenant (S18).
+- **Gestionar el stream ni sus durables** (`STREAM.CREATE|UPDATE|DELETE|PURGE`, `CONSUMER.DELETE|NAMES`,
+  `CONSUMER.DURABLE.CREATE`): son de quien aprovisiona. Un durable de estado se recrea con `flux state resync`,
+  con credenciales de operación.
+
+#### La excepción a §3.5
+
+[§3.5](#35-lo-que-nunca-se-concede) niega a un servicio `$JS.API.DIRECT.GET.*`. Este apartado la **acota**, no la
+levanta: lo que se concede es la **forma por subject** de un contrato y un tenant concretos —o, para el dueño,
+de su dominio—, y es lo único. En `protocol.json` la lista de lo denegable sigue siendo
+`security.acl.neverGrantedPattern`, que caza todo `DIRECT.GET`; las dos formas concedibles figuran en
+`security.acl.neverGrantedExceptions`, que **refiere** su patrón en `state.acl` (una sola fuente). Es una lista
+aparte y no un `(?!…)` dentro del patrón porque los motores sin lookahead (Rust `regex`, Go `RE2`) tienen que
+poder compilarlo; quien aplique el patrón ignorando las excepciones se equivoca hacia lo seguro. La forma de
+cuerpo, cualquier comodín por encima del tenant y `DIRECT.GET.>` siguen denegados. `check-protocol-json.mjs` lo
+prueba en los dos sentidos.
+
+#### Aprovisionamiento
+
+`flux provision` ([§3.6](#36-aprovisionamiento-los-streams-no-los-crea-el-servicio)) lee el mismo manifiesto y,
+para cada dominio con estado:
+
+- crea **`STATE_<DOM>`** con la configuración de `protocol.json` → `state.stream`
+  (`max_msgs_per_subject: 1`, `allow_direct`, `max_age: 0`, `discard: old`, `duplicate_window: 2m`; réplicas con
+  `--replicas`);
+- hace que **`DLQ_<DOM>`** capture también `dlq.state.<dom>.>`. Si ya existía con solo `dlq.<dom>.>` —lo creó un
+  `flux provision` de la 1.0—, **lo amplía**: es lo único que la herramienta cambia en un recurso existente, no
+  pierde mensajes (A-44) y `--dry-run` lo muestra como `se ampliaría`. Cualquier otra diferencia se informa y no
+  se toca;
+- crea el durable de cada `watches` (uno por tenant si confina) con `deliver_policy: last_per_subject` y el resto
+  de la configuración canónica ([03-delivery.md §2](03-delivery.md)), y el durable con el que el dueño lee su
+  DLQ de estado.
+
+Un dominio **sin** contratos de estado conserva su `DLQ_<DOM>` de la 1.0 y no recibe ningún permiso de estado:
+1.1 es aditiva.
 
 ## 4. Multi-tenant
 

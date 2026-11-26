@@ -21,6 +21,18 @@
  *     broker le denegaría su propio consumidor.
  *
  * Las configuraciones canónicas salen de protocol.json, no de constantes duplicadas aquí.
+ *
+ * Estado replicado (10-state.md §2.1, §5.2 y §6): para cada dominio que TIENE estado —el que
+ * tiene un contrato en `schemas/state/`— crea además `STATE_<DOM>` con la configuración de
+ * `protocol.json` → `state.stream`, hace que `DLQ_<DOM>` capture también `dlq.state.<dom>.>`, y
+ * crea los durables de estado de cada `watches` (uno por tenant si confina) y el del dueño para
+ * su DLQ de estado. Un dominio solo de eventos no cambia: 1.1 es aditiva.
+ *
+ * Única excepción a «nunca sobrescribe»: si `DLQ_<DOM>` existe con SOLO `dlq.<dom>.>` (lo creó
+ * un `flux provision` de la 1.0) y el dominio ha ganado estado, se AMPLÍA con `dlq.state.<dom>.>`.
+ * Ampliar los subjects de un stream con mensajes no pierde ninguno (A-44) y es lo único que hace
+ * falta para que la DLQ de estado exista; cualquier otra diferencia se sigue informando y no se
+ * toca.
  */
 
 import { readFile } from "node:fs/promises";
@@ -40,8 +52,9 @@ import { c, OK, FAIL, WARN, fmtDuration } from "./ui.mjs";
 import {
   analizarManifiesto,
   dlqStreamName,
-  loadBundleSubjects,
+  loadBundle,
   permisosDe,
+  stateStreamName,
   streamName,
 } from "../../scripts/lib/manifest.mjs";
 
@@ -58,12 +71,17 @@ export function duracionMs(texto) {
   return Number(m[1]) * { s: 1_000, m: 60_000, h: 3_600_000, d: 86_400_000 }[m[2]];
 }
 
+/** `state.stream.maxAge` es un número de segundos (0 = no caduca); el de los eventos, `30d`. */
+function duracionState(v) {
+  return typeof v === "number" ? nanos(v * 1000) : nanos(duracionMs(v));
+}
+
 // ─── Lo que DEBE existir ─────────────────────────────────────────────────────
 
 /** Configuración canónica de stream y de consumidor, leída de protocol.json. */
 export async function leerCanonico() {
   const p = JSON.parse(await readFile(join(RAIZ, "protocol.json"), "utf8"));
-  return { stream: p.stream, consumer: p.consumer };
+  return { stream: p.stream, consumer: p.consumer, state: p.state };
 }
 
 /**
@@ -72,7 +90,10 @@ export async function leerCanonico() {
  */
 export function recursosDeseados(servicios, canonico, replicas) {
   const dominios = [...new Set(servicios.flatMap((s) => s.owns))].sort();
+  // Un dominio tiene estado si su dueño lo declara (`stateOwns`: el bundle tiene un contrato suyo).
+  const conEstado = new Set(servicios.flatMap((s) => s.stateOwns ?? []));
   const { event, dlq } = canonico.stream;
+  const st = canonico.state.stream;
 
   const streams = dominios.flatMap((d) => [
     {
@@ -95,7 +116,8 @@ export function recursosDeseados(servicios, canonico, replicas) {
       name: dlqStreamName(d),
       config: {
         name: dlqStreamName(d),
-        subjects: [`dlq.${d}.>`],
+        // Con estado, la DLQ captura también la de estado: sin tenant ni clave, cinco tokens.
+        subjects: conEstado.has(d) ? [`dlq.${d}.>`, `dlq.state.${d}.>`] : [`dlq.${d}.>`],
         storage: StorageType.File,
         retention: RetentionPolicy.Limits,
         discard: DiscardPolicy.Old,
@@ -103,7 +125,34 @@ export function recursosDeseados(servicios, canonico, replicas) {
         num_replicas: replicas,
       },
       comparar: ["subjects", "storage", "retention", "discard", "max_age", "num_replicas"],
+      // Ampliar sus subjects con los de estado no pierde mensajes (A-44): único cambio que se hace.
+      ampliable: conEstado.has(d),
     },
+    // STATE_<DOM>: un valor por clave. Lo que, mal puesto, no da error y rompe la semántica son
+    // las cuatro últimas líneas (`flux doctor` las audita).
+    ...(conEstado.has(d)
+      ? [
+          {
+            name: stateStreamName(d),
+            config: {
+              name: stateStreamName(d),
+              subjects: [`state.${d}.>`],
+              storage: StorageType.File,
+              retention: RetentionPolicy.Limits,
+              discard: DiscardPolicy.Old,
+              max_age: duracionState(st.maxAge),
+              duplicate_window: nanos(duracionMs(st.duplicateWindow)),
+              max_msgs_per_subject: st.maxMsgsPerSubject,
+              allow_direct: st.allowDirect,
+              num_replicas: replicas,
+            },
+            comparar: [
+              "subjects", "storage", "retention", "discard", "max_age", "duplicate_window",
+              "max_msgs_per_subject", "allow_direct", "num_replicas",
+            ],
+          },
+        ]
+      : []),
   ]);
 
   const k = canonico.consumer;
@@ -122,7 +171,9 @@ export function recursosDeseados(servicios, canonico, replicas) {
         max_deliver: k.maxDeliver,
         backoff: k.backoffMs.map(nanos),
         max_ack_pending: k.maxAckPending,
-        deliver_policy: DeliverPolicy.All,
+        // Un `watch` entrega la FOTO —el último valor de cada clave— y después los cambios
+        // (10-state.md §5.2): `last_per_subject`. El resto, la configuración canónica de siempre.
+        deliver_policy: d.kind === "state" ? DeliverPolicy.LastPerSubject : DeliverPolicy.All,
         replay_policy: ReplayPolicy.Instant,
       },
       comparar: [
@@ -142,6 +193,7 @@ const NANOS = new Set(["max_age", "duplicate_window", "ack_wait"]);
 /** Un valor legible: las duraciones de JetStream van en nanosegundos. */
 function legible(campo, v) {
   if (v === undefined || v === null) return c.gray("(sin valor)");
+  if (campo === "max_age" && v === 0) return "0 (no caduca)";
   if (NANOS.has(campo)) return fmtDuration(v);
   if (campo === "backoff") return `[${v.map((x) => fmtDuration(x)).join(", ")}]`;
   if (Array.isArray(v)) return `[${v.join(", ")}]`;
@@ -209,11 +261,23 @@ export async function provision(jsm, deseados, { dryRun }) {
       if (info) {
         streamsExistentes.add(s.name);
         const dif = diferencias(s.config, info.config, s.comparar);
-        registrar(
-          dif.length
-            ? { recurso, accion: "difiere", dif }
-            : { recurso, accion: "sin cambios" },
-        );
+        if (dif.length && s.ampliable && esAmpliacion(dif, info.config.subjects, s.config.subjects)) {
+          // El dominio ha ganado estado y su DLQ solo captura la de eventos: se amplía, sin perder
+          // un mensaje (A-44). Lo único que esta herramienta cambia en un recurso que ya existe.
+          const nuevos = s.config.subjects.filter((x) => !info.config.subjects.includes(x));
+          if (dryRun) {
+            registrar({ recurso, accion: "se ampliaría", detalle: `+ ${nuevos.join(", ")}` });
+          } else {
+            await jsm.streams.update(s.name, { subjects: s.config.subjects });
+            registrar({ recurso, accion: "ampliado", detalle: `+ ${nuevos.join(", ")}` });
+          }
+        } else {
+          registrar(
+            dif.length
+              ? { recurso, accion: "difiere", dif }
+              : { recurso, accion: "sin cambios" },
+          );
+        }
       } else if (dryRun) {
         registrar({ recurso, accion: "se crearía", detalle: s.config.subjects.join(", ") });
       } else {
@@ -262,6 +326,19 @@ export async function provision(jsm, deseados, { dryRun }) {
   return resultado;
 }
 
+/**
+ * ¿La única diferencia es que a un stream le FALTAN subjects que debería capturar (y no tiene
+ * ninguno de más)? Es el caso de `DLQ_<DOM>` de la 1.0 en un dominio que gana estado.
+ */
+export function esAmpliacion(dif, existentes, deseados) {
+  return (
+    dif.length === 1 &&
+    dif[0].campo === "subjects" &&
+    existentes.every((x) => deseados.includes(x)) &&
+    deseados.some((x) => !existentes.includes(x))
+  );
+}
+
 /** Un permiso denegado se explica por sí solo; un timeout, no. */
 function explicar(e) {
   const m = e?.message ?? String(e);
@@ -279,11 +356,13 @@ const ETIQUETA = {
   "sin cambios": (t) => c.gray(t),
   difiere: (t) => c.yellow(t),
   "se crearía": (t) => c.cyan(t),
+  ampliado: (t) => c.green(t),
+  "se ampliaría": (t) => c.cyan(t),
   error: (t) => c.red(t),
 };
 
 function imprimir(r, ancho) {
-  const etiqueta = ETIQUETA[r.accion](r.accion.toUpperCase().padEnd(11));
+  const etiqueta = ETIQUETA[r.accion](r.accion.toUpperCase().padEnd(12));
   const detalle = r.detalle && r.accion !== "error" ? c.gray(`  ${r.detalle}`) : "";
   console.log(`  ${etiqueta} ${r.recurso.padEnd(ancho)}${detalle}`.trimEnd());
   if (r.accion === "error") console.log(`      ${c.red(r.detalle)}`);
@@ -306,15 +385,15 @@ export async function comandoProvision(jsm, args) {
     console.error(`${FAIL} no se pudo leer el manifiesto "${ruta}": ${e.message}`);
     return 2;
   }
-  let subjects;
+  let elBundle;
   try {
-    subjects = await loadBundleSubjects(bundle ?? BUNDLE_POR_DEFECTO);
+    elBundle = await loadBundle(bundle ?? BUNDLE_POR_DEFECTO);
   } catch (e) {
     console.error(`${FAIL} ${e.message}`);
     return 2;
   }
 
-  const { problemas, servicios } = analizarManifiesto(manifiesto, subjects);
+  const { problemas, servicios } = analizarManifiesto(manifiesto, elBundle);
   if (problemas.length) {
     console.error(`${FAIL} ${problemas.length} problema(s) en el manifiesto:`);
     for (const p of problemas) console.error(`  ${FAIL} ${p.m}${p.hint ? `\n    ${c.gray(p.hint)}` : ""}`);
@@ -332,13 +411,16 @@ export async function comandoProvision(jsm, args) {
   const r = await provision(jsm, deseados, { dryRun });
 
   const cuenta = (a) => r.filter((x) => x.accion === a).length;
-  const [creados, iguales, difieren, errores, pendientes] = [
+  const [creados, iguales, difieren, errores, pendientes, ampliados, porAmpliar] = [
     cuenta("creado"), cuenta("sin cambios"), cuenta("difiere"), cuenta("error"), cuenta("se crearía"),
+    cuenta("ampliado"), cuenta("se ampliaría"),
   ];
   console.log();
   const partes = [
     pendientes && `${pendientes} se crearía(n)`,
+    porAmpliar && `${porAmpliar} se ampliaría(n)`,
     creados && `${creados} creado(s)`,
+    ampliados && `${ampliados} ampliado(s)`,
     iguales && `${iguales} sin cambios`,
     difieren && c.yellow(`${difieren} con diferencias`),
     errores && c.red(`${errores} con error`),
@@ -357,7 +439,7 @@ export async function comandoProvision(jsm, args) {
     );
     return 1;
   }
-  if (!creados && !pendientes) console.log(`\n${OK} Sin cambios: el broker ya tiene todo lo que el manifiesto exige.`);
+  if (!creados && !pendientes && !ampliados && !porAmpliar) console.log(`\n${OK} Sin cambios: el broker ya tiene todo lo que el manifiesto exige.`);
   else if (dryRun) console.log(`\n${OK} Simulación completa. Ejecuta sin --dry-run para crearlo.`);
   else console.log(`\n${OK} Aprovisionado.`);
   return 0;

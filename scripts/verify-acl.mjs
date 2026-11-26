@@ -50,14 +50,17 @@
 
 import { spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
+import { readFileSync, writeFileSync } from "node:fs";
 import { readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
 
 import {
   dlqDurableName,
+  dlqStateDurableName,
   dlqStreamName,
   domainOf,
   durableName,
+  stateStreamName,
   streamName,
 } from "./lib/manifest.mjs";
 // La infraestructura común con conformance/security.mjs: arrancar y parar nats-server, claves,
@@ -350,22 +353,43 @@ async function manifiestoTemporal(obj) {
   await writeFile(f, JSON.stringify(obj));
   return f;
 }
+function manifiestoTemporalSync(obj) {
+  const f = path.join(TMP, `manifiesto-${++nManifiesto}.json`);
+  writeFileSync(f, JSON.stringify(obj));
+  return f;
+}
+/** Un bundle con los eventos de ejemplo y NINGÚN contrato de estado: el de antes de 1.1. */
+function bundleSinEstadoSync() {
+  const f = path.join(TMP, "bundle-sin-estado.json");
+  const b = JSON.parse(readFileSync(path.join(ROOT, "schemas", "bundle.json"), "utf8"));
+  delete b.state;
+  writeFileSync(f, JSON.stringify(b));
+  return f;
+}
 
 
 async function seccionGenerador(subjectsBundle) {
   seccion("1. El generador");
 
-  const check = gen(EJEMPLO, "--check");
-  afirmar(check.codigo === 0 && /12 durable/.test(check.salida), "--check valida el manifiesto de ejemplo y cuenta 12 durables", check.salida + check.errores);
-
   const json = permisosJson();
-  afirmar(json.length === 4, "--json devuelve un elemento por servicio");
+  const nDurables = json.reduce((n, s) => n + s.durables.length, 0);
+  const check = gen(EJEMPLO, "--check");
+  afirmar(check.codigo === 0 && new RegExp(`${nDurables} durable`).test(check.salida), `--check valida el manifiesto de ejemplo y cuenta ${nDurables} durables`, check.salida + check.errores);
+
+  const nServicios = JSON.parse(await readFile(EJEMPLO, "utf8")).services.length;
+  afirmar(json.length === nServicios, `--json devuelve un elemento por servicio (${nServicios})`);
 
   // La lista cerrada de lo concedible y la de lo denegable salen de protocol.json: una sola
   // fuente, que check-protocol-json prueba en los dos sentidos.
-  const acl = JSON.parse(await readFile(path.join(ROOT, "protocol.json"), "utf8")).security.acl;
-  const permitidos = Object.entries(acl.permissionPatterns).filter(([k]) => !k.startsWith("$")).map(([, v]) => new RegExp(v));
-  const peligroso = new RegExp(acl.neverGrantedPattern);
+  const proto = JSON.parse(await readFile(path.join(ROOT, "protocol.json"), "utf8"));
+  const acl = proto.security.acl;
+  // La lista cerrada es la de eventos MÁS la de estado (protocol.json → state.acl): un permiso que no
+  // encaje en ninguna es un error del generador. Y lo denegable lo es salvo las dos formas de
+  // DIRECT.GET de estado (`security.acl.neverGrantedExceptions`: se miden en las secciones de estado).
+  const patronesEstado = Object.entries(proto.state.acl).filter(([k, v]) => typeof v === "string" && !k.startsWith("$") && k !== "observerStreamInfoState");
+  const permitidos = [...Object.entries(acl.permissionPatterns), ...patronesEstado].filter(([k]) => !k.startsWith("$")).map(([, v]) => new RegExp(v));
+  const excepciones = (acl.neverGrantedExceptions ?? []).map((ruta) => new RegExp(ruta.split(".").reduce((o, k) => o?.[k], proto)));
+  const peligroso = { test: (x) => new RegExp(acl.neverGrantedPattern).test(x) && !excepciones.some((re) => re.test(x)) };
   for (const s of json) {
     afirmar(
       s.subscribe.length === 1 && s.subscribe[0] === `_INBOX.${s.name}.>`,
@@ -373,7 +397,8 @@ async function seccionGenerador(subjectsBundle) {
       JSON.stringify(s.subscribe),
     );
     const malos = s.publish.filter((p) => peligroso.test(p) || !permitidos.some((re) => re.test(p)));
-    afirmar(malos.length === 0, `${s.name}: ningún permiso de publicación fuera de la lista cerrada (nada de $JS.API.>, DURABLE.CREATE, MSG.GET, gestión de streams)`, malos.join("\n"));
+    afirmar(malos.length === 0, `${s.name}: ningún permiso de publicación fuera de la lista cerrada (nada de $JS.API.>, DURABLE.CREATE, MSG.GET, la forma de cuerpo de DIRECT.GET, STREAM.INFO.STATE_*, gestión de streams)`, malos.join("\n"));
+    afirmar(!s.publish.some((p) => /^\$JS\.API\.STREAM\.INFO\.STATE_/.test(p)), `${s.name}: NINGÚN permiso STREAM.INFO.STATE_<DOM>: lista todas las claves y todos los tenants (A-39)`);
   }
 
   // La forma exacta de un servicio, fijada a mano: si el generador cambia de forma, esto lo grita.
@@ -417,6 +442,8 @@ async function seccionGenerador(subjectsBundle) {
     [...json, ...dev].every((x) => x.publish.length > 0 && x.subscribe.length > 0),
     "ninguna lista de permisos sale vacía (en NATS `allow: []` significa «sin restricción», no «nada»)",
   );
+
+  seccionGeneradorEstado(json, dev);
 
   const sinMapa = gen(EJEMPLO);
   afirmar(sinMapa.codigo === 0 && /nkey: "<NKEY_DE_PEDIDOS_API>"/.test(sinMapa.salida), "sin --nkeys cada usuario lleva el placeholder <NKEY_DE_…>");
@@ -494,7 +521,7 @@ async function seccionGenerador(subjectsBundle) {
 
   // Modelo B: mismos permisos, otra account por tenant.
   const tenants = permisosJson("--tenants");
-  afirmar(tenants.length === 8 && tenants.every((t) => ["acme", "globex"].includes(t.tenant)), "--tenants --json: un elemento por servicio y tenant (4 × 2)");
+  afirmar(tenants.length === 2 * json.length && tenants.every((t) => ["acme", "globex"].includes(t.tenant)), `--tenants --json: un elemento por servicio y tenant (${json.length} × 2)`);
   afirmar(
     tenants.every((t) => {
       const o = json.find((s) => s.name === t.name);
@@ -509,6 +536,385 @@ async function seccionGenerador(subjectsBundle) {
   );
 
   return { json, claves, subjectsBundle };
+}
+
+/**
+ * El generador y el estado (10-state.md §8, 06-security.md §3.8), sin servidor: la forma EXACTA de
+ * lo que recibe cada rol, lo que el manifiesto rechaza y lo que acepta. Los permisos se EJECUTAN
+ * contra un broker en las secciones 3b, 4b, 5b y 6b.
+ */
+function seccionGeneradorEstado(json, dev) {
+  const rol = (n) => json.find((s) => s.name === n);
+  const crm = rol("crm-api");
+  const tienda = rol("tienda-web");
+  const informes = rol("informes-api");
+
+  afirmar(
+    JSON.stringify(crm.publish) === JSON.stringify([
+      "$JS.API.INFO",
+      "clientes.>",
+      "$JS.API.STREAM.INFO.EVT_CLIENTES",
+      "$JS.API.CONSUMER.INFO.DLQ_CLIENTES.crm-api__dlq_clientes",
+      "$JS.API.CONSUMER.MSG.NEXT.DLQ_CLIENTES.crm-api__dlq_clientes",
+      "$JS.ACK.DLQ_CLIENTES.crm-api__dlq_clientes.>",
+      "state.clientes.>",
+      "$JS.API.DIRECT.GET.STATE_CLIENTES.state.clientes.>",
+      "$JS.API.CONSUMER.INFO.DLQ_CLIENTES.crm-api__dlq_state_clientes",
+      "$JS.API.CONSUMER.MSG.NEXT.DLQ_CLIENTES.crm-api__dlq_state_clientes",
+      "$JS.ACK.DLQ_CLIENTES.crm-api__dlq_state_clientes.>",
+    ]),
+    "crm-api (dueño del estado de clientes): lista EXACTA — state.clientes.>, DIRECT.GET de su dominio y su durable de DLQ de estado",
+    crm.publish.join("\n"),
+  );
+  afirmar(
+    JSON.stringify(tienda.publish) === JSON.stringify([
+      "$JS.API.INFO",
+      "$JS.API.CONSUMER.INFO.STATE_CLIENTES.tienda-web__state_clientes_cliente_v1__acme",
+      "$JS.API.CONSUMER.MSG.NEXT.STATE_CLIENTES.tienda-web__state_clientes_cliente_v1__acme",
+      "$JS.ACK.STATE_CLIENTES.tienda-web__state_clientes_cliente_v1__acme.>",
+      "$JS.API.DIRECT.GET.STATE_CLIENTES.state.clientes.cliente.v1.acme.*",
+      "$JS.API.STREAM.INFO.DLQ_CLIENTES",
+      "dlq.state.clientes.cliente.v1",
+    ]),
+    "tienda-web (observador confinado a acme): lista EXACTA — su durable, DIRECT.GET con el tenant FIJADO, la DLQ de estado y nada de STREAM.INFO.STATE_CLIENTES",
+    tienda.publish.join("\n"),
+  );
+  afirmar(
+    informes.publish.includes("$JS.API.DIRECT.GET.STATE_CLIENTES.state.clientes.cliente.v1.*.*") &&
+      informes.publish.includes("$JS.API.CONSUMER.INFO.STATE_CLIENTES.informes-api__state_clientes_cliente_v1") &&
+      informes.durables.some((d) => d.kind === "state" && d.tenant === null && d.filter === "state.clientes.cliente.v1.*.*"),
+    "informes-api (sin confinar): durable sin sufijo de tenant, filtro `…v1.*.*` y DIRECT.GET de todos los tenants",
+    informes.publish.join("\n"),
+  );
+  afirmar(
+    json.filter((s) => s.publish.some((p) => /^state\./.test(p))).map((s) => s.name).join() === "crm-api",
+    "SOLO el dueño recibe un permiso de publicación sobre `state.…`: ningún observador ni ningún otro servicio escribe estado",
+  );
+  afirmar(
+    json.every((s) => s.publish.every((p) => !/^\$JS\.API\.DIRECT\.GET\.STATE_[A-Z0-9_]+(\.>)?$/.test(p) && p !== "$JS.API.DIRECT.GET.>")),
+    "ningún servicio recibe la forma de CUERPO de DIRECT.GET ($JS.API.DIRECT.GET.<stream>) ni DIRECT.GET.>",
+  );
+  afirmar(
+    json.filter((s) => s.publish.some((p) => p.includes("DIRECT.GET"))).map((s) => s.name).join() === "crm-api,tienda-web,informes-api",
+    "DIRECT.GET solo lo reciben quien tiene estado (el dueño y los observadores); pedidos-api, facturacion-api, inventario-api y logistica-api, ninguno",
+  );
+  afirmar(tienda.watches[0].tenants.join() === "acme" && informes.watches[0].tenants === null, "--json expone `watches` normalizado: tenants [acme] y null (todos)");
+
+  const creaDev = dev.find((s) => s.name === "tienda-web").publish.filter((p) => p.includes("CONSUMER.CREATE."));
+  afirmar(
+    JSON.stringify(creaDev) === JSON.stringify(["$JS.API.CONSUMER.CREATE.STATE_CLIENTES.tienda-web__state_clientes_cliente_v1__acme.state.clientes.cliente.v1.acme.*"]),
+    "--dev: CONSUMER.CREATE del durable de estado PROPIO con su filtro exacto (tenant fijado), y nada más",
+    creaDev.join("\n"),
+  );
+  afirmar(
+    json.every((s) => !s.publish.some((p) => p.includes("CONSUMER.CREATE."))),
+    "por defecto, ningún CREATE tampoco de estado",
+  );
+
+  // Manifiestos que el generador DEBE rechazar y los que DEBE aceptar.
+  const base = (watches, extra = {}, dueño = { name: "crm-api", owns: ["clientes"] }) => ({
+    services: [dueño, { name: "web-api", watches, ...extra }],
+  });
+  const rechazos = [
+    ["un contrato de estado que no existe en el bundle", base(["clientes.cliente.v9"]), /no existe en el bundle/],
+    ["un subject de EVENTO en `watches`", base(["pedidos.pedido.v1.creado"]), /subject de EVENTO/],
+    ["`tenants` vacío (leído como «todos» sería la trampa de allow: [])", base([{ contract: "clientes.cliente.v1", tenants: [] }]), /lista NO vacía/],
+    ["`tenant` en singular (una errata no puede ser «todos los tenants»)", base([{ contract: "clientes.cliente.v1", tenant: "acme" }]), /campo desconocido «tenant»/],
+    ["un tenant en mayúsculas", base([{ contract: "clientes.cliente.v1", tenants: ["Acme"] }]), /tenant inválido/],
+    ["un comodín como tenant", base([{ contract: "clientes.cliente.v1", tenants: ["*"] }]), /tenant inválido/],
+    ["un tenant de 65 caracteres", base([{ contract: "clientes.cliente.v1", tenants: ["a".repeat(65)] }]), /tenant inválido/],
+    ["tenants repetidos", base([{ contract: "clientes.cliente.v1", tenants: ["acme", "acme"] }]), /repetidos/],
+    ["el mismo contrato dos veces", base(["clientes.cliente.v1", { contract: "clientes.cliente.v1", tenants: ["acme"] }]), /observa dos veces/],
+    ["`watches` que no es una lista", base("clientes.cliente.v1"), /debe ser una lista/],
+    ["una clave de servicio desconocida (`watch`)", base([], { watch: ["clientes.cliente.v1"] }), /clave desconocida «watch»[\s\S]*watches/],
+    ["observar un dominio sin dueño", { services: [{ name: "web-api", watches: ["clientes.cliente.v1"] }] }, /nadie declara ser dueño/],
+    ["el dueño observa su propio estado", { services: [{ name: "crm-api", owns: ["clientes"], watches: ["clientes.cliente.v1"] }] }, /su propio estado/],
+    ["consumir un subject de `state.` como un evento", base([], { consumes: ["state.clientes.cliente.v1.acme"] }), /RESERVADO[\s\S]*watches/],
+    ["ser dueño del dominio reservado `state` (recibiría `state.>`)", { services: [{ name: "x-api", owns: ["state"] }] }, /RESERVADO[\s\S]*TODOS los dominios/],
+    ["ser dueño del dominio reservado `dlq`", { services: [{ name: "x-api", owns: ["dlq"] }] }, /RESERVADO/],
+    ["ser dueño del dominio reservado `rpc`", { services: [{ name: "x-api", owns: ["rpc"] }] }, /RESERVADO/],
+    ["observar un contrato de un dominio reservado", base(["state.cliente.v1"]), /RESERVADO/],
+  ];
+  for (const [que, m, patron] of rechazos) {
+    const r = gen(manifiestoTemporalSync(m), "--check");
+    afirmar(r.codigo === 1 && patron.test(r.errores), `rechaza ${que}`, `exit ${r.codigo}: ${r.errores.trim()}`);
+  }
+  const dosTenants = gen(manifiestoTemporalSync(base([{ contract: "clientes.cliente.v1", tenants: ["globex", "acme-corp"] }])), "--json");
+  const web = dosTenants.codigo === 0 ? JSON.parse(dosTenants.salida).find((x) => x.name === "web-api") : null;
+  afirmar(
+    !!web &&
+      web.durables.map((d) => d.durable).join() === "web-api__state_clientes_cliente_v1__acme_corp,web-api__state_clientes_cliente_v1__globex" &&
+      web.publish.filter((p) => p.includes("DIRECT.GET")).join() === "$JS.API.DIRECT.GET.STATE_CLIENTES.state.clientes.cliente.v1.acme-corp.*,$JS.API.DIRECT.GET.STATE_CLIENTES.state.clientes.cliente.v1.globex.*" &&
+      web.publish.filter((p) => p === "dlq.state.clientes.cliente.v1").length === 1,
+    "acepta varios tenants: un durable (con `-` → `_`) y un DIRECT.GET por tenant, y UN solo `dlq.state.<contrato>`",
+    dosTenants.errores + (web ? web.publish.join("\n") : dosTenants.salida),
+  );
+  const sinEstado = gen(manifiestoTemporalSync({ services: [{ name: "crm-api", owns: ["clientes"] }] }), "--bundle", bundleSinEstadoSync(), "--json");
+  afirmar(
+    sinEstado.codigo === 0 && !JSON.parse(sinEstado.salida)[0].publish.some((p) => p.startsWith("state.") || p.includes("DIRECT.GET")),
+    "con un bundle SIN contratos de estado, el dueño no recibe ningún permiso de estado (un dominio tiene estado si el bundle lo dice)",
+  );
+}
+
+// ─── Estado: el ciclo de cada rol y las sondas ───────────────────────────────
+
+const CONTRATO = "clientes.cliente.v1";
+const STREAM_ESTADO = "STATE_CLIENTES";
+const subjEstado = (tenant, clave) => `state.${CONTRATO}.${tenant}.${clave}`;
+const datosEstado = (version, clave) => enc.encode(JSON.stringify({ clienteId: clave, aggregateVersion: version }));
+
+/**
+ * DIRECT.GET por subject, como lo pide un SDK (`$JS.API.DIRECT.GET.<stream>.<subject>`, A-32).
+ * `denegado` es una violación de permiso; `no_existe` el 404 del broker; `leido` trae la secuencia
+ * y el cuerpo. Un stream que no existe, o sin allow_direct, NO contesta (`sin_respuesta`).
+ */
+async function directGet(nc, subject, { stream = STREAM_ESTADO, cuerpo = "" } = {}) {
+  try {
+    const r = await nc.request(`$JS.API.DIRECT.GET.${stream}.${subject}`, cuerpo, { timeout: 1500 });
+    const code = r.headers?.code ?? 0;
+    if (code === 404) return { estado: "no_existe" };
+    if (code >= 400) return { estado: "mala_peticion", code };
+    return { estado: "leido", seq: Number(r.headers.get("Nats-Sequence")), subject: r.headers.get("Nats-Subject"), data: dec.decode(r.data) };
+  } catch (e) {
+    if (esViolacion(e)) return { estado: "denegado" };
+    return { estado: /no responders/i.test(`${e?.message} ${e?.cause?.message}`) ? "sin_respuesta" : "otro", detalle: resumen(e) };
+  }
+}
+
+/** Una escritura condicional por JetStream, como el paso 3 de `put` (10-state.md §3.2). */
+async function escribirEstado(nc, subject, datos, { esperada, msgID = randomUUID() }) {
+  const ack = await jetstream(nc, { timeout: 2000 }).publish(subject, datos, { msgID, expect: { lastSubjectSequence: esperada } });
+  return ack;
+}
+
+/**
+ * El ciclo ESTADO de un DUEÑO, con sus permisos generados: el paso 1 de `put` (DIRECT.GET), la
+ * escritura condicional, el chequeo de secuencia, escribir en todos sus tenants y leer su DLQ de
+ * estado con un pull consumer. Independiente: un permiso que falta rompe SU paso.
+ */
+async function cicloEstadoDueño({ nc, svc, ops, marca }) {
+  const pasos = [];
+  const paso = async (nombre, fn) => {
+    try {
+      pasos.push({ nombre, ok: true, detalle: await conTiempo(fn(), 8000, nombre) });
+    } catch (e) {
+      pasos.push({ nombre, ok: false, detalle: resumen(e) });
+    }
+  };
+  const clave = `dueno-${marca}`;
+  const [sAcme, sGlobex] = [subjEstado("acme", clave), subjEstado("globex", clave)];
+  const durable = dlqStateDurableName(svc.name, svc.stateOwns[0]);
+  const dlqStream = dlqStreamName(svc.stateOwns[0]);
+
+  // Terreno: un mensaje en la DLQ de estado y el durable de su lectura, limpio.
+  await ops.jsm.consumers.delete(dlqStream, durable).catch(() => {});
+  await ops.jsm.consumers.add(dlqStream, await configConsumidor(durable, `dlq.state.${svc.stateOwns[0]}.>`));
+  await ops.js.publish(`dlq.state.${CONTRATO}`, enc.encode(`{"muerto":"${marca}"}`), { msgID: randomUUID() });
+
+  let s1;
+  let s2;
+  await paso("put(): DIRECT.GET de la clave nueva → 404 (no hay valor: S = 0)", async () => {
+    const r = await directGet(nc, sAcme);
+    if (r.estado !== "no_existe") throw new Error(`${r.estado} ${r.detalle ?? ""}`);
+  });
+  await paso(`put(): publicar con Nats-Expected-Last-Subject-Sequence 0 → el acuse es de ${STREAM_ESTADO}`, async () => {
+    const ack = await escribirEstado(nc, sAcme, datosEstado(1, clave), { esperada: 0 });
+    if (ack.stream !== STREAM_ESTADO) throw new Error(`lo capturó ${ack.stream}`);
+    s1 = ack.seq;
+  });
+  await paso("get(): relee la clave y ve su propia secuencia", async () => {
+    const r = await directGet(nc, sAcme);
+    if (r.estado !== "leido" || r.seq !== s1 || !r.data.includes(clave)) throw new Error(JSON.stringify(r));
+  });
+  await paso("put(): actualiza con la secuencia leída → se aplica y la anterior sale del stream", async () => {
+    s2 = (await escribirEstado(nc, sAcme, datosEstado(2, clave), { esperada: s1 })).seq;
+    const info = await ops.jsm.streams.info(STREAM_ESTADO, { subjects_filter: sAcme });
+    if (info.state.subjects?.[sAcme] !== 1) throw new Error(`mensajes en la clave: ${info.state.subjects?.[sAcme]}`);
+  });
+  await paso("put(): una secuencia vieja la rechaza el BROKER (10071): el chequeo condicional funciona bajo la ACL", async () => {
+    try {
+      await escribirEstado(nc, sAcme, datosEstado(3, clave), { esperada: s1 });
+    } catch (e) {
+      if (e?.code === 10071 || /wrong last sequence/.test(e?.message)) return;
+      throw e;
+    }
+    throw new Error("el broker aceptó una escritura con la secuencia vieja");
+  });
+  await paso("put(): escribe también en OTRO tenant de su dominio (globex): el dueño escribe todos los suyos", async () => {
+    const ack = await escribirEstado(nc, sGlobex, datosEstado(1, clave), { esperada: 0 });
+    if (ack.stream !== STREAM_ESTADO) throw new Error(`lo capturó ${ack.stream}`);
+  });
+  await paso(`DLQ de estado: leer ${dlqStream} con su pull consumer → CONSUMER.INFO, MSG.NEXT y ack`, async () => {
+    const c = await jetstream(nc, { timeout: 2000 }).consumers.get(dlqStream, durable);
+    const m = await recibirUno(c, 2500);
+    if (!m) throw new Error("no llegó el mensaje de la DLQ de estado");
+    m.ack();
+    await nc.flush();
+    await sleep(300);
+    const i = await ops.jsm.consumers.info(dlqStream, durable);
+    if (i.num_ack_pending !== 0 || i.ack_floor.stream_seq < m.seq) throw new Error("el ack no se registró");
+  });
+  return { pasos, ok: pasos.every((p) => p.ok), fallidos: pasos.filter((p) => !p.ok).map((p) => p.nombre) };
+}
+
+/**
+ * El ciclo ESTADO de un OBSERVADOR (`watch` y `get`): comprueba su DLQ, pregunta por su durable,
+ * pide la foto, confirma, lee una clave por DIRECT.GET y manda a la DLQ de estado lo que no pudo
+ * aplicar. Con `exhaustivo`, además drena el durable y exige que NUNCA llegue un tenant ajeno.
+ */
+async function cicloEstadoObservador({ nc, svc, ops, marca, exhaustivo = false }) {
+  const pasos = [];
+  const paso = async (nombre, fn) => {
+    try {
+      pasos.push({ nombre, ok: true, detalle: await conTiempo(fn(), 8000, nombre) });
+    } catch (e) {
+      pasos.push({ nombre, ok: false, detalle: resumen(e) });
+    }
+  };
+  const w = svc.watches[0];
+  const d = svc.durables.find((x) => x.kind === "state");
+  const tenant = w.tenants?.[0] ?? "acme";
+  const confinado = !!w.tenants;
+  const claveAcme = `obs-${marca}`;
+  const dlqStream = dlqStreamName(w.domain);
+
+  // Terreno: el dueño (ops, aquí) escribe la clave en dos tenants y el durable arranca limpio, con la
+  // configuración de `flux provision` (last_per_subject).
+  await ops.js.publish(subjEstado("acme", claveAcme), datosEstado(1, claveAcme), { msgID: randomUUID() });
+  await ops.js.publish(subjEstado("globex", claveAcme), datosEstado(1, claveAcme), { msgID: randomUUID() });
+  await ops.jsm.consumers.delete(d.stream, d.durable).catch(() => {});
+  await ops.jsm.consumers.add(d.stream, { ...(await configConsumidor(d.durable, d.filter)), deliver_policy: "last_per_subject" });
+
+  const js = jetstream(nc, { timeout: 2000 });
+  await paso("connect(): jetstreamManager → $JS.API.INFO", async () => {
+    await jetstreamManager(nc, { timeout: 2000 });
+  });
+  await paso(`watch(): comprueba su DLQ → STREAM.INFO.${dlqStream}`, async () => {
+    const r = await pedir(nc, `$JS.API.STREAM.INFO.${dlqStream}`);
+    if (r.estado !== "respondido" || r.json?.config?.name !== dlqStream) throw new Error(r.estado === "respondido" ? JSON.stringify(r.json?.error) : r.detalle);
+  });
+  let consumidor;
+  await paso(`watch(): consumers.get → CONSUMER.INFO de ${d.durable}`, async () => {
+    consumidor = await js.consumers.get(d.stream, d.durable);
+  });
+  let m;
+  await paso(`watch(): pide la foto (CONSUMER.MSG.NEXT) y llega una entrada de ${confinado ? `acme` : "un tenant"}, con el subject original`, async () => {
+    m = await recibirUno(consumidor, 2500);
+    if (!m) throw new Error("no llegó ninguna entrada");
+    if (!m.subject.startsWith(`state.${CONTRATO}.`)) throw new Error(`llegó con el subject ${m.subject}`);
+    if (confinado && !m.subject.startsWith(`state.${CONTRATO}.${tenant}.`)) throw new Error(`LLEGÓ UN TENANT AJENO: ${m.subject}`);
+  });
+  if (m) {
+    m.ack();
+    await nc.flush();
+    await sleep(300);
+    await paso("ack(): el broker lo registra (ack_floor al día)", async () => {
+      const i = await ops.jsm.consumers.info(d.stream, d.durable);
+      if (i.num_ack_pending !== 0 || i.ack_floor.stream_seq < m.seq) throw new Error(`pendientes ${i.num_ack_pending}, ack_floor ${i.ack_floor.stream_seq}`);
+    });
+  } else {
+    pasos.push({ nombre: "ack(): el broker lo registra (ack_floor al día)", ok: false, detalle: "no hay entrada" });
+  }
+  await paso(`get(): DIRECT.GET de la clave del tenant ${tenant} (con el tenant fijado)`, async () => {
+    const r = await directGet(nc, subjEstado(tenant, claveAcme));
+    if (r.estado !== "leido" || !r.data.includes(claveAcme)) throw new Error(JSON.stringify(r));
+  });
+  await paso(`DLQ de estado: publicar en dlq.state.${CONTRATO} → lo captura ${dlqStream}`, async () => {
+    const r = await js.publish(`dlq.state.${CONTRATO}`, enc.encode('{"key":"x","revision":1}'), { msgID: randomUUID() });
+    if (r.stream !== dlqStream) throw new Error(`lo capturó ${r.stream}`);
+  });
+  if (exhaustivo) {
+    await paso(confinado ? `confinamiento: drena el durable y NUNCA llega un tenant que no sea ${tenant}` : "sin confinar: drena el durable y llegan los dos tenants (acme y globex)", async () => {
+      const vistos = new Set([m?.subject].filter(Boolean));
+      for (let i = 0; i < 40; i++) {
+        const x = await recibirUno(consumidor, 1000); // el pull exige `expires` ≥ 1000 ms
+        if (!x) break;
+        vistos.add(x.subject);
+        x.ack();
+      }
+      const ajenos = [...vistos].filter((s) => confinado && !s.startsWith(`state.${CONTRATO}.${tenant}.`));
+      if (ajenos.length) throw new Error(`tenant ajeno: ${ajenos.join(", ")}`);
+      if (!confinado && ![...vistos].some((s) => s.includes(".acme.")) ) throw new Error(`no vio acme: ${[...vistos].join(", ")}`);
+    });
+  }
+  return { pasos, ok: pasos.every((p) => p.ok), fallidos: pasos.filter((p) => !p.ok).map((p) => p.nombre) };
+}
+
+/**
+ * Las sondas de estado: lo que cada servicio puede y NO puede hacer sobre `STATE_CLIENTES`. Cada
+ * sonda dice a quién le está permitido; el resto DEBE recibir una violación. Devuelven `true` si
+ * lo PELIGROSO estuvo permitido.
+ */
+function sondasEstado(marca) {
+  const k = `sonda-${marca}`;
+  const peticion = (subject, cuerpo = {}) => async (nc) => (await pedir(nc, subject, cuerpo)).estado !== "denegado";
+  const crudo = (subject) => async (nc) => (await publicarCrudo(nc, subject)) === "permitido";
+  const get = (subject, opts) => async (nc) => (await directGet(nc, subject, opts)).estado !== "denegado";
+  const jsEscribe = (subject) => async (nc) => {
+    try {
+      await jetstream(nc, { timeout: 1500 }).publish(subject, enc.encode(JSON.stringify({ aggregateVersion: 1 })), { msgID: randomUUID() });
+      return true;
+    } catch (e) {
+      return esViolacion(e) ? false : /no responders|no stream/i.test(e?.message ?? "") ? true : `otro error: ${resumen(e)}`;
+    }
+  };
+  const duenos = ["crm-api"];
+  const todosConEstado = ["crm-api", "tienda-web", "informes-api"];
+  return [
+    // ── Escribir ─────────────────────────────────────────────────────────────
+    ["escribir estado por JetStream en state.clientes.cliente.v1.acme.<clave>", jsEscribe(subjEstado("acme", k)), duenos],
+    ["…y por CORE, que sobrescribiría SIN chequeo de secuencia (A-45)", crudo(subjEstado("acme", `${k}-core`)), duenos],
+    ["escribir el estado de OTRO tenant (globex)", crudo(subjEstado("globex", `${k}-core`)), duenos],
+    ["escribir el estado de OTRO dominio (state.pedidos.pedido.v1.acme.<clave>)", crudo(`state.pedidos.pedido.v1.acme.${k}`), []],
+    ["publicar un EVENTO en el dominio del estado (clientes.cliente.v1.registrado)", crudo("clientes.cliente.v1.registrado"), duenos],
+    // ── Leer: DIRECT.GET por subject ─────────────────────────────────────────
+    ["DIRECT.GET de una clave del tenant acme", get(subjEstado("acme", k)), todosConEstado],
+    ["DIRECT.GET de una clave del tenant globex", get(subjEstado("globex", k)), ["crm-api", "informes-api"]],
+    ["DIRECT.GET con un comodín en el tenant (…v1.*.<clave>)", get(subjEstado("*", k)), ["crm-api", "informes-api"]],
+    ["DIRECT.GET con un comodín por encima del tenant (state.clientes.>)", get("state.clientes.>"), duenos],
+    ["DIRECT.GET del estado de otro dominio", get(`state.pedidos.pedido.v1.acme.${k}`, { stream: "STATE_PEDIDOS" }), []],
+    // ── Leer: la forma de CUERPO, que ninguna ACL ve (A-38) ─────────────────
+    ["DIRECT.GET de CUERPO ($JS.API.DIRECT.GET.STATE_CLIENTES + {seq:1}): lee cualquier mensaje", async (nc) => (await pedir(nc, `$JS.API.DIRECT.GET.${STREAM_ESTADO}`, { seq: 1 })).estado !== "denegado", []],
+    ["STREAM.MSG.GET.STATE_CLIENTES por secuencia", peticion(`$JS.API.STREAM.MSG.GET.${STREAM_ESTADO}`, { seq: 1 }), []],
+    // ── Metadatos y gestión del stream ───────────────────────────────────────
+    ["STREAM.INFO.STATE_CLIENTES con subjects_filter: lista TODAS las claves y tenants (A-39)", peticion(`$JS.API.STREAM.INFO.${STREAM_ESTADO}`, { subjects_filter: "state.clientes.>" }), []],
+    ["STREAM.PURGE.STATE_CLIENTES", peticion(`$JS.API.STREAM.PURGE.${STREAM_ESTADO}`), []],
+    ["STREAM.UPDATE.STATE_CLIENTES", peticion(`$JS.API.STREAM.UPDATE.${STREAM_ESTADO}`), []],
+    ["STREAM.DELETE.STATE_CLIENTES", peticion(`$JS.API.STREAM.DELETE.${STREAM_ESTADO}`), []],
+    ["CONSUMER.NAMES.STATE_CLIENTES (qué durables hay)", peticion(`$JS.API.CONSUMER.NAMES.${STREAM_ESTADO}`), []],
+    ["crear un consumidor de estado con el filtro de TODOS los tenants", peticion(`$JS.API.CONSUMER.CREATE.${STREAM_ESTADO}.espia__state.state.clientes.cliente.v1.*.*`, { stream_name: STREAM_ESTADO, config: { durable_name: "espia__state", filter_subject: "state.clientes.cliente.v1.*.*", ack_policy: "explicit" } }), []],
+    ["crear un consumidor de estado con la API antigua DURABLE.CREATE", peticion(`$JS.API.CONSUMER.DURABLE.CREATE.${STREAM_ESTADO}.espia2__state`, { stream_name: STREAM_ESTADO, config: { durable_name: "espia2__state", filter_subject: "state.clientes.cliente.v1.globex.*", ack_policy: "explicit" } }), []],
+    // ── Los durables de los demás ────────────────────────────────────────────
+    ["CONSUMER.INFO del durable de estado de tienda-web", peticion(`$JS.API.CONSUMER.INFO.${STREAM_ESTADO}.tienda-web__state_clientes_cliente_v1__acme`), ["tienda-web"]],
+    ["CONSUMER.MSG.NEXT del durable de estado de tienda-web (quitarle la foto)", peticion(`$JS.API.CONSUMER.MSG.NEXT.${STREAM_ESTADO}.tienda-web__state_clientes_cliente_v1__acme`, { batch: 1, expires: 300_000_000 }), ["tienda-web"]],
+    ["CONSUMER.MSG.NEXT del durable de estado de informes-api", peticion(`$JS.API.CONSUMER.MSG.NEXT.${STREAM_ESTADO}.informes-api__state_clientes_cliente_v1`, { batch: 1, expires: 300_000_000 }), ["informes-api"]],
+    ["confirmar (ack) un mensaje del durable de estado de tienda-web", crudo(`$JS.ACK.${STREAM_ESTADO}.tienda-web__state_clientes_cliente_v1__acme.1.1.1.1.0`), ["tienda-web"]],
+    ["CONSUMER.MSG.NEXT del durable de la DLQ de estado de crm-api", peticion("$JS.API.CONSUMER.MSG.NEXT.DLQ_CLIENTES.crm-api__dlq_state_clientes", { batch: 1, expires: 300_000_000 }), ["crm-api"]],
+    // ── La DLQ de estado ─────────────────────────────────────────────────────
+    ["publicar en dlq.state.clientes.cliente.v1 (la DLQ de estado de lo que observa)", crudo(`dlq.state.${CONTRATO}`), ["tienda-web", "informes-api"]],
+    ["publicar en la DLQ de estado de un contrato que NO observa (dlq.state.pedidos.pedido.v1)", crudo("dlq.state.pedidos.pedido.v1"), []],
+    ["publicar en dlq.state con tenant y clave (7 tokens: lo que la DLQ de estado NO lleva)", crudo(`dlq.state.${CONTRATO}.acme.${k}`), []],
+    ["STREAM.INFO.DLQ_CLIENTES (el SDK comprueba la DLQ al abrir)", peticion("$JS.API.STREAM.INFO.DLQ_CLIENTES"), ["tienda-web", "informes-api"]],
+    // ── Suscribirse ──────────────────────────────────────────────────────────
+    ["suscribirse a state.clientes.> (los observadores no reciben nada por suscripción)", async (nc) => (await suscribirCrudo(nc, "state.clientes.>")) === "permitido", []],
+    ["suscribirse a dlq.state.>", async (nc) => (await suscribirCrudo(nc, "dlq.state.>")) === "permitido", []],
+  ];
+}
+
+/** Ejecuta las sondas de estado como `nombre` y compara con lo que le corresponde. Devuelve los desvíos. */
+async function desviosDeSondasEstado(nc, nombre, sondas) {
+  const desvios = [];
+  for (const [que, fn, permitidoPara] of sondas) {
+    let permitido;
+    try {
+      permitido = await fn(nc);
+    } catch (e) {
+      permitido = `error: ${resumen(e)}`;
+    }
+    const esperado = permitidoPara.includes(nombre);
+    if (permitido !== esperado) desvios.push({ que, esperado, permitido });
+  }
+  return desvios;
 }
 
 // ─── Principal ───────────────────────────────────────────────────────────────
@@ -600,6 +1006,37 @@ async function main() {
   const mutanteInbox = { ...nuevaClave(), nombre: "fact-mutante-inbox" };
   const mutanteApi = { ...nuevaClave(), nombre: "logi-mutante-api" };
   const logi = json.find((s) => s.name === "logistica-api");
+
+  // Estado: una variante por permiso de tienda-web (el observador confinado) y de crm-api (el
+  // dueño), SIN ese permiso; y mutantes sembrados que conceden DE MÁS (06-security.md §3.8).
+  const tiendaP = json.find((s) => s.name === "tienda-web");
+  const crmP = json.find((s) => s.name === "crm-api");
+  const variantesTienda = tiendaP.publish.map((p, i) => ({ quitado: p, ...nuevaClave(), nombre: `tienda-sin-${i}` }));
+  const variantesCrm = crmP.publish.map((p, i) => ({ quitado: p, ...nuevaClave(), nombre: `crm-sin-${i}` }));
+  const direct = "$JS.API.DIRECT.GET.STATE_CLIENTES.state.clientes.cliente.v1";
+  const mutantesEstado = [
+    { que: "tienda-web + `state.clientes.>`: un observador que ESCRIBE", base: "tienda-web", anade: ["state.clientes.>"], flip: ["escribir estado por JetStream", "…y por CORE", "escribir el estado de OTRO tenant"] },
+    { que: "tienda-web + STREAM.INFO.STATE_CLIENTES: lista claves y tenants (A-39)", base: "tienda-web", anade: ["$JS.API.STREAM.INFO.STATE_CLIENTES"], flip: ["STREAM.INFO.STATE_CLIENTES con subjects_filter"] },
+    { que: "tienda-web con DIRECT.GET `…v1.*.*` en vez de `…acme.*`: SIN tenant fijado", base: "tienda-web", cambia: [[`${direct}.acme.*`, `${direct}.*.*`]], flip: ["DIRECT.GET de una clave del tenant globex", "DIRECT.GET con un comodín en el tenant"] },
+    { que: "tienda-web + la forma de CUERPO de DIRECT.GET", base: "tienda-web", anade: ["$JS.API.DIRECT.GET.STATE_CLIENTES"], flip: ["DIRECT.GET de CUERPO"] },
+    { que: "tienda-web + `$JS.API.DIRECT.GET.>` «para arreglarlo»", base: "tienda-web", anade: ["$JS.API.DIRECT.GET.>"], flip: ["DIRECT.GET de CUERPO", "DIRECT.GET de una clave del tenant globex", "DIRECT.GET con un comodín en el tenant", "DIRECT.GET con un comodín por encima del tenant", "DIRECT.GET del estado de otro dominio"] },
+    { que: "tienda-web + CONSUMER.CREATE.STATE_CLIENTES.>: crea un consumidor de todos los tenants", base: "tienda-web", anade: ["$JS.API.CONSUMER.CREATE.STATE_CLIENTES.>"], flip: ["crear un consumidor de estado con el filtro de TODOS"] },
+    { que: "tienda-web + MSG.NEXT del durable de informes-api: le quita la foto", base: "tienda-web", anade: ["$JS.API.CONSUMER.MSG.NEXT.STATE_CLIENTES.informes-api__state_clientes_cliente_v1"], flip: ["CONSUMER.MSG.NEXT del durable de estado de informes-api"] },
+    { que: "crm-api + `state.>`: el dueño de un dominio escribe el estado de TODOS", base: "crm-api", anade: ["state.>"], flip: ["escribir el estado de OTRO dominio"] },
+    { que: "crm-api + STREAM.INFO.STATE_CLIENTES (decisión: tampoco el dueño)", base: "crm-api", anade: ["$JS.API.STREAM.INFO.STATE_CLIENTES"], flip: ["STREAM.INFO.STATE_CLIENTES con subjects_filter"] },
+  ].map((m, i) => ({ ...m, ...nuevaClave(), nombre: `m-estado-${i}` }));
+  const permisosMutante = (m) => {
+    const base = json.find((x) => x.name === m.base);
+    let pub = base.publish.map((x) => m.cambia?.find(([de]) => de === x)?.[1] ?? x);
+    if (m.cambia && JSON.stringify(pub) === JSON.stringify(base.publish)) throw new Error(`el mutante «${m.que}» no cambia nada`);
+    pub = [...pub, ...(m.anade ?? [])];
+    return { publish: pub, subscribe: base.subscribe };
+  };
+  const extraEstado =
+    variantesTienda.map((x) => usuarioConf(x.pub, tiendaP.publish.filter((p) => p !== x.quitado), tiendaP.subscribe)).join("") +
+    variantesCrm.map((x) => usuarioConf(x.pub, crmP.publish.filter((p) => p !== x.quitado), crmP.subscribe)).join("") +
+    mutantesEstado.map((m) => { const pm = permisosMutante(m); return usuarioConf(m.pub, pm.publish, pm.subscribe); }).join("");
+
   const extra =
     variantes.map((x) => usuarioConf(x.pub, fact.publish.filter((p) => p !== x.quitado), fact.subscribe)).join("") +
     usuarioConf(sinInbox.pub, fact.publish, ["_INBOX.nadie.>"]) +
@@ -607,13 +1044,14 @@ async function main() {
     devSinCreate.map((x) => usuarioConf(x.pub, factDev.publish.filter((p) => p !== x.quitado), factDev.subscribe)).join("") +
     usuarioConf(mutanteInbox.pub, fact.publish, ["_INBOX.>"]) +
     usuarioConf(mutanteApi.pub, [...logi.publish, "$JS.API.>"], logi.subscribe) +
+    extraEstado +
     `      { nkey: "${ops.pub}" },\n`;
 
   seccion("2. flux provision");
   let A;
   try {
     A = await arrancar("A", conUsuarios(generada, extra));
-    afirmar(true, `nats-server carga la config generada con include (puerto ${A.port}); ${json.length} servicios + ops + ${variantes.length + devSinCreate.length + 4} usuarios de prueba`);
+    afirmar(true, `nats-server carga la config generada con include (puerto ${A.port}); ${json.length} servicios + ops + ${variantes.length + devSinCreate.length + 4 + variantesTienda.length + variantesCrm.length + mutantesEstado.length} usuarios de prueba`);
   } catch (e) {
     afirmar(false, "nats-server carga la config generada con include", e.message);
     return;
@@ -632,14 +1070,23 @@ async function main() {
     return out.sort();
   };
 
+  // Lo que el manifiesto exige: EVT_ y DLQ_ por dominio, STATE_ por dominio con estado, y los durables.
+  const dominiosDueños = [...new Set(json.flatMap((s) => s.owns))];
+  const dominiosEstado = [...new Set(json.flatMap((s) => s.stateOwns))];
+  const nDurables = json.reduce((n, s) => n + s.durables.length, 0);
+  const nStreams = 2 * dominiosDueños.length + dominiosEstado.length;
+  const nRecursos = nStreams + nDurables;
   const dry = provision(EJEMPLO, "--dry-run");
-  afirmar(dry.codigo === 0 && /20 se crearía/.test(dry.salida), "--dry-run cuenta lo que crearía (8 streams y 12 durables) y sale con 0", dry.salida + dry.errores);
+  afirmar(dry.codigo === 0 && new RegExp(`${nRecursos} se crearía`).test(dry.salida), `--dry-run cuenta lo que crearía (${nStreams} streams y ${nDurables} durables) y sale con 0`, dry.salida + dry.errores);
   afirmar((await nombresStreams()).length === 0, "--dry-run NO crea nada: el broker sigue vacío");
 
   const crea = provision(EJEMPLO);
-  afirmar(crea.codigo === 0 && /20 creado/.test(crea.salida), "provision crea 8 streams y 12 durables", crea.salida + crea.errores);
-  const esperadosStreams = [...new Set(json.flatMap((s) => s.owns))].flatMap((d) => [streamName(d), dlqStreamName(d)]).sort();
-  afirmar(JSON.stringify(await nombresStreams()) === JSON.stringify(esperadosStreams), `crea exactamente los streams EVT_/DLQ_ de cada dominio: ${esperadosStreams.join(", ")}`);
+  afirmar(crea.codigo === 0 && new RegExp(`${nRecursos} creado`).test(crea.salida), `provision crea ${nStreams} streams y ${nDurables} durables`, crea.salida + crea.errores);
+  const esperadosStreams = [
+    ...dominiosDueños.flatMap((d) => [streamName(d), dlqStreamName(d)]),
+    ...dominiosEstado.map(stateStreamName),
+  ].sort();
+  afirmar(JSON.stringify(await nombresStreams()) === JSON.stringify(esperadosStreams), `crea exactamente los streams EVT_/DLQ_ de cada dominio y STATE_ de cada dominio con estado: ${esperadosStreams.join(", ")}`);
   let faltan = [];
   for (const s of json) {
     for (const d of s.durables) {
@@ -656,7 +1103,7 @@ async function main() {
   const antes = JSON.stringify([(await opsA.jsm.streams.info("EVT_PEDIDOS")).created, (await opsA.jsm.consumers.info("EVT_PEDIDOS", "facturacion-api__pedidos_pedido_v1_creado")).created]);
   const repite = provision(EJEMPLO);
   const despues = JSON.stringify([(await opsA.jsm.streams.info("EVT_PEDIDOS")).created, (await opsA.jsm.consumers.info("EVT_PEDIDOS", "facturacion-api__pedidos_pedido_v1_creado")).created]);
-  afirmar(repite.codigo === 0 && /20 sin cambios/.test(repite.salida) && /Sin cambios/.test(repite.salida), "repetir es IDEMPOTENTE: «20 sin cambios», exit 0", repite.salida);
+  afirmar(repite.codigo === 0 && new RegExp(`${nRecursos} sin cambios`).test(repite.salida) && /Sin cambios/.test(repite.salida), `repetir es IDEMPOTENTE: «${nRecursos} sin cambios», exit 0`, repite.salida);
   afirmar(antes === despues, "…y no recrea nada (las marcas de creación no cambian)");
 
   // Una diferencia sembrada: se informa, no se sobrescribe, y la salida es distinta de 0.
@@ -674,6 +1121,73 @@ async function main() {
   await opsA.jsm.consumers.update("EVT_PEDIDOS", "facturacion-api__pedidos_pedido_v1_creado", { max_ack_pending: 256 });
   const vuelta = provision(EJEMPLO);
   afirmar(vuelta.codigo === 0 && /Sin cambios/.test(vuelta.salida), "restituidos los valores, vuelve a «sin cambios»: la comparación no da falsos positivos");
+
+  // ── Estado: lo que provision crea, amplía e informa ──────────────────────────
+  // El stream de estado lleva la configuración de protocol.json → state.stream, y los durables de estado,
+  // last_per_subject con el filtro del contrato y su tenant (10-state.md §2.1 y §5.2).
+  const infoEstado = await opsA.jsm.streams.info("STATE_CLIENTES");
+  const cE = infoEstado.config;
+  afirmar(
+    cE.max_msgs_per_subject === 1 && cE.allow_direct === true && cE.max_age === 0 && cE.discard === "old" && cE.storage === "file" &&
+      cE.duplicate_window === nanos(120_000) && cE.num_replicas === 1 && JSON.stringify(cE.subjects) === '["state.clientes.>"]',
+    "STATE_CLIENTES lleva la config de 10-state.md §2.1: max_msgs_per_subject 1, allow_direct, max_age 0, discard old, ventana 2 m, file",
+    JSON.stringify(cE),
+  );
+  const durEstado = await opsA.jsm.consumers.info("STATE_CLIENTES", "tienda-web__state_clientes_cliente_v1__acme");
+  afirmar(
+    durEstado.config.deliver_policy === "last_per_subject" && durEstado.config.filter_subject === "state.clientes.cliente.v1.acme.*" &&
+      durEstado.config.ack_wait === nanos(30_000) && durEstado.config.max_deliver === 6 && durEstado.config.max_ack_pending === 256,
+    "el durable de estado confinado: last_per_subject, filtro `…v1.acme.*` y la config canónica (ack_wait == backoff[0], max_deliver 6)",
+    JSON.stringify(durEstado.config),
+  );
+  const durTodos = await opsA.jsm.consumers.info("STATE_CLIENTES", "informes-api__state_clientes_cliente_v1");
+  afirmar(durTodos.config.filter_subject === "state.clientes.cliente.v1.*.*" && durTodos.config.deliver_policy === "last_per_subject", "el durable de estado sin confinar: sin sufijo de tenant y filtro `…v1.*.*`");
+  const durDlqEstado = await opsA.jsm.consumers.info("DLQ_CLIENTES", "crm-api__dlq_state_clientes");
+  afirmar(durDlqEstado.config.filter_subject === "dlq.state.clientes.>" && durDlqEstado.config.deliver_policy === "all", "el durable con el que el dueño lee su DLQ de estado: filtro `dlq.state.clientes.>`");
+  afirmar(JSON.stringify((await opsA.jsm.streams.info("DLQ_CLIENTES")).config.subjects) === '["dlq.clientes.>","dlq.state.clientes.>"]', "DLQ_CLIENTES de un dominio CON estado captura dlq.<dom>.> y dlq.state.<dom>.>");
+  afirmar(JSON.stringify((await opsA.jsm.streams.info("DLQ_PEDIDOS")).config.subjects) === '["dlq.pedidos.>"]', "…y la de un dominio SIN estado no cambia: 1.1 es aditiva");
+
+  // Una DLQ de la 1.0 (solo dlq.<dom>.>) que gana estado se AMPLÍA, sin perder mensajes: es lo único
+  // que provision cambia en un recurso existente (A-44).
+  await opsA.jsm.streams.update("DLQ_CLIENTES", { subjects: ["dlq.clientes.>"] });
+  await opsA.js.publish("dlq.clientes.cliente.v1.registrado", enc.encode('{"muerto":"antes de ampliar"}'));
+  const mensajesAntes = (await opsA.jsm.streams.info("DLQ_CLIENTES")).state.messages;
+  const ensayo = provision(EJEMPLO, "--dry-run");
+  afirmar(
+    ensayo.codigo === 0 && /SE AMPLIARÍA\s+DLQ_CLIENTES\s+\+ dlq\.state\.clientes\.>/.test(ensayo.salida) && /1 se ampliaría/.test(ensayo.salida),
+    "--dry-run con una DLQ de la 1.0 dice «se ampliaría» (+ dlq.state.clientes.>) y sale con 0",
+    ensayo.salida,
+  );
+  afirmar(JSON.stringify((await opsA.jsm.streams.info("DLQ_CLIENTES")).config.subjects) === '["dlq.clientes.>"]', "…y no la toca");
+  const amplia = provision(EJEMPLO);
+  const dlqAmpliada = await opsA.jsm.streams.info("DLQ_CLIENTES");
+  afirmar(
+    amplia.codigo === 0 && /AMPLIADO\s+DLQ_CLIENTES\s+\+ dlq\.state\.clientes\.>/.test(amplia.salida) &&
+      JSON.stringify(dlqAmpliada.config.subjects) === '["dlq.clientes.>","dlq.state.clientes.>"]' && dlqAmpliada.state.messages === mensajesAntes,
+    `provision AMPLÍA DLQ_CLIENTES con dlq.state.clientes.> sin perder mensajes (${mensajesAntes} antes y después) y sale con 0`,
+    amplia.salida,
+  );
+  const tras = provision(EJEMPLO);
+  afirmar(tras.codigo === 0 && new RegExp(`${nRecursos} sin cambios`).test(tras.salida), "y repetir vuelve a ser «sin cambios»: la ampliación es idempotente");
+
+  // Lo que NO es una ampliación se informa y no se toca: una DLQ con un subject de más, y un stream de
+  // estado con allow_direct a false (sin él, get y el paso 1 de put no reciben respuesta: A-32).
+  await opsA.jsm.streams.update("DLQ_CLIENTES", { subjects: ["dlq.clientes.>", "dlq.state.clientes.>", "dlq.otro.>"] });
+  await opsA.jsm.streams.update("STATE_CLIENTES", { allow_direct: false });
+  const rara = provision(EJEMPLO);
+  afirmar(
+    rara.codigo === 1 && /DIFIERE\s+DLQ_CLIENTES\s*\n\s+subjects:/.test(rara.salida) && /DIFIERE\s+STATE_CLIENTES\s*\n\s+allow_direct: existente false, deseado true/.test(rara.salida) && !/AMPLIADO/.test(rara.salida),
+    "una DLQ con un subject DE MÁS y un STATE_ con allow_direct false se informan (DIFIERE), no se amplían y la salida es 1",
+    rara.salida,
+  );
+  afirmar(
+    (await opsA.jsm.streams.info("STATE_CLIENTES")).config.allow_direct === false && (await opsA.jsm.streams.info("DLQ_CLIENTES")).config.subjects.includes("dlq.otro.>"),
+    "…y NO sobrescribe: ambos siguen como estaban",
+  );
+  await opsA.jsm.streams.update("STATE_CLIENTES", { allow_direct: true });
+  await opsA.jsm.streams.update("DLQ_CLIENTES", { subjects: ["dlq.clientes.>", "dlq.state.clientes.>"] });
+  const restituido = provision(EJEMPLO);
+  afirmar(restituido.codigo === 0 && /Sin cambios/.test(restituido.salida), "restituidos, vuelve a «sin cambios»");
 
   // Nunca borra: lo que el manifiesto no menciona se queda.
   await opsA.jsm.streams.add({ name: "EVT_AJENO", subjects: ["ajeno.>"] });
@@ -693,11 +1207,25 @@ async function main() {
   const subjectPropio = (s) => Object.keys(bundle.subjects).find((x) => domainOf(x) === s.owns[0]) ?? `${s.owns[0]}.cosa.v1.ocurrida`;
   let ackVisto;
   for (const svc of json) {
+    if (!svc.owns.length) continue; // un observador de estado puro no tiene dominio propio: su ciclo es el de la 3b
     const nc = await comoServicio(A.url, svc.name, pares[svc.name].seed);
     const r = await ciclo({ nc, svc, ops: opsA, subjectPropio: subjectPropio(svc), nakTerm: true });
     console.log(`  ${svc.name}  (dueño de ${svc.owns.join(", ")}; consume ${svc.consumes.join(", ")})`);
     for (const p of r.pasos) afirmar(p.ok, `    ${p.nombre}`, p.ok ? undefined : p.detalle);
     if (svc.name === "facturacion-api") ackVisto = r.ack;
+    await nc.close();
+  }
+
+  // ── 3b. El ciclo de ESTADO ─────────────────────────────────────────────────
+  seccion("3b. El ciclo de ESTADO de cada rol, con sus permisos generados (10-state.md: put, get, watch, DLQ de estado)");
+  for (const svc of json.filter((x) => x.stateOwns.length || x.watches.length)) {
+    const nc = await comoServicio(A.url, svc.name, pares[svc.name].seed);
+    const marca = randomUUID().slice(0, 8);
+    const rol = svc.stateOwns.length ? `dueño del estado de ${svc.stateOwns.join(", ")}` : `observa ${svc.watches.map((w) => `${w.contract} (${w.tenants ? w.tenants.join(", ") : "todos los tenants"})`).join(", ")}`;
+    console.log(`  ${svc.name}  (${rol})`);
+    const r = svc.stateOwns.length ? await cicloEstadoDueño({ nc, svc, ops: opsA, marca }) : await cicloEstadoObservador({ nc, svc, ops: opsA, marca, exhaustivo: true });
+    for (const p of r.pasos) afirmar(p.ok, `    ${p.nombre}`, p.ok ? undefined : p.detalle);
+    afirmar(nc.violaciones.length === 0, `    ni una sola violación de permiso en toda la conversación de ${svc.name}`, nc.violaciones.join("\n"));
     await nc.close();
   }
 
@@ -787,6 +1315,25 @@ async function main() {
   await espia.close();
   await victima.close();
 
+  // ── 4b. Estado: lo que NO se puede hacer ──────────────────────────────────
+  seccion("4b. Estado: quién puede y quién NO puede cada cosa (escribir, leer, el stream, los durables ajenos, la DLQ)");
+  {
+    const sondasE = sondasEstado(randomUUID().slice(0, 8));
+    const usuarios = ["crm-api", "tienda-web", "informes-api", "facturacion-api"];
+    const desvios = new Map(sondasE.map(([que]) => [que, []]));
+    for (const u of usuarios) {
+      const nc = await comoServicio(A.url, u, pares[u].seed);
+      for (const d of await desviosDeSondasEstado(nc, u, sondasE)) desvios.get(d.que).push(`${u}: esperado ${d.esperado ? "permitido" : "denegado"}, ${d.permitido === true ? "PERMITIDO" : d.permitido === false ? "denegado" : d.permitido}`);
+      await nc.close();
+    }
+    for (const [que, , para] of sondasE) {
+      afirmar(desvios.get(que).length === 0, `${que}  →  ${para.length ? `solo ${para.join(", ")}` : "NADIE"}`, desvios.get(que).join("\n"));
+    }
+    nota(`${sondasE.length} sondas × ${usuarios.length} servicios (crm-api, tienda-web, informes-api y facturacion-api, que no tiene estado)`);
+    // Los consumidores y los mensajes que las sondas hayan podido crear quedan fuera del camino de lo demás.
+    for (const n of ["espia__state", "espia2__state"]) await opsA.jsm.consumers.delete(STREAM_ESTADO, n).catch(() => {});
+  }
+
   // ── 5. Minimalidad ─────────────────────────────────────────────────────────
   seccion("5. Minimalidad: sin CUALQUIERA de los permisos de facturacion-api, su ciclo se rompe");
   const svcFact = fact;
@@ -812,6 +1359,27 @@ async function main() {
       `--dev sin ${x.quitado} → el ciclo SIGUE (el SDK cae a CONSUMER.INFO)`,
       r.fallidos.join("\n"),
     );
+  }
+
+  // ── 5b. Minimalidad del estado ─────────────────────────────────────────────
+  seccion("5b. Minimalidad del estado: sin CUALQUIERA de los permisos de tienda-web (observador) o crm-api (dueño), su ciclo se rompe");
+  for (const x of variantesTienda) {
+    const nc = await comoServicio(A.url, x.nombre, x.seed, "tienda-web");
+    const r = await cicloEstadoObservador({ nc, svc: tiendaP, ops: opsA, marca: randomUUID().slice(0, 8) });
+    await nc.close();
+    const corto = r.fallidos.length > 2 ? `${r.fallidos.slice(0, 2).join("; ")} (+${r.fallidos.length - 2} más)` : r.fallidos.join("; ");
+    afirmar(!r.ok, `tienda-web sin ${x.quitado} → el ciclo falla en: ${corto || "(nada: el permiso sobra)"}`);
+  }
+  const svcCrm = crmP;
+  for (const x of variantesCrm) {
+    const nc = await comoServicio(A.url, x.nombre, x.seed, "crm-api");
+    // El ciclo de eventos de crm-api (dominio propio y su DLQ) más el de estado: cada permiso, en el suyo.
+    const eventos = await ciclo({ nc, svc: svcCrm, ops: opsA, subjectPropio: subjectPropio(svcCrm) });
+    const estado = await cicloEstadoDueño({ nc, svc: svcCrm, ops: opsA, marca: randomUUID().slice(0, 8) });
+    await nc.close();
+    const fallidos = [...eventos.fallidos, ...estado.fallidos];
+    const corto = fallidos.length > 2 ? `${fallidos.slice(0, 2).join("; ")} (+${fallidos.length - 2} más)` : fallidos.join("; ");
+    afirmar(fallidos.length > 0, `crm-api sin ${x.quitado} → el ciclo falla en: ${corto || "(nada: el permiso sobra)"}`);
   }
 
   // ── 6. Las sondas pueden fallar ────────────────────────────────────────────
@@ -852,6 +1420,24 @@ async function main() {
   // Los mutantes han podido crear cosas: se barren, y se comprueba que el resto no se vio afectado.
   for (const n of ["logi-mutante-api__espia", "logi-mutante-api__espia2", "logistica-api__espia", "logistica-api__espia2", "logistica-api__dlq_pedidos", "facturacion-api__espia", "facturacion-api__espia2"]) {
     for (const s of ["EVT_INVENTARIO", "DLQ_PEDIDOS"]) await opsA.jsm.consumers.delete(s, n).catch(() => {});
+  }
+
+  // ── 6b. Mutantes de estado ─────────────────────────────────────────────────
+  seccion("6b. Las sondas de ESTADO detectan una ACL que concede DE MÁS: mutantes sembrados");
+  {
+    const sondasE = sondasEstado(randomUUID().slice(0, 8));
+    for (const m of mutantesEstado) {
+      const nc = await comoServicio(A.url, m.nombre, m.seed, m.base);
+      const desvios = await desviosDeSondasEstado(nc, m.base, sondasE);
+      await nc.close();
+      for (const que of m.flip) {
+        const d = desvios.find((x) => x.que.includes(que));
+        afirmar(!!d && d.permitido === true && d.esperado === false, `mutante «${m.que}»: la sonda «${que}» lo DETECTA (permitido)`, d ? JSON.stringify(d) : "la sonda no cambió");
+      }
+      const inesperados = desvios.filter((d) => !m.flip.some((q) => d.que.includes(q)));
+      afirmar(inesperados.length === 0, `mutante «${m.que}»: no abre NADA más de lo que dice`, inesperados.map((d) => d.que).join("\n"));
+    }
+    for (const n of ["espia__state", "espia2__state"]) await opsA.jsm.consumers.delete(STREAM_ESTADO, n).catch(() => {});
   }
 
   await opsA.nc.close();
@@ -914,6 +1500,8 @@ async function seccionRegresion(json) {
 async function seccionTenants(json) {
   seccion("8. Modelo B (--tenants): una account por tenant, mismos permisos, aislamiento real");
   const tenants = ["acme", "globex"];
+  const nRecursosB =
+    2 * new Set(json.flatMap((s) => s.owns)).size + new Set(json.flatMap((s) => s.stateOwns)).size + json.reduce((n, s) => n + s.durables.length, 0);
   const ids = tenants.flatMap((t) => json.map((s) => `${s.name}@${t}`));
   const pares = Object.fromEntries(ids.map((id) => [id, nuevaClave()]));
   const opsPorTenant = Object.fromEntries(tenants.map((t) => [t, nuevaClave()]));
@@ -945,7 +1533,7 @@ async function seccionTenants(json) {
   };
   for (const t of tenants) {
     const r = await provisionar(t);
-    afirmar(r.status === 0 && /20 creado/.test(r.stdout), `provision en la account de ${t} (una vez por account)`, r.stdout + r.stderr);
+    afirmar(r.status === 0 && new RegExp(`${nRecursosB} creado`).test(r.stdout), `provision en la account de ${t} (una vez por account)`, r.stdout + r.stderr);
   }
 
   const opsAcme = await conectarOps(D.url, opsPorTenant.acme.seed);
