@@ -246,6 +246,34 @@ impl fmt::Display for SchemaNotFoundError {
 
 impl StdError for SchemaNotFoundError {}
 
+// ─── Errores de aprovisionamiento y de permisos ──────────────────────────────
+
+/// Código estable de un stream o consumidor que no existe y que este servicio no puede
+/// crear — 06-security.md §3.
+pub const NOT_PROVISIONED_CODE: &str = "NOT_PROVISIONED";
+
+/// Código estable de una operación que el broker denegó por permisos — 06-security.md §3.
+pub const PERMISSION_DENIED_CODE: &str = "PERMISSION_DENIED";
+
+/// Qué recurso de JetStream falta. Es un tipo de flux y no el de NATS: la API pública no
+/// expone el broker (00-protocol.md §3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResourceKind {
+    /// Un stream (`EVT_<DOMINIO>`, `DLQ_<DOMINIO>`).
+    Stream,
+    /// Un consumidor durable.
+    Consumer,
+}
+
+impl fmt::Display for ResourceKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::Stream => "stream",
+            Self::Consumer => "consumidor",
+        })
+    }
+}
+
 /// Un campo en el que el servidor no honró lo solicitado.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConfigDifference {
@@ -368,6 +396,43 @@ pub enum FluxError {
         differences: Vec<ConfigDifference>,
     },
 
+    /// Falta un stream o un consumidor y el broker deniega crearlo — 06-security.md §3.
+    ///
+    /// **No es un timeout.** En producción streams y consumidores los aprovisiona la
+    /// infraestructura (`flux provision`) y la ACL del servicio no concede crearlos: con un
+    /// recurso ausente, la petición de creación se deniega, el broker no responde y
+    /// `async-nats` solo lo cuenta como "timed out" a los 5–30 s. El SDK escucha las
+    /// denegaciones y falla al instante, nombrando el recurso que falta.
+    ///
+    /// Se clasifica **PERMANENT**: reintentar no hace aparecer el recurso, igual que un 403
+    /// no se arregla esperando (04-errors.md §1.2).
+    #[error("{}", format_not_provisioned(*.kind, .name, .denied))]
+    NotProvisioned {
+        /// Qué falta.
+        kind: ResourceKind,
+        /// Su nombre (`EVT_PEDIDOS`, `facturacion-api__pedidos_pedido_v1_creado`).
+        name: String,
+        /// La denegación literal del broker (`Publish to "$JS.API.STREAM.CREATE.…"`).
+        denied: String,
+    },
+
+    /// El broker denegó una operación por permisos — 06-security.md §3.
+    ///
+    /// Es la otra cara de [`FluxError::NotProvisioned`]: aquí ni siquiera hay permiso para
+    /// *mirar* si el recurso existe, o para publicar en un subject. El caso típico es una
+    /// ACL de la v1, que no concede nada de `$JS.API.*` ni un inbox privado: el SDK moderno
+    /// no puede ni consultar su stream, y sin esta detección el síntoma es un timeout que no
+    /// dice nada.
+    ///
+    /// **PERMANENT**, por la misma razón que [`FluxError::NotProvisioned`].
+    #[error("{}", format_permission_denied(.operation, .denied))]
+    PermissionDenied {
+        /// Lo que el SDK intentaba, en términos de flux (`abrir el stream EVT_PEDIDOS`).
+        operation: String,
+        /// La denegación literal del broker.
+        denied: String,
+    },
+
     /// Fallo de transporte: conexión, publicación, creación de stream o de consumidor.
     #[error("{context}")]
     Transport {
@@ -397,6 +462,24 @@ fn format_mismatch(durable: &str, diffs: &[ConfigDifference]) -> String {
          Si el campo es ack_wait, comprueba que backoff[0] valga exactamente lo mismo.",
     );
     s
+}
+
+fn format_not_provisioned(kind: ResourceKind, name: &str, denied: &str) -> String {
+    format!(
+        "el {kind} `{name}` no existe y este servicio no tiene permiso para crearlo \
+         (el broker denegó {denied}). En producción los streams y los consumidores se \
+         aprovisionan fuera del SDK con `flux provision`, con credenciales de operación \
+         (06-security.md §3): aprovisiónalo y reinicia el servicio. No es un timeout."
+    )
+}
+
+fn format_permission_denied(operation: &str, denied: &str) -> String {
+    format!(
+        "el broker denegó {denied} al {operation}. La ACL de este servicio no concede ese \
+         subject (06-security.md §3). Una ACL de la v1 —sin permisos sobre `$JS.API.*` ni \
+         inbox privado `_INBOX.<servicio>.>`— no basta: ver «Seguridad» en el README del \
+         SDK para la lista exacta de permisos."
+    )
 }
 
 impl FluxError {
@@ -486,9 +569,16 @@ impl FluxError {
             // es sintácticamente correcto —se parseó, no es POISON— pero incumple su
             // contrato, y reintentarlo seis veces dará seis veces lo mismo
             // — 00-protocol.md §5 y 04-errors.md §1.2.
-            Self::Permanent(_) | Self::SchemaValidation(_) | Self::SchemaNotFound(_) => {
-                Some(ErrorClass::Permanent)
-            }
+            //
+            // `NotProvisioned` y `PermissionDenied` también: son el 403 del broker. Un
+            // handler que publica y recibe uno de los dos no lo arregla esperando, así que
+            // sin clase caerían en la política de lo desconocido —2 entregas, ~30 s de cola
+            // bloqueada— para acabar en el mismo sitio.
+            Self::Permanent(_)
+            | Self::SchemaValidation(_)
+            | Self::SchemaNotFound(_)
+            | Self::NotProvisioned { .. }
+            | Self::PermissionDenied { .. } => Some(ErrorClass::Permanent),
             Self::Poison(_) => Some(ErrorClass::Poison),
             _ => None,
         }
@@ -504,6 +594,9 @@ impl FluxError {
         match self {
             Self::SchemaValidation(_) => return Some(INVALID_SCHEMA_CODE),
             Self::SchemaNotFound(_) => return Some(SCHEMA_NOT_FOUND_CODE),
+            // Igual que los de esquema: el código es el que agrupa el panel, no la app.
+            Self::NotProvisioned { .. } => return Some(NOT_PROVISIONED_CODE),
+            Self::PermissionDenied { .. } => return Some(PERMISSION_DENIED_CODE),
             _ => {}
         }
         let f = self.failure()?;
@@ -695,6 +788,71 @@ mod tests {
         assert_eq!(ErrorClass::Retryable.as_str(), "retryable");
         assert_eq!(ErrorClass::Permanent.as_str(), "permanent");
         assert_eq!(ErrorClass::Poison.as_str(), "poison");
+    }
+
+    /// 06-security.md §3: un recurso que falta y no se puede crear es PERMANENT — esperar no
+    /// lo crea — y lleva un código estable que NO cambia la aplicación.
+    #[test]
+    fn not_provisioned_es_permanent_con_codigo_estable() {
+        let err = FluxError::NotProvisioned {
+            kind: ResourceKind::Stream,
+            name: "EVT_PEDIDOS".into(),
+            denied: "Publish to \"$JS.API.STREAM.CREATE.EVT_PEDIDOS\"".into(),
+        };
+        assert_eq!(err.class(), Some(ErrorClass::Permanent));
+        assert_eq!(err.code(), Some("NOT_PROVISIONED"));
+        assert_eq!(err.code(), Some(NOT_PROVISIONED_CODE));
+        assert_eq!(err.retry_after(), None);
+
+        // Accionable: nombra el recurso y dice cómo se arregla. Y dice que NO es un timeout.
+        let texto = err.to_string();
+        assert!(texto.contains("stream `EVT_PEDIDOS`"), "{texto}");
+        assert!(texto.contains("flux provision"), "{texto}");
+        assert!(texto.contains("No es un timeout"), "{texto}");
+
+        let consumidor = FluxError::NotProvisioned {
+            kind: ResourceKind::Consumer,
+            name: "facturacion-api__pedidos_pedido_v1_creado".into(),
+            denied: "Publish to \"$JS.API.CONSUMER.CREATE.…\"".into(),
+        };
+        assert!(consumidor
+            .to_string()
+            .contains("consumidor `facturacion-api__"));
+    }
+
+    #[test]
+    fn permission_denied_es_permanent_con_codigo_estable() {
+        let err = FluxError::PermissionDenied {
+            operation: "consultar el stream `EVT_PEDIDOS`".into(),
+            denied: "Publish to \"$JS.API.STREAM.INFO.EVT_PEDIDOS\"".into(),
+        };
+        assert_eq!(err.class(), Some(ErrorClass::Permanent));
+        assert_eq!(err.code(), Some(PERMISSION_DENIED_CODE));
+        assert!(err.to_string().contains("$JS.API.STREAM.INFO.EVT_PEDIDOS"));
+        // Los dos códigos son distintos: «falta el recurso» y «no puedo ni mirarlo» son dos
+        // incidentes con dos remedios.
+        assert_ne!(NOT_PROVISIONED_CODE, PERMISSION_DENIED_CODE);
+    }
+
+    /// Envueltos por una capa de la aplicación siguen clasificándose: un handler que publica
+    /// y recibe uno de los dos no puede caer en la política de lo desconocido.
+    #[test]
+    fn los_errores_de_provision_y_permisos_se_clasifican_envueltos() {
+        for err in [
+            FluxError::NotProvisioned {
+                kind: ResourceKind::Consumer,
+                name: "c".into(),
+                denied: "d".into(),
+            },
+            FluxError::PermissionDenied {
+                operation: "o".into(),
+                denied: "d".into(),
+            },
+        ] {
+            let envuelto = Envuelto(err);
+            let c = as_classified(&envuelto).expect("se encuentra en la cadena");
+            assert_eq!(c.class(), Some(ErrorClass::Permanent));
+        }
     }
 
     #[test]

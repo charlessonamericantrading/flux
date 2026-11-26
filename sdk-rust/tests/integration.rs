@@ -26,12 +26,24 @@ fn nats_url() -> Option<String> {
         .map(|_| url)
 }
 
+/// Sin broker: salta con aviso, o FALLA si `FLUX_REQUIRE_BROKER=1`. En CI eso evita que un
+/// NATS que no arrancó deje todos estos tests «en verde» sin haberse ejecutado: un fixture
+/// que nadie ejecuta aparenta cobertura.
+fn sin_broker() {
+    let exigido = std::env::var("FLUX_REQUIRE_BROKER").is_ok_and(|v| !v.is_empty() && v != "0");
+    assert!(
+        !exigido,
+        "FLUX_REQUIRE_BROKER=1 y no hay NATS en FLUX_NATS_URL (default nats://127.0.0.1:4222)"
+    );
+    eprintln!("saltado: no hay NATS en FLUX_NATS_URL");
+}
+
 macro_rules! broker {
     () => {
         match nats_url() {
             Some(u) => u,
             None => {
-                eprintln!("saltado: no hay NATS en FLUX_NATS_URL");
+                sin_broker();
                 return;
             }
         }
