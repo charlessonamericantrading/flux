@@ -5147,13 +5147,16 @@ drenar **cada operación** y esperar a los handlers *antes* de cerrar—: medido
 100 ms deja la petición sin respuesta; con `unsubscribe` a los 100 ms, la petición en vuelo termina con su
 respuesta y la siguiente falla en ~1 ms con `no responders`.
 
-> **No medido.** Con latencia de red real, un `unsubscribe` que descarta lo ya enviado por el servidor
-> **PUEDE** perder una petición que viajaba; el *drain* de la librería espera al viaje de ida y vuelta que lo
-> evita. Localmente, 4 ejecuciones de 400 peticiones seguidas no perdieron ninguna con ninguno de los dos:
-> no hay una medida que fije cuál usar, y por eso se pide el drenaje. Y en un **cluster**, el interés
-> se propaga de forma asíncrona: la petición que sale justo cuando se va el último puede agotar su timeout en
-> vez de recibir `no responders` (A-70: 4 de 10 sin esperar, 0 de 10 a los 5 ms). Un SDK **DEBERÍA** esperar un
-> margen breve tras dejar de escuchar antes de cerrar.
+> **Medido con latencia de red real (A-91, `async-nats` 0.50).** El `drain` **no espera al `PONG`**: retira la
+> suscripción en cuanto escribe el `UNSUB`, y lo que el servidor ya envió y aún viaja **se pierde**; quien llama ve
+> `RPC_TIMEOUT`. Con la librería sola se pierden 0 / 4 / 13 / 23 mensajes con 0 / 5 / 15 / 30 ms por sentido, y
+> `unsubscribe` casi lo mismo (1 / 5 / 15 / 28): ninguno de los dos lo evita, y la API pública no ofrece otra
+> cosa. Con el SDK, 10 paradas bajo carga pierden de 1 a ~130 peticiones con 0 a 15 ms. **Por eso la parada
+> ordenada no basta bajo carga y con red**: lo que hay que hacer es **sacar la instancia del reparto antes de
+> pararla** (quitarla del balanceo o dejar de enviarle tráfico) y entonces parar. Localmente (0 ms) no se pierde
+> nada. Y en un **cluster**, el interés se propaga de forma asíncrona: la petición que sale justo cuando se va
+> el último puede agotar su timeout en vez de recibir `no responders` (A-70: 4 de 10 sin esperar, 0 de 10 a los 5
+> ms). Un SDK **DEBERÍA** esperar un margen breve tras dejar de escuchar antes de cerrar.
 
 ### 5.6 Tenants y concurrencia
 
@@ -5439,8 +5442,9 @@ Declarado para que nadie asuma de más:
 - **No propaga el plazo** de quien llama al que responde: un handler puede seguir trabajando cuando ya nadie
   espera, y su efecto se aplica. La idempotencia por `id` cubre el caso peligroso.
 - **No hay contrapresión ni *load shedding*.** Core NATS no tiene acuse: un responder sobrecargado no puede decir
-  «ahora no», y quien llama solo ve `RPC_TIMEOUT`. No se ha medido el límite de mensajes pendientes por
-  suscripción (*slow consumer*).
+  «ahora no», y quien llama solo ve `RPC_TIMEOUT`. **La cola de una suscripción tiene un límite y, llena, descarta
+  sin error**: con `async-nats` 0.50 son **65 536** mensajes y los 4 463 que sobraron de 70 000 peticiones se
+  perdieron (A-92); el SDK de Rust lo avisa por su `logger`. No se midió con `nats.js`.
 - **No elige instancias por salud** (§2.4): una colgada se lleva su parte.
 - **No oculta la existencia de una operación** a quien tenga permiso de publicar en ella, y `no responders` dice
   si **hay** alguien escuchando.
