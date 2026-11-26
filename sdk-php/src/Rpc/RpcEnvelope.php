@@ -106,7 +106,7 @@ final class RpcEnvelope
     }
 
     /** @param array<string,mixed>|object $data */
-    private static function assertObject(mixed $data, string $what): void
+    public static function assertObject(mixed $data, string $what): void
     {
         $isObject = $data instanceof \stdClass || (is_array($data) && ($data === [] || !array_is_list($data)));
         if (!$isObject) {

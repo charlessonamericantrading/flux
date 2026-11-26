@@ -41,11 +41,37 @@ final readonly class SchemaBundle
      * @param array<string,string> $subjects subject → URI del esquema con el MINOR más
      *        alto de su mayor.
      * @param array<string,array<string,mixed>> $schemas URI → JSON Schema.
+     * @param array<string,string> $state contrato (`clientes.cliente.v1`) → URI del esquema de estado con el MINOR más alto de su
+     *        mayor (10-state.md §10). Sin red.
+     * @param array<string,array{request:string,reply:string}> $rpc operación (`clientes.cliente.v1.obtener`) → URI de su petición y
+     *        de su respuesta (11-request-reply.md §11.1). Sin red.
      */
     public function __construct(
         public array $subjects = [],
         public array $schemas = [],
+        public array $state = [],
+        public array $rpc = [],
     ) {
+    }
+
+    /** La URI del esquema de un contrato de estado, o `null` si el índice `state` del bundle no lo conoce. */
+    public function stateUriFor(string $contract): ?string
+    {
+        $uri = $this->state[$contract] ?? null;
+
+        return ($uri === null || $uri === '') ? null : $uri;
+    }
+
+    /**
+     * La URI del esquema de la petición o de la respuesta de una operación, o `null` si el índice `rpc` no la conoce.
+     *
+     * @param 'request'|'reply' $side
+     */
+    public function rpcUriFor(string $operation, string $side): ?string
+    {
+        $uri = $this->rpc[$operation][$side] ?? null;
+
+        return (!is_string($uri) || $uri === '') ? null : $uri;
     }
 
     /**
@@ -101,7 +127,12 @@ final readonly class SchemaBundle
         /** @var array<string,array<string,mixed>> $schemas */
         $schemas = is_array($bundle['schemas'] ?? null) ? $bundle['schemas'] : [];
 
-        return new self($subjects, $schemas);
+        /** @var array<string,string> $state */
+        $state = is_array($bundle['state'] ?? null) ? $bundle['state'] : [];
+        /** @var array<string,array{request:string,reply:string}> $rpc */
+        $rpc = is_array($bundle['rpc'] ?? null) ? $bundle['rpc'] : [];
+
+        return new self($subjects, $schemas, $state, $rpc);
     }
 
     /**

@@ -140,7 +140,7 @@ protocolo a v2.
 | [Java](sdk-java/) | **L3** | 144 | ✅ (Maven en el runner) | `signing` |
 | [.NET](sdk-dotnet/) | **L3** | 189 | ✅ | `signing` |
 | [Rust](sdk-rust/) | L2 | 175 | ✅ (incl. 14 contra NATS real) | `signing` `security` `state` `rpc` |
-| [PHP](sdk-php/) | **L3** | 640 | ✅ incl. 53 de integración contra un NATS real con TLS, nkeys y las ACLs generadas | `signing` `security` |
+| [PHP](sdk-php/) | **L3** | 640 | ✅ incl. 53 de integración contra un NATS real con TLS, nkeys y las ACLs generadas | `signing` `security` `state` |
 
 Los cinco primeros se compilan y ejecutan en CI en cada push. La suite de conformidad corre
 aparte, contra un NATS real: **14/14**.

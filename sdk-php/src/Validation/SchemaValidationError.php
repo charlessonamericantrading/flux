@@ -18,7 +18,7 @@ use Flux\FluxError;
  * CloudEvent, así que no es POISON; y su `data` no va a cambiar entre entregas, así que
  * reintentarlo son 51 minutos de cola bloqueada para llegar exactamente al mismo sitio.
  */
-final class SchemaValidationError extends FluxError
+class SchemaValidationError extends FluxError
 {
     /** Código estable para métricas y para la extensión `dlqerror` — 08-observability.md §2.2. */
     public const CODE = 'INVALID_SCHEMA';

@@ -23,7 +23,8 @@ final readonly class ConnectOptions
      * @param string $environment `produccion`, `staging`, `dev`. Alimenta `source`.
      * @param string $version SemVer del servicio. Va en `producerversion`; sin él un bug
      *        de payload en producción no se puede acotar a un despliegue.
-     * @param string $tenantId Tenant por defecto de los eventos publicados. `system` para
+     * @param string|null $tenantId Tenant por defecto de los eventos publicados (`null` = `system`; **no es lo mismo en estado**: ahí no
+     *        hay tenant por defecto y `null` es «ninguno», 10-state.md §2.4). `system` para
      *        eventos de plataforma — y **solo** para eso: `"system"` NO DEBE usarse como
      *        comodín ni como default cuando el tenant real se desconoce, porque si no se
      *        sabe de quién es un evento el bug está aguas arriba (09-multitenancy.md §5).
@@ -85,7 +86,7 @@ final readonly class ConnectOptions
         public string $service,
         public string $environment,
         public string $version,
-        public string $tenantId = 'system',
+        public ?string $tenantId = null,
         public TenantIsolation $tenantIsolation = TenantIsolation::Off,
         public string $classification = 'internal',
         public array $schemas = [],

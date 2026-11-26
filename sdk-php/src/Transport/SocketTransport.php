@@ -23,7 +23,7 @@ use Psr\Log\LoggerInterface;
  * verificación de host, credenciales (`.creds` y nkey), `NOT_PROVISIONED` y `PERMISSION_DENIED` rápidos, los tres códigos de
  * `connect()` y un `subscribe()` que falla si se deniega el pull. `BasisNatsTransport` no puede: ver `Connection`.
  */
-final class SocketTransport implements NatsTransport, ProbesPull
+final class SocketTransport implements StateTransport
 {
     /** Un timeout por defecto para las peticiones de la API de JetStream (el broker contesta en milisegundos o no contesta). */
     private const API_TIMEOUT_MS = 5_000;
@@ -102,6 +102,14 @@ final class SocketTransport implements NatsTransport, ProbesPull
 
     public function close(): void
     {
+        // Lo último que se escribió —un ack, una publicación— ha llegado al broker antes de cerrar: el protocolo es ordenado y el PONG
+        // contesta tras procesar todo lo anterior. Es la parte «ordenada» de una parada ordenada. Un fallo aquí no impide cerrar.
+        if ($this->conn->isConnected()) {
+            try {
+                $this->conn->flush(1_000);
+            } catch (\Throwable) {
+            }
+        }
         $this->conn->close();
     }
 
@@ -192,12 +200,39 @@ final class SocketTransport implements NatsTransport, ProbesPull
 
     public function createDurableConsumer(string $stream, string $durable, array $config): array
     {
+        return $this->ensureConsumer($stream, $durable, $config)['config'];
+    }
+
+    /**
+     * Toma el consumidor durable si existe y, solo si no existe, lo crea (desarrollo). Devuelve su configuración efectiva y lo pendiente.
+     *
+     * No necesita `STREAM.INFO` del stream: `CONSUMER.INFO` distingue «no existe el consumidor» (10014) de «no existe el stream» (10059)
+     * (A-48), que es todo lo que hace falta para dar `NOT_PROVISIONED` o `PERMISSION_DENIED` según 04-errors.md §5. Es lo que permite
+     * al estado no consultar el stream, cuyo `STREAM.INFO` lista todas las claves y todos los tenants (A-39).
+     *
+     * @param array<string,mixed> $config
+     *
+     * @return array{config:array<string,mixed>,numPending:int,numAckPending:int}
+     */
+    public function ensureConsumer(string $stream, string $durable, array $config): array
+    {
         // Se pregunta ANTES de crear: en producción lo aprovisiona `flux provision`, y entonces el SDK no necesita permiso de creación.
         // Intentar crear primero provocaba una denegación espuria en cada arranque.
         $info = $this->api('$JS.API.CONSUMER.INFO.' . $stream . '.' . $durable);
         $code = self::errorCode($info);
         if ($code === null) {
-            return $info['config'] ?? [];
+            return self::consumerState($info);
+        }
+        if ($code === self::STREAM_NOT_FOUND) {
+            throw new NotProvisionedException(
+                'stream',
+                $stream,
+                null,
+                $this->service,
+                '$JS.API.CONSUMER.INFO.' . $stream . '.' . $durable,
+                "el stream \"{$stream}\" no existe (`CONSUMER.INFO` contestó «stream not found», 10059) y \"{$this->service}\" no lo crea: "
+                . 'aprovisiónalo con `flux provision`, con credenciales de operación, y compruébalo con `flux doctor` (06-security.md §3.6).',
+            );
         }
         if ($code !== self::CONSUMER_NOT_FOUND) {
             throw new \RuntimeException("la API de JetStream rechazó consultar el consumidor \"{$durable}\" de \"{$stream}\": " . self::errorText($info));
@@ -216,12 +251,64 @@ final class SocketTransport implements NatsTransport, ProbesPull
             // Otra instancia del servicio pudo crearlo entre la pregunta y la creación.
             $again = $this->api('$JS.API.CONSUMER.INFO.' . $stream . '.' . $durable);
             if (self::errorCode($again) === null) {
-                return $again['config'] ?? [];
+                return self::consumerState($again);
             }
             throw new \RuntimeException("no se pudo crear el consumidor \"{$durable}\" de \"{$stream}\": " . self::errorText($created));
         }
 
-        return $created['config'] ?? [];
+        return self::consumerState($created);
+    }
+
+    /**
+     * @param array<string,mixed> $info
+     *
+     * @return array{config:array<string,mixed>,numPending:int,numAckPending:int}
+     */
+    private static function consumerState(array $info): array
+    {
+        return [
+            'config' => is_array($info['config'] ?? null) ? $info['config'] : [],
+            'numPending' => (int) ($info['num_pending'] ?? 0),
+            'numAckPending' => (int) ($info['num_ack_pending'] ?? 0),
+        ];
+    }
+
+    /**
+     * El consumidor por su nombre, o `null` si no existe (10014). Lo usa el `watch` para reabrir el consumo tras un `flux state resync`.
+     *
+     * @return array{config:array<string,mixed>,numPending:int,numAckPending:int}|null
+     */
+    public function consumerInfo(string $stream, string $durable): ?array
+    {
+        $info = $this->api('$JS.API.CONSUMER.INFO.' . $stream . '.' . $durable);
+        $code = self::errorCode($info);
+        if ($code === null) {
+            return self::consumerState($info);
+        }
+        if ($code === self::CONSUMER_NOT_FOUND || $code === self::STREAM_NOT_FOUND) {
+            return null;
+        }
+
+        throw new \RuntimeException("la API de JetStream rechazó consultar el consumidor \"{$durable}\" de \"{$stream}\": " . self::errorText($info));
+    }
+
+    /**
+     * La configuración de un stream, o `null` si no existe. NO se usa sobre `STATE_<DOM>` (su `STREAM.INFO` lista claves y tenants).
+     *
+     * @return array<string,mixed>|null
+     */
+    public function streamConfig(string $name): ?array
+    {
+        $info = $this->api('$JS.API.STREAM.INFO.' . $name);
+        $code = self::errorCode($info);
+        if ($code === null) {
+            return is_array($info['config'] ?? null) ? $info['config'] : [];
+        }
+        if ($code === self::STREAM_NOT_FOUND) {
+            return null;
+        }
+
+        throw new \RuntimeException("la API de JetStream rechazó consultar el stream \"{$name}\": " . self::errorText($info));
     }
 
     public function consumerPending(string $stream, string $durable): ?int
@@ -230,6 +317,48 @@ final class SocketTransport implements NatsTransport, ProbesPull
         $info = $this->api('$JS.API.CONSUMER.INFO.' . $stream . '.' . $durable);
 
         return isset($info['num_pending']) && is_int($info['num_pending']) ? $info['num_pending'] : null;
+    }
+
+    // ─── Lecturas directas (estado) ───────────────────────────────────────────
+
+    /**
+     * `DIRECT.GET` por **subject**: el último mensaje de un subject, sin consumidor ni acuse. La forma de cuerpo (`{"seq": n}`) lee cualquier
+     * mensaje y ninguna ACL la ve: no se usa (06-security.md §3.5, 10-state.md §8).
+     *
+     * Un stream que no existe, o sin `allow_direct`, **no da 404: no contesta nadie** (`no responders`), y los dos casos se ven igual (A-32):
+     * `NOT_PROVISIONED`, con las dos causas en el mensaje.
+     *
+     * @return array{seq:int,data:string,headers:array<string,string>}|null `null` si la clave no existe (404)
+     *
+     * @throws NotProvisionedException|PermissionDeniedException
+     */
+    public function directGet(string $stream, string $subject, int $timeoutMs = 5_000): ?array
+    {
+        $denied = '$JS.API.DIRECT.GET.' . $stream . '.' . $subject;
+        try {
+            $r = $this->conn->request($denied, '', $timeoutMs);
+        } catch (NoRespondersException $e) {
+            throw new NotProvisionedException(
+                'stream',
+                $stream,
+                null,
+                $this->service,
+                $denied,
+                "nadie contestó en \"{$denied}\": el stream \"{$stream}\" no existe, o existe sin `allow_direct: true`, y los dos casos se ven "
+                . "exactamente igual (no hay un 404: no responde nadie). \"{$this->service}\" no lo crea ni lo consulta —los SDKs no usan "
+                . '`STREAM.INFO` sobre el estado, porque lista todas las claves y todos los tenants (A-39)—. Aprovisiónalo con `flux provision`, '
+                . 'con credenciales de operación, y compruébalo con `flux doctor` (10-state.md §5.1, 04-errors.md §6).',
+                $e,
+            );
+        }
+        if ($r->status === 404) {
+            return null;
+        }
+        if ($r->status !== null) {
+            throw new \RuntimeException("DIRECT.GET de {$subject} contestó {$r->status} {$r->statusText}");
+        }
+
+        return ['seq' => (int) ($r->header('Nats-Sequence') ?? 0), 'data' => $r->payload, 'headers' => $r->headers];
     }
 
     // ─── El pull ──────────────────────────────────────────────────────────────
@@ -297,8 +426,9 @@ final class SocketTransport implements NatsTransport, ProbesPull
                 }
                 if ($m->status !== null) {
                     // 404 «no hay mensajes», 408 «el pull expiró», 409 «consumidor borrado / límite», 400 «petición mal formada».
-                    if ($m->status === 409) {
-                        throw new \RuntimeException("el broker cerró el pull del consumidor \"{$durable}\" ({$m->status} {$m->statusText})");
+                    if ($m->status === 409 || $m->status === 503) {
+                        // El consumidor se borró (409) o no existe (503, `no responders`): no es un consumidor ocioso.
+                        throw new ConsumerGoneException($stream, $durable, $m->status, $m->statusText);
                     }
                     break;
                 }
@@ -324,11 +454,21 @@ final class SocketTransport implements NatsTransport, ProbesPull
      * se evapora (02-naming.md §1.1): por eso se espera el acuse del stream, la única red de seguridad contra una errata de subject.
      *
      * @return array<string,mixed> el acuse (`stream`, `seq`, `duplicate`) o `{ error: … }`
+     *
+     * @throws NoRespondersException si ningún stream captura el subject (con `publish()` se envuelve en un mensaje accionable)
      */
     public function publishAck(string $subject, string $payload, array $headers = [], int $timeoutMs = self::API_TIMEOUT_MS): array
     {
+        $reply = $this->conn->request($subject, $payload, $timeoutMs, $headers);
+        $decoded = json_decode($reply->payload, true);
+
+        return is_array($decoded) ? $decoded : ['error' => ['description' => 'el acuse no es JSON']];
+    }
+
+    public function publish(string $subject, string $payload, array $headers = []): void
+    {
         try {
-            $reply = $this->conn->request($subject, $payload, $timeoutMs, $headers);
+            $ack = $this->publishAck($subject, $payload, $headers);
         } catch (NoRespondersException $e) {
             throw new \RuntimeException(
                 "JetStream no acusó recibo de la publicación en \"{$subject}\". Ningún stream captura ese subject. Revisa las mayúsculas "
@@ -337,14 +477,6 @@ final class SocketTransport implements NatsTransport, ProbesPull
                 $e,
             );
         }
-        $decoded = json_decode($reply->payload, true);
-
-        return is_array($decoded) ? $decoded : ['error' => ['description' => 'el acuse no es JSON']];
-    }
-
-    public function publish(string $subject, string $payload, array $headers = []): void
-    {
-        $ack = $this->publishAck($subject, $payload, $headers);
         if (isset($ack['error'])) {
             throw new \RuntimeException(
                 "JetStream rechazó la publicación en \"{$subject}\": " . self::errorText($ack) . '. Si dice «no stream», ningún stream captura '

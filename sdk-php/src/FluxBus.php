@@ -42,12 +42,21 @@ use Flux\Validation\Validator;
  */
 final class FluxBus
 {
+    /** Lo que espera cada fuente a un mensaje cuando el bucle de `run()` atiende a más de una. */
+    private const SLICE_MS = 200;
+
     private readonly Classifier $classifier;
     private readonly string $source;
     private readonly MetricsSink $metrics;
     private readonly ?Signer $signer;
     private readonly ?Verifier $verifier;
     private readonly ?Validator $validator;
+
+    /**
+     * El estado replicado (`put`, `delete`, `get`, `watch`) — specification/10-state.md. Solo con el transporte por defecto
+     * (`SocketTransport`): con otro, usarlo lanza un error que lo explica.
+     */
+    public readonly State\StateClient $state;
 
     /** @var list<Subscription> */
     private array $subscriptions = [];
@@ -86,6 +95,17 @@ final class FluxBus
 
         $this->metrics->connectionState(
             $transport->isConnected() ? ConnectionState::Connected : ConnectionState::Disconnected
+        );
+
+        $this->state = new State\StateClient(
+            $transport instanceof Transport\StateTransport ? $transport : null,
+            $options,
+            $this->source,
+            $this->metrics,
+            $this->classifier,
+            $this->validator,
+            $this->signer,
+            $this->verifier,
         );
     }
 
@@ -202,7 +222,7 @@ final class FluxBus
             producerversion: $this->options->version,
             // El contexto heredado gana sobre el default de conexión: un evento derivado
             // pertenece al tenant del evento que lo causó, no al del servicio.
-            tenantid: $tenantId ?? $inherited?->tenantid ?? $this->options->tenantId,
+            tenantid: $tenantId ?? $inherited?->tenantid ?? $this->options->tenantId ?? 'system',
             dataclassification: $classification ?? $this->options->classification,
             dataschema: $this->schemaFor($subject),
             // Si el evento no nace de otro, `correlationid` se inicializa con su propio
@@ -324,7 +344,7 @@ final class FluxBus
         if ($this->options->tenantIsolation === TenantIsolation::Strict && $tenantFilter === null) {
             throw new TenantIsolationException(
                 $subject,
-                self::tenantIsolationReason($this->options->tenantId),
+                self::tenantIsolationReason($this->options->tenantId ?? 'system'),
             );
         }
 
@@ -500,11 +520,18 @@ final class FluxBus
                 $this->subscriptions,
                 static fn (Subscription $s): bool => $s->active,
             ));
-            if ($active === []) {
+            $watching = $this->state->hasActiveWatches();
+            if ($active === [] && !$watching) {
                 return $processed;
             }
 
             $gotSomething = false;
+
+            // Con varias fuentes (suscripciones y `watch` de estado) cada una espera una rodaja corta, no el `idleTimeoutMs` entero: el
+            // bucle es SERIE —no hay hilos ni bucle de eventos—, y una fuente que espera cinco segundos a un mensaje que no llega dejaría
+            // sin atender a las demás y haría lenta la parada ordenada. Con una sola, el `idleTimeoutMs` completo, como siempre.
+            $sources = count($active) + ($watching ? 1 : 0);
+            $sliceMs = $sources > 1 ? min($idleTimeoutMs, self::SLICE_MS) : $idleTimeoutMs;
 
             foreach ($active as $subscription) {
                 // Antes de pedir mensajes, no después: si `fetch` se queda bloqueado el
@@ -524,12 +551,15 @@ final class FluxBus
                         $subscription->stream,
                         $subscription->durable,
                         1,
-                        $idleTimeoutMs,
+                        $sliceMs,
                     );
                 } catch (\Throwable $e) {
                     // Fallo transitorio del broker o de la conexión. No mata el bucle.
                     $this->log('warning', "[flux] fallo al recibir de {$subscription->subject}: "
                         . $e->getMessage());
+                    // Un fallo que no espera (un consumidor borrado, la conexión caída) haría girar el bucle a toda velocidad y llenaría el
+                    // log: una pausa corta, que `shouldStop` ve en la vuelta siguiente.
+                    usleep(200_000);
                     continue;
                 }
 
@@ -547,6 +577,14 @@ final class FluxBus
                             . $e->getMessage());
                     }
                     $processed++;
+                }
+            }
+
+            if ($watching) {
+                $fromState = $this->state->poll($sliceMs);
+                if ($fromState > 0) {
+                    $gotSomething = true;
+                    $processed += $fromState;
                 }
             }
 
@@ -1038,6 +1076,7 @@ final class FluxBus
         foreach ($this->subscriptions as $subscription) {
             $subscription->cancel();
         }
+        $this->state->stopAll();
 
         $this->transport->close();
 

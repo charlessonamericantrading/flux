@@ -85,6 +85,51 @@ final class Ack
     }
 
     /**
+     * La secuencia del stream del mensaje (`revision` de una entrada de estado), leída del subject de respuesta. `null` si no se puede
+     * determinar.
+     *
+     *     v1 (9 tokens):  $JS.ACK.<stream>.<consumer>.<entregas>.<sseq>.…
+     *     v2 (12 tokens): $JS.ACK.<dominio>.<hash>.<stream>.<consumer>.<entregas>.<sseq>.…
+     */
+    public static function streamSequence(?string $replyTo): ?int
+    {
+        if ($replyTo === null) {
+            return null;
+        }
+        $tokens = explode('.', $replyTo);
+        $index = match (true) {
+            count($tokens) === 9 => 5,
+            count($tokens) >= 12 => 7,
+            default => null,
+        };
+
+        return $index !== null && ctype_digit($tokens[$index]) ? (int) $tokens[$index] : null;
+    }
+
+    /**
+     * La secuencia del CONSUMIDOR de esta entrega (`cseq`), leída del subject de respuesta. Crece con cada entrega, también con las
+     * reentregas, y **vuelve a 1 si el durable se borró y se recreó**: es lo único que delata, sin preguntar al broker, que el consumidor de
+     * un `watch` ya no es el que se comprobó al abrir (`flux state resync`, o alguien que lo recreó con otro filtro).
+     *
+     *     v1 (9 tokens):  $JS.ACK.<stream>.<consumer>.<entregas>.<sseq>.<cseq>.…
+     *     v2 (12 tokens): $JS.ACK.<dominio>.<hash>.<stream>.<consumer>.<entregas>.<sseq>.<cseq>.…
+     */
+    public static function consumerSequence(?string $replyTo): ?int
+    {
+        if ($replyTo === null) {
+            return null;
+        }
+        $tokens = explode('.', $replyTo);
+        $index = match (true) {
+            count($tokens) === 9 => 6,
+            count($tokens) >= 12 => 8,
+            default => null,
+        };
+
+        return $index !== null && ctype_digit($tokens[$index]) ? (int) $tokens[$index] : null;
+    }
+
+    /**
      * Mensajes que el servidor sabe pendientes para este consumidor, leído del **último**
      * token del subject de respuesta.
      *

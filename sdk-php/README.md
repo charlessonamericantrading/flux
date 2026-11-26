@@ -34,7 +34,7 @@ composer require flux/sdk        # requiere PHP >= 8.2
 > |---|---|
 > | `signing` | ✅ |
 > | `security` | ✅ con el transporte por defecto (`SocketTransport`). **No** con `BasisNatsTransport` (ver [Seguridad](#seguridad-permisos-inbox-tls-y-credenciales)) |
-> | `state` | ⏳ el sobre, el subject y los vectores sí; `put`/`get`/`watch` contra el broker, en el siguiente paso |
+> | `state` | ✅ con el transporte por defecto: `put`/`delete`/`get` en cualquier script, `watch` en un worker (ver [Estado replicado](#estado-replicado-state)) |
 > | `rpc` | ⏳ ídem |
 >
 > `BasisNatsTransport` (sobre `basis-company/nats`) sigue verificado contra un broker **abierto**
@@ -530,6 +530,43 @@ new ConnectOptions(/* … */, pendingPollMs: 15_000);
 > casi nada siempre. Para publicar métricas de un publisher web hace falta un backend con
 > estado compartido (APCu, Redis) implementando `MetricsSink`. Es la contrapartida del
 > modelo de ejecución de PHP, no una limitación del recolector.
+
+## Estado replicado (`state`)
+
+El valor ACTUAL de un agregado, que su dueño publica y los demás observan ([10-state.md](../specification/10-state.md)): sustituye a
+`GET /clientes/123`, a la carga inicial y al polling de datos.
+
+```php
+$bus->state->put('clientes.cliente.v1', 'cli-1', ['clienteId' => 'cli-1', 'nombre' => 'Ana', 'aggregateVersion' => 7], tenantId: 'acme');
+$bus->state->delete('clientes.cliente.v1', 'cli-1', aggregateVersion: 8, tenantId: 'acme');   // una lápida: el dato personal sale del stream
+$entrada = $bus->state->get('clientes.cliente.v1', 'cli-1', tenantId: 'acme');                // StateEntry | null (una lápida es null)
+
+$bus->state->watch('clientes.cliente.v1', function (StateEntry $e, StateHandlerContext $ctx): void {
+    $e->deleted ? borrarCopia($e->tenantId, $e->key) : guardarCopia($e);   // idempotente y sin asumir orden
+}, tenantId: 'acme', onSynced: fn () => marcarListo());
+$bus->run();   // el worker conduce el watch
+```
+
+| | Dónde sirve |
+|---|---|
+| `put`, `delete`, `get` | **Cualquier script**, también una petición web: son llamadas síncronas puntuales (`get` sustituye a un `GET` a otro servicio) |
+| `watch` | **Un worker** (proceso CLI de larga vida, Swoole/RoadRunner): `watch()` registra y abre el durable, y el consumo lo conduce `run()`. En hosting compartido, sin worker, el camino es el gateway (`gateway/`, `12-edge.md`) |
+
+Lo que hace por ti, y **se ejecuta contra un `nats-server` real con los permisos de `gen-acl.mjs`**:
+
+- **`put` condicional**: no escribe una versión que no avanza (`stale`, que no es un error) y publica con `Nats-Expected-Last-Subject-Sequence`; el
+  conflicto es el 10071 **y el 10164** (en un R3 bajo carrera, A-49). Si el acuse se pierde, el reintento reconoce su propio mensaje por el `id` y no
+  lo toma por un `stale`. Tres conflictos seguidos son `STATE_CONFLICT`, reintentable.
+- **`watch`**: un durable por servicio y tenant, `last_per_subject`, `onSynced` UNA vez por `watch()` (de inmediato con el contrato vacío), DLQ de
+  estado **sin el dato** (la DLQ guarda 90 días), y reapertura del consumo tras un `flux state resync` (borrar y recrear el durable): un pull a un
+  consumidor que ya no existe no es «no hay mensajes», es un aviso y un reintento; y un durable recreado con **otro filtro** no se consume.
+- **Los siete códigos** de 04-errors.md §6, el dominio `state` reservado en `publish`, y L3 contra el índice `state` del bundle (la lápida contra `eliminado`).
+- Un `watch` abierto dentro de un handler **no** hereda el tenant del evento; un `put`, sí.
+
+**Qué NO hace** (y por qué es honesto): con `BasisNatsTransport` o `InMemoryTransport` el estado **falla de forma explícita** —no hay `DIRECT.GET` por
+subject ni la publicación condicional—: no se degrada en silencio.
+
+---
 
 ## Aislamiento de tenant
 

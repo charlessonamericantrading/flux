@@ -1218,13 +1218,19 @@
       "php": {
         "capabilities": [
           "signing",
-          "security"
+          "security",
+          "state"
         ],
         "evidence": {
           "security": [
             "sdk-php/tests/Integration/SecurityIntegrationTest.php",
             "sdk-php/tests/Integration/NotProvisionedIntegrationTest.php",
             "sdk-php/tests/NatsClientTest.php"
+          ],
+          "state": [
+            "sdk-php/tests/Integration/StateIntegrationTest.php",
+            "sdk-php/tests/Integration/StateSemanticsIntegrationTest.php",
+            "sdk-php/src/State/StateClient.php"
           ]
         }
       }
