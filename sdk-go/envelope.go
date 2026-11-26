@@ -16,6 +16,7 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 // DataClassification es la clasificación del dato transportado — 06-security.md §5.
@@ -327,24 +328,26 @@ func BuildEvent(in BuildEventInput) (Event, error) {
 		return Event{}, err
 	}
 
-	for _, req := range []struct{ name, value string }{
-		{"ID", in.ID},
-		{"Source", in.Source},
-		{"DataSchema", in.DataSchema},
-		{"CorrelationID", in.CorrelationID},
-		{"TenantID", in.TenantID},
-		{"ProducerVersion", in.ProducerVersion},
+	// Los atributos que el SDK rellena no pueden llegar vacíos: una cadena vacía y una ausente son lo mismo (01-envelope.md
+	// §3.1, §3.3), y un evento que su propio parser rechazaría no se construye. Con el código que daría el parser ante el
+	// mismo defecto.
+	for _, req := range []struct{ name, value, code string }{
+		{"ID", in.ID, CodeMissingRequiredAttr},
+		{"Source", in.Source, CodeMissingRequiredAttr},
+		{"DataSchema", in.DataSchema, CodeMissingRequiredAttr},
+		{"CorrelationID", in.CorrelationID, CodeMissingRequiredExt},
+		{"TenantID", in.TenantID, CodeMissingRequiredExt},
+		{"ProducerVersion", in.ProducerVersion, CodeMissingRequiredExt},
 	} {
 		if req.value == "" {
-			return Event{}, &EnvelopeError{Message: fmt.Sprintf(
+			return Event{}, invalidInput(req.code, fmt.Sprintf(
 				"%s es obligatorio y llegó vacío. Lo rellena el SDK a partir de ConnectOptions; "+
-					"si estás llamando a BuildEvent a mano, rellénalo (01-envelope.md §5)", req.name)}
+					"si estás llamando a BuildEvent a mano, rellénalo (01-envelope.md §5)", req.name))
 		}
 	}
 	if !in.DataClassification.IsValid() {
-		return Event{}, &EnvelopeError{Message: fmt.Sprintf(
-			"dataclassification %q no es válida: debe ser public, internal, confidential o restricted (06-security.md §5)",
-			in.DataClassification)}
+		return Event{}, &InvalidDataClassificationError{
+			baseError{CodeInvalidDataClassif, ClassPermanent, nil}, string(in.DataClassification), "rpc"}
 	}
 
 	t := in.Time
@@ -519,7 +522,10 @@ func marshalNoHTMLEscape(v any) ([]byte, error) {
 // El orden de las comprobaciones es el mismo que en el SDK de Node, para que los dos
 // den el mismo `code` ante el mismo mensaje corrupto.
 func ParseEvent(b []byte) (Event, error) {
-	if !json.Valid(b) {
+	// UTF-8 ESTRICTO: `json.Valid` sustituye los bytes inválidos en vez de rechazarlos, y un mensaje que no es UTF-8 —o que
+	// empieza por una marca de orden de bytes— no es JSON (RFC 8259 §8.1). Dos SDKs que lo interpretan distinto darían dos
+	// veredictos para el mismo mensaje.
+	if !utf8.Valid(b) || !json.Valid(b) {
 		return Event{}, NewPoisonError("el cuerpo del mensaje no es JSON válido",
 			WithCode("MALFORMED_JSON"))
 	}
@@ -631,6 +637,16 @@ func ParseEvent(b []byte) (Event, error) {
 		return Event{}, NewPoisonError(
 			"un atributo del envelope tiene un tipo incompatible con el contrato",
 			WithCode("INVALID_ATTRIBUTE_TYPE"), WithCause(err))
+	}
+	// Los tipos son exactos TAMBIÉN en lo no obligatorio: `dlqreason` es una de las tres clases y `dlqattempts` un entero de
+	// 0 a 2^32−1. Es el último código de ParseEvent (el orden es parte del contrato entre SDKs).
+	if r := e.DLQReason; r != "" && r != DLQReasonRetryable && r != DLQReasonPermanent && r != DLQReasonPoison {
+		return Event{}, NewPoisonError("dlqreason tiene un tipo incompatible con el contrato (01-envelope.md §2.4)",
+			WithCode("INVALID_ATTRIBUTE_TYPE"))
+	}
+	if e.DLQAttempts < 0 || int64(e.DLQAttempts) > 4294967295 {
+		return Event{}, NewPoisonError("dlqattempts tiene un tipo incompatible con el contrato (01-envelope.md §2.4)",
+			WithCode("INVALID_ATTRIBUTE_TYPE"))
 	}
 	return e, nil
 }

@@ -1182,13 +1182,18 @@
       "go": {
         "capabilities": [
           "signing",
-          "security"
+          "security",
+          "state"
         ],
         "evidence": {
           "security": [
             "sdk-go/security_integration_test.go",
             "sdk-go/security_connect_test.go",
             "sdk-go/security_test.go"
+          ],
+          "state": [
+            "sdk-go/state_integration_test.go",
+            "sdk-go/state_test.go"
           ]
         }
       },

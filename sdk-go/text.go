@@ -210,3 +210,8 @@ func timeFromParts(y, mo, d, h, mi, s, ms, offsetMin int) time.Time {
 	return time.Date(y, time.Month(mo), d, h, mi, s, ms*1_000_000, time.UTC).
 		Add(-time.Duration(offsetMin) * time.Minute)
 }
+
+// CanonicalTime devuelve la forma canónica de un instante RFC 3339 (`2026-08-20T10:41:07.318Z`: UTC, exactamente tres decimales y
+// `Z`), o ok=false si no es un instante válido. Los constructores puros normalizan con ella el `time` que reciben de fuera
+// (01-envelope.md §2.2).
+func CanonicalTime(text string) (string, bool) { return canonicalTime(text) }

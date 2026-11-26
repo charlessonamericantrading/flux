@@ -405,6 +405,53 @@ mencionar el tipo. No compensa para 1 MB.
 
 ---
 
+## Estado replicado: `State()` — capacidad `state`
+
+Un valor por clave, replicado por el broker y leído por quien lo necesita sin preguntar al dueño
+([`10-state.md`](../specification/10-state.md)). El dueño escribe con `Put` y `Delete`; los demás servicios lo observan con
+`Watch` (la copia local) o lo leen con `Get`.
+
+```go
+st := bus.State()
+
+// El DUEÑO. `aggregateVersion` es suyo (su contador monotónico): el SDK ni lo inventa ni lo incrementa.
+res, err := st.Put(ctx, "clientes.cliente.v1", "cli-1",
+    map[string]any{"clienteId": "cli-1", "nombre": "Ana", "aggregateVersion": 7},
+    flux.WithStateTenant("acme"))
+// res.Outcome: "ok", o "stale" si la versión no avanza (NO es un error: otro escribió una más nueva).
+
+_, err = st.Delete(ctx, "clientes.cliente.v1", "cli-1", 8, flux.WithStateTenant("acme")) // lápida: lleva su versión
+
+// El OBSERVADOR: la copia local. `WithOnSynced` avisa UNA vez, cuando ya tiene el último valor de cada clave.
+sub, err := st.Watch(ctx, "clientes.cliente.v1", func(ctx context.Context, e flux.StateEntry, d flux.StateDelivery) error {
+    // e.Deleted: una lápida. Un error devuelto se clasifica como el de un evento (reintento, DLQ).
+    return nil
+}, flux.WithOnSynced(func() { /* ya se puede servir lecturas */ }))
+defer sub.Unsubscribe()
+```
+
+| Qué | Cómo lo cumple el SDK de Go |
+|---|---|
+| **Escritura condicional** | `Put` y `Delete` siguen el algoritmo de §3.2: leer la clave, **reconocer la propia escritura por su `id`** (un acuse perdido no se convierte en `stale`), descartar una versión que no avanza, y publicar por JetStream con `Nats-Expected-Last-Subject-Sequence`. Ante un conflicto de secuencia vuelve a leer, hasta **3 intentos**, y agotados da `STATE_CONFLICT` (RETRYABLE). El conflicto se reconoce por el **código** de la API de JetStream —**10071 y 10164**, no por el texto—. |
+| **Identidad** | El tenant va en el subject (`state.<dominio>.<agregado>.v<major>.<tenant>.<clave>`) y **no hay tenant por defecto** ni `system` implícito: sin tenant, `INVALID_TENANT_FOR_STATE`. La clave se valida (`^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$`): el broker acepta `*`, `a.b` y 2000 caracteres, y una clave sin validar es un subject fantasma. |
+| **Clasificación** | Sin `WithStateClassification`, `confidential` (no la de la conexión). `restricted` se rechaza al publicar y es **POISON** al consumir. La lápida es siempre `internal`. |
+| **L3** | Con `Validation` activa, `data` se valida contra el esquema que resuelve el índice `state` del bundle —sin red— **antes de leer ni escribir**, y el mensaje cita la **ruta y la regla, nunca el valor** (un estado es donde vive el dato personal). |
+| **Un observador** | Un durable `<servicio>__state_<contrato>` con `DeliverLastPerSubject`: un observador nuevo recibe solo el último valor de cada clave, no el historial. Si el durable se **borra** bajo el `Watch` (`flux state resync`), la librería para el consumo en ~1 ms y el SDK lo **reabre**. |
+| **Lo que miente** | Una entrada cuyo `tenantid`, `subject` o `type` no coinciden con el subject de NATS es **POISON** (`STATE_SUBJECT_MISMATCH`) y no se aplica. La DLQ de estado guarda `{ key, revision }`: nunca el `data` (90 días de retención) ni la firma. |
+| **Permisos** | `Put` y `Delete` fallan con `PERMISSION_DENIED` (no por timeout) si falta publicar en el subject del estado; un stream sin aprovisionar es `NOT_PROVISIONED` con las dos causas posibles (stream o `allow_direct` ausentes). |
+
+Los siete códigos de §6 son `INVALID_TENANT_FOR_STATE`, `INVALID_STATE_CONTRACT`, `INVALID_STATE_KEY`,
+`MISSING_AGGREGATE_VERSION`, `STATE_SUBJECT_MISMATCH`, `STATE_CONFLICT` y `RESERVED_DOMAIN`; cada uno es un tipo propio con
+su clase y su código **fijos** y se reconoce con `errors.As`. `INVALID_DATACLASSIFICATION` y `INVALID_SCHEMA` (L3) completan
+los de la capacidad.
+
+### Lo que se midió de `nats.go` para el estado
+
+`PublishMsg` con `WithExpectLastSequencePerSubject` devuelve un `*jetstream.APIError` con `ErrorCode` 10071 (239 de 239
+rechazos con 8 escritores sobre una clave); un `DIRECT.GET` de una clave ausente contesta con la cabecera `Status: 404` y sin
+error, y el de un stream que no existe da `ErrNoResponders`; y un durable borrado bajo un `Consume` vivo entrega
+`jetstream.ErrConsumerDeleted` y la librería **para ella misma** el consumo en ~1 ms (en Node son 43 s). PLAN.md, A-196 y A-197.
+
 ## Métricas
 
 Siete métricas con nombres y etiquetas fijados por el protocolo
@@ -686,6 +733,9 @@ servidor**, no solo sobre la solicitada.
 | `security.go` | `Credentials`, `TLSOptions`, `ConnectionRejectedError`, `InvalidCredentialsError`, `InvalidTLSOptionsError`, `NotProvisionedError`, `PermissionDeniedError`, y la traducción de las opciones a `nats.go` |
 | `denials.go` | Las denegaciones de permisos que `nats.go` solo entrega de forma asíncrona, y `guard` (competirlas con la respuesta) |
 | `text.go`, `canonical.go` | UTF-8 literal y la forma canónica de `data` (`01-envelope.md §4.1`) |
+| `state.go`, `state_pure.go` | `State()`: `Put`, `Delete`, `Get`, `Watch` (`10-state.md`); la parte pura —subject, contrato, clave, `aggregateVersion`, sobre de estado y de DLQ— es lo que ejerce el arnés cruzado |
+| `validation.go` | también el mensaje de L3 **sin valores** de un estado |
+| `external_id.go` | `WithExternalKey`: el `id` determinista de un hecho importado (`01-envelope.md §2.6.1`) |
 
 ## Desarrollo
 

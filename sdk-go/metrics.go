@@ -28,6 +28,8 @@ const (
 	MetricHandlerDuration = "flux_event_handler_duration_seconds"
 	MetricEventsDLQ       = "flux_events_dlq_total"
 	MetricEventsRetried   = "flux_events_retried_total"
+	// MetricStateWrites es de la capacidad `state` (08-observability.md §2.4).
+	MetricStateWrites     = "flux_state_writes_total"
 	MetricConsumerPending = "flux_consumer_pending"
 	MetricConnectionState = "flux_connection_state"
 )
@@ -218,6 +220,12 @@ func (m *InMemoryMetrics) observe(name string, labels []label, value float64) {
 	}
 }
 
+// StateWrite implementa StateMetricsSink: `flux_state_writes_total{contract, outcome}`, un `Put` o un `Delete`, sin
+// distinguirlos (08-observability.md §2.4). `contract` es lo ÚNICO que el estado añade como etiqueta: nunca la clave ni el tenant.
+func (m *InMemoryMetrics) StateWrite(contract, outcome string) {
+	m.inc(MetricStateWrites, []label{{"contract", contract}, {"outcome", outcome}})
+}
+
 // EventPublished implementa MetricsSink.
 func (m *InMemoryMetrics) EventPublished(subject string, outcome PublishOutcome) {
 	m.inc(MetricEventsPublished, []label{{"subject", subject}, {"outcome", string(outcome)}})
@@ -289,7 +297,7 @@ func (m *InMemoryMetrics) Render() string {
 		}
 	}
 	familia("counter", []string{
-		MetricEventsPublished, MetricEventsConsumed, MetricEventsDLQ, MetricEventsRetried,
+		MetricEventsPublished, MetricEventsConsumed, MetricEventsDLQ, MetricEventsRetried, MetricStateWrites,
 	}, counters)
 	familia("gauge", []string{MetricConsumerPending, MetricConnectionState}, gauges)
 

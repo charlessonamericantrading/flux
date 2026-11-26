@@ -149,6 +149,7 @@ type DLQEventInfo struct {
 // ─── Opciones de publicación ─────────────────────────────────────────────────
 
 type publishConfig struct {
+	externalKey    *string
 	aggregateID    string
 	tenantID       string
 	classification DataClassification
@@ -163,6 +164,14 @@ type PublishOption func(*publishConfig)
 // NO al subject de NATS — 01-envelope.md §2.1.
 func WithAggregateID(id string) PublishOption {
 	return func(c *publishConfig) { c.aggregateID = id }
+}
+
+// WithExternalKey publica un hecho IMPORTADO de un sistema externo (el aviso de una pasarela de pagos, que el proveedor
+// reenvía durante horas): el `id` deja de ser un UUIDv7 nuevo y se DERIVA de `<source>|<clave>` y del instante del hecho,
+// de modo que el mismo hecho reenviado da siempre el mismo `id` y los consumidores lo deduplican (01-envelope.md §2.6.1).
+// EXIGE WithEventTime: el instante del hecho EXTERNO es lo que hace estable el `id`; con «ahora», cada reenvío tendría el suyo.
+func WithExternalKey(key string) PublishOption {
+	return func(c *publishConfig) { c.externalKey = &key }
 }
 
 // WithTenantID sobrescribe el tenant para esta publicación.
@@ -564,11 +573,25 @@ func (b *Bus) Publish(ctx context.Context, subject string, data any, opts ...Pub
 	// UUIDv7: monotónico en el tiempo, así que ordenar por `id` dentro de un mismo
 	// `source` equivale a ordenar por instante de generación — útil al reconstruir
 	// historiales desde la DLQ (01-envelope.md §2.2).
-	id, err := uuid.NewV7()
-	if err != nil {
-		return Event{}, fmt.Errorf("flux: no se pudo generar el UUIDv7 del evento: %w", err)
+	var eventID string
+	if cfg.externalKey != nil {
+		// Un hecho importado de un sistema externo tiene un `id` DETERMINISTA (01-envelope.md §2.6.1).
+		if cfg.when.IsZero() {
+			return Event{}, &EnvelopeError{Message: "WithExternalKey exige WithEventTime: el instante del hecho EXTERNO, que es lo que " +
+				"hace estable el `id`. Con «ahora» cada reenvío del proveedor tendría su propio `id` y nadie podría deduplicarlo " +
+				"(01-envelope.md §2.6.1). Si el proveedor no da un instante, no hay `id` determinista: omite WithExternalKey y " +
+				"deduplica por una clave de negocio de `data`"}
+		}
+		if eventID, err = ExternalEventID(b.source, *cfg.externalKey, cfg.when); err != nil {
+			return Event{}, err
+		}
+	} else {
+		id, err := uuid.NewV7()
+		if err != nil {
+			return Event{}, fmt.Errorf("flux: no se pudo generar el UUIDv7 del evento: %w", err)
+		}
+		eventID = id.String()
 	}
-	eventID := id.String()
 
 	inherited, hasContext := EventContextFrom(ctx)
 
