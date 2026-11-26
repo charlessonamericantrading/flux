@@ -1,0 +1,36 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.internal/rpc/clientes/cliente/calcular-descuento/request/1.0.0.json",
+  "title": "rpc clientes.cliente.v1.calcular-descuento — petición",
+  "description": "La PETICIÓN de `clientes.cliente.v1.calcular-descuento`: un CÁLCULO, no un dato guardado —el caso para el que existe la petición/respuesta—. Va con `type: com.flux.rpc.clientes.cliente.calcular-descuento.request.v1`. Lleva la referencia `clienteId`, nunca el dato del cliente. Importes en enteros de la unidad mínima (`totalCents`) más moneda ISO 4217 (01-envelope.md §4). Ejemplos byte a byte en 11-request-reply.md §3.5.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "clienteId",
+    "totalCents",
+    "moneda"
+  ],
+  "properties": {
+    "clienteId": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$",
+      "description": "Identificador del cliente: una referencia opaca, nunca PII. Es el mismo `clienteId` que llevan los eventos y la clave del estado de `clientes.cliente.v1`."
+    },
+    "totalCents": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Total del pedido en la unidad mínima de la moneda (céntimos). Nunca un decimal."
+    },
+    "moneda": {
+      "type": "string",
+      "pattern": "^[A-Z]{3}$",
+      "description": "Moneda, ISO 4217."
+    },
+    "campana": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 100,
+      "description": "Campaña comercial en curso, si hay una. Opcional."
+    }
+  }
+}

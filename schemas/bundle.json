@@ -1,7 +1,7 @@
 {
-  "$comment": "GENERADO por scripts/bundle-schemas.mjs — no editar a mano. Indexa los JSON Schema por la URI que aparece en el atributo dataschema del CloudEvent. `subjects` y `state` resuelven el esquema de versión más alta de un contrato de evento y de estado respectivamente.",
+  "$comment": "GENERADO por scripts/bundle-schemas.mjs — no editar a mano. Indexa los JSON Schema por la URI que aparece en el atributo dataschema del CloudEvent. `subjects`, `state` y `rpc` resuelven el esquema de versión más alta de un contrato de evento, de estado y de una operación de petición/respuesta (esta, uno por lado: { request, reply }) respectivamente.",
   "generatedFrom": "schemas/",
-  "count": 6,
+  "count": 11,
   "subjects": {
     "facturacion.factura.v2.emitida": "https://schemas.internal/facturacion/factura/emitida/2.0.0.json",
     "inventario.stock.v1.ajustado": "https://schemas.internal/inventario/stock/ajustado/1.0.0.json",
@@ -10,6 +10,16 @@
   },
   "state": {
     "clientes.cliente.v1": "https://schemas.internal/state/clientes/cliente/1.0.0.json"
+  },
+  "rpc": {
+    "clientes.cliente.v1.calcular-descuento": {
+      "request": "https://schemas.internal/rpc/clientes/cliente/calcular-descuento/request/1.0.0.json",
+      "reply": "https://schemas.internal/rpc/clientes/cliente/calcular-descuento/reply/1.0.0.json"
+    },
+    "clientes.cliente.v1.obtener": {
+      "request": "https://schemas.internal/rpc/clientes/cliente/obtener/request/1.0.0.json",
+      "reply": "https://schemas.internal/rpc/clientes/cliente/obtener/reply/1.0.0.json"
+    }
   },
   "schemas": {
     "https://schemas.internal/facturacion/factura/emitida/2.0.0.json": {
@@ -293,6 +303,130 @@
         }
       }
     },
+    "https://schemas.internal/rpc/clientes/cliente/calcular-descuento/reply/1.0.0.json": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "$id": "https://schemas.internal/rpc/clientes/cliente/calcular-descuento/reply/1.0.0.json",
+      "title": "rpc clientes.cliente.v1.calcular-descuento — respuesta",
+      "description": "La RESPUESTA de `clientes.cliente.v1.calcular-descuento`, con `type: com.flux.rpc.clientes.cliente.calcular-descuento.reply.v1`. El descuento va en la unidad mínima de la moneda de la petición. Quien escribe esta respuesta es el dueño y quienes la leen son los llamantes: añadir un valor a un enum exigiría `x-extensible-enum` (11-request-reply.md §11).",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "descuentoCents",
+        "moneda"
+      ],
+      "properties": {
+        "descuentoCents": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Descuento en la unidad mínima de la moneda. Nunca un decimal."
+        },
+        "moneda": {
+          "type": "string",
+          "pattern": "^[A-Z]{3}$",
+          "description": "Moneda, ISO 4217: la de la petición."
+        },
+        "motivo": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 200,
+          "description": "Por qué se aplica ese descuento, en texto legible. Opcional."
+        }
+      }
+    },
+    "https://schemas.internal/rpc/clientes/cliente/calcular-descuento/request/1.0.0.json": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "$id": "https://schemas.internal/rpc/clientes/cliente/calcular-descuento/request/1.0.0.json",
+      "title": "rpc clientes.cliente.v1.calcular-descuento — petición",
+      "description": "La PETICIÓN de `clientes.cliente.v1.calcular-descuento`: un CÁLCULO, no un dato guardado —el caso para el que existe la petición/respuesta—. Va con `type: com.flux.rpc.clientes.cliente.calcular-descuento.request.v1`. Lleva la referencia `clienteId`, nunca el dato del cliente. Importes en enteros de la unidad mínima (`totalCents`) más moneda ISO 4217 (01-envelope.md §4). Ejemplos byte a byte en 11-request-reply.md §3.5.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "clienteId",
+        "totalCents",
+        "moneda"
+      ],
+      "properties": {
+        "clienteId": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$",
+          "description": "Identificador del cliente: una referencia opaca, nunca PII. Es el mismo `clienteId` que llevan los eventos y la clave del estado de `clientes.cliente.v1`."
+        },
+        "totalCents": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Total del pedido en la unidad mínima de la moneda (céntimos). Nunca un decimal."
+        },
+        "moneda": {
+          "type": "string",
+          "pattern": "^[A-Z]{3}$",
+          "description": "Moneda, ISO 4217."
+        },
+        "campana": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 100,
+          "description": "Campaña comercial en curso, si hay una. Opcional."
+        }
+      }
+    },
+    "https://schemas.internal/rpc/clientes/cliente/obtener/reply/1.0.0.json": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "$id": "https://schemas.internal/rpc/clientes/cliente/obtener/reply/1.0.0.json",
+      "title": "rpc clientes.cliente.v1.obtener — respuesta",
+      "description": "La RESPUESTA de `clientes.cliente.v1.obtener`, con `type: com.flux.rpc.clientes.cliente.obtener.reply.v1`. Lleva dato personal (`nombre`, `email`), así que los campos van con `x-pii` y el que responde la clasifica `confidential`: el broker no la persiste (core NATS, sin stream) mientras ningún stream capture `rpc.>` (`flux doctor`, 11-request-reply.md §8). Quien escribe esta respuesta es el dueño y quienes la leen son los llamantes: un valor nuevo en un enum EXIGE `x-extensible-enum`.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "clienteId",
+        "nombre",
+        "email"
+      ],
+      "properties": {
+        "clienteId": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$",
+          "description": "Identificador del cliente: una referencia opaca, nunca PII. Es el mismo `clienteId` que llevan los eventos y la clave del estado de `clientes.cliente.v1`."
+        },
+        "nombre": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 200,
+          "x-pii": true,
+          "description": "Nombre completo. Dato personal: el SDK lo redacta en logs."
+        },
+        "email": {
+          "type": "string",
+          "minLength": 3,
+          "maxLength": 254,
+          "pattern": "^[^@\\s]+@[^@\\s]+$",
+          "x-pii": true,
+          "description": "Correo electrónico. Dato personal: el SDK lo redacta en logs."
+        },
+        "pais": {
+          "type": "string",
+          "pattern": "^[A-Z]{2}$",
+          "description": "País de residencia, ISO 3166-1 alfa-2. Opcional."
+        }
+      }
+    },
+    "https://schemas.internal/rpc/clientes/cliente/obtener/request/1.0.0.json": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "$id": "https://schemas.internal/rpc/clientes/cliente/obtener/request/1.0.0.json",
+      "title": "rpc clientes.cliente.v1.obtener — petición",
+      "description": "La PETICIÓN de la operación `clientes.cliente.v1.obtener` (subject `rpc.clientes.cliente.v1.obtener`), con `type: com.flux.rpc.clientes.cliente.obtener.request.v1`. Ejemplo de FORMA: cómo se declara un esquema de petición y su respuesta con `x-pii`. Ojo: leer un dato que el dueño GUARDA es estado (`state.get` / `state.watch`, 10-state.md), no petición/respuesta (11-request-reply.md §1); una operación así solo se justifica si el dueño no replica el agregado como estado. Quien escribe este esquema es el DUEÑO, que es quien lo lee: ver la regla de compatibilidad de 11-request-reply.md §11.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "clienteId"
+      ],
+      "properties": {
+        "clienteId": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$",
+          "description": "Identificador del cliente: una referencia opaca, nunca PII. Es el mismo `clienteId` que llevan los eventos y la clave del estado de `clientes.cliente.v1`."
+        }
+      }
+    },
     "https://schemas.internal/state/clientes/cliente/1.0.0.json": {
       "$schema": "https://json-schema.org/draft/2020-12/schema",
       "$id": "https://schemas.internal/state/clientes/cliente/1.0.0.json",
@@ -336,6 +470,63 @@
           "type": "string",
           "pattern": "^[A-Z]{2}$",
           "description": "País de residencia, ISO 3166-1 alfa-2. Opcional."
+        }
+      }
+    },
+    "https://schemas.internal/system/rpc/error/1.0.0.json": {
+      "$schema": "https://json-schema.org/draft/2020-12/schema",
+      "$id": "https://schemas.internal/system/rpc/error/1.0.0.json",
+      "title": "system.rpc.error",
+      "description": "El error de una petición/respuesta: lo que el que responde devuelve EN LUGAR de la respuesta. Es el `dataschema` FIJO de todo error, de cualquier operación, con `type: com.flux.rpc.error.v1` y `dataclassification: internal`. `class` es binaria —`retryable` o `permanent`—: quien llama lo convierte en `RetryableError` o `PermanentError`, y un handler de eventos que llama a una operación hereda la clasificación sin hacer nada. `code` es un identificador estable (`HTTP_503`, `PEDIDO_YA_CANCELADO`), nunca el mensaje. `message` NO DEBE contener valores de `data` —cita rutas (`/totalCents`), no contenidos—: acaba en logs. `retryAfterMs` solo tiene sentido con `retryable` — 11-request-reply.md §3.3.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "class",
+        "code",
+        "message"
+      ],
+      "properties": {
+        "class": {
+          "type": "string",
+          "enum": [
+            "retryable",
+            "permanent"
+          ],
+          "description": "Qué hacer con el fallo: reintentar o no. `poison` no viaja: para quien llama, una petición que el otro lado no pudo interpretar es `permanent`."
+        },
+        "code": {
+          "type": "string",
+          "pattern": "^[A-Z][A-Z0-9]*(_[A-Z0-9]+)*$",
+          "maxLength": 64,
+          "description": "Código estable y agrupable (04-errors.md §5): MAYÚSCULAS y guiones bajos. Nunca el texto del error."
+        },
+        "message": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1000,
+          "description": "Qué falló y cómo se arregla, para quien lee el log. Sin valores de `data` ni el texto de excepciones no clasificadas."
+        },
+        "retryAfterMs": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Sugerencia para el PRIMER reintento, en milisegundos. Solo con `class: retryable`."
+        }
+      },
+      "if": {
+        "properties": {
+          "class": {
+            "const": "permanent"
+          }
+        },
+        "required": [
+          "class"
+        ]
+      },
+      "then": {
+        "not": {
+          "required": [
+            "retryAfterMs"
+          ]
         }
       }
     },
