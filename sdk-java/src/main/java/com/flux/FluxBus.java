@@ -615,6 +615,10 @@ public final class FluxBus implements AutoCloseable {
     final Validation.Validator validator;
     final boolean validateOnConsume;
     final String source;
+    /** El fallo de firma (en modo {@code warn}) de la verificacion en curso EN ESTE HILO; ver {@link #verify}. */
+    private final ThreadLocal<String> signatureFailure = new ThreadLocal<>();
+    /** Estado replicado — la capacidad {@code state}. */
+    private final FluxState state;
     private final Set<Subscription> subscriptions =
             Collections.newSetFromMap(new ConcurrentHashMap<>());
     private final Set<String> ensuredStreams = ConcurrentHashMap.newKeySet();
@@ -658,7 +662,7 @@ public final class FluxBus implements AutoCloseable {
         // Las claves se decodifican UNA vez, en connect(): un PEM mal escrito debe romper
         // el arranque del servicio y no la primera publicacion a las 3 de la manana.
         this.signer = Signing.createSigner(options.signing);
-        this.verifier = Signing.createVerifier(options.signing);
+        this.verifier = Signing.createVerifier(options.signing, code -> signatureFailure.set(code));
         // Los esquemas se compilan UNA vez, por el mismo motivo y ademas por throughput:
         // compilar un JSON Schema por evento esta en la ruta caliente. En modo OFF esto
         // devuelve null y no se carga ni la libreria de validacion — 00-protocol.md §5.
@@ -679,6 +683,7 @@ public final class FluxBus implements AutoCloseable {
                             return t;
                         })
                         : null;
+        this.state = new FluxState(this);
         this.metrics.connectionState(MetricsSink.ConnectionState.CONNECTED);
     }
 
@@ -829,6 +834,38 @@ public final class FluxBus implements AutoCloseable {
         return subscriptions.size();
     }
 
+    /**
+     * Estado replicado — la capacidad {@code state} (specification/10-state.md): {@code put}, {@code delete}, {@code get} y
+     * {@code watch}. El valor ACTUAL de un agregado, que su dueno publica y los demas observan.
+     */
+    public FluxState state() {
+        return state;
+    }
+
+    // ─── lo que comparte state (package-private) ──────────────────────
+
+    /** Firma el evento si hay clave. Es lo ULTIMO antes de serializar: la firma cubre el sobre completo (07-signing.md §5). */
+    FluxEvent sign(FluxEvent event) {
+        return signer != null ? signer.sign(event) : event;
+    }
+
+    /**
+     * Verifica la firma. {@code require} lanza (POISON); {@code warn} la registra y sigue, y entonces devuelve {@code true}:
+     * el que consume cuenta {@code invalid_signature} sin cambiar el destino del mensaje.
+     */
+    boolean verify(FluxEvent event) {
+        if (verifier == null) {
+            return false;
+        }
+        signatureFailure.remove();
+        try {
+            verifier.check(event);
+            return signatureFailure.get() != null;
+        } finally {
+            signatureFailure.remove();
+        }
+    }
+
     /** Informa si la conexion sigue viva. Es el healthcheck que exige 03-delivery.md §6. */
     public boolean isConnected() {
         return connection.getStatus() == Connection.Status.CONNECTED;
@@ -841,6 +878,7 @@ public final class FluxBus implements AutoCloseable {
             s.unsubscribe();
         }
         subscriptions.clear();
+        state.stopAll();
         wipScheduler.shutdownNow();
         if (pendingScheduler != null) {
             pendingScheduler.shutdownNow();

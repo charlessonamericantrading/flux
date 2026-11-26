@@ -270,7 +270,7 @@ fuente es `protocol.json`.
 | **declara** la capacidad y **no tiene arnés registrado** (o figura en `pending`) | **FALLO**, aunque se ejecute con `--only` que lo excluya: sin arnés no hay evidencia |
 | **no declara** la capacidad | no la ejecuta, la marca `–` en la tabla e imprime **`N/A: no declara state`** (o `rpc`) en el resumen. No es un fallo; tampoco es un salto silencioso |
 
-Hoy declaran `state` y `rpc` Node y Rust; Python, Go, Java, .NET y PHP salen `N/A` en las dos.
+Hoy declaran `state` Node, Rust y Java, y `rpc` Node y Rust; Python, Go, .NET y PHP salen `N/A` en las dos.
 
 `--exigir state,rpc` añade lo que un «N/A» verde no demuestra: **falla** si ningún SDK de los activos ejecutó esa
 capacidad (porque `protocol.json` dejó de declararla, o porque un `--only` dejó fuera a quien la declara). CI lo

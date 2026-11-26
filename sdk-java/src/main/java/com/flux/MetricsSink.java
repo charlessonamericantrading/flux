@@ -96,6 +96,72 @@ public interface MetricsSink {
         }
     }
 
+    /** Etiqueta {@code outcome} de {@code flux_state_writes_total} — §2.4. */
+    enum StateWriteOutcome {
+        OK("ok"),
+        /** La version no avanzaba: NO es un error. */
+        STALE("stale"),
+        /** El chequeo de secuencia agoto sus 3 intentos: {@code STATE_CONFLICT}. */
+        CONFLICT("conflict"),
+        /** {@code MISSING_AGGREGATE_VERSION}, o la validacion L3 de {@code data} falla. */
+        INVALID_SCHEMA("invalid_schema");
+
+        private final String wire;
+
+        StateWriteOutcome(String wire) {
+            this.wire = wire;
+        }
+
+        public String wire() {
+            return wire;
+        }
+    }
+
+    /** Etiqueta {@code outcome} de {@code flux_rpc_client_requests_total} — §2.5. Uno por llamada. */
+    enum RpcClientOutcome {
+        OK("ok"),
+        UNAVAILABLE("unavailable"),
+        TIMEOUT("timeout"),
+        RETRYABLE("retryable"),
+        /** Un error {@code permanent} del que responde, {@code PERMISSION_DENIED}, {@code STALE_REQUEST}, {@code RPC_MESSAGE_TOO_LARGE} o un fallo de firma. */
+        PERMANENT("permanent"),
+        INVALID_SCHEMA("invalid_schema"),
+        /** {@code RPC_INVALID_REPLY}: lo que llego no es la respuesta a esta peticion. */
+        INVALID_REPLY("invalid_reply");
+
+        private final String wire;
+
+        RpcClientOutcome(String wire) {
+            this.wire = wire;
+        }
+
+        public String wire() {
+            return wire;
+        }
+    }
+
+    /** Etiqueta {@code outcome} de {@code flux_rpc_server_requests_total} — §2.5. Uno por peticion recibida. */
+    enum RpcServerOutcome {
+        OK("ok"),
+        RETRYABLE("retryable"),
+        PERMANENT("permanent"),
+        /** La peticion no se pudo interpretar o no traia subject de respuesta: es lo que debe despertar a alguien. */
+        POISON("poison"),
+        INVALID_SCHEMA("invalid_schema"),
+        INVALID_SIGNATURE("invalid_signature"),
+        STALE_REQUEST("stale_request");
+
+        private final String wire;
+
+        RpcServerOutcome(String wire) {
+            this.wire = wire;
+        }
+
+        public String wire() {
+            return wire;
+        }
+    }
+
     /** Valores de {@code flux_connection_state} — §2.1. */
     enum ConnectionState {
         DISCONNECTED(0),
@@ -155,6 +221,30 @@ public interface MetricsSink {
 
     /** {@code flux_connection_state}. Sin etiquetas — §2. */
     void connectionState(ConnectionState state);
+
+    /**
+     * {@code flux_state_writes_total{contract,outcome}} — la capacidad {@code state} (08-observability.md §2.4).
+     *
+     * <p>OPCIONAL a proposito ({@code default}): un {@code MetricsSink} escrito antes de la capacidad {@code state} sigue
+     * compilando, y las siete metricas de todo SDK L2 no cambian. {@code contract} es {@code <dominio>.<agregado>.v<major>};
+     * NUNCA la clave ni el tenant.
+     */
+    default void stateWrite(String contract, StateWriteOutcome outcome) {
+    }
+
+    /**
+     * Las metricas de la capacidad {@code rpc} (08-observability.md §2.5): van fuera de las siete y son opcionales por la
+     * misma razon. {@code operation} es {@code <dominio>.<agregado>.v<major>.<operacion>}, sin {@code rpc.}.
+     */
+    default void rpcClientRequest(String operation, RpcClientOutcome outcome) {
+    }
+
+    default void rpcServerRequest(String operation, RpcServerOutcome outcome) {
+    }
+
+    /** {@code role}: {@code client} o {@code server}. Mismos buckets que {@link #DURATION_BUCKETS}. */
+    default void rpcDuration(String operation, String role, double seconds) {
+    }
 
     /**
      * No-op. Es el DEFAULT: un SDK de protocolo no debe imponer un backend de metricas a

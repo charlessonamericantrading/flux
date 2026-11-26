@@ -7,9 +7,10 @@ se comporta exactamente como en L2 y no arrastra ninguna dependencia de más.
 El contrato normativo vive en [`specification/`](../specification/); si algo de este
 README diverge de la spec, manda la spec.
 
-**Capacidades opcionales** (`protocol.json` → `capabilities.sdks.java`): `signing` y `security`. La segunda se declara **solo**
-porque sus pruebas se ejecutan contra un `nats-server` real con los permisos que genera `scripts/gen-acl.mjs` y los streams que
-crea `flux provision` (§Seguridad).
+**Capacidades opcionales** (`protocol.json` → `capabilities.sdks.java`): `signing`, `security` y `state`. Las dos últimas se
+declaran **solo** porque sus pruebas se ejecutan contra un `nats-server` real con los permisos que genera `scripts/gen-acl.mjs`
+y los streams que crea `flux provision` (§Seguridad, §Estado replicado), y porque los vectores cruzados de `state` dan los
+**mismos bytes y códigos** que Node y Rust.
 
 ```xml
 <dependency>
@@ -425,6 +426,48 @@ ajeno (`/connz` lo confirma en las pruebas). `subscribe()` pregunta por el durab
 crea si existe: con los permisos de producción no hay `CONSUMER.CREATE` y crear primero dejaba una violación en el log del
 servidor en cada arranque.
 
+## Estado replicado (`state`)
+
+El valor **actual** de un agregado, que su dueño publica y los demás observan
+([`10-state.md`](../specification/10-state.md)): sustituye a `GET /clientes/123`, a la carga inicial y al polling.
+
+```java
+FluxState state = bus.state();                                   // tenantId de connect(), o PutOptions.tenantId(...)
+
+state.put("clientes.cliente.v1", "cli-1", Map.of("clienteId", "cli-1", "nombre", "Ana",
+        "email", "ana@example.com", "aggregateVersion", 7));    // → WriteResult(applied, OK|STALE, revision)
+state.delete("clientes.cliente.v1", "cli-1", 8);                 // una LÁPIDA: el dato personal ya no está en el stream
+Optional<FluxState.Entry> e = state.get("clientes.cliente.v1", "cli-1");   // DIRECT.GET; vacío si no existe o es una lápida
+
+state.watch("clientes.cliente.v1", (ctx, entry, delivery) -> {
+    if (entry.deleted()) { /* DEBE borrar su copia local */ }
+    else upsert(entry.key(), entry.data(), entry.aggregateVersion());   // idempotente; WHERE aggregate_version < $n
+}, new FluxState.WatchOptions().onSynced(() -> listo()));
+```
+
+`put` es **condicional**: relee la clave, no escribe una versión que no avanza (`stale`, que **no** es un error) y publica con
+`Nats-Expected-Last-Subject-Sequence`. El conflicto es el código **10071 o el 10164** (el segundo, sin número, es el que da un
+cluster bajo carrera): se reconocen los dos y se reintenta hasta 3 veces (`STATE_CONFLICT`, RETRYABLE). Si el mensaje leído es
+**el propio** (un acuse perdido), se reconoce por el `id` y no se convierte en un `stale` con su propio dato. `aggregateVersion`
+es del dueño, no del SDK. Los siete códigos de [`04-errors.md` §6](../specification/04-errors.md) y la validación en el orden de
+`10-state.md` §3.6 —**sin red**— están cubiertos por los vectores cruzados con Node y Rust, byte a byte.
+
+**El `watch` no usa el consumo simplificado de `jnats`** (A-206). `getConsumerContext` construye un `StreamContext`, y su
+constructor pide `STREAM.INFO.STATE_<DOM>`, que lista todas las claves y todos los tenants y que **ningún observador tiene
+concedido** (A-39): bajo los permisos de producción el `watch` no arrancaba. Se usa una suscripción de pull ligada al durable
+(`PullSubscribeOptions.fastBind`: ni crea ni consulta nada) con un bucle propio. Medido: `iterate(100, 10 s)` entrega con sus
+metadatos (`pending` 2, 1, 0), un mensaje que llega durante la espera se entrega al publicarse, y **si el durable se borra**
+(`flux state resync`) la libreria lo dice con `JetStreamStatusException 409 Consumer Deleted` a los **26 ms** y `503` mientras no
+exista; la misma suscripción vuelve a entregar la foto cuando se recrea. Con el `consume()` de la librería, en cambio, tras el
+`409` no volvía a pedir hasta su alarma de latidos: **89 s** (A-205). El bucle espera al durable con backoff de 100 ms a 5 s,
+**comprueba su configuración** como al abrir (un durable recreado con otro filtro entregaría las claves de otro tenant sin
+ningún error) y avisa por el logger.
+
+Lo que se comprueba al consumir, en el orden de `10-state.md` §5.4: sobre válido, **el subject manda** (tenant y clave del
+subject contra los del sobre; discrepar es POISON), `restricted` no se admite, `aggregateVersion` válido, firma y, con L3,
+esquema. Lo que falla va a `dlq.state.<contrato>` con el sobre original **sin su dato** (`data = { key, revision }`) y sin firma;
+un mensaje ilegible se sintetiza desde el subject y **no se copia su cuerpo**.
+
 ## Diferencias con los SDKs de referencia (Node y Go)
 
 El envelope, el naming, la taxonomía de errores y la config de consumidor son
@@ -807,9 +850,10 @@ Jackson emite bien. Ahora `serialize` escribe vía `writeValueAsString(...).getB
 | `SchemaBundle.java` | El `bundle.json` leído: subject → URI y URI → esquema. Solo Jackson |
 | `SchemaValidationException.java` | El payload no cumple su esquema. PERMANENT, con **todos** los errores |
 | `SchemaNotFoundException.java` | El bundle no trae el esquema que el evento declara. PERMANENT |
-| `MetricsSink.java` | El contrato de métricas: siete métodos con parámetros nombrados, buckets y `NONE` |
+| `MetricsSink.java` | El contrato de métricas: siete métodos con parámetros nombrados, buckets y `NONE`; más cuatro **opcionales** (`default`) para `state` y `rpc` |
 | `InMemoryMetrics.java` | Recolector sin dependencias con salida en formato Prometheus |
 | `TenantIsolationException.java` | Suscripción sin filtro de tenant con el aislamiento en estricto |
+| `FluxState.java` · `StateEnvelope.java` · `StateErrors.java` | La capacidad `state`: `put`/`delete`/`get`/`watch` (el cliente, que habla con el broker), y el sobre, los nombres y los siete códigos (funciones **puras**, las que comparan los vectores cruzados) |
 | `Security.java` · `SecurityErrors.java` · `TlsOptions.java` | La capacidad `security`: TLS verificado (host incluido), credenciales, el inbox privado, la clasificación de la primera conexión y los cinco códigos |
 | `Denials.java` · `FluxListener.java` | Lo que `jnats` notifica por callbacks: las denegaciones de permisos (competidas con la respuesta, con el aviso registrado antes de lanzar la operación) y la cuenta de `-ERR` que las espera |
 | `ExternalId.java` · `CanonicalTime.java` · `Text.java` · `ReservedDomainException.java` | El `id` determinista de un hecho importado (`externalKey`), `time` canónico, longitudes en puntos de código y los dominios reservados |
@@ -826,7 +870,8 @@ node conformance/harness/build-java.mjs
 node conformance/cross-sdk.mjs --only node,java --verbose
 ```
 
-Las pruebas de unidad no requieren un broker. **Las de integración sí** (`SecurityIntegrationTest`, `TlsIntegrationTest`): arrancan un `nats-server` real con TLS, los permisos que genera
+Las pruebas de unidad no requieren un broker. **Las de integración sí** (`SecurityIntegrationTest`, `TlsIntegrationTest`,
+`StateIntegrationTest`): arrancan un `nats-server` real con TLS, los permisos que genera
 `scripts/gen-acl.mjs` de `examples/services.json` y los streams y durables que crea `flux provision`, de modo que **quitar un
 permiso se nota**. Necesitan `node`, `openssl`, `npm install` en `cli/` y el binario de `nats-server`:
 
@@ -865,9 +910,10 @@ Cubren:
   `outcome="invalid_signature"` sin tocar el `dlqreason`;
 - **aislamiento de tenant** — `STRICT` sin tenant lanza, `"system"` no cuenta como filtro,
   precedencia suscripción → conexión;
-- **seguridad** — los códigos en su situación y en **ninguna otra**; contra el broker real y con permisos exactos: el ciclo,
-  cada permiso que se quita, `NOT_PROVISIONED`, la primera conexión con una CA que no firmó, un host fuera de los SAN, una
-  credencial rechazada y mTLS;
+- **seguridad y estado** — los códigos de cada capacidad en su situación y en **ninguna otra**; contra el broker real y con
+  permisos exactos: el ciclo, cada permiso que se quita, `NOT_PROVISIONED`, la primera conexión con una CA que no firmó, un host
+  fuera de los SAN, una credencial rechazada y mTLS; las 100 claves con `onSynced`, las lápidas, el conflicto de secuencia
+  fabricado y tres escritores en carrera, el `resync`, la DLQ de estado y L3 con el bundle real;
 - **validación L3** — los mismos casos que `sdk-node/test/validation.test.ts` (requerido
   ausente, tipo incorrecto, campo desconocido, patrón incumplido, **todos** los errores a la
   vez, esquema ausente del bundle, `warn` que avisa sin lanzar, `off` que no compila nada),

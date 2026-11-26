@@ -161,6 +161,26 @@ public final class InMemoryMetrics implements MetricsSink {
         set("flux_connection_state", labels(), state.value());
     }
 
+    @Override
+    public void stateWrite(String contract, StateWriteOutcome outcome) {
+        inc("flux_state_writes_total", labels("contract", contract, "outcome", outcome.wire()));
+    }
+
+    @Override
+    public void rpcClientRequest(String operation, RpcClientOutcome outcome) {
+        inc("flux_rpc_client_requests_total", labels("operation", operation, "outcome", outcome.wire()));
+    }
+
+    @Override
+    public void rpcServerRequest(String operation, RpcServerOutcome outcome) {
+        inc("flux_rpc_server_requests_total", labels("operation", operation, "outcome", outcome.wire()));
+    }
+
+    @Override
+    public void rpcDuration(String operation, String role, double seconds) {
+        observe("flux_rpc_duration_seconds", labels("operation", operation, "role", role), seconds);
+    }
+
     // ─── Exposicion ──────────────────────────────────────────────────────────
 
     /**
@@ -180,6 +200,9 @@ public final class InMemoryMetrics implements MetricsSink {
             out.add("# TYPE flux_events_consumed_total counter");
             out.add("# TYPE flux_events_dlq_total counter");
             out.add("# TYPE flux_events_retried_total counter");
+            out.add("# TYPE flux_state_writes_total counter");
+            out.add("# TYPE flux_rpc_client_requests_total counter");
+            out.add("# TYPE flux_rpc_server_requests_total counter");
             for (Map.Entry<String, AtomicLong> e : counters.entrySet()) {
                 out.add(e.getKey() + " " + e.getValue().get());
             }
@@ -192,6 +215,7 @@ public final class InMemoryMetrics implements MetricsSink {
             }
 
             out.add("# TYPE flux_event_handler_duration_seconds histogram");
+            out.add("# TYPE flux_rpc_duration_seconds histogram");
             for (Map.Entry<String, Histogram> e : histograms.entrySet()) {
                 String k = e.getKey();
                 Histogram h = e.getValue();

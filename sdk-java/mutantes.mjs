@@ -52,6 +52,28 @@ const MUTANTES = [
     archivo: "FluxBus.java", de: "throw new NotProvisionedException(ResourceKind.STREAM, name, null, options.service, denied.subject(), null,\n                    denied);", a: "throw denied;", pruebas: ["SecurityIntegrationTest#streamSinAprovisionar"] },
   { id: "aviso-en-cada-ack", que: "avisar del ack denegado en cada mensaje en vez de una vez por subject",
     archivo: "Denials.java", de: "return seen.putIfAbsent(normalize(d.subject()), d.operation()) == null ? d : null;", a: "return d;", pruebas: ["SecurityIntegrationTest#ackDenegadoSoloTieneElLog"] },
+
+  // ── estado ──
+  { id: "estado-sin-cabecera-de-secuencia", que: "publicar sin `Nats-Expected-Last-Subject-Sequence`: dos instancias del dueño se pisan y una versión vieja sobrescribe a una nueva",
+    archivo: "FluxState.java", de: ".messageId(id).expectedLastSubjectSequence(expected).build())", a: ".messageId(id).build())", pruebas: ["StateIntegrationTest#conflictoDeterminista", "StateIntegrationTest#escritoresConcurrentes"] },
+  { id: "estado-version-que-no-avanza", que: "escribir una versión que no avanza (el `stale` no se decide)",
+    archivo: "FluxState.java", de: "if (actual != null && actual.version != null && version <= actual.version) {", a: "if (false && actual != null && actual.version != null && version <= actual.version) {", pruebas: ["StateIntegrationTest#stale"] },
+  { id: "estado-sin-reconocer-el-propio-mensaje", que: "no reconocer el propio mensaje (paso 1b): un acuse perdido se convierte en `stale` con su propio dato",
+    archivo: "FluxState.java", de: "if (actual != null && actual.ids.contains(id)) {", a: "if (false && actual != null && actual.ids.contains(id)) {", pruebas: ["StateIntegrationTest#elPropioMensajeSeReconoce"] },
+  { id: "estado-conflicto-solo-10071", que: "reconocer solo el código 10071 del conflicto: bajo carrera en un cluster el broker da el 10164 y el SDK no reintenta",
+    archivo: "FluxState.java", de: "static final List<Integer> CONFLICT_CODES = List.of(10071, 10164);", a: "static final List<Integer> CONFLICT_CODES = List.of(10071);", pruebas: ["StateUnitTest#losDosCodigosDelConflicto"] },
+  { id: "estado-el-watch-pide-stream-info", que: "abrir el watch pidiendo `STREAM.INFO` del stream de estado (lista todas las claves y tenants: ningún observador lo tiene concedido, A-39)",
+    archivo: "FluxState.java", de: "w.sub = bus.jetStream.subscribe(null, PullSubscribeOptions.fastBind(stream, durable));", a: "bus.jsm.getStreamInfo(stream);\n            w.sub = bus.jetStream.subscribe(null, PullSubscribeOptions.fastBind(stream, durable));", pruebas: ["StateIntegrationTest#cicloDe100Claves"] },
+  { id: "estado-onsynced-no-inmediato", que: "esperar a una entrada para dar `onSynced` aunque el contrato esté vacío: el servicio queda «sincronizando» para siempre",
+    archivo: "FluxState.java", de: "if (found.getNumPending() == 0 && found.getNumAckPending() == 0) {", a: "if (false && found.getNumPending() == 0 && found.getNumAckPending() == 0) {", pruebas: ["StateIntegrationTest#onSyncedConContratoVacio"] },
+  { id: "estado-no-reabre-un-durable-borrado", que: "no reabrir el consumo cuando el durable se borra (`flux state resync`): el watch queda inerte con la conexión viva",
+    archivo: "FluxState.java", de: "                    reopen(status);", a: "                    sleep(1000);", pruebas: ["StateIntegrationTest#resync"] },
+  { id: "estado-filtro-sin-comprobar", que: "no comprobar el filtro del durable aprovisionado: entregaría las claves de otro tenant sin ningún error",
+    archivo: "FluxState.java", de: "if (!java.util.Objects.equals(requested.getFilterSubject(), eff) || (filters != null && filters.size() > 1)) {", a: "if (false) {", pruebas: ["StateIntegrationTest#durableConOtroFiltro"] },
+  { id: "estado-identidad-del-sobre", que: "fiarse del sobre y no del subject: un mensaje de otro tenant llega al handler",
+    archivo: "FluxState.java", de: "if (!tenant.equals(event.tenantid())) {", a: "if (false) {", pruebas: ["StateIntegrationTest#sobreQueMiente"] },
+  { id: "estado-clasificacion-de-la-conexion", que: "usar `internal` y no `confidential` como clasificación por defecto de un estado (retención de 30 días en vez de 7 para un dato personal)",
+    archivo: "FluxState.java", de: "StateEnvelope.assertClassification(po.classification == null ? null : po.classification.wire());", a: "StateEnvelope.assertClassification(po.classification == null ? \"internal\" : po.classification.wire());", pruebas: ["StateIntegrationTest#elSobreEnElBroker"] },
 ];
 
 // ── ejecución ───────────────────────────────────────────────────────────────

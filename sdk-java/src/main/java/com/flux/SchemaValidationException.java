@@ -21,12 +21,12 @@ import java.util.List;
  * <p>{@link #errors()} trae TODOS los fallos, no solo el primero. Reportar de uno en uno
  * convierte arreglar un payload con tres campos mal en tres despliegues — 00-protocol.md §5.
  */
-public final class SchemaValidationException extends FluxErrors.FluxException {
+public class SchemaValidationException extends FluxErrors.FluxException {
 
     private static final long serialVersionUID = 1L;
 
     /** Codigo estable para metricas y alertas. Nunca el mensaje — 08-observability.md §2.2. */
-    public static final String CODE = "SCHEMA_VALIDATION_FAILED";
+    public static final String CODE = "INVALID_SCHEMA";
 
     private final String subject;
     private final String dataschema;
@@ -39,6 +39,14 @@ public final class SchemaValidationException extends FluxErrors.FluxException {
      */
     public SchemaValidationException(String subject, String dataschema, List<String> errors) {
         super(buildMessage(subject, dataschema, errors), CODE, null);
+        this.subject = subject;
+        this.dataschema = dataschema;
+        this.errors = errors == null ? List.of() : Collections.unmodifiableList(List.copyOf(errors));
+    }
+
+    /** Para los errores de peticion/respuesta de rpc, que dicen DE QUIEN es el fallo (11-request-reply.md §5.2). */
+    protected SchemaValidationException(String message, String subject, String dataschema, List<String> errors) {
+        super(message, CODE, null);
         this.subject = subject;
         this.dataschema = dataschema;
         this.errors = errors == null ? List.of() : Collections.unmodifiableList(List.copyOf(errors));
