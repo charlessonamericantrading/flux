@@ -259,14 +259,14 @@ Reconectar «indefinidamente» es lo correcto **una vez conectado**. La primera 
 caso, porque ahí hay dos clases de fallo que el cliente NATS no distingue y que piden
 respuestas opuestas:
 
-| El `connect()` inicial falla porque… | ¿Lo arregla reintentar? | El SDK |
-|---|---|---|
-| El broker aún no ha arrancado (conexión rechazada o sin respuesta) | **Sí** | **DEBE** esperar, con la misma espera con jitter que la reconexión |
-| El broker rechaza las credenciales | No | **DEBE** fallar de inmediato |
-| El certificado del servidor no verifica: CA ausente o equivocada, host fuera de los SAN, caducado | No | **DEBE** fallar de inmediato |
-| Se exige TLS y el servidor no lo ofrece | No | **DEBE** fallar de inmediato, y **NO DEBE** bajar a texto plano |
-| Una opción local está mal formada: un `.creds` ilegible, una semilla que no es de usuario, una CA que no es PEM | No | **DEBE** fallar **antes** de abrir ningún socket |
-| Se exige mTLS y el cliente no presenta certificado | No | **DEBERÍA** fallar de inmediato: no todos los clientes NATS lo distinguen de un timeout |
+| El `connect()` inicial falla porque… | ¿Lo arregla reintentar? | El SDK | Código ([04-errors.md §5.3](04-errors.md)) |
+|---|---|---|---|
+| El broker aún no ha arrancado (conexión rechazada o sin respuesta) | **Sí** | **DEBE** esperar, con la misma espera con jitter que la reconexión | ninguno: no es un error |
+| El broker rechaza las credenciales | No | **DEBE** fallar de inmediato | `CONNECTION_REJECTED`, motivo `auth` |
+| El certificado del servidor no verifica: CA ausente o equivocada, host fuera de los SAN, caducado | No | **DEBE** fallar de inmediato | `CONNECTION_REJECTED`, motivo `tls` |
+| Se exige TLS y el servidor no lo ofrece | No | **DEBE** fallar de inmediato, y **NO DEBE** bajar a texto plano | `CONNECTION_REJECTED`, motivo `tls` |
+| Una opción local está mal formada: un `.creds` ilegible, una semilla que no es de usuario, una CA que no es PEM | No | **DEBE** fallar **antes** de abrir ningún socket | `INVALID_CREDENTIALS` o `INVALID_TLS_OPTIONS`, según la opción |
+| Se exige mTLS y el cliente no presenta certificado | No | **DEBERÍA** fallar de inmediato: no todos los clientes NATS lo distinguen de un timeout | `CONNECTION_REJECTED`, motivo `tls` |
 
 Un servicio que arranca antes que NATS es lo normal en un compose, y por eso la primera fila
 existe: morir en el primer intento convertiría cada despliegue en una carrera. Pero esperar es
@@ -292,7 +292,10 @@ solo el SDK sabe qué errores son de «aún no está» y cuáles de «esto no ca
   como un `ConnectionError` más (A-24). Cada SDK **DEBERÍA** tener, contra un broker real, un
   caso por cada fila de la tabla: es la única forma de saber que sigue reconociéndose cuando
   la librería cambia.
-- El error **DEBE** decir la causa y qué revisar ([04-errors.md §5.3](04-errors.md)).
+- El error **DEBE** llevar el código de la tabla, decir la causa y qué revisar
+  ([04-errors.md §5.3](04-errors.md)). El código importa tanto como el comportamiento: una
+  fila que fallara «rápido» pero con el código de otra mandaría a quien opera a buscar donde
+  no es. Por eso el caso de cada fila comprueba **qué** código sale, no solo que sale.
 - Esta regla es de la **primera** conexión. Qué debe hacer un SDK si el broker rechaza las
   credenciales durante una *re*conexión (una credencial que caduca o se rota) **no está
   medido**, y este documento no lo fija.
