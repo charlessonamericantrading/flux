@@ -1,8 +1,8 @@
 {
   "suite": "security-acl",
   "title": "Los permisos que genera gen-acl.mjs, ejecutados contra un nats-server real",
-  "spec": "specification/06-security.md §2 y §3",
-  "plan": "docs/plan-v1.1/PLAN.md §1.5 (S1–S11) y Apéndice A",
+  "spec": "specification/06-security.md §2 y §3 (el estado, en §3.8)",
+  "plan": "docs/plan-v1.1/PLAN.md §1.5 (S1–S14), Fase 2 (S15–S20) y Apéndice A",
   "runner": "conformance/security.mjs",
   "$comment": "Estos casos son DATOS: conformance/security.mjs no sabe qué es S1, solo ejecuta las operaciones de `vocabulary` y compara lo observado con `expect`. Añadir un caso es escribir JSON; solo una operación nueva toca el intérprete (conformance/security/interprete.mjs). El orden de las claves de un paso no importa; un campo desconocido, o una expectativa sobre algo que la operación no observa, es un ERROR al cargar: una errata no puede degradarse a «no se comprueba nada». Un caso DEBE llevar `spec`, `rationale` (qué se rompe si deja de ser cierto), `observed` (versión del servidor, fecha y resultado) y, si nace de un bug, `counterExample`. Los nombres de stream y de durable van LITERALES: es una derivación independiente de la de scripts/lib/manifest.mjs, y si el generador nombrara mal un durable un caso que reutilizase su código concedería exactamente el permiso equivocado y pasaría.",
   "verifiedAgainst": "nats-server 2.14.5",
@@ -15,13 +15,16 @@
       "pedidos-api": "dueño de pedidos; consume inventario.stock.v1.ajustado",
       "facturacion-api": "dueño de facturacion; consume pedidos.pedido.v1.creado y .cancelado",
       "inventario-api": "dueño de inventario; consume pedidos.pedido.v1.creado y .cancelado",
-      "logistica-api": "dueño de logistica; consume pedidos.pedido.v1.*, facturacion.factura.v2.emitida"
+      "logistica-api": "dueño de logistica; consume pedidos.pedido.v1.*, facturacion.factura.v2.emitida",
+      "crm-api": "dueño de clientes, que tiene estado (schemas/state/clientes/cliente): escribe `state.clientes.>`, lee lo suyo con DIRECT.GET y lee su DLQ de estado",
+      "tienda-web": "observa el estado clientes.cliente.v1 CONFINADA al tenant acme (`watches` con `tenants`)",
+      "informes-api": "observa el estado clientes.cliente.v1 de TODOS los tenants (`watches` sin `tenants`)"
     },
     "tls": "El servidor exige TLS (sin allow_non_tls) con un certificado de una CA efímera creada con openssl para esta ejecución. Todo cliente de la suite confía solo en esa CA."
   },
 
   "vocabulary": {
-    "$comment": "`as` es un actor: el nombre de un servicio del manifiesto (conecta con SU nkey y SU inbox privado `_INBOX.<servicio>`), `ops`, o un objeto { service, inbox?, + variante }. `inbox`: `private` (por defecto en un servicio), `default` (el aleatorio de la librería: lo que haría un SDK que no fije el prefijo; por defecto en ops) o un prefijo explícito. Una VARIANTE parte de los permisos que genera gen-acl.mjs para el servicio y los estropea a propósito: `without` (quita permisos de publicación: DEBEN existir), `extraPublish`, `extraSubscribe`, `replaceSubscribe` (reemplaza la suscripción; `[]` escribe `allow: []`, que NATS lee como «sin restricción») o `dev` (parte de gen-acl.mjs --dev). Las variantes no existen con --acl (no hay permisos generados de los que partir). `{me}` en una cadena es el servicio que actúa y `{marker}` una marca única por caso y ejecución. `expect` compara con lo que la operación observa: valor exacto, o { match: regex }, { includes }, { lte }, { gte }, { not }, { present: bool }; una clave con puntos entra en objetos (`reply.error.err_code`). `control: true` marca un paso cuyo resultado esperado es lo MALO: demuestra que la sonda puede fallar. `onlyWith: generated-acl` lo omite con --acl.",
+    "$comment": "`as` es un actor: el nombre de un servicio del manifiesto (conecta con SU nkey y SU inbox privado `_INBOX.<servicio>`), `ops`, o un objeto { service, inbox?, + variante }. `inbox`: `private` (por defecto en un servicio), `default` (el aleatorio de la librería: lo que haría un SDK que no fije el prefijo; por defecto en ops) o un prefijo explícito. Una VARIANTE parte de los permisos que genera gen-acl.mjs para el servicio y los estropea a propósito: `without` (quita permisos de publicación: DEBEN existir), `extraPublish`, `extraSubscribe`, `replaceSubscribe` (reemplaza la suscripción; `[]` escribe `allow: []`, que NATS lee como «sin restricción») o `dev` (parte de gen-acl.mjs --dev). Las variantes no existen con --acl (no hay permisos generados de los que partir). `{me}` en una cadena es el servicio que actúa y `{marker}` una marca única por caso y ejecución. `expect` compara con lo que la operación observa: valor exacto, o { match: regex }, { includes }, { lte }, { gte }, { not }, { present: bool }; una clave con puntos entra en objetos (`reply.error.err_code`). `control: true` marca un paso cuyo resultado esperado es lo MALO: demuestra que la sonda puede fallar. `onlyWith: generated-acl` lo omite con --acl. `save: nombre` guarda el `seq` que observó el paso, y `{ \"ref\": nombre, \"plus\": n }` lo usa en los argumentos o en `expect` de un paso POSTERIOR (la secuencia de una escritura condicional del estado): una referencia a algo no guardado es un error al cargar.",
     "ops": {
       "connect": {
         "doc": "Una conexión que puede NO establecerse. `tls`: ca (la buena) | wrong_ca (confía en una CA que no firmó el certificado del servidor) | system (solo las CA del sistema) | none (texto plano, por un socket: la librería de NATS sube sola a TLS). `auth`: ok | unknown_key (una nkey bien formada que el servidor no conoce) | none.",
@@ -53,20 +56,28 @@
         "outcomes": ["denied", "answered", "no_answer"]
       },
       "js_publish": {
-        "doc": "Publicación por JetStream, esperando el acuse del stream que la captura.",
+        "doc": "Publicación por JetStream, esperando el acuse del stream que la captura. `data` es una cadena JSON (u objeto). `msgId`: Nats-Msg-Id (por defecto uno nuevo). `expectedLastSubjectSeq`: Nats-Expected-Last-Subject-Sequence, la escritura condicional del estado (0 = «la clave no existe»; 10-state.md §3.2). `errCode` es el err_code de JetStream cuando la rechaza (10071 «wrong last sequence»; 10164 en un cluster).",
         "needsActor": true,
         "args": ["subject"],
-        "optional": ["data"],
-        "observes": ["outcome", "stream", "seq", "text", "ms"],
+        "optional": ["data", "msgId", "expectedLastSubjectSeq"],
+        "observes": ["outcome", "stream", "seq", "errCode", "text", "ms"],
         "outcomes": ["ok", "denied", "error"]
       },
       "create_consumer": {
-        "doc": "Crear un consumidor con la config canónica y un filtro dado en el CUERPO (`filter`). `subjectFilter` es el filtro que va en el SUBJECT de la petición (por defecto, el mismo; `null` = sin filtro en el subject). `api: durable_create` usa la API antigua CONSUMER.DURABLE.CREATE, donde el filtro va solo en el cuerpo y ninguna ACL lo ve.",
+        "doc": "Crear un consumidor con la config canónica y un filtro dado en el CUERPO (`filter`). `subjectFilter` es el filtro que va en el SUBJECT de la petición (por defecto, el mismo; `null` = sin filtro en el subject). `api: durable_create` usa la API antigua CONSUMER.DURABLE.CREATE, donde el filtro va solo en el cuerpo y ninguna ACL lo ve. `deliver`: all (por defecto) | last_per_subject (la de un `watch` de estado).",
         "needsActor": true,
         "args": ["stream", "durable", "filter"],
-        "optional": ["subjectFilter", "api"],
+        "optional": ["subjectFilter", "api", "deliver"],
         "observes": ["outcome", "text", "reply", "ms"],
         "outcomes": ["denied", "answered", "no_answer"]
+      },
+      "direct_get": {
+        "doc": "DIRECT.GET como lo hace `get` de estado y el paso 1 de `put` (A-32): `$JS.API.DIRECT.GET.<stream>.<subject>`, sin cuerpo. Trae las cabeceras del mensaje (`seq` = Nats-Sequence, `subject` = Nats-Subject). Sin `subject` es la forma de CUERPO (`$JS.API.DIRECT.GET.<stream>` + `body`), que lee cualquier mensaje y que ninguna ACL ve. `not_found` es el 404 del broker; `no_answer`, un stream que no existe o sin allow_direct (se ven igual, A-32). `denied` es una violación de permiso.",
+        "needsActor": true,
+        "args": ["stream"],
+        "optional": ["subject", "body", "timeoutMs"],
+        "observes": ["outcome", "status", "seq", "subject", "data", "text", "ms"],
+        "outcomes": ["found", "not_found", "bad_request", "denied", "no_answer", "error"]
       },
       "delete_consumer": {
         "doc": "Lo hace ops: borra un consumidor (para que otro actor lo CREE de verdad).",
@@ -127,7 +138,7 @@
   },
 
   "brokerObservations": {
-    "$comment": "Qué caso cubre cada observación del Apéndice A del plan que es del BROKER. Las que no aparecen aquí no tienen caso en esta suite: o son del SDK (A-8b, A-26…A-28, A-30), o son de las fases 2 y 3 (A-9…A-18), o necesitan otra forma de arrancar el servidor (A-8d, A-23).",
+    "$comment": "Qué caso cubre cada observación del Apéndice A del plan que es del BROKER. Las que no aparecen aquí no tienen caso en esta suite: o son del SDK (A-8b, A-26…A-28, A-30), o son del estado sin ACL (A-9…A-13 y A-31…A-50, que ejecuta conformance/state-broker.mjs; aquí solo se repiten las que dependen de la ACL: A-14, A-32, A-33, A-38, A-39, A-40, A-44 y A-45), o de la fase 3 (A-15…A-18), o necesitan otra forma de arrancar el servidor (A-8d, A-23).",
     "A-1": ["S9"],
     "A-2": ["S6", "S9"],
     "A-3": ["S1"],
@@ -139,12 +150,20 @@
     "A-8a": ["S1", "S2"],
     "A-8c": ["S10"],
     "A-8f": ["S6", "S13"],
+    "A-14": ["S15", "S17"],
     "A-19": ["S12"],
     "A-20": ["S12"],
     "A-21": ["S13"],
     "A-22": ["S6"],
     "A-24": ["S8"],
     "A-25": ["S14"],
+    "A-32": ["S15"],
+    "A-33": ["S15"],
+    "A-38": ["S15", "S17", "S18"],
+    "A-39": ["S18"],
+    "A-40": ["S17"],
+    "A-44": ["S19"],
+    "A-45": ["S16"],
     "A-27": ["S10", "S11"],
     "A-29": ["S11"]
   },
@@ -569,6 +588,207 @@
       "steps": [
         { "as": { "service": "facturacion-api", "replaceSubscribe": [] }, "op": "subscribe", "subject": "_INBOX.>", "title": "control: con `subscribe: { allow: [] }` el servicio SÍ puede suscribirse a `_INBOX.>`", "control": true, "expect": { "outcome": "permitted" } },
         { "as": { "service": "facturacion-api", "replaceSubscribe": [] }, "op": "subscribe", "subject": "inventario.>", "title": "…y a un dominio que no tiene concedido", "control": true, "expect": { "outcome": "permitted" } }
+      ]
+    },
+
+    {
+      "id": "S15",
+      "title": "El ciclo de ESTADO de extremo a extremo bajo la ACL generada: el dueño escribe con CAS, el observador lo recibe",
+      "spec": "10-state.md §3, §5 y §8; 06-security.md §3.8: los permisos de estado por rol",
+      "plan": "PLAN Fase 2: gen-acl.mjs (clave `watches`) y permisos de estado",
+      "covers": ["A-14", "A-32", "A-33", "A-38"],
+      "rationale": "Es el S1 del estado: prueba que los permisos que el generador da al DUEÑO y al OBSERVADOR bastan para el ciclo que describe 10-state.md —`put` (DIRECT.GET para la secuencia, publicación condicional, rechazo de una secuencia vieja), `get`, `watch` (CONSUMER.INFO, MSG.NEXT, ack) y la DLQ de estado—, sin una sola denegación. Un permiso que falte se manifiesta como un servicio que no puede escribir o leer, o —peor— como un ack denegado que reentrega para siempre (A-19). El caso mira también el efecto en el broker (ack pendiente, qué tenant llega) y no solo la ausencia de errores. Y que el chequeo `Nats-Expected-Last-Subject-Sequence` funciona BAJO la ACL: es lo que impide que dos instancias del dueño pisen un valor nuevo con uno viejo.",
+      "observed": { "server": "nats-server 2.14.5", "date": "2026-11-26", "result": "Sin una sola denegación en crm-api, tienda-web e informes-api (0 violaciones). crm-api: DIRECT.GET de la clave nueva → 404 «Message Not Found»; publicación con Nats-Expected-Last-Subject-Sequence 0 → acuse de STATE_CLIENTES; la misma con 0 otra vez → err 10071 «wrong last sequence: 1»; relectura con la secuencia del acuse; actualización con esa secuencia → se aplica (la revisión anterior sale del stream); escribe también en globex. tienda-web: DIRECT.GET con el tenant fijado ve la revisión 2; su durable entrega SOLO la clave de acme (subject original, ack de 9 tokens), nada de globex, y deja ackPending 0 y numPending 0. informes-api recibe acme y globex. La DLQ de estado: el observador publica en dlq.state.clientes.cliente.v1 (la captura DLQ_CLIENTES, ampliada por flux provision) y el dueño la lee con su pull consumer." },
+      "steps": [
+        { "as": "ops", "op": "reset_consumer", "stream": "STATE_CLIENTES", "durable": "tienda-web__state_clientes_cliente_v1__acme", "filter": "state.clientes.cliente.v1.acme.*", "deliver": "new", "expect": { "outcome": "ok" } },
+        { "as": "ops", "op": "reset_consumer", "stream": "STATE_CLIENTES", "durable": "informes-api__state_clientes_cliente_v1", "filter": "state.clientes.cliente.v1.*.*", "deliver": "new", "expect": { "outcome": "ok" } },
+        { "as": "ops", "op": "reset_consumer", "stream": "DLQ_CLIENTES", "durable": "crm-api__dlq_state_clientes", "filter": "dlq.state.clientes.>", "deliver": "new", "expect": { "outcome": "ok" } },
+        { "as": "crm-api", "op": "direct_get", "stream": "STATE_CLIENTES", "subject": "state.clientes.cliente.v1.acme.{marker}", "title": "put() paso 1: DIRECT.GET de la clave nueva → 404 (no hay valor: S = 0)", "expect": { "outcome": "not_found", "status": 404 } },
+        { "as": "crm-api", "op": "js_publish", "subject": "state.clientes.cliente.v1.acme.{marker}", "expectedLastSubjectSeq": 0, "msgId": "acme-{marker}-v1", "data": "{\"clienteId\":\"{marker}\",\"aggregateVersion\":1}", "save": "rev1", "title": "put() paso 3: publica por JetStream con Nats-Expected-Last-Subject-Sequence 0", "expect": { "outcome": "ok", "stream": "STATE_CLIENTES" } },
+        { "as": "crm-api", "op": "js_publish", "subject": "state.clientes.cliente.v1.acme.{marker}", "expectedLastSubjectSeq": 0, "msgId": "{marker}-otra", "data": "{\"clienteId\":\"{marker}\",\"aggregateVersion\":1}", "title": "la MISMA clave con 0 otra vez: la rechaza el BROKER (10071, «wrong last sequence») — el chequeo condicional funciona bajo la ACL", "expect": { "outcome": "error", "errCode": 10071 } },
+        { "as": "crm-api", "op": "direct_get", "stream": "STATE_CLIENTES", "subject": "state.clientes.cliente.v1.acme.{marker}", "title": "get(): relee la clave y ve la secuencia de su escritura", "expect": { "outcome": "found", "seq": { "ref": "rev1" }, "data": { "includes": "\"aggregateVersion\":1" } } },
+        { "as": "crm-api", "op": "js_publish", "subject": "state.clientes.cliente.v1.acme.{marker}", "expectedLastSubjectSeq": { "ref": "rev1" }, "msgId": "acme-{marker}-v2", "data": "{\"clienteId\":\"{marker}\",\"aggregateVersion\":2}", "save": "rev2", "title": "put(): actualiza con la secuencia leída → se aplica, y la anterior sale del stream", "expect": { "outcome": "ok", "stream": "STATE_CLIENTES" } },
+        { "as": "crm-api", "op": "js_publish", "subject": "state.clientes.cliente.v1.globex.{marker}", "expectedLastSubjectSeq": 0, "msgId": "globex-{marker}-v1", "data": "{\"clienteId\":\"{marker}\",\"aggregateVersion\":1}", "title": "el dueño escribe TAMBIÉN en otro tenant de su dominio (globex)", "expect": { "outcome": "ok", "stream": "STATE_CLIENTES" } },
+        { "as": "tienda-web", "op": "direct_get", "stream": "STATE_CLIENTES", "subject": "state.clientes.cliente.v1.acme.{marker}", "title": "get() del observador: DIRECT.GET con el tenant fijado ve el último valor", "expect": { "outcome": "found", "seq": { "ref": "rev2" }, "data": { "includes": "\"aggregateVersion\":2" } } },
+        { "as": "tienda-web", "op": "pull", "stream": "STATE_CLIENTES", "durable": "tienda-web__state_clientes_cliente_v1__acme", "title": "watch(): CONSUMER.INFO, MSG.NEXT y llega la entrada de acme con el subject original (solo el último valor)", "expect": { "outcome": "message", "subject": "state.clientes.cliente.v1.acme.{marker}", "data": { "includes": "\"aggregateVersion\":2" } } },
+        { "as": "tienda-web", "op": "ack", "kind": "ack", "title": "ack", "expect": { "violation": null } },
+        { "as": "tienda-web", "op": "pull", "stream": "STATE_CLIENTES", "durable": "tienda-web__state_clientes_cliente_v1__acme", "timeoutMs": 1200, "title": "…y la clave de globex NO llega a su durable: lo filtra el broker", "expect": { "outcome": "none" } },
+        { "as": "ops", "op": "consumer_state", "stream": "STATE_CLIENTES", "durable": "tienda-web__state_clientes_cliente_v1__acme", "title": "el broker registró el ack: nada pendiente", "expect": { "ackPending": 0, "numPending": 0 } },
+        { "as": "informes-api", "op": "pull", "stream": "STATE_CLIENTES", "durable": "informes-api__state_clientes_cliente_v1", "title": "el observador SIN confinar recibe acme…", "expect": { "outcome": "message", "subject": "state.clientes.cliente.v1.acme.{marker}" } },
+        { "as": "informes-api", "op": "ack", "kind": "ack", "expect": { "violation": null } },
+        { "as": "informes-api", "op": "pull", "stream": "STATE_CLIENTES", "durable": "informes-api__state_clientes_cliente_v1", "title": "…y globex", "expect": { "outcome": "message", "subject": "state.clientes.cliente.v1.globex.{marker}" } },
+        { "as": "informes-api", "op": "ack", "kind": "ack", "expect": { "violation": null } },
+        { "as": "ops", "op": "consumer_state", "stream": "STATE_CLIENTES", "durable": "informes-api__state_clientes_cliente_v1", "expect": { "ackPending": 0, "numPending": 0 } },
+        { "as": "tienda-web", "op": "js_publish", "subject": "dlq.state.clientes.cliente.v1", "data": "{\"key\":\"{marker}\",\"revision\":1}", "title": "el observador manda a la DLQ de estado lo que no pudo aplicar (la captura DLQ_CLIENTES, ampliada por flux provision)", "expect": { "outcome": "ok", "stream": "DLQ_CLIENTES" } },
+        { "as": "crm-api", "op": "pull", "stream": "DLQ_CLIENTES", "durable": "crm-api__dlq_state_clientes", "title": "el DUEÑO lee la DLQ de estado con su pull consumer (CONSUMER.INFO, MSG.NEXT), sin ninguna suscripción", "expect": { "outcome": "message", "subject": "dlq.state.clientes.cliente.v1", "data": { "includes": "{marker}" } } },
+        { "as": "crm-api", "op": "ack", "kind": "ack", "expect": { "violation": null } },
+        { "as": "ops", "op": "consumer_state", "stream": "DLQ_CLIENTES", "durable": "crm-api__dlq_state_clientes", "expect": { "ackPending": 0 } },
+        { "as": "crm-api", "op": "violations", "title": "ni una sola denegación en toda la conversación (crm-api)", "expect": { "count": 0 } },
+        { "as": "tienda-web", "op": "violations", "title": "ni una sola denegación en toda la conversación (tienda-web)", "expect": { "count": 0 } },
+        { "as": "informes-api", "op": "violations", "title": "ni una sola denegación en toda la conversación (informes-api)", "expect": { "count": 0 } }
+      ]
+    },
+
+    {
+      "id": "S16",
+      "title": "Solo el dueño escribe estado: ningún otro servicio escribe el de un dominio ajeno, ni por JetStream ni por core",
+      "spec": "10-state.md §3: solo el dueño escribe; 06-security.md §3.8: `state.<dom>.>` solo para el dueño de un dominio con estado",
+      "plan": "PLAN Fase 2: «otro servicio no escribe estado ajeno»",
+      "covers": ["A-45"],
+      "rationale": "Todo el valor del estado depende de que solo el dueño lo escriba: es lo que hace que un observador pueda fiarse del último valor. Y un publish de CORE a un subject de estado lo captura el stream SIN acuse y SIN chequeo de secuencia (A-45): sobrescribiría el valor del dueño. Por eso el control es la ACL, no el SDK. Se prueba con todos los roles: un observador (confinado y sin confinar), un servicio sin estado, el dueño de OTRO dominio (que tiene eventos pero ningún contrato de estado) y el dueño de clientes escribiendo en el de otro dominio. Que la clave NO exista después lo mira ops: una denegación que solo se vio como «sin excepción» no demuestra que no aterrizó. Los dos pasos de control (mutantes) demuestran que la sonda puede fallar: con `state.clientes.>` de más un observador escribe, y con `state.>` el dueño escribe el estado de otro dominio.",
+      "observed": { "server": "nats-server 2.14.5", "date": "2026-11-26", "result": "Permissions Violation for Publish to \"state.clientes.cliente.v1.acme.<clave>\" para tienda-web, informes-api, facturacion-api y pedidos-api, tanto por JetStream como por core (sin acuse y sin chequeo, A-45); crm-api, a \"state.pedidos.…\" y \"state.facturacion.…\"; pedidos-api, que no tiene estado, tampoco a su propio \"state.pedidos.…\". Ninguna de esas claves llegó al stream (404 desde ops). Controles: el dueño escribe (acuse de STATE_CLIENTES); con `state.clientes.>` de más tienda-web escribe y la clave aterriza; con `state.>` de más crm-api publica en el estado de otro dominio." },
+      "steps": [
+        { "as": "crm-api", "op": "js_publish", "subject": "state.clientes.cliente.v1.acme.{marker}", "expectedLastSubjectSeq": 0, "msgId": "acme-{marker}-v1", "data": "{\"clienteId\":\"{marker}\",\"aggregateVersion\":1}", "title": "control: el DUEÑO sí escribe su estado", "control": true, "expect": { "outcome": "ok", "stream": "STATE_CLIENTES" } },
+        { "as": "tienda-web", "op": "js_publish", "subject": "state.clientes.cliente.v1.acme.{marker}-tienda", "data": "{\"clienteId\":\"{marker}\",\"aggregateVersion\":1}", "title": "tienda-web: escribir estado por JetStream en el dominio de otro", "expect": { "outcome": "denied" } },
+        { "as": "tienda-web", "op": "publish", "subject": "state.clientes.cliente.v1.acme.{marker}-tienda-core", "title": "tienda-web: …y por CORE, que sobrescribiría SIN chequeo de secuencia (A-45)", "expect": { "outcome": "denied" } },
+        { "as": "informes-api", "op": "js_publish", "subject": "state.clientes.cliente.v1.acme.{marker}-informes", "data": "{\"clienteId\":\"{marker}\",\"aggregateVersion\":1}", "title": "informes-api: escribir estado por JetStream en el dominio de otro", "expect": { "outcome": "denied" } },
+        { "as": "informes-api", "op": "publish", "subject": "state.clientes.cliente.v1.acme.{marker}-informes-core", "title": "informes-api: …y por CORE, que sobrescribiría SIN chequeo de secuencia (A-45)", "expect": { "outcome": "denied" } },
+        { "as": "facturacion-api", "op": "js_publish", "subject": "state.clientes.cliente.v1.acme.{marker}-facturacion", "data": "{\"clienteId\":\"{marker}\",\"aggregateVersion\":1}", "title": "facturacion-api: escribir estado por JetStream en el dominio de otro", "expect": { "outcome": "denied" } },
+        { "as": "facturacion-api", "op": "publish", "subject": "state.clientes.cliente.v1.acme.{marker}-facturacion-core", "title": "facturacion-api: …y por CORE, que sobrescribiría SIN chequeo de secuencia (A-45)", "expect": { "outcome": "denied" } },
+        { "as": "pedidos-api", "op": "js_publish", "subject": "state.clientes.cliente.v1.acme.{marker}-pedidos", "data": "{\"clienteId\":\"{marker}\",\"aggregateVersion\":1}", "title": "pedidos-api: escribir estado por JetStream en el dominio de otro", "expect": { "outcome": "denied" } },
+        { "as": "pedidos-api", "op": "publish", "subject": "state.clientes.cliente.v1.acme.{marker}-pedidos-core", "title": "pedidos-api: …y por CORE, que sobrescribiría SIN chequeo de secuencia (A-45)", "expect": { "outcome": "denied" } },
+        { "as": "crm-api", "op": "publish", "subject": "state.pedidos.pedido.v1.acme.{marker}", "title": "el dueño de clientes NO escribe el estado de OTRO dominio (pedidos)", "expect": { "outcome": "denied" } },
+        { "as": "crm-api", "op": "publish", "subject": "state.facturacion.factura.v2.acme.{marker}", "title": "…ni el de facturacion", "expect": { "outcome": "denied" } },
+        { "as": "pedidos-api", "op": "publish", "subject": "state.clientes.cliente.v1.acme.{marker}-pedidos", "title": "el dueño de pedidos (que no tiene estado) NO escribe el estado de clientes", "expect": { "outcome": "denied" } },
+        { "as": "pedidos-api", "op": "publish", "subject": "state.pedidos.pedido.v1.acme.{marker}", "title": "…ni el suyo: un dominio sin contratos de estado no recibe `state.<dom>.>`", "expect": { "outcome": "denied" } },
+        { "as": "ops", "op": "direct_get", "stream": "STATE_CLIENTES", "subject": "state.clientes.cliente.v1.acme.{marker}-tienda", "title": "nada de lo anterior llegó al stream: la clave de tienda-web no existe", "expect": { "outcome": "not_found" } },
+        { "as": "ops", "op": "direct_get", "stream": "STATE_CLIENTES", "subject": "state.clientes.cliente.v1.acme.{marker}-informes-core", "title": "…ni la de informes-api", "expect": { "outcome": "not_found" } },
+        { "as": "ops", "op": "direct_get", "stream": "STATE_CLIENTES", "subject": "state.clientes.cliente.v1.acme.{marker}-facturacion", "title": "…ni la de facturacion-api", "expect": { "outcome": "not_found" } },
+        { "as": { "service": "tienda-web", "extraPublish": ["state.clientes.>"] }, "op": "js_publish", "subject": "state.clientes.cliente.v1.acme.{marker}-mutante", "data": "{\"clienteId\":\"{marker}\",\"aggregateVersion\":1}", "title": "control (mutante): si a tienda-web se le concede `state.clientes.>` de más, SÍ escribe: la sonda detecta un observador que escribe", "control": true, "expect": { "outcome": "ok", "stream": "STATE_CLIENTES" } },
+        { "as": { "service": "crm-api", "extraPublish": ["state.>"] }, "op": "publish", "subject": "state.pedidos.pedido.v1.acme.{marker}", "title": "control (mutante): si al dueño se le concede `state.>` de más, escribe el estado de OTRO dominio", "control": true, "expect": { "outcome": "permitted" } },
+        { "as": "ops", "op": "direct_get", "stream": "STATE_CLIENTES", "subject": "state.clientes.cliente.v1.acme.{marker}-mutante", "title": "…y la escritura del mutante SÍ aterrizó en el stream", "control": true, "expect": { "outcome": "found" } }
+      ]
+    },
+
+    {
+      "id": "S17",
+      "title": "Un tenant NO lee el estado de otro: el confinamiento por tenant lo aplica el broker",
+      "spec": "06-security.md §3.8 y 10-state.md §8: el tenant va en el subject, y DIRECT.GET y el filtro del durable lo llevan fijado",
+      "plan": "PLAN Fase 2: «un tenant no lee el estado de otro» (A-14)",
+      "covers": ["A-14", "A-38", "A-40"],
+      "rationale": "El tenant va en el SUBJECT del estado precisamente para que el broker pueda confinar a un servicio: el sobre es un dato que rellena el productor, y un filtro en el consumidor no resiste a un servicio comprometido. Si el generador concediera `…v1.*.*` donde el manifiesto dice `tenants: [acme]`, tienda-web leería los clientes de globex sin que nada se quejara. Se prueba por TODAS las vías: DIRECT.GET de otro tenant, con un comodín en el tenant y por encima de él; `consumers.add` con el filtro de todos los tenants (en el subject, que ve la ACL, y en el cuerpo, que no ve: lo rechaza el servidor, A-40); el durable aprovisionado, que solo entrega acme aunque haya claves de globex; y los durables de los demás. El paso de control con `…v1.*.*` demuestra que la sonda puede fallar.",
+      "observed": { "server": "nats-server 2.14.5", "date": "2026-11-26", "result": "tienda-web (confinada a acme) lee la clave de su tenant por DIRECT.GET y recibe por su durable solo la de acme; Permissions Violation para la de globex, para `…v1.*.<clave>` y para `state.clientes.>`; un `>` en la clave (`…v1.acme.>`) se lee: sigue siendo su tenant. En producción no tiene CONSUMER.CREATE; con --dev, el subject con el filtro de todos los tenants o con el de globex se deniega, y con el subject concedido y `*.*` en el cuerpo el SERVIDOR responde 10131 «did not match filtered subject from create subject»; el filtro exacto crea su durable con last_per_subject. Sus peticiones al durable de informes-api (INFO, MSG.NEXT): denegadas. Controles: informes-api, sin confinar, lee globex; con `…v1.*.*` en lugar de `…acme.*` tienda-web también." },
+      "steps": [
+        { "as": "ops", "op": "js_publish", "subject": "state.clientes.cliente.v1.acme.{marker}", "data": "{\"clienteId\":\"{marker}\",\"aggregateVersion\":1}", "title": "ops (el dueño, aquí) escribe la clave en acme…", "expect": { "outcome": "ok", "stream": "STATE_CLIENTES" } },
+        { "as": "ops", "op": "js_publish", "subject": "state.clientes.cliente.v1.globex.{marker}", "data": "{\"clienteId\":\"{marker}\",\"aggregateVersion\":1}", "title": "…y en globex", "expect": { "outcome": "ok", "stream": "STATE_CLIENTES" } },
+        { "as": "tienda-web", "op": "direct_get", "stream": "STATE_CLIENTES", "subject": "state.clientes.cliente.v1.acme.{marker}", "title": "control: tienda-web (confinada a acme) SÍ lee la clave de SU tenant", "control": true, "expect": { "outcome": "found", "data": { "includes": "{marker}" } } },
+        { "as": "tienda-web", "op": "direct_get", "stream": "STATE_CLIENTES", "subject": "state.clientes.cliente.v1.globex.{marker}", "title": "DIRECT.GET de la clave de OTRO tenant (globex) → denegado (A-14)", "expect": { "outcome": "denied" } },
+        { "as": "tienda-web", "op": "direct_get", "stream": "STATE_CLIENTES", "subject": "state.clientes.cliente.v1.*.{marker}", "title": "DIRECT.GET con un comodín en el tenant (…v1.*.<clave>)", "expect": { "outcome": "denied" } },
+        { "as": "tienda-web", "op": "direct_get", "stream": "STATE_CLIENTES", "subject": "state.clientes.>", "title": "DIRECT.GET de TODO el estado (state.clientes.>)", "expect": { "outcome": "denied" } },
+        { "as": "tienda-web", "op": "direct_get", "stream": "STATE_CLIENTES", "subject": "state.clientes.cliente.v1.acme.>", "title": "control: un `>` en la CLAVE (…v1.acme.>) sigue dentro de SU tenant: lo puede leer (A-38). Lo que no puede es salir del tenant", "control": true, "expect": { "outcome": "found", "data": { "includes": "{marker}" } } },
+        { "as": "tienda-web", "op": "create_consumer", "stream": "STATE_CLIENTES", "durable": "tienda-web__state_clientes_cliente_v1__acme", "filter": "state.clientes.cliente.v1.*.*", "deliver": "last_per_subject", "title": "en producción NO puede crear un consumidor, ni con el filtro de TODOS los tenants", "expect": { "outcome": "denied" } },
+        { "as": "tienda-web", "op": "create_consumer", "stream": "STATE_CLIENTES", "durable": "tienda-web__state_clientes_cliente_v1__acme", "filter": "state.clientes.cliente.v1.acme.*", "deliver": "last_per_subject", "title": "…ni siquiera con el filtro EXACTO de su tenant: el durable lo crea `flux provision`, no el servicio (como con los eventos, S2)", "expect": { "outcome": "denied" } },
+        { "as": "ops", "op": "delete_consumer", "stream": "STATE_CLIENTES", "durable": "tienda-web__state_clientes_cliente_v1__acme", "expect": { "outcome": "ok" } },
+        { "as": { "service": "tienda-web", "dev": true }, "op": "create_consumer", "stream": "STATE_CLIENTES", "durable": "tienda-web__state_clientes_cliente_v1__acme", "filter": "state.clientes.cliente.v1.*.*", "deliver": "last_per_subject", "title": "con --dev: crear su durable con el filtro de TODOS los tenants en el subject → denegado (A-14)", "expect": { "outcome": "denied" } },
+        { "as": { "service": "tienda-web", "dev": true }, "op": "create_consumer", "stream": "STATE_CLIENTES", "durable": "tienda-web__state_clientes_cliente_v1__acme", "filter": "state.clientes.cliente.v1.globex.*", "deliver": "last_per_subject", "title": "con --dev: con el filtro de OTRO tenant (globex) → denegado", "expect": { "outcome": "denied" } },
+        { "as": { "service": "tienda-web", "dev": true }, "op": "create_consumer", "stream": "STATE_CLIENTES", "durable": "tienda-web__state_clientes_cliente_v1__acme", "filter": "state.clientes.cliente.v1.*.*", "subjectFilter": "state.clientes.cliente.v1.acme.*", "deliver": "last_per_subject", "title": "con --dev: el subject concedido (acme.*) y el filtro de TODOS los tenants en el CUERPO → lo rechaza el SERVIDOR (A-40)", "expect": { "outcome": "answered", "reply.error.description": { "match": "did not match filtered subject from create subject" } } },
+        { "as": { "service": "tienda-web", "dev": true }, "op": "create_consumer", "stream": "STATE_CLIENTES", "durable": "tienda-web__state_clientes_cliente_v1__acme", "filter": "state.clientes.cliente.v1.acme.*", "deliver": "last_per_subject", "title": "control: con --dev y el filtro EXACTO de su tenant, SÍ crea su durable", "control": true, "expect": { "outcome": "answered", "reply.error": { "present": false }, "reply.config.filter_subject": "state.clientes.cliente.v1.acme.*", "reply.config.deliver_policy": "last_per_subject" } },
+        { "as": "ops", "op": "reset_consumer", "stream": "STATE_CLIENTES", "durable": "tienda-web__state_clientes_cliente_v1__acme", "filter": "state.clientes.cliente.v1.acme.*", "deliver": "new", "expect": { "outcome": "ok" } },
+        { "as": "ops", "op": "js_publish", "subject": "state.clientes.cliente.v1.acme.{marker}-b", "data": "{\"clienteId\":\"{marker}\",\"aggregateVersion\":1}", "title": "ops escribe una clave más en acme…", "expect": { "outcome": "ok", "stream": "STATE_CLIENTES" } },
+        { "as": "ops", "op": "js_publish", "subject": "state.clientes.cliente.v1.globex.{marker}-b", "data": "{\"clienteId\":\"{marker}\",\"aggregateVersion\":1}", "title": "…y otra en globex", "expect": { "outcome": "ok", "stream": "STATE_CLIENTES" } },
+        { "as": "tienda-web", "op": "pull", "stream": "STATE_CLIENTES", "durable": "tienda-web__state_clientes_cliente_v1__acme", "title": "el watch de tienda-web recibe la de acme…", "expect": { "outcome": "message", "subject": "state.clientes.cliente.v1.acme.{marker}-b" } },
+        { "as": "tienda-web", "op": "ack", "kind": "ack", "expect": { "violation": null } },
+        { "as": "tienda-web", "op": "pull", "stream": "STATE_CLIENTES", "durable": "tienda-web__state_clientes_cliente_v1__acme", "timeoutMs": 1200, "title": "…y la de globex NO le llega nunca: el filtro del durable lo aplica el broker", "expect": { "outcome": "none" } },
+        { "as": "informes-api", "op": "direct_get", "stream": "STATE_CLIENTES", "subject": "state.clientes.cliente.v1.globex.{marker}", "title": "control: informes-api (SIN confinar) SÍ lee la clave de globex", "control": true, "expect": { "outcome": "found", "data": { "includes": "{marker}" } } },
+        { "as": "tienda-web", "op": "request", "subject": "$JS.API.CONSUMER.INFO.STATE_CLIENTES.informes-api__state_clientes_cliente_v1", "title": "no puede consultar el durable de estado de informes-api", "expect": { "outcome": "denied" } },
+        { "as": "tienda-web", "op": "request", "subject": "$JS.API.CONSUMER.MSG.NEXT.STATE_CLIENTES.informes-api__state_clientes_cliente_v1", "body": { "batch": 1, "expires": 300000000 }, "title": "…ni pedir sus mensajes (quitarle la foto)", "expect": { "outcome": "denied" } },
+        { "as": { "service": "tienda-web", "extraPublish": ["$JS.API.DIRECT.GET.STATE_CLIENTES.state.clientes.cliente.v1.*.*"], "without": ["$JS.API.DIRECT.GET.STATE_CLIENTES.state.clientes.cliente.v1.acme.*"] }, "op": "direct_get", "stream": "STATE_CLIENTES", "subject": "state.clientes.cliente.v1.globex.{marker}", "title": "control (mutante): con `…v1.*.*` en lugar de `…acme.*` (SIN el tenant fijado), tienda-web SÍ lee globex: la sonda detecta un confinamiento roto", "control": true, "expect": { "outcome": "found", "data": { "includes": "{marker}" } } }
+      ]
+    },
+
+    {
+      "id": "S18",
+      "title": "Un servicio no puede consultar ni gestionar el stream de estado más allá de lo concedido",
+      "spec": "06-security.md §3.5 y §3.8; 10-state.md §8: STREAM.INFO.STATE_<DOM> no se concede a nadie, y la forma de cuerpo de DIRECT.GET, nunca",
+      "plan": "PLAN Fase 2: «un observador no puede crear/consultar el stream de estado más allá de lo concedido»",
+      "covers": ["A-6", "A-38", "A-39"],
+      "rationale": "STREAM.INFO con `subjects_filter` en el cuerpo devuelve TODOS los subjects del stream con su recuento (A-39): las claves y los tenants de todos. Con ese único permiso un servicio confinado a acme conoce los clientes de globex, y el SDK no lo necesita (`put`, `get` y `watch` funcionan sin él). Y la forma de cuerpo de DIRECT.GET lee cualquier mensaje por secuencia o por subject sin que ninguna ACL vea el cuerpo (A-6, A-38): es el atajo que anularía el confinamiento por tenant de S17. El generador no concede ni lo uno ni lo otro, ni siquiera al dueño. Los controles demuestran que las sondas pueden fallar: ops sí los hace, y con el permiso de más un observador lista y lee todo.",
+      "observed": { "server": "nats-server 2.14.5", "date": "2026-11-26", "result": "STREAM.INFO.STATE_CLIENTES con subjects_filter: Permissions Violation para tienda-web, informes-api, crm-api y facturacion-api (ops obtiene la lista de claves: A-39). La forma de cuerpo de DIRECT.GET (last_by_subj) y STREAM.MSG.GET: Permissions Violation también para el dueño. STREAM.PURGE, UPDATE y DELETE, CONSUMER.NAMES, CONSUMER.DELETE y DURABLE.CREATE sobre STATE_CLIENTES: Permissions Violation, todas en 0–1 ms. facturacion-api, que no tiene estado, no lee una clave ni consulta durables ajenos. Controles: ops lee por la forma de cuerpo; con STREAM.INFO.STATE_CLIENTES o con DIRECT.GET.STATE_CLIENTES de más, tienda-web lista las claves de todos y lee cualquier mensaje." },
+      "steps": [
+        { "as": "ops", "op": "js_publish", "subject": "state.clientes.cliente.v1.acme.{marker}", "data": "{\"clienteId\":\"{marker}\",\"aggregateVersion\":1}", "title": "ops escribe una clave y otra en globex, para que haya qué listar…", "expect": { "outcome": "ok", "stream": "STATE_CLIENTES" } },
+        { "as": "ops", "op": "js_publish", "subject": "state.clientes.cliente.v1.globex.{marker}", "data": "{\"clienteId\":\"{marker}\",\"aggregateVersion\":1}", "expect": { "outcome": "ok", "stream": "STATE_CLIENTES" } },
+        { "as": "ops", "op": "request", "subject": "$JS.API.STREAM.INFO.STATE_CLIENTES", "body": { "subjects_filter": "state.clientes.>" }, "title": "control (A-39): STREAM.INFO con `subjects_filter` lista TODAS las claves y todos los tenants", "control": true, "expect": { "outcome": "answered", "reply.state.num_subjects": { "gte": 2 } } },
+        { "as": "tienda-web", "op": "request", "subject": "$JS.API.STREAM.INFO.STATE_CLIENTES", "body": { "subjects_filter": "state.clientes.>" }, "title": "tienda-web: STREAM.INFO.STATE_CLIENTES con subjects_filter → denegado: no se le concede a NINGÚN rol", "expect": { "outcome": "denied" } },
+        { "as": "informes-api", "op": "request", "subject": "$JS.API.STREAM.INFO.STATE_CLIENTES", "body": { "subjects_filter": "state.clientes.>" }, "title": "informes-api: STREAM.INFO.STATE_CLIENTES con subjects_filter → denegado: no se le concede a NINGÚN rol", "expect": { "outcome": "denied" } },
+        { "as": "crm-api", "op": "request", "subject": "$JS.API.STREAM.INFO.STATE_CLIENTES", "body": { "subjects_filter": "state.clientes.>" }, "title": "crm-api: STREAM.INFO.STATE_CLIENTES con subjects_filter → denegado: no se le concede a NINGÚN rol", "expect": { "outcome": "denied" } },
+        { "as": "facturacion-api", "op": "request", "subject": "$JS.API.STREAM.INFO.STATE_CLIENTES", "body": { "subjects_filter": "state.clientes.>" }, "title": "facturacion-api: STREAM.INFO.STATE_CLIENTES con subjects_filter → denegado: no se le concede a NINGÚN rol", "expect": { "outcome": "denied" } },
+        { "as": "tienda-web", "op": "direct_get", "stream": "STATE_CLIENTES", "body": { "last_by_subj": "state.clientes.cliente.v1.acme.{marker}" }, "title": "tienda-web: la forma de CUERPO de DIRECT.GET ($JS.API.DIRECT.GET.STATE_CLIENTES + last_by_subj) → denegado: lee cualquier mensaje y ninguna ACL ve el cuerpo (A-38)", "expect": { "outcome": "denied" } },
+        { "as": "informes-api", "op": "direct_get", "stream": "STATE_CLIENTES", "body": { "last_by_subj": "state.clientes.cliente.v1.acme.{marker}" }, "title": "informes-api: la forma de CUERPO de DIRECT.GET ($JS.API.DIRECT.GET.STATE_CLIENTES + last_by_subj) → denegado: lee cualquier mensaje y ninguna ACL ve el cuerpo (A-38)", "expect": { "outcome": "denied" } },
+        { "as": "crm-api", "op": "direct_get", "stream": "STATE_CLIENTES", "body": { "last_by_subj": "state.clientes.cliente.v1.acme.{marker}" }, "title": "crm-api: la forma de CUERPO de DIRECT.GET ($JS.API.DIRECT.GET.STATE_CLIENTES + last_by_subj) → denegado: lee cualquier mensaje y ninguna ACL ve el cuerpo (A-38)", "expect": { "outcome": "denied" } },
+        { "as": "ops", "op": "direct_get", "stream": "STATE_CLIENTES", "body": { "last_by_subj": "state.clientes.cliente.v1.acme.{marker}" }, "title": "control: ops SÍ puede leer por la forma de cuerpo", "control": true, "expect": { "outcome": "found", "data": { "includes": "{marker}" } } },
+        { "as": "tienda-web", "op": "request", "subject": "$JS.API.STREAM.MSG.GET.STATE_CLIENTES", "body": { "seq": 1 }, "title": "STREAM.MSG.GET.STATE_CLIENTES por secuencia", "expect": { "outcome": "denied" } },
+        { "as": "crm-api", "op": "request", "subject": "$JS.API.STREAM.MSG.GET.STATE_CLIENTES", "body": { "seq": 1 }, "title": "…tampoco el dueño", "expect": { "outcome": "denied" } },
+        { "as": "tienda-web", "op": "request", "subject": "$JS.API.STREAM.PURGE.STATE_CLIENTES", "title": "purgar el stream de estado (el dueño de clientes tampoco: el stream no es suyo, es del que aprovisiona)", "expect": { "outcome": "denied" } },
+        { "as": "crm-api", "op": "request", "subject": "$JS.API.STREAM.PURGE.STATE_CLIENTES", "expect": { "outcome": "denied" } },
+        { "as": "crm-api", "op": "request", "subject": "$JS.API.STREAM.UPDATE.STATE_CLIENTES", "title": "modificar el stream de estado (max_msgs_per_subject, allow_direct…)", "expect": { "outcome": "denied" } },
+        { "as": "crm-api", "op": "request", "subject": "$JS.API.STREAM.DELETE.STATE_CLIENTES", "title": "borrar el stream de estado", "expect": { "outcome": "denied" } },
+        { "as": "tienda-web", "op": "request", "subject": "$JS.API.CONSUMER.NAMES.STATE_CLIENTES", "title": "listar los durables del stream de estado", "expect": { "outcome": "denied" } },
+        { "as": "tienda-web", "op": "request", "subject": "$JS.API.CONSUMER.DELETE.STATE_CLIENTES.tienda-web__state_clientes_cliente_v1__acme", "title": "borrar su propio durable (lo borra quien aprovisiona: flux state resync)", "expect": { "outcome": "denied" } },
+        { "as": "tienda-web", "op": "create_consumer", "api": "durable_create", "stream": "STATE_CLIENTES", "durable": "tienda-web__espia", "filter": "state.clientes.cliente.v1.globex.*", "title": "DURABLE.CREATE (API antigua) sobre el estado de otro tenant", "expect": { "outcome": "denied" } },
+        { "as": "facturacion-api", "op": "direct_get", "stream": "STATE_CLIENTES", "subject": "state.clientes.cliente.v1.acme.{marker}", "title": "un servicio SIN estado (facturacion-api) NO lee estado", "expect": { "outcome": "denied" } },
+        { "as": "facturacion-api", "op": "request", "subject": "$JS.API.CONSUMER.INFO.STATE_CLIENTES.tienda-web__state_clientes_cliente_v1__acme", "title": "…ni consulta el durable de otro", "expect": { "outcome": "denied" } },
+        { "as": { "service": "tienda-web", "extraPublish": ["$JS.API.STREAM.INFO.STATE_CLIENTES"] }, "op": "request", "subject": "$JS.API.STREAM.INFO.STATE_CLIENTES", "body": { "subjects_filter": "state.clientes.>" }, "title": "control (mutante): con STREAM.INFO.STATE_CLIENTES de más, tienda-web SÍ lista las claves y los tenants de todos: la sonda lo detecta", "control": true, "expect": { "outcome": "answered", "reply.state.num_subjects": { "gte": 2 } } },
+        { "as": { "service": "tienda-web", "extraPublish": ["$JS.API.DIRECT.GET.STATE_CLIENTES"] }, "op": "direct_get", "stream": "STATE_CLIENTES", "body": { "last_by_subj": "state.clientes.cliente.v1.acme.{marker}" }, "title": "control (mutante): con la forma de CUERPO de DIRECT.GET de más, SÍ lee cualquier mensaje", "control": true, "expect": { "outcome": "found", "data": { "includes": "{marker}" } } }
+      ]
+    },
+
+    {
+      "id": "S19",
+      "title": "La DLQ de estado: el observador escribe en `dlq.state.<contrato>` y solo ahí; el dueño la lee y nadie más",
+      "spec": "10-state.md §6 y §8; 06-security.md §3.1 y §3.8",
+      "plan": "PLAN Fase 2: ampliación de DLQ_<DOM> con `dlq.state.<dom>.>`",
+      "covers": ["A-44"],
+      "rationale": "La DLQ de estado lleva cinco tokens —sin tenant ni clave— para que no se multiplique, y la captura el mismo `DLQ_<DOM>` de los eventos (ampliado por `flux provision`: sin esa ampliación, publicar ahí por JetStream falla porque nadie lo captura). Si el generador concediera `dlq.state.>`, cualquier observador escribiría en la DLQ de los demás contratos, y el triaje del dueño se llenaría de muertos ajenos. Si no concediera el permiso de LEER al dueño, la DLQ de estado sería un cementerio sin visitas. Que NO la lean los observadores importa por otra razón: aunque no lleva el dato, sí lleva claves y las firmas de error.",
+      "observed": { "server": "nats-server 2.14.5", "date": "2026-11-26", "result": "tienda-web e informes-api publican en dlq.state.clientes.cliente.v1 por JetStream y lo captura DLQ_CLIENTES (ampliado por flux provision con dlq.state.clientes.>). Permissions Violation para dlq.state.pedidos.pedido.v1, para la forma con tenant y clave (siete tokens), para la DLQ de eventos de clientes, y para facturacion-api y crm-api en dlq.state.clientes.cliente.v1. El dueño lee su DLQ de estado con crm-api__dlq_state_clientes (CONSUMER.INFO, MSG.NEXT, ack); tienda-web, ni el INFO ni el MSG.NEXT de ese durable. STREAM.INFO.DLQ_CLIENTES responde a tienda-web (el SDK lo comprueba al abrir) y se deniega a facturacion-api." },
+      "steps": [
+        { "as": "ops", "op": "reset_consumer", "stream": "DLQ_CLIENTES", "durable": "crm-api__dlq_state_clientes", "filter": "dlq.state.clientes.>", "deliver": "new", "expect": { "outcome": "ok" } },
+        { "as": "tienda-web", "op": "js_publish", "subject": "dlq.state.clientes.cliente.v1", "data": "{\"key\":\"{marker}\",\"revision\":1}", "title": "el observador manda a `dlq.state.<contrato>` lo que no puede aplicar: lo captura DLQ_CLIENTES (A-44)", "expect": { "outcome": "ok", "stream": "DLQ_CLIENTES" } },
+        { "as": "informes-api", "op": "js_publish", "subject": "dlq.state.clientes.cliente.v1", "data": "{\"key\":\"{marker}-i\",\"revision\":1}", "title": "…también el que observa todos los tenants (un solo subject de DLQ por contrato, sin tenant ni clave)", "expect": { "outcome": "ok", "stream": "DLQ_CLIENTES" } },
+        { "as": "tienda-web", "op": "js_publish", "subject": "dlq.state.pedidos.pedido.v1", "data": "{\"clienteId\":\"{marker}\",\"aggregateVersion\":1}", "title": "NO a la de estado de un contrato que no observa", "expect": { "outcome": "denied" } },
+        { "as": "tienda-web", "op": "js_publish", "subject": "dlq.state.clientes.cliente.v1.acme.{marker}", "data": "{\"clienteId\":\"{marker}\",\"aggregateVersion\":1}", "title": "…ni con tenant y clave (siete tokens: lo que la DLQ de estado no lleva)", "expect": { "outcome": "denied" } },
+        { "as": "tienda-web", "op": "publish", "subject": "dlq.clientes.cliente.v1.registrado", "title": "…ni a la de EVENTOS de clientes (no consume ninguno)", "expect": { "outcome": "denied" } },
+        { "as": "facturacion-api", "op": "js_publish", "subject": "dlq.state.clientes.cliente.v1", "data": "{\"clienteId\":\"{marker}\",\"aggregateVersion\":1}", "title": "un servicio que no observa clientes NO escribe en su DLQ de estado", "expect": { "outcome": "denied" } },
+        { "as": "crm-api", "op": "js_publish", "subject": "dlq.state.clientes.cliente.v1", "data": "{\"clienteId\":\"{marker}\",\"aggregateVersion\":1}", "title": "el DUEÑO tampoco: la DLQ de estado la escribe quien no pudo aplicar, no quien escribe", "expect": { "outcome": "denied" } },
+        { "as": "crm-api", "op": "create_consumer", "stream": "DLQ_CLIENTES", "durable": "crm-api__dlq_state_clientes", "filter": "dlq.state.clientes.>", "title": "en producción el dueño NO crea su durable de DLQ de estado (lo hace flux provision), ni con el filtro exacto", "expect": { "outcome": "denied" } },
+        { "as": "crm-api", "op": "pull", "stream": "DLQ_CLIENTES", "durable": "crm-api__dlq_state_clientes", "title": "el DUEÑO lee su DLQ de estado con el pull consumer `crm-api__dlq_state_clientes`", "expect": { "outcome": "message", "subject": "dlq.state.clientes.cliente.v1", "data": { "includes": "{marker}" } } },
+        { "as": "crm-api", "op": "ack", "kind": "ack", "expect": { "violation": null } },
+        { "as": "tienda-web", "op": "pull", "stream": "DLQ_CLIENTES", "durable": "crm-api__dlq_state_clientes", "timeoutMs": 800, "title": "un observador NO lee la DLQ de estado del dueño (ni su CONSUMER.INFO)", "expect": { "outcome": "denied" } },
+        { "as": "tienda-web", "op": "request", "subject": "$JS.API.CONSUMER.MSG.NEXT.DLQ_CLIENTES.crm-api__dlq_state_clientes", "body": { "batch": 1, "expires": 300000000 }, "title": "…ni pedir sus mensajes", "expect": { "outcome": "denied" } },
+        { "as": "tienda-web", "op": "request", "subject": "$JS.API.STREAM.INFO.DLQ_CLIENTES", "title": "control: SÍ puede consultar la DLQ del dominio (el SDK la comprueba al abrir)", "control": true, "expect": { "outcome": "answered", "reply.config.name": "DLQ_CLIENTES" } },
+        { "as": "facturacion-api", "op": "request", "subject": "$JS.API.STREAM.INFO.DLQ_CLIENTES", "title": "un servicio que no observa clientes, no", "expect": { "outcome": "denied" } },
+        { "as": { "service": "tienda-web", "without": ["dlq.state.clientes.cliente.v1"] }, "op": "request", "subject": "$JS.API.STREAM.INFO.DLQ_CLIENTES", "title": "(sin el permiso de publicar en la DLQ, conserva el de consultarla: son dos permisos)", "expect": { "outcome": "answered" } }
+      ]
+    },
+
+    {
+      "id": "S20",
+      "title": "Minimalidad del estado: sin cualquiera de los permisos del observador o del dueño, el fallo es el que toca",
+      "spec": "06-security.md §3.8: cada permiso de estado es necesario; 06-security.md §3.7: las denegaciones se ven",
+      "plan": "PLAN Fase 2: «mutantes: quitar un permiso es detectado»",
+      "covers": ["A-19", "A-20", "A-21"],
+      "rationale": "Es el S12 del estado y la mitad de la minimalidad que `verify-acl.mjs` mide con ciclos completos. Cada permiso de estado tiene una función y, sin él, un fallo concreto: sin DIRECT.GET un observador no puede `get` ni el dueño dar el paso 1 de `put`; sin CONSUMER.INFO no hay `watch`; sin MSG.NEXT el `watch` queda inerte y parece sano (A-20); sin el ack la foto se reentrega para siempre (A-19); sin `dlq.state.<contrato>` lo que no se puede aplicar se pierde. Si el generador dejara de conceder uno, o lo cambiara por otra forma, el servicio arrancaría y fallaría en producción. Con él, los fallos silenciosos no pueden serlo: se ven por el aviso del broker y por el estado del consumidor.",
+      "observed": { "server": "nats-server 2.14.5", "date": "2026-11-26", "result": "Sin DIRECT.GET: Permissions Violation en `get` (tienda-web) y en el paso 1 de `put` (crm-api). Sin CONSUMER.INFO: `consumers.get` denegado nombrando el subject. Sin MSG.NEXT: el pull no lanza; solo el aviso «Permissions Violation for Publish to $JS.API.CONSUMER.MSG.NEXT.…» y el consumidor queda con numPending 1 y delivered 0 (A-20). Sin el permiso de ack: la entrada llega y el ack se deniega en silencio (aviso «Publish to $JS.ACK.…»), con ackPending 1 (A-19). Sin `dlq.state.<contrato>`, sin STREAM.INFO.DLQ_CLIENTES o sin `state.clientes.>`: Permissions Violation en 0–18 ms." },
+      "steps": [
+        { "as": "ops", "op": "reset_consumer", "stream": "STATE_CLIENTES", "durable": "tienda-web__state_clientes_cliente_v1__acme", "filter": "state.clientes.cliente.v1.acme.*", "deliver": "new", "expect": { "outcome": "ok" } },
+        { "as": "ops", "op": "reset_consumer", "stream": "DLQ_CLIENTES", "durable": "crm-api__dlq_state_clientes", "filter": "dlq.state.clientes.>", "deliver": "new", "expect": { "outcome": "ok" } },
+        { "as": "ops", "op": "js_publish", "subject": "state.clientes.cliente.v1.acme.{marker}", "data": "{\"clienteId\":\"{marker}\",\"aggregateVersion\":1}", "title": "ops escribe una clave de acme y un muerto en la DLQ de estado…", "expect": { "outcome": "ok", "stream": "STATE_CLIENTES" } },
+        { "as": "ops", "op": "js_publish", "subject": "dlq.state.clientes.cliente.v1", "data": "{\"key\":\"{marker}\",\"revision\":1}", "expect": { "outcome": "ok", "stream": "DLQ_CLIENTES" } },
+        { "as": { "service": "tienda-web", "without": ["$JS.API.DIRECT.GET.STATE_CLIENTES.state.clientes.cliente.v1.acme.*"] }, "op": "direct_get", "stream": "STATE_CLIENTES", "subject": "state.clientes.cliente.v1.acme.{marker}", "title": "tienda-web sin DIRECT.GET: `get` se deniega", "expect": { "outcome": "denied" } },
+        { "as": { "service": "tienda-web", "without": ["$JS.API.CONSUMER.INFO.STATE_CLIENTES.tienda-web__state_clientes_cliente_v1__acme"] }, "op": "pull", "stream": "STATE_CLIENTES", "durable": "tienda-web__state_clientes_cliente_v1__acme", "timeoutMs": 800, "title": "tienda-web sin CONSUMER.INFO: `consumers.get` (lo primero que hace `watch`) se deniega, nombrando el subject", "expect": { "outcome": "denied" } },
+        { "as": { "service": "tienda-web", "without": ["$JS.API.CONSUMER.MSG.NEXT.STATE_CLIENTES.tienda-web__state_clientes_cliente_v1__acme"] }, "op": "pull", "stream": "STATE_CLIENTES", "durable": "tienda-web__state_clientes_cliente_v1__acme", "timeoutMs": 1200, "title": "tienda-web sin MSG.NEXT: el pull NO lanza (A-20): solo el aviso del broker delata un `watch` inerte", "expect": { "outcome": "denied", "text": { "match": "CONSUMER\\.MSG\\.NEXT\\.STATE_CLIENTES\\.tienda-web__state_clientes_cliente_v1__acme" } } },
+        { "as": "ops", "op": "consumer_state", "stream": "STATE_CLIENTES", "durable": "tienda-web__state_clientes_cliente_v1__acme", "title": "…y el consumidor queda inerte: la foto sigue ahí, sin entregar", "expect": { "numPending": 1, "delivered": 0 } },
+        { "as": { "service": "tienda-web", "without": ["$JS.ACK.STATE_CLIENTES.tienda-web__state_clientes_cliente_v1__acme.>"] }, "op": "pull", "stream": "STATE_CLIENTES", "durable": "tienda-web__state_clientes_cliente_v1__acme", "title": "tienda-web sin el permiso de ack: la entrada llega y se procesa…", "expect": { "outcome": "message", "subject": "state.clientes.cliente.v1.acme.{marker}" } },
+        { "as": { "service": "tienda-web", "without": ["$JS.ACK.STATE_CLIENTES.tienda-web__state_clientes_cliente_v1__acme.>"] }, "op": "ack", "kind": "ack", "title": "…y el ack lo deniega el broker SIN excepción (A-19): solo un aviso por la conexión", "expect": { "outcome": "sent", "violation": { "match": "Publish to \"\\$JS\\.ACK\\.STATE_CLIENTES\\.tienda-web__state_clientes_cliente_v1__acme\\." } } },
+        { "as": "ops", "op": "consumer_state", "stream": "STATE_CLIENTES", "durable": "tienda-web__state_clientes_cliente_v1__acme", "title": "…y la entrada se reentregará cada ack_wait, sin fin", "expect": { "ackPending": 1 } },
+        { "as": { "service": "tienda-web", "without": ["dlq.state.clientes.cliente.v1"] }, "op": "js_publish", "subject": "dlq.state.clientes.cliente.v1", "data": "{\"clienteId\":\"{marker}\",\"aggregateVersion\":1}", "title": "tienda-web sin `dlq.state.<contrato>`: no puede mandar a la DLQ de estado", "expect": { "outcome": "denied" } },
+        { "as": { "service": "tienda-web", "without": ["$JS.API.STREAM.INFO.DLQ_CLIENTES"] }, "op": "request", "subject": "$JS.API.STREAM.INFO.DLQ_CLIENTES", "title": "tienda-web sin STREAM.INFO.DLQ_CLIENTES: `watch` no puede comprobar su DLQ al abrir", "expect": { "outcome": "denied" } },
+        { "as": { "service": "crm-api", "without": ["state.clientes.>"] }, "op": "js_publish", "subject": "state.clientes.cliente.v1.acme.{marker}-x", "data": "{\"clienteId\":\"{marker}\",\"aggregateVersion\":1}", "title": "crm-api sin `state.clientes.>`: `put` se deniega", "expect": { "outcome": "denied" } },
+        { "as": { "service": "crm-api", "without": ["$JS.API.DIRECT.GET.STATE_CLIENTES.state.clientes.>"] }, "op": "direct_get", "stream": "STATE_CLIENTES", "subject": "state.clientes.cliente.v1.acme.{marker}", "title": "crm-api sin DIRECT.GET de su dominio: el paso 1 de `put` (leer la secuencia) se deniega", "expect": { "outcome": "denied" } },
+        { "as": { "service": "crm-api", "without": ["$JS.API.CONSUMER.INFO.DLQ_CLIENTES.crm-api__dlq_state_clientes"] }, "op": "pull", "stream": "DLQ_CLIENTES", "durable": "crm-api__dlq_state_clientes", "timeoutMs": 800, "title": "crm-api sin CONSUMER.INFO de su durable de DLQ de estado: no la puede leer", "expect": { "outcome": "denied" } },
+        { "as": { "service": "crm-api", "without": ["$JS.API.CONSUMER.MSG.NEXT.DLQ_CLIENTES.crm-api__dlq_state_clientes"] }, "op": "pull", "stream": "DLQ_CLIENTES", "durable": "crm-api__dlq_state_clientes", "timeoutMs": 1200, "title": "crm-api sin MSG.NEXT: el pull se deniega sin excepción: lo delata el aviso del broker", "expect": { "outcome": "denied", "text": { "match": "CONSUMER\\.MSG\\.NEXT\\.DLQ_CLIENTES\\.crm-api__dlq_state_clientes" } } },
+        { "as": { "service": "crm-api", "without": ["$JS.ACK.DLQ_CLIENTES.crm-api__dlq_state_clientes.>"] }, "op": "pull", "stream": "DLQ_CLIENTES", "durable": "crm-api__dlq_state_clientes", "title": "crm-api sin el permiso de ack: lee el muerto…", "expect": { "outcome": "message", "subject": "dlq.state.clientes.cliente.v1" } },
+        { "as": { "service": "crm-api", "without": ["$JS.ACK.DLQ_CLIENTES.crm-api__dlq_state_clientes.>"] }, "op": "ack", "kind": "ack", "title": "…y el ack se deniega en silencio", "expect": { "outcome": "sent", "violation": { "match": "Publish to \"\\$JS\\.ACK\\.DLQ_CLIENTES\\.crm-api__dlq_state_clientes\\." } } },
+        { "as": "crm-api", "op": "pull", "stream": "STATE_CLIENTES", "durable": "tienda-web__state_clientes_cliente_v1__acme", "timeoutMs": 800, "title": "con TODOS sus permisos, crm-api sigue sin poder leer el durable de estado de tienda-web", "expect": { "outcome": "denied" } }
       ]
     }
   ]

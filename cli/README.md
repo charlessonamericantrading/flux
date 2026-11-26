@@ -318,21 +318,33 @@ durable `<servicio>__<subject>` con la configuración canónica de
 [03-delivery.md §2](../specification/03-delivery.md). Más, por cada dueño, el durable con el
 que lee su propia DLQ (`<servicio>__dlq_<dominio>`).
 
+**Estado replicado** ([10-state.md](../specification/10-state.md)). Por cada dominio que **tiene** estado
+—el bundle tiene un contrato suyo en `schemas/state/`— crea además `STATE_<DOM>` con la
+configuración de `protocol.json` → `state.stream` (`max_msgs_per_subject: 1`, `allow_direct`,
+`max_age: 0`, `discard: old`, ventana de 2 m), hace que `DLQ_<DOM>` capture también
+`dlq.state.<dom>.>`, y crea el durable de cada `watches` del manifiesto —uno por tenant si confina,
+`<servicio>__state_<dom>_<agr>_v<M>[__<tenant>]`, con `deliver_policy: last_per_subject`— y el
+durable con el que el dueño lee su DLQ de estado (`<servicio>__dlq_state_<dominio>`). Un dominio sin
+estado no cambia. El formato de `watches` y los permisos que genera, en
+[06-security.md §3.8](../specification/06-security.md#38-estado-replicado-watches-y-sus-permisos).
+
 ```
 $ flux provision examples/services.json --dry-run
-flux provision --dry-run  examples/services.json · 8 stream(s), 12 consumidor(es) · réplicas 1
+flux provision --dry-run  examples/services.json · 11 stream(s), 16 consumidor(es) · réplicas 1
   Simulación: no se crea nada.
 
   SE CREARÍA  EVT_FACTURACION                                                   facturacion.>
   SE CREARÍA  DLQ_FACTURACION                                                   dlq.facturacion.>
   …
+  SE CREARÍA  STATE_CLIENTES                                                    state.clientes.>
   SE CREARÍA  EVT_PEDIDOS / facturacion-api__pedidos_pedido_v1_creado           filtro pedidos.pedido.v1.creado
+  SE CREARÍA  STATE_CLIENTES / tienda-web__state_clientes_cliente_v1__acme      filtro state.clientes.cliente.v1.acme.*
   …
-  20 se crearía(n)
+  27 se crearía(n)
 
 $ flux provision examples/services.json        # y otra vez
   …
-  20 sin cambios
+  27 sin cambios
 
 ✓ Sin cambios: el broker ya tiene todo lo que el manifiesto exige.
 ```
@@ -341,7 +353,7 @@ $ flux provision examples/services.json        # y otra vez
 |---|---|
 | **Idempotente** | Una segunda ejecución no cambia nada y lo dice. Es lo que permite llamarla en cada despliegue sin miedo |
 | **Nunca borra** | Un stream borrado es el historial de un dominio. Lo que el manifiesto no menciona se ignora; auditarlo es trabajo de `flux doctor` |
-| **Nunca sobrescribe** | Si un stream o un consumidor existe con otra configuración, **informa de la diferencia** y lo deja como está. Cambiar la retención de un stream vivo, o `max_ack_pending` de un consumidor con mensajes en vuelo, es una decisión de una persona |
+| **Nunca sobrescribe** | Si un stream o un consumidor existe con otra configuración, **informa de la diferencia** y lo deja como está. Cambiar la retención de un stream vivo, o `max_ack_pending` de un consumidor con mensajes en vuelo, es una decisión de una persona. **Una sola excepción, que solo añade**: un `DLQ_<DOM>` de la 1.0 (solo `dlq.<dom>.>`) cuyo dominio ha ganado estado se **amplía** con `dlq.state.<dom>.>`: no pierde ningún mensaje (A-44). `--dry-run` lo muestra como `SE AMPLIARÍA`, y una DLQ con un subject de más se informa como diferencia y no se toca |
 | **`--dry-run` no crea nada** | Pero sí consulta el broker, así que distingue «se crearía» de «ya existe» |
 | **Una sola fuente** | Los nombres y la expansión de `consumes` salen del mismo módulo que usa el generador de ACL ([`scripts/lib/manifest.mjs`](../scripts/lib/manifest.mjs)), y las configuraciones, de `protocol.json`. Si cada uno calculase el nombre de un durable por su cuenta, el servicio arrancaría y el broker le denegaría su propio consumidor |
 

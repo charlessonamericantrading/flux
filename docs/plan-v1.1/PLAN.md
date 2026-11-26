@@ -328,7 +328,8 @@ node scripts/gen-acl.mjs <services.json> [--bundle <bundle.json>] [--nkeys <mapa
 - `--json` imprime un array con un elemento por servicio (por servicio y tenant con
   `--tenants`): `{ name, publish, subscribe, owns, consumes, durables }`, donde `consumes` ya
   está **expandido** a subjects exactos y `durables` es `[{ stream, durable, filter, kind }]`
-  (`kind` ∈ `events | dlq`).
+  (`kind` ∈ `events | dlq | state | dlq-state`; los de estado llevan además `contract` y `tenant`). Con la
+  Fase 2, cada elemento trae también `stateOwns` y `watches`.
 - `--dev` añade `CONSUMER.CREATE` de cada durable propio (ver arriba). Sin él, ningún permiso
   de `CREATE`. Una lista de permisos **nunca** sale vacía: en NATS `allow: []` significa «sin
   restricción», no «nada» (medido).
@@ -444,7 +445,7 @@ de compose en sí no se ha podido ejecutar (el contenedor de desarrollo no tiene
 **Aceptación**
 
 ```bash
-FLUX_REQUIRE_BROKER=1 node conformance/security.mjs                  # S1–S14 en verde
+FLUX_REQUIRE_BROKER=1 node conformance/security.mjs                  # S1–S20 en verde
 node conformance/security.mjs --acl conformance/fixtures/acl-v1.conf # DEBE fallar en S1 y S6
 ```
 
@@ -633,11 +634,11 @@ await bus.state.watch("clientes.cliente.v1", async (entrada, ctx) => {
 | `scripts/bundle-schemas.mjs`, `check-compat.mjs` | Recorrer `schemas/state/`; índice `state` en el bundle; error con pista si falta `aggregateVersion` | **Hecho** (reglas en `scripts/schema-rules.mjs`) |
 | `schemas/state/clientes/cliente/1.0.0.json`, `schemas/system/state/eliminado/1.0.0.json` | Esquema de ejemplo con `x-pii`, y la lápida | **Hecho** |
 | `conformance/cases/` | `state-broker.json` (A-31 … A-49), `state-semantics.json` (A-50) y `cross-sdk-state-envelope.json`; los ejecuta `conformance/state-broker.mjs` | **Hecho** |
-| `scripts/gen-acl.mjs` | Clave `watches`. Dueño: publica en `state.<dom>.>` y `DIRECT.GET` de su dominio. Observador: `CONSUMER.INFO`, `MSG.NEXT` y `ACK` de su durable, `DIRECT.GET` acotado a su tenant, `dlq.state.<contrato>` y `STREAM.INFO.DLQ_<DOM>`; **sin** `STREAM.INFO.STATE_<DOM>`. Patrones en `protocol.json` → `state.acl` | Pendiente (agente de permisos) |
-| `cli/` | `flux state ls \| get \| resync`; `provision` crea `STATE_` y amplía `DLQ_<DOM>`; `doctor` audita su config; `dlq replay` rechaza `dlq.state.>`; `tail` entiende `state.` | Pendiente (agente de CLI) |
+| `scripts/gen-acl.mjs` | Clave `watches`. Dueño: publica en `state.<dom>.>` y `DIRECT.GET` de su dominio. Observador: `CONSUMER.INFO`, `MSG.NEXT` y `ACK` de su durable, `DIRECT.GET` acotado a su tenant, `dlq.state.<contrato>` y `STREAM.INFO.DLQ_<DOM>`; **sin** `STREAM.INFO.STATE_<DOM>`. Patrones en `protocol.json` → `state.acl` | **Hecho** (`fase-2-acl`): `watches` es `"clientes.cliente.v1"` (todos los tenants) o `{ contract, tenants }` (confinado; un durable y un `DIRECT.GET` por tenant). **Difiere de `state.acl` en un punto**: el dueño tampoco recibe `STREAM.INFO.STATE_<DOM>` (el SDK no lo usa). Rechaza dominios reservados, `tenants: []`, claves desconocidas y observar el propio dominio. `06-security.md` §3.8 |
+| `cli/` | `flux state ls \| get \| resync`; `provision` crea `STATE_` y amplía `DLQ_<DOM>`; `doctor` audita su config; `dlq replay` rechaza `dlq.state.>`; `tail` entiende `state.` | `provision`: **hecho** (`fase-2-acl`: `STATE_<DOM>`, durables `last_per_subject`, la DLQ de estado y la ampliación de `DLQ_<DOM>`, que es lo único que cambia en un recurso existente). Lo demás, pendiente (agente de CLI) |
 | `sdk-node/`, `sdk-rust/` | La API de 2.6, con tests contra NATS real y los escenarios de `state-semantics.json` | Pendiente |
 | `conformance/harness/` | Operaciones `state-build`, `state-tombstone`, `state-subject`, `state-dlq`, con los vectores de `cross-sdk-state-envelope.json` | Pendiente (integración) |
-| `conformance/security.mjs` | Otro servicio no escribe estado ajeno; un tenant no lee el de otro. Los casos de datos de `state-broker.json` (`acls.estado`) ya lo miden contra una ACL a mano | Pendiente (integración) |
+| `conformance/security.mjs` | Otro servicio no escribe estado ajeno; un tenant no lee el de otro. Los casos de datos de `state-broker.json` (`acls.estado`) ya lo miden contra una ACL a mano | **Hecho** (`fase-2-acl`): S15 (ciclo de extremo a extremo), S16 (solo el dueño escribe), S17 (un tenant no lee el de otro), S18 (el stream de estado), S19 (la DLQ de estado) y S20 (minimalidad); más la sección de estado de `verify-acl.mjs` |
 
 **Aceptación:** la definición de hecho, más un test de extremo a extremo: el dueño escribe
 100 claves, un observador nuevo las recibe todas y recibe `onSynced`, se borra una, el observador
@@ -995,6 +996,11 @@ Reproducible: [`evidencia/ejecutar.sh`](evidencia/ejecutar.sh).
 | A-48 | `CONSUMER.INFO` de un consumidor inexistente y de un stream inexistente | 404 con err **10014** «consumer not found» y **10059** «stream not found»: se distinguen sin `STREAM.INFO`. Caso `consumer-info-distinguishes-missing-stream-and-consumer` |
 | A-49 | Cluster de 3 nodos locales: stream R3 con la config de estado; carrera de 8 escritores con la misma S; lectura directa tras un `put`; 3 instancias del dueño | Config devuelta tal cual. **Bajo carrera: 210 de 210 rechazos con err 10164 «wrong last sequence», SIN número**; sin carrera sigue siendo 10071 con número. 400 `put` seguidos de su lectura inmediata: 0 lecturas obsoletas (**no** demuestra que no ocurra con latencia real). 3 instancias sobre la misma clave sin pausa: de 90 `put`, 49 ok, 27 `stale`, 14 `STATE_CONFLICT`. Casos `cluster-r3-cas-conflict-code`, `cluster-three-owner-instances-converge` |
 | A-50 | El algoritmo de `put`/`delete`/`get` y la foto de `watch` (10-state.md §3.2, §5.5), como implementación de referencia sobre NATS crudo | Los escenarios de `state-semantics.json`: versiones y `stale`; recrear tras la lápida; clave inexistente; versión 0, decimal o > 2^53 − 1; propia escritura tras un acuse perdido; 3 conflictos → `STATE_CONFLICT`, un rival con versión mayor → `stale`; 3 instancias convergen; mismo `cli-1` en dos tenants; foto con lápida, vacía y con escrituras. Nueve mutantes de la referencia (`--mutant`) los hacen fallar todos |
+| A-51 | Dos escrituras a claves **distintas** con el mismo `Nats-Msg-Id` dentro de `duplicate_window`, ambas con `Nats-Expected-Last-Subject-Sequence: 0` (hallado en S15) | **La segunda no se escribe y el acuse no es un error**: `duplicate: true` con la secuencia de la primera. El chequeo de secuencia pasa (la clave es nueva) y el de duplicados la descarta. Un `Nats-Msg-Id` que no sea el `id` único del evento —un fixture que lo reutilice— pierde escrituras en silencio |
+| A-52 | Ampliar `DLQ_<DOM>` con `dlq.state.<dom>.>` por `flux provision` teniendo un mensaje; `--dry-run` antes | `se ampliaría`, y después `ampliado`: el mensaje sigue ahí (1), y repetir da «sin cambios». Reproduce A-44 por la CLI |
+| A-53 | `streams.update` de `STATE_<DOM>` con `max_age: 60s` y `duplicate_window` de 2 m | Err «duplicates window can not be larger then max age»: un `max_age` corto no es una forma de que el estado caduque con la ventana de la 1.0; el estado usa `max_age: 0` |
+| A-54 | La ACL generada ejecutada de extremo a extremo (S15 a S20): el dueño, un observador confinado a `acme` y uno sin confinar | Sin una sola violación en los ciclos positivos. Con `DIRECT.GET…v1.acme.*` se lee una clave de `acme` y un `…acme.>` (sigue siendo su tenant); se deniegan `globex`, `…v1.*.<clave>`, `state.<dom>.>` y la forma de cuerpo. Un `publish` de core a un subject de estado se deniega a todos menos al dueño. `STREAM.INFO.STATE_<DOM>`, `STREAM.MSG.GET`, `STREAM.PURGE` y el durable de otro: denegados a los cuatro roles. Quitar cualquiera de los permisos de estado rompe el ciclo (`verify-acl.mjs`, 5b) |
+| A-55 | Qué pide `@nats-io/jetstream` 3.4.0 bajo los permisos de estado generados (observador confinado y dueño) | `DirectStreamAPIImpl.getMessage(stream, { last_by_subj })` emite exactamente `$JS.API.DIRECT.GET.<stream>.<subject>`, sin cuerpo y **sin ninguna violación**; **no es público** (`jetstream(nc).direct` es `undefined`), así que un SDK pide `nc.request` a ese subject y mira `headers.code` (404 = no hay valor; las cabeceras traen `Nats-Sequence`). `jsm.streams.getMessage` usa `STREAM.MSG.GET` y `jsm.streams.info("STATE_…")` usa `STREAM.INFO`: **denegados**, también al dueño. `consumers.get` (CONSUMER.INFO) y `publish` con `expect: { lastSubjectSequence }` funcionan; el conflicto llega como `JetStreamApiError` con `code` 10071 |
 A-19 a A-27 los reproduce `sdk-node/test/integration/` (`acl.test.ts`, `auth.test.ts`,
 `tls.test.ts`), contra nats-server 2.14.5 y `@nats-io/*` 3.4.0. A-28 a A-30 los reproduce
 `sdk-rust/tests/security.rs`, contra nats-server 2.14.5 y `async-nats` 0.50.
@@ -1007,8 +1013,9 @@ ejemplos byte a byte; un nodo, una ACL escrita a mano y un cluster de tres nodos
 completo es su bloque `brokerObservations`): A-1 → S9 · A-2 → S6, S9 · A-3 → S1 · A-4 → S2 ·
 A-5 → S3 · A-6 → S4 · A-7 → S6 · A-8 → S5 · A-8a → S1, S2 · A-8c → S10 · A-8f → S6, S13 ·
 A-19, A-20 → S12 · A-21 → S13 · A-22 → S6 · A-24 → S8 (la parte del broker) · A-25 → S14 ·
-A-27 → S10, S11 · A-29 → S11.
-Las del **estado** (A-9 … A-14 y A-31 … A-50) son casos de
+A-27 → S10, S11 · A-29 → S11 · A-14 → S15, S17 · A-32, A-33 → S15 · A-38 → S15, S17, S18 · A-39 → S18 ·
+A-40 → S17 · A-44 → S19 · A-45 → S16.
+Las del **estado** (A-9 … A-14 y A-31 … A-50; las que dependen de la ACL —A-14, A-32, A-33, A-38 a A-40, A-44, A-45— se repiten bajo los permisos generados en S15 a S19) son casos de
 [`conformance/cases/state-broker.json`](../../conformance/cases/state-broker.json) y
 [`state-semantics.json`](../../conformance/cases/state-semantics.json): cada caso lleva su lista `covers`.
 **No tienen caso** porque son del SDK o de la librería (A-8b, A-26, A-28, A-30; los cubren

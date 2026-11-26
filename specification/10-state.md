@@ -694,7 +694,8 @@ tiene el dato porque le llegó.
 ## 8. Permisos
 
 Los permisos de estado los **genera** `gen-acl.mjs` (clave `watches` del manifiesto) y se
-documentan junto a los demás en [06-security.md §3](06-security.md); esto es lo que el estado
+documentan junto a los demás en [06-security.md §3.8](06-security.md#38-estado-replicado-watches-y-sus-permisos)
+(el formato de `watches`, lo que recibe cada rol y los casos S15 a S20 que lo ejecutan); esto es lo que el estado
 necesita, **medido** contra un broker con una ACL escrita a mano (A-38 a A-40), y lo que el
 generador debe producir. `protocol.json` → `state.acl` fija los patrones.
 
@@ -738,7 +739,9 @@ Lo que se midió, y por qué la lista es esta:
   `STREAM.INFO` con `subjects_filter` en el cuerpo devuelve **todos los subjects del stream con
   su recuento**, es decir, **todas las claves y todos los tenants** (A-39). Con ese único permiso,
   un servicio confinado a `acme` conoce los clientes de `globex`. Sin él, `put`, `get` y `watch`
-  funcionan igual (A-38, A-48). El dueño **PUEDE** tenerlo, porque ya ve todos sus tenants.
+  funcionan igual (A-38, A-48). El dueño **PUEDE** tenerlo, porque ya ve todos sus tenants; el generador
+  **no se lo concede** (06-security.md §3.8): el SDK tampoco lo usa, y si un día hace falta es un permiso más
+  del dueño, nunca del observador.
   Lo que **sí** queda visible para un observador es lo que expone `STREAM.INFO.DLQ_<DOM>`:
   los subjects de DLQ —cinco tokens, sin clave ni tenant— y sus recuentos.
 
