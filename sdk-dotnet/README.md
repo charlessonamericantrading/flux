@@ -477,6 +477,200 @@ configurar nada.
 
 ---
 
+## Seguridad: permisos, inbox, TLS y credenciales
+
+[06-security.md §2 y §3](../specification/06-security.md). Lo que sigue **está ejecutado contra un `nats-server` real** en
+[`tests/Flux.Tests/Integration/SecurityIntegrationTests.cs`](tests/Flux.Tests/Integration/SecurityIntegrationTests.cs) —con la ACL
+que genera `scripts/gen-acl.mjs` y los streams y durables de `flux provision`, no con un broker abierto— y, lo que no necesita
+broker, en [`tests/Flux.Tests/SecurityTests.cs`](tests/Flux.Tests/SecurityTests.cs). Cada afirmación tiene un test que pasa con lo
+correcto y otro que falla con lo incorrecto.
+
+```csharp
+var bus = await FluxBus.ConnectAsync(new ConnectOptions
+{
+    Servers     = "tls://nats.interno:4222",
+    Service     = "pedidos-api",
+    Environment = "produccion",
+    Version     = "1.0.0",
+    Tls         = new TlsOptions { CaFile = "/etc/flux/ca.pem" },                    // CA propia; mTLS: CertFile + KeyFile
+    Credentials = new NatsCredentials { CredsFile = "/run/secrets/pedidos-api.creds" },
+    Logger      = logger,        // ⚠️ configúralo: un `ack` denegado solo deja rastro ahí
+});
+```
+
+### El inbox es privado y no es una opción
+
+El SDK conecta **siempre** con `_INBOX.<servicio>` como prefijo de inbox (`NatsOpts.InboxPrefix`). Las respuestas a las peticiones de
+JetStream —y las entregas de los consumidores pull— viajan por él. Con el `_INBOX.>` común, cualquier servicio con permiso de
+suscripción sobre él **lee las entregas de los demás** (A-2, A-22). No es una opción: un servicio que eligiera otro prefijo se quedaría
+sin permiso de suscripción y sin una pista de por qué. Un nombre de servicio con punto o mayúsculas se rechaza (`InvalidServiceNameException`):
+el servicio pasa a ser un token de subject.
+
+### Permisos exactos
+
+Los de [`gen-acl.mjs`](../scripts/gen-acl.mjs) y [06-security.md §3.4](../specification/06-security.md): sin **ningún** permiso de suscripción
+sobre subjects de dominio (se consume por pull y lo que confina es `$JS.API`), y por cada consumidor `CONSUMER.INFO`, `CONSUMER.MSG.NEXT` y
+`$JS.ACK.<S>.<d>.>`. Dos matices del SDK:
+
+- **`CONSUMER.INFO` es imprescindible y `CONSUMER.CREATE` no**: `SubscribeAsync` **pregunta primero** si el consumidor existe y solo lo crea si
+  no (con un durable aprovisionado por `flux provision` no intenta crear nada y el broker no anota ni una violación). Sin `INFO` falla con
+  `PERMISSION_DENIED`, no con `NOT_PROVISIONED`: no se sabe si falta.
+- **`CONSUMER.MSG.NEXT` (el pull) hace fallar `SubscribeAsync` si falta**, con `PERMISSION_DENIED` y el subject completo. El broker no contesta a un
+  pull denegado y el consumidor quedaría inerte y «sano». Se comprueba **antes de devolver**, con una petición propia al mismo subject y un
+  JSON truncado (`{`) que el servidor contesta `400` sin entregar nada (A-212) — no con un temporizador.
+
+### Cuando falta un permiso: un error, no un timeout
+
+NATS.Net **no entrega** las denegaciones (A-210): una petición de la API de JetStream denegada espera 5 s y lanza
+`NatsJSApiNoResponseException`, un `PublishAsync` denegado espera 10,5 s, y el `-ERR 'Permissions Violation …'` del servidor solo se escribe en
+el `ILogger` de la librería. Es la situación de `async-nats` (Rust), no la de `@nats-io/*` (Node). El SDK le da a la librería un
+`ILoggerFactory` propio que **escucha esos `-ERR`** y, mientras espera una respuesta, **también** espera una denegación del subject al que acaba de
+publicar: gana la primera, y una denegación llega en milisegundos.
+
+| Situación | Excepción | Código | Clase |
+|---|---|---|---|
+| El stream o el consumidor **no existe** y la ACL no concede crearlo | `NotProvisionedException` | `NOT_PROVISIONED` | PERMANENT |
+| Ni siquiera hay permiso para **consultar** el recurso, para publicar en un subject o para pedir mensajes del pull | `PermissionDeniedException` | `PERMISSION_DENIED` | PERMANENT |
+
+Las dos llevan el recurso o el subject **completo** y dicen dónde se arregla (`flux provision`; la ACL). Un handler que las provoque —publicar en un
+dominio ajeno— va a la DLQ en la primera entrega.
+
+⚠️ **Lo que no se puede convertir en excepción**: el `ack` (y `nak`, `term` y el WIP, que publican en el mismo `$JS.ACK.…`) es una publicación sin
+respuesta, y un pull que se deniega *después* de que `SubscribeAsync` devolviera tampoco tiene a quién devolverlo. Llegan por `ConnectOptions.Logger`
+(`[flux] el broker denegó publicar en "$JS.ACK.EVT_X.d.>" … se REENTREGA cada ack_wait, sin fin y sin error`), **una vez por subject**. Configura siempre el logger.
+
+### Los errores de `ConnectAsync`
+
+[04-errors.md §5.3](../specification/04-errors.md). Tres códigos estables, **todos PERMANENT** (`ClassifiedException.FluxCode` y `FluxClass`):
+
+| Excepción | `FluxCode` | Cuándo |
+|---|---|---|
+| `ConnectionRejectedException` (`Reason`: `Auth` o `Tls`) | `CONNECTION_REJECTED` | El broker **contestó** y rechazó la primera conexión por algo que esperar no arregla: credencial rechazada; certificado que no verifica (CA ausente o equivocada, host fuera de los SAN, caducado); TLS exigido y el broker no lo ofrece; mTLS sin certificado de cliente |
+| `InvalidCredentialsException` | `INVALID_CREDENTIALS` | Credencial mal formada, detectada **antes de abrir ningún socket**: valor vacío (casi siempre una variable de entorno sin definir), `User` sin `Password`, más de un método, `.creds` ilegible o sin JWT y semilla, semilla que no es `SU…` |
+| `InvalidTlsOptionsException` | `INVALID_TLS_OPTIONS` | Opción TLS mal formada, también **sin red**: un fichero ilegible o que no es PEM, un certificado de cliente sin su clave (o al revés), una clave que no es la del certificado |
+
+Una credencial bien formada pero equivocada es `CONNECTION_REJECTED` (`Auth`), nunca `INVALID_CREDENTIALS`; y un broker que aún no ha arrancado **no es
+ninguno de los tres**: `ConnectAsync` espera (con backoff y jitter) y se cancela con el `CancellationToken`. Un nombre de servicio inválido o una lista de
+servidores que no se entiende (`ArgumentException`) tampoco llevan código.
+
+### La primera conexión: medida, no supuesta
+
+El plan pedía medir si la primera conexión de cada librería se cuelga (Fase 6, (a)). **NATS.Net 2.5.16 no se cuelga ni se queda muda**: `ConnectAsync`
+no reintenta nada por su cuenta y falla en 1–86 ms, con la causa dentro (A-211). No tiene el defecto de `waitOnFirstConnect` de Node (A-24) ni el de
+`retry_on_initial_connect` de `async-nats` (A-30). Pero **tampoco distingue** «el broker aún no está» de «esto no cambia por esperar», así que el bucle
+de espera es del SDK (`FluxBus.ConnectWhenAvailableAsync`): reconoce por la cadena de causas la credencial rechazada, el handshake TLS fallido, el TLS
+exigido sin TLS y el mTLS sin certificado, y **espera solo lo demás** (03-delivery.md §6.1). Trampas medidas en la librería: con `TlsMode.Auto` y sin
+`CaFile` **baja a texto plano** (por eso el SDK usa siempre `Require` cuando se le pasa `Tls`), y una CA o un `.creds` inexistentes llegan envueltos como
+un fallo transitorio o como un `FileNotFoundException` suelto (por eso se validan antes de abrir un socket).
+
+### TLS y credenciales
+
+- **`Tls` exige TLS** y no baja a texto plano (`TlsMode.Require`). Una **CA propia sustituye** a las del sistema. `new TlsOptions()` exige TLS con las CA del sistema.
+- **`NatsCredentials`**: `CredsFile` o `CredsContent` (JWT + semilla), `NkeySeed`, `Token` o `User`+`Password`; **un solo método**. El mensaje nunca lleva el valor de una
+  credencial, y las URL con credenciales embebidas se redactan al nombrar el broker.
+- ⚠️ `CredsFile` se lee **al conectar**: rotar el fichero exige crear un bus nuevo (Node lo relee en cada reconexión). Con un `.creds` el SDK envía además la clave
+  pública derivada de la semilla (NATS.Net no lo hace): un servidor con nkeys estáticas la exige y uno en modo JWT la ignora.
+
+### Qué está verificado y cómo
+
+```bash
+NATS_SERVER=/ruta/a/nats-server FLUX_REQUIRE_BROKER=1 dotnet test sdk-dotnet/Flux.sln --filter SecurityIntegration
+```
+
+Cada test arranca su propio broker en un puerto del rango `FLUX_TEST_PORTS` (por defecto 4800–4899) con una config que escribe el test; necesita `node` (para `gen-acl.mjs` y
+`flux provision`, con `npm install` en `cli/`) y `openssl` (para los certificados). Sin `NATS_SERVER` se **saltan con aviso**… salvo `FLUX_REQUIRE_BROKER=1`, que es lo que usa el CI y
+los convierte en un fallo: un job verde no puede significar «no se ejecutó nada».
+
+| Se comprueba | Test |
+|---|---|
+| Extremo a extremo con permisos exactos, sin una violación y con el ack confirmado; un dominio ajeno se deniega rápido | `A_*` |
+| La ACL antigua falla **clara y rápido** (nombrando `$JS.API.STREAM.INFO.EVT_PEDIDOS`), y con los permisos exactos la misma operación funciona | `B_*` |
+| `NOT_PROVISIONED` (stream, consumidor), info antes de crear **sin una violación en el log del servidor**, creación con permiso (`--dev`), y `PERMISSION_DENIED` sin permiso de consultar | `C_*` |
+| Sin permiso de pull `SubscribeAsync` falla; con él funciona y la sonda no se lleva ningún mensaje (`Attempt == 1`) | `D_*` |
+| Sin permiso de ack: el logger lo dice una vez, con la consecuencia, y el evento queda sin confirmar | `E_*` |
+| Usuario y contraseña, token, nkey y `.creds` —correctos e incorrectos— y los valores mal formados **sin ningún broker escuchando** | `F_*` |
+| TLS con CA propia, CA equivocada, host fuera de los SAN, TLS exigido sin TLS, mTLS con y sin certificado de cliente, y las opciones TLS mal formadas sin red | `G_*` |
+| El broker que aún no ha arrancado se espera, y se cancela; **cada código de `ConnectAsync` en su situación y en ninguna otra** | `H_*` |
+
+⚠️ **Lo que NO está ejecutado**: `.creds` contra un broker en **modo operador/JWT** (solo contra uno con nkeys estáticas, donde el JWT no se comprueba: A-8e); la reconexión
+con credenciales que caducan o rotan (la spec tampoco lo fija); un cluster.
+
+---
+
+## Estado replicado (capacidad `state`)
+
+El contrato es [`specification/10-state.md`](../specification/10-state.md): el valor **actual** de una clave, replicado a quien lo observa, con **un** dueño que escribe.
+`bus.State` es el cliente (`StateClient`); el contrato se nombra como `<dominio>.<agregado>.v<major>` (`clientes.cliente.v1`) y el stream es `STATE_<DOM>`.
+
+```csharp
+await using var bus = await FluxBus.ConnectAsync(new ConnectOptions { Service = "crm-api", /* … */ TenantId = "acme" });
+
+// El dueño escribe. `aggregateVersion` va en `data` y es obligatoria: sin ella no hay actualización condicional.
+var r = await bus.State.PutAsync("clientes.cliente.v1", "cli-1", new { clienteId = "cli-1", nombre = "Ana", aggregateVersion = 7 });
+// r.Applied, r.Outcome (Ok | Stale), r.Revision
+
+await bus.State.DeleteAsync("clientes.cliente.v1", "cli-1", new StateDeleteOptions { AggregateVersion = 8 });   // la lápida
+
+// Una lectura puntual (DIRECT.GET): null si no existe O si es una lápida.
+StateEntry? e = await bus.State.GetAsync("clientes.cliente.v1", "cli-1");
+
+// Quien observa: la foto actual y luego los cambios. El handler es idempotente y no asume orden.
+await using var watch = await bus.State.WatchAsync(
+    "clientes.cliente.v1",
+    async (entry, delivery, ct) =>
+    {
+        if (entry.Deleted) { await copia.BorrarAsync(entry.TenantId, entry.Key, ct); return; }
+        await copia.AplicarAsync(entry.TenantId, entry.Key, entry.AggregateVersion, entry.Data!.Value, ct);   // UPDATE … WHERE aggregate_version < $n
+    },
+    new StateWatchOptions { OnSynced = () => Console.WriteLine("copia al día") });
+await watch.Synced;
+```
+
+También se puede consumir como `IAsyncEnumerable<StateEntry>`: `await foreach (var e in bus.State.WatchEntriesAsync("clientes.cliente.v1", ct: ct)) { … }`. La entrada se
+**confirma al volver el cuerpo del bucle a pedir la siguiente**; si el cuerpo lanza o se hace `break`, no se confirma y se reentrega.
+
+**Lo que hace `PutAsync` y no hay que escribir:** lee el último mensaje de la clave (`DIRECT.GET`), lo reconoce si es **suyo** (el `id` que ya publicó: un acuse perdido no es un `stale`),
+descarta una versión que no avanza (`Stale`, **no es un error**: la igual tampoco avanza) y publica **siempre por JetStream** con `Nats-Expected-Last-Subject-Sequence` y `Nats-Msg-Id`. Un conflicto
+(**10071** y también **10164**, el de un R3 bajo carrera) vuelve a leer; a los **3 intentos** es `StateConflictException` (`STATE_CONFLICT`, RETRYABLE). El `tenantid` del sobre es el del
+subject de NATS; la clasificación por omisión es `confidential` y `restricted` se rechaza (`INVALID_DATACLASSIFICATION`).
+
+**`watch`** crea un durable por servicio, contrato y tenant (`tienda-web__state_clientes_cliente_v1__acme`) con `deliver_policy: last_per_subject`, y **comprueba** que el broker lo tiene así
+(un durable con otro filtro entregaría un tenant ajeno sin error: `ConsumerConfigMismatchException`). Si el durable se borra (`flux state resync`) el `watch` se reabre solo y entrega la foto
+otra vez (0,1 s medido, A-216). `OnSynced` se dispara **una vez**, también con el contrato vacío (y entonces antes de entregar nada).
+
+**Una entrada que no se puede aplicar** va a `dlq.state.<dom>.<agr>.v<M>` con el sobre original y **sin su dato** (`data` pasa a `{ key, revision }`: un dato personal ya borrado no sobrevive 90 días
+en la DLQ) y **sin la firma**. Un error del handler que no es de flux no deja su mensaje en `dlqerror` (puede citar la fila entera): solo el código y una frase fija. `STATE_SUBJECT_MISMATCH`
+—el sobre y el subject de NATS discrepan en tenant, clave o tipo—, `restricted` y un cuerpo ilegible son **POISON**: nunca llegan al handler, y `OnPoison` recibe `Raw` vacío.
+
+| Código | Cuándo | Clase |
+|---|---|---|
+| `INVALID_STATE_CONTRACT` | el contrato no es `<dominio>.<agregado>.v<major>` (major de 1 a 4 dígitos) | PERMANENT |
+| `INVALID_TENANT_FOR_STATE` | tenant ausente, mayúsculas, `_`, `.`, más de 64 caracteres | PERMANENT |
+| `INVALID_STATE_KEY` | la clave no es un token (`^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$`, coincidencia **completa**: un `\n` final no vale) | PERMANENT |
+| `MISSING_AGGREGATE_VERSION` | `aggregateVersion` ausente, `null`, cadena, `0`, negativa, `7.5`, **`7.0`** o mayor que 2^53 − 1 | PERMANENT |
+| `STATE_SUBJECT_MISMATCH` | al consumir: el sobre miente sobre el subject | POISON |
+| `STATE_CONFLICT` | tres conflictos de secuencia seguidos | RETRYABLE |
+| `RESERVED_DOMAIN` | un contrato o un subject de evento en `state`, `dlq`, `rpc` o `system` | PERMANENT |
+
+El orden de validación es el de §3.6 y **el primero que falla gana**: dominio reservado → forma del contrato → clave → tenant → versión → clasificación → resto del sobre.
+
+**Dónde .NET se aparta de Node y de Rust**, y por qué los bytes siguen siendo los mismos:
+
+- `7.0` y `1e0` se rechazan como en Rust (un `JsonElement` conserva el texto del número). Node no puede distinguirlos de `7` (§3.4).
+- La forma canónica de `data` (§4.1 de la spec del sobre: UTF-8 literal, sin espacios, la última clave repetida gana) **no** la da `System.Text.Json` (escapa los planos astrales y no deduplica
+  claves): la escribe `CanonicalJson`. `dlqerror` se recorta a **1024 bytes UTF-8** sin partir un carácter; `message` de un error de rpc cuenta **puntos de código**; `time` se normaliza a 3 decimales y `Z`.
+- `NATS.Net` devuelve el 10071 dentro del `PubAck` y lanza `NatsJSDuplicateMessageException` ante un duplicado donde Node y Rust devuelven `duplicate: true`: A-214.
+
+Los tests: `tests/Flux.Tests/StateTests.cs` (sin broker: **todos los vectores de estado de `conformance/harness/vectors.json`** en proceso, con los SHA-256 de la spec, y las reglas de clave, tenant y versión),
+`Integration/StateSemanticsTests.cs` (los escenarios de `conformance/cases/state-semantics.json` contra un broker: tres instancias del dueño convergen, el acuse perdido, los tenants) y
+`Integration/StateIntegrationTests.cs` (con los permisos de `gen-acl` y `flux provision`: **el ciclo de 100 claves**, la lápida, un observador confinado a su tenant, cada permiso que falta, la DLQ de
+estado, el POISON, la reapertura tras un resync, el 10164 fabricado). `Flux.ConformanceHarness` implementa `state-build`, `state-tombstone`, `state-subject`, `state-dlq` y `external-id`: el cruzado
+(`node conformance/cross-sdk.mjs --only node,dotnet --exigir state`) compara sus **87** vectores con los de Node, byte a byte.
+
+⚠️ **Lo que NO está ejecutado**: un stream de estado con `replicas: 3` (el 10164 se fabrica; el caso `cluster-three-owner-instances-converge` no corre aquí), y la lectura de réplica de §3.7 bajo carga.
+
+---
+
 ## Diferencias con el SDK de referencia (Node)
 
 El envelope, el naming, la taxonomía de errores y la config de consumidor son **idénticos
@@ -885,12 +1079,22 @@ dotnet build sdk-dotnet/Flux.sln -v quiet
 node conformance/cross-sdk.mjs --only node,dotnet --verbose
 ```
 
-Los tests no requieren un broker: cubren naming, envelope, clasificación, contexto, la
-verificación de config de consumidor, la firma, las métricas y el aislamiento de tenant —
-que es donde vive la semántica del protocolo. La conformidad contra un NATS real se
-verifica con [`conformance/`](../conformance/).
+La mayoría de los tests no requieren un broker: cubren naming, envelope, clasificación, contexto, la
+verificación de config de consumidor, la firma, las métricas, el aislamiento de tenant y la parte pura de la
+seguridad —que es donde vive la semántica del protocolo—. **Los de `tests/Flux.Tests/Integration/` arrancan su
+propio `nats-server`** (permisos generados por `scripts/gen-acl.mjs`, streams y durables de `flux provision`,
+TLS, credenciales): necesitan `NATS_SERVER`, `node` con `npm install` en `cli/` y `openssl`, y sin ellos se
+**saltan con aviso**… salvo `FLUX_REQUIRE_BROKER=1`, que los convierte en un fallo (es lo que usa el CI):
 
-> **Nota de procedencia.** Este SDK se escribió en una máquina **sin `dotnet` instalado**,
+```bash
+(cd cli && npm install)
+NATS_SERVER=/ruta/a/nats-server FLUX_REQUIRE_BROKER=1 FLUX_TEST_PORTS=4800-4899 dotnet test sdk-dotnet/Flux.sln
+```
+
+La conformidad contra un NATS real se verifica además con [`conformance/`](../conformance/).
+
+> **Nota de procedencia.** *(Histórica: la Fase 6 —`security`— se escribió y ejecutó con `dotnet` 8.0.428 y `nats-server` 2.14.5.)*
+> Este SDK se escribió en una máquina **sin `dotnet` instalado**,
 > así que la suite la ejecuta el CI (`.github/workflows/spec.yml`, job *SDK .NET*). Las
 > partes que sí se pudieron verificar localmente fueron las que se comparten con el SDK de
 > Java, que sí se compiló y ejecutó: el orden de los atributos del envelope firmado, el

@@ -503,15 +503,39 @@ jobs:
       - run: mvn -B -q -f sdk-java/pom.xml test
 
   sdk-dotnet:
-    name: SDK .NET — build y tests
+    name: SDK .NET — build, tests e integración contra NATS real (permisos generados)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-dotnet@v4
         with:
           dotnet-version: '8.0.x'
+      # Los tests de integración usan la ACL que genera `scripts/gen-acl.mjs` y los streams y durables de `flux provision`
+      # (la CLI real, con credenciales de operación): hace falta node con las dependencias de `cli/`, y openssl (viene en el
+      # runner) para los certificados de TLS. nats-server 2.14.5 exige Go 1.25 en su go.mod.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+          cache: false
+      - name: Compilar nats-server 2.14.5
+        env:
+          GOBIN: ${{ runner.temp }}/bin
+        run: |
+          go install github.com/nats-io/nats-server/v2@v2.14.5
+          "$GOBIN/nats-server" --version
+      - run: npm install --no-audit --no-fund
+        working-directory: cli
       - run: dotnet build sdk-dotnet/Flux.sln
-      - run: dotnet test sdk-dotnet/Flux.sln
+      # FLUX_REQUIRE_BROKER hace que la AUSENCIA del broker (o de node, o de la CLI) sea un fallo y no un salto con aviso: sin
+      # ella, un binario que no se compilara dejaría el CI verde sin haber ejecutado nunca los tests que prueban los permisos.
+      - name: Tests (unitarios + integración contra nats-server con permisos generados)
+        env:
+          NATS_SERVER: ${{ runner.temp }}/bin/nats-server
+          FLUX_REQUIRE_BROKER: '1'
+        run: dotnet test sdk-dotnet/Flux.sln
 
   sdk-php:
     name: SDK PHP — lint y tests

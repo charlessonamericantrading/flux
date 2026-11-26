@@ -138,7 +138,7 @@ protocolo a v2.
 | [Python](sdk-python/) | **L3** | 205 | ✅ | `signing` |
 | [Go](sdk-go/) | **L3** | 162 | ✅ (también con `-race`) | `signing` |
 | [Java](sdk-java/) | **L3** | 144 | ✅ (Maven en el runner) | `signing` |
-| [.NET](sdk-dotnet/) | **L3** | 189 | ✅ | `signing` |
+| [.NET](sdk-dotnet/) | **L3** | 407 | ✅ (incl. 53 contra NATS real con permisos generados) | `signing` `security` `state` |
 | [Rust](sdk-rust/) | L2 | 175 | ✅ (incl. 14 contra NATS real) | `signing` `security` `state` `rpc` |
 | [PHP](sdk-php/) | **L3** | 304 | ✅ incl. 3 de integración contra NATS real | `signing` |
 | [PHP](sdk-php/) | L2 | 201 | ✅ (transporte no — ver abajo) | `signing` |

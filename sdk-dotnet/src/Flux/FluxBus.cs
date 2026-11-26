@@ -35,11 +35,35 @@ public interface IFluxLogger
     void Error(string message);
 }
 
-/// <summary>Credenciales de NATS. NUNCA versionadas — 06-security.md §2.</summary>
+/// <summary>
+/// Credenciales de NATS. NUNCA versionadas — 06-security.md §2. Se admite UN solo método.
+/// </summary>
+/// <remarks>
+/// <list type="table">
+/// <listheader><term>Método</term><description>Campos</description></listheader>
+/// <item><term><c>.creds</c> (JWT + nkey), el recomendado</term><description><see cref="CredsFile"/> (ruta) o <see cref="CredsContent"/> (contenido)</description></item>
+/// <item><term>nkey</term><description><see cref="NkeySeed"/></description></item>
+/// <item><term>token</term><description><see cref="Token"/></description></item>
+/// <item><term>usuario y contraseña</term><description><see cref="User"/> + <see cref="Password"/></description></item>
+/// </list>
+/// Un valor vacío (casi siempre una variable de entorno sin definir), <c>User</c> sin
+/// <c>Password</c>, más de un método, un <c>.creds</c> ilegible o una semilla que no es de usuario
+/// lanzan <see cref="InvalidCredentialsException"/> en <see cref="FluxBus.ConnectAsync"/>, antes de
+/// abrir ningún socket: nunca se degradan a «sin credenciales».
+/// </remarks>
 public sealed record NatsCredentials
 {
-    /// <summary>Ruta a un fichero <c>.creds</c>. Es la forma recomendada.</summary>
+    /// <summary>
+    /// Ruta a un fichero <c>.creds</c>. Es la forma recomendada. Se lee al conectar: rotarlo
+    /// exige crear un bus nuevo.
+    /// </summary>
     public string? CredsFile { get; init; }
+
+    /// <summary>Contenido de un <c>.creds</c>, por ejemplo leído de un gestor de secretos.</summary>
+    public string? CredsContent { get; init; }
+
+    /// <summary>Semilla de una nkey de USUARIO (<c>SU…</c>).</summary>
+    public string? NkeySeed { get; init; }
 
     /// <summary>Token de autenticación.</summary>
     public string? Token { get; init; }
@@ -187,8 +211,15 @@ public sealed record ConnectOptions
     /// </remarks>
     public int StreamReplicas { get; init; } = 1;
 
-    /// <summary>Credenciales. NUNCA versionadas — 06-security.md §2.</summary>
+    /// <summary>Credenciales. NUNCA versionadas — 06-security.md §2. Ver <see cref="NatsCredentials"/>.</summary>
     public NatsCredentials? Credentials { get; init; }
+
+    /// <summary>
+    /// TLS contra el listener de NATS, con CA propia y certificado de cliente opcionales.
+    /// <b>Obligatorio en producción</b> — 06-security.md §2. Ver <see cref="TlsOptions"/>:
+    /// pasarlo (aunque sea vacío) EXIGE TLS y no baja a texto plano.
+    /// </summary>
+    public TlsOptions? Tls { get; init; }
 
     /// <summary>
     /// Origen del <c>traceparent</c> W3C. <see langword="null"/> usa
@@ -344,27 +375,80 @@ public sealed class FluxBus : IAsyncDisposable
     private readonly string _source;
     private readonly ConcurrentDictionary<Subscription, byte> _subscriptions = new();
     private readonly ConcurrentDictionary<string, byte> _ensuredStreams = new(StringComparer.Ordinal);
+    private readonly DenialLog _denials;
+    private readonly string _inboxPrefix;
+    private readonly ConcurrentDictionary<object, Func<Task>> _tracked = new();
 
-    private FluxBus(NatsConnection connection, NatsJSContext jetStream, ConnectOptions options)
+    private FluxBus(
+        NatsConnection connection,
+        NatsJSContext jetStream,
+        ConnectOptions options,
+        DenialLog denials,
+        string inboxPrefix)
     {
         _connection = connection;
         _jetStream = jetStream;
         _options = options;
+        _denials = denials;
+        _inboxPrefix = inboxPrefix;
         _classifier = new Classifier(options.Classifier);
         _metrics = options.Metrics ?? NoMetrics.Instance;
         _source = Protocol.SourceUri(options.Environment, options.Service);
         _metrics.ConnectionState(Flux.ConnectionState.Connected);
+        _denials.Recorded += ReportDenial;
+        State = new StateClient(this);
     }
+
+    /// <summary>
+    /// Estado replicado — la capacidad <c>state</c> (specification/10-state.md): <c>PutAsync</c>, <c>DeleteAsync</c>, <c>GetAsync</c> y
+    /// <c>WatchAsync</c>. El valor ACTUAL de un agregado, que su dueño publica y los demás observan; sustituye a
+    /// <c>GET /clientes/123</c>, a la carga inicial y al polling de datos.
+    /// </summary>
+    public StateClient State { get; }
+
+    // ─── lo que los clientes de capacidad (State, Rpc) necesitan del bus ─────
+
+    internal NatsConnection Connection => _connection;
+
+    internal NatsJSContext JetStream => _jetStream;
+
+    internal ConnectOptions Options => _options;
+
+    internal string Source => _source;
+
+    internal IMetricsSink Metrics => _metrics;
+
+    internal Classifier Classifier => _classifier;
+
+    internal string? CurrentTraceparent() => _options.TraceparentProvider?.Invoke() ?? FluxContext.ActiveTraceparent();
+
+    /// <summary>Registra algo que <see cref="DisposeAsync"/> debe parar antes de cerrar la conexión.</summary>
+    internal void Track(object key, Func<Task> stop) => _tracked[key] = stop;
+
+    internal void Untrack(object key) => _tracked.TryRemove(key, out _);
+
+    internal Task PublishToDlqRawAsync(string dlqSubject, FluxEvent dlqEvent, string msgId, CancellationToken cancellationToken) =>
+        PublishToDlqAsync(dlqSubject[4..], dlqEvent, msgId, cancellationToken);
 
     /// <summary>
     /// Abre la conexión al bus.
     /// </summary>
     /// <remarks>
-    /// Reconecta indefinidamente con backoff y JITTER: sin jitter, mil servicios reconectan
-    /// en el mismo milisegundo y tiran el cluster que acaba de levantarse — 03-delivery.md §6.
+    /// <b>Primera conexión</b> (03-delivery.md §6.1): espera a un broker que aún no ha arrancado, con la
+    /// misma espera con jitter que la reconexión, pero NO espera lo que no cambia por esperar: una
+    /// credencial rechazada o un certificado que no verifica fallan de inmediato. <b>Una vez
+    /// conectado</b>, reconecta indefinidamente con backoff y JITTER: sin jitter, mil servicios
+    /// reconectan en el mismo milisegundo y tiran el cluster que acaba de levantarse — 03-delivery.md §6.
+    /// <para>
+    /// El inbox es <c>_INBOX.&lt;servicio&gt;</c>, fijado por el SDK y no configurable
+    /// — 06-security.md §3.3.
+    /// </para>
     /// </remarks>
-    /// <exception cref="ArgumentException">Falta algún dato obligatorio del envelope.</exception>
+    /// <exception cref="ArgumentException">Falta algún dato obligatorio del envelope, o la lista de servidores no se entiende.</exception>
     /// <exception cref="InvalidServiceNameException">El nombre de servicio no cumple 02-naming.md §4.</exception>
+    /// <exception cref="InvalidCredentialsException">Las credenciales están mal formadas (<c>INVALID_CREDENTIALS</c>). Antes de abrir ningún socket.</exception>
+    /// <exception cref="InvalidTlsOptionsException">Las opciones TLS están mal formadas (<c>INVALID_TLS_OPTIONS</c>). Antes de abrir ningún socket.</exception>
+    /// <exception cref="ConnectionRejectedException">El broker rechazó la conexión por algo que esperar no arregla (<c>CONNECTION_REJECTED</c>, motivo <c>auth</c> o <c>tls</c>).</exception>
     public static async Task<FluxBus> ConnectAsync(ConnectOptions options, CancellationToken cancellationToken = default)
     {
         ArgumentNullException.ThrowIfNull(options);
@@ -399,40 +483,140 @@ public sealed class FluxBus : IAsyncDisposable
                 nameof(options));
         }
 
+        // Todo lo que se puede comprobar SIN red se comprueba ANTES de abrir ningún socket
+        // — 04-errors.md §5.3: un valor mal formado falla con su nombre y no se reintenta.
+        var inboxPrefix = ConnectSecurity.InboxPrefixFor(options.Service);
+        var auth = ConnectSecurity.BuildAuth(options.Credentials);
+        var tls = ConnectSecurity.BuildTls(options.Tls);
+        var servers = ValidateServers(options.Servers);
+
+        var denials = new DenialLog { InboxPrefix = inboxPrefix };
         var natsOptions = NatsOpts.Default with
         {
-            Url = options.Servers,
+            Url = servers,
             Name = options.Service + "@" + options.Environment,
+            // Inbox PRIVADO, siempre y no configurable: ver ConnectSecurity.InboxPrefixFor.
+            InboxPrefix = inboxPrefix,
             // -1 = reconexión indefinida. Un corte largo del broker no debe matar el
             // servicio: los acks pendientes se reentregan y la idempotencia los cubre.
+            // Esto solo rige UNA VEZ conectado; la primera conexión es de ConnectWhenAvailableAsync.
             MaxReconnectRetry = -1,
             ReconnectWaitMin = TimeSpan.FromSeconds(1),
             ReconnectWaitMax = TimeSpan.FromSeconds(30),
             ReconnectJitter = TimeSpan.FromSeconds(1),
-            AuthOpts = BuildAuthOptions(options.Credentials),
+            AuthOpts = auth,
+            TlsOpts = tls ?? NatsTlsOpts.Default,
+            // La librería no entrega las denegaciones de permisos: solo las escribe en su logger.
+            // Ver Denials.cs.
+            LoggerFactory = denials,
         };
 
-        var connection = new NatsConnection(natsOptions);
-        await connection.ConnectAsync().ConfigureAwait(false);
-        cancellationToken.ThrowIfCancellationRequested();
+        var connection = await ConnectWhenAvailableAsync(natsOptions, options, cancellationToken)
+            .ConfigureAwait(false);
 
-        return new FluxBus(connection, new NatsJSContext(connection), options);
-    }
-
-    private static NatsAuthOpts BuildAuthOptions(NatsCredentials? credentials)
-    {
-        if (credentials is null)
+        // PING/PONG: el protocolo es ordenado, así que si el servidor denegó la suscripción al
+        // inbox (que NATS.Net hace al conectar) su `-ERR` llega ANTES que este PONG. Sin él, la
+        // primera operación aún no sabría que ninguna respuesta puede llegar (A-210).
+        try
         {
-            return NatsAuthOpts.Default;
+            await connection.PingAsync(cancellationToken).ConfigureAwait(false);
+        }
+        catch
+        {
+            await connection.DisposeAsync().ConfigureAwait(false);
+            throw;
         }
 
-        return NatsAuthOpts.Default with
+        return new FluxBus(connection, new NatsJSContext(connection), options, denials, inboxPrefix);
+    }
+
+    /// <summary>
+    /// Una lista de servidores que se entiende, o <see cref="ArgumentException"/>. No es ninguno de
+    /// los tres códigos de <c>connect()</c> (04-errors.md §5.3): no es un rechazo del broker.
+    /// </summary>
+    private static string ValidateServers(string servers)
+    {
+        var partes = servers.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+        if (partes.Length == 0)
         {
-            CredsFile = credentials.CredsFile,
-            Token = credentials.Token,
-            Username = credentials.User,
-            Password = credentials.Password,
-        };
+            throw new ArgumentException("Servers está vacío: indica al menos un `nats://host:4222`", nameof(servers));
+        }
+
+        foreach (var parte in partes)
+        {
+            var conEsquema = parte.Contains("://", StringComparison.Ordinal) ? parte : "nats://" + parte;
+            if (!Uri.TryCreate(conEsquema, UriKind.Absolute, out var uri) ||
+                uri.Scheme is not ("nats" or "tls" or "ws" or "wss") ||
+                string.IsNullOrEmpty(uri.Host))
+            {
+                throw new ArgumentException(
+                    $"no se entiende el servidor \"{ConnectSecurity.RedactServers(parte)}\": se espera " +
+                    "`nats://host:4222` (o `tls://host:4222`), con varios separados por coma",
+                    nameof(servers));
+            }
+        }
+
+        return servers;
+    }
+
+    /// <summary>
+    /// Espera a que el broker esté disponible —un servicio que arranca antes que NATS es lo normal en
+    /// un compose— pero NO espera lo que no va a cambiar — 03-delivery.md §6.1.
+    /// </summary>
+    /// <remarks>
+    /// NATS.Net 2.5.16 no reintenta la primera conexión por su cuenta: falla en milisegundos, con la
+    /// causa dentro (A-211). No tiene el defecto de <c>waitOnFirstConnect</c> (Node, A-24: se cuelga) ni
+    /// el de <c>retry_on_initial_connect</c> (<c>async-nats</c>, A-30: queda arrancado y mudo). Pero
+    /// tampoco distingue «el broker aún no está» de «esto no cambia por esperar», así que el bucle es
+    /// del SDK: <see cref="ConnectSecurity.PermanentConnectError"/> decide qué se espera y qué no.
+    /// Con la misma espera con jitter que la reconexión —sin jitter, mil servicios que esperan a un
+    /// NATS que arranca llaman a la vez—.
+    /// </remarks>
+    private static async Task<NatsConnection> ConnectWhenAvailableAsync(
+        NatsOpts natsOptions,
+        ConnectOptions options,
+        CancellationToken cancellationToken)
+    {
+        var warned = false;
+        for (;;)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+
+            // Una conexión NUEVA por intento: tras un fallo la anterior queda a medias.
+            var connection = new NatsConnection(natsOptions);
+            try
+            {
+                await connection.ConnectAsync().AsTask().WaitAsync(cancellationToken).ConfigureAwait(false);
+                return connection;
+            }
+            catch (Exception e)
+            {
+                await connection.DisposeAsync().ConfigureAwait(false);
+                if (e is OperationCanceledException && cancellationToken.IsCancellationRequested)
+                {
+                    throw;
+                }
+
+                var permanent = ConnectSecurity.PermanentConnectError(e, options.Servers);
+                if (permanent is not null)
+                {
+                    throw permanent;
+                }
+
+                if (!warned)
+                {
+                    warned = true;
+                    options.Logger?.Warn(
+                        "[flux] el broker " + ConnectSecurity.RedactServers(options.Servers) +
+                        " no está disponible; se reintenta con espera y jitter hasta que arranque: " +
+                        e.GetType().Name + ": " + e.Message);
+                }
+            }
+
+            var espera = natsOptions.ReconnectWaitMin +
+                         TimeSpan.FromMilliseconds(Random.Shared.NextDouble() * natsOptions.ReconnectJitter.TotalMilliseconds);
+            await Task.Delay(espera, cancellationToken).ConfigureAwait(false);
+        }
     }
 
     /// <summary>
@@ -556,11 +740,17 @@ public sealed class FluxBus : IAsyncDisposable
         // del consumidor — 03-delivery.md §3.
         try
         {
-            var ack = await _jetStream.PublishAsync(
-                subject: subject,
-                data: payload,
-                opts: new NatsJSPubOpts { MsgId = evento.Id },
-                cancellationToken: cancellationToken).ConfigureAwait(false);
+            // Guardado: un publish denegado NO falla en NATS.Net (espera 10,5 s y lanza un error sin
+            // una palabra de permisos). Se compite con el `-ERR` del broker — Denials.cs.
+            var ack = await GuardAsync(
+                new[] { subject },
+                token => _jetStream.PublishAsync(
+                    subject: subject,
+                    data: payload,
+                    opts: new NatsJSPubOpts { MsgId = evento.Id },
+                    cancellationToken: token).AsTask(),
+                "publicar el evento",
+                cancellationToken).ConfigureAwait(false);
 
             ack.EnsureSuccess();
         }
@@ -664,8 +854,7 @@ public sealed class FluxBus : IAsyncDisposable
         };
 
         var stream = Protocol.StreamName(parsed.Domain);
-        var consumer = await _jetStream
-            .CreateOrUpdateConsumerAsync(stream, requested, cancellationToken)
+        var consumer = await EnsureConsumerAsync(stream, durable, requested, cancellationToken)
             .ConfigureAwait(false);
 
         // El servidor no siempre devuelve lo que se le pide. Requisito L2 — 03-delivery.md §2.1.
@@ -673,6 +862,10 @@ public sealed class FluxBus : IAsyncDisposable
             durable,
             ConsumerConfigSnapshot.Canonical(maxAckPending),
             Snapshot(consumer.Info.Config));
+
+        // El pull denegado NO da error y deja un consumidor inerte que parece sano: hay que
+        // comprobarlo ANTES de devolver, no basta con registrarlo — 06-security.md §3.7.
+        await EnsurePullAllowedAsync(stream, durable, cancellationToken).ConfigureAwait(false);
 
         var subscription = new Subscription(this, subject, durable, stream);
         _subscriptions[subscription] = 0;
@@ -702,7 +895,7 @@ public sealed class FluxBus : IAsyncDisposable
 
     private static TimeSpan FromNanos(long nanos) => TimeSpan.FromTicks(nanos / 100L);
 
-    private static ConsumerConfigSnapshot Snapshot(ConsumerConfig config) => new()
+    internal static ConsumerConfigSnapshot Snapshot(ConsumerConfig config) => new()
     {
         AckWait = config.AckWait,
         MaxDeliver = (int)config.MaxDeliver,
@@ -998,14 +1191,28 @@ public sealed class FluxBus : IAsyncDisposable
         CancellationToken cancellationToken)
     {
         var payload = Envelope.Serialize(dlqEvent);
-        var ack = await _jetStream.PublishAsync(
-            subject: Protocol.DlqSubject(subject),
-            data: payload,
-            // El msgID incluye el consumidor: dos consumidores distintos del mismo evento
-            // producen dos entradas de DLQ, y son dos hechos distintos.
-            opts: new NatsJSPubOpts { MsgId = msgId },
-            cancellationToken: cancellationToken).ConfigureAwait(false);
-        ack.EnsureSuccess();
+        var dlqSubject = Protocol.DlqSubject(subject);
+        try
+        {
+            var ack = await GuardAsync(
+                new[] { dlqSubject },
+                token => _jetStream.PublishAsync(
+                    subject: dlqSubject,
+                    data: payload,
+                    // El msgID incluye el consumidor: dos consumidores distintos del mismo evento
+                    // producen dos entradas de DLQ, y son dos hechos distintos.
+                    opts: new NatsJSPubOpts { MsgId = msgId },
+                    cancellationToken: token).AsTask(),
+                "enrutar el evento a la DLQ",
+                cancellationToken).ConfigureAwait(false);
+            ack.EnsureSuccess();
+        }
+        catch (NatsJSDuplicateMessageException)
+        {
+            // NATS.Net lanza donde Node y Rust devuelven `duplicate: true`. Un duplicado aquí NO es un fallo: es la reentrega de un mensaje
+            // cuya entrada de DLQ ya se guardó y cuyo `term()` no llegó a confirmarse. Tratarlo como error lo dejaría sin terminar
+            // y se reentregaría hasta `max_deliver` con la DLQ ya escrita.
+        }
     }
 
     /// <summary>
@@ -1057,7 +1264,7 @@ public sealed class FluxBus : IAsyncDisposable
             DlqReason = DlqReason.Poison,
             DlqAttempts = 1,
             DlqConsumer = consumer,
-            DlqError = Envelope.Truncate(error, Envelope.MaxDlqErrorChars),
+            DlqError = Text.TruncateUtf8Bytes(error, Envelope.MaxDlqErrorBytes),
             DlqTime = now,
             Data = data,
         };
@@ -1125,15 +1332,36 @@ public sealed class FluxBus : IAsyncDisposable
             return;
         }
 
+        var infoSubject = "$JS.API.STREAM.INFO." + name;
         try
         {
-            await _jetStream.GetStreamAsync(name, cancellationToken: cancellationToken).ConfigureAwait(false);
+            await GuardAsync(
+                new[] { infoSubject },
+                token => _jetStream.GetStreamAsync(name, cancellationToken: token).AsTask(),
+                "abrir el stream `" + name + "`",
+                cancellationToken).ConfigureAwait(false);
         }
-        catch (NatsJSApiException e) when (e.Error.Code == 404)
+        // Solo «no existe» autoriza a crearlo. Cualquier otro fallo de la consulta —un permiso
+        // denegado, un JetStream apagado— NO cae en el crear: el error que llegaría sería el de
+        // crear, que no explica nada de lo que pasó de verdad. Una consulta denegada es
+        // PERMISSION_DENIED (no se sabe si falta), no NOT_PROVISIONED — 04-errors.md §5.
+        catch (NatsJSApiException e) when (IsNotFound(e, ResourceKind.Stream))
         {
+            var createSubject = "$JS.API.STREAM.CREATE." + name;
             try
             {
-                await _jetStream.CreateStreamAsync(configFactory(), cancellationToken).ConfigureAwait(false);
+                await GuardAsync(
+                    new[] { createSubject },
+                    token => _jetStream.CreateStreamAsync(configFactory(), token).AsTask(),
+                    "crear el stream `" + name + "`",
+                    cancellationToken).ConfigureAwait(false);
+            }
+            catch (PermissionDeniedException denied) when (denied.Operation == DeniedOperation.Publish &&
+                                                          denied.DeniedSubject == createSubject)
+            {
+                // «Falta y no puedo crearlo»: la pareja crear → denegado Y consultar → no existe.
+                throw new NotProvisionedException(
+                    ResourceKind.Stream, name, null, _options.Service, denied.DeniedSubject, denied);
             }
             catch (NatsJSApiException)
             {
@@ -1144,6 +1372,208 @@ public sealed class FluxBus : IAsyncDisposable
 
         _ensuredStreams[name] = 0;
     }
+
+    /// <summary>
+    /// Toma el consumidor durable si existe y, solo si no existe, lo crea — <b>info antes de
+    /// crear</b> — 06-security.md §3.4.
+    /// </summary>
+    /// <remarks>
+    /// En producción lo aprovisiona <c>flux provision</c>, y entonces el SDK no necesita permiso de
+    /// creación: intentar crear primero provocaba una denegación espuria en cada arranque. Que ya
+    /// exista con otra configuración no es un error de aquí: lo decide
+    /// <see cref="ConsumerConfigVerifier"/>. Si no existe y crearlo está DENEGADO, no es un fallo de
+    /// red ni un timeout: es que nadie lo aprovisionó — <see cref="NotProvisionedException"/>.
+    /// </remarks>
+    internal async Task<INatsJSConsumer> EnsureConsumerAsync(
+        string stream,
+        string durable,
+        ConsumerConfig requested,
+        CancellationToken cancellationToken)
+    {
+        var infoSubject = $"$JS.API.CONSUMER.INFO.{stream}.{durable}";
+        Task<INatsJSConsumer> Info(CancellationToken token) =>
+            _jetStream.GetConsumerAsync(stream, durable, token).AsTask();
+        var attempt = $"consultar el consumidor `{durable}` del stream `{stream}`";
+
+        try
+        {
+            return await GuardAsync(new[] { infoSubject }, Info, attempt, cancellationToken).ConfigureAwait(false);
+        }
+        catch (NatsJSApiException e) when (IsNotFound(e, ResourceKind.Consumer))
+        {
+            // No existe: se intenta crearlo (desarrollo, o una ACL amplia).
+        }
+
+        var createSubject = $"$JS.API.CONSUMER.CREATE.{stream}.{durable}.{requested.FilterSubject}";
+        try
+        {
+            return await GuardAsync(
+                new[] { createSubject },
+                token => _jetStream.CreateConsumerAsync(stream, requested, token).AsTask(),
+                $"crear el consumidor `{durable}` del stream `{stream}`",
+                cancellationToken).ConfigureAwait(false);
+        }
+        catch (PermissionDeniedException denied) when (denied.Operation == DeniedOperation.Publish &&
+                                                      denied.DeniedSubject == createSubject)
+        {
+            throw new NotProvisionedException(
+                ResourceKind.Consumer, durable, stream, _options.Service, denied.DeniedSubject, denied);
+        }
+        catch (NatsJSApiException)
+        {
+            // Otra instancia del servicio pudo crearlo entre la pregunta y la creación.
+            return await GuardAsync(new[] { infoSubject }, Info, attempt, cancellationToken).ConfigureAwait(false);
+        }
+    }
+
+    /// <summary>
+    /// Comprueba que el servicio PUEDE pedir mensajes de su consumidor, o falla con
+    /// <see cref="PermissionDeniedException"/> nombrando el subject denegado.
+    /// </summary>
+    /// <remarks>
+    /// <b>Por qué una sonda y no esperar al primer pull.</b> Un pull denegado no da error: el servidor
+    /// descarta el mensaje y manda un <c>-ERR</c> aparte (A-20). NATS.Net publica el primer pull desde
+    /// una tarea de fondo, sin orden respecto a quien llama (A-212): mirar «un poco después» es una
+    /// carrera, y la detección NO DEBE depender de un temporizador fijo. Lo determinista es no
+    /// depender del pull de la librería: se pregunta lo mismo sobre <b>el mismo subject</b>
+    /// (<c>$JS.API.CONSUMER.MSG.NEXT.&lt;stream&gt;.&lt;durable&gt;</c>) con una petición propia y se compite
+    /// su respuesta con la denegación. El cuerpo es un JSON truncado, <c>{</c>, <b>a propósito</b>: el
+    /// servidor lo contesta <c>400 Bad Request</c> al instante, sin apuntar la petición como pendiente
+    /// y sin sacar ningún mensaje del consumidor (cualquier pull válido podría llevarse uno, que
+    /// quedaría sin ack hasta <c>ack_wait</c>). Medido: 400 en ~11 ms con el permiso, y sin respuesta
+    /// más un <c>-ERR</c> sin él.
+    /// <para>
+    /// Si la sonda no obtiene ni respuesta ni denegación (el broker no contesta, o contesta algo
+    /// inesperado) NO se falla: se avisa por el logger y se sigue. No poder comprobarlo no es lo mismo
+    /// que estar denegado.
+    /// </para>
+    /// </remarks>
+    internal async Task EnsurePullAllowedAsync(string stream, string durable, CancellationToken cancellationToken)
+    {
+        var subject = $"$JS.API.CONSUMER.MSG.NEXT.{stream}.{durable}";
+        // Una denegación de un intento anterior sobre este durable no debe condenar a este.
+        _denials.Forget(subject);
+
+        try
+        {
+            var reply = await GuardAsync(
+                new[] { subject },
+                token => _connection.RequestAsync<byte[], byte[]>(
+                    subject,
+                    new byte[] { (byte)'{' },
+                    replyOpts: new NatsSubOpts { Timeout = PullProbeTimeout },
+                    cancellationToken: token).AsTask(),
+                $"pedir mensajes del consumidor `{durable}` del stream `{stream}` (sin ese permiso el " +
+                "consumidor se quedaría inerte, sin recibir nada y sin ningún error)",
+                cancellationToken).ConfigureAwait(false);
+
+            if (reply.Headers?.Code != 400)
+            {
+                _options.Logger?.Warn(
+                    $"[flux] no se pudo comprobar el permiso de pull de `{durable}` en `{stream}`: la sonda no " +
+                    $"obtuvo el 400 esperado (respuesta {reply.Headers?.Code}). Si la ACL no concede `{subject}`, " +
+                    "el consumidor se quedará inerte y solo lo dirá este logger");
+            }
+        }
+        catch (Exception e) when (e is NatsException or TimeoutException)
+        {
+            _options.Logger?.Warn(
+                $"[flux] no se pudo comprobar el permiso de pull de `{durable}` en `{stream}`: la sonda no obtuvo " +
+                $"respuesta ({e.GetType().Name}). Si la ACL no concede `{subject}`, el consumidor se quedará " +
+                "inerte y solo lo dirá este logger");
+        }
+    }
+
+    /// <summary>Cuánto espera la sonda del pull. Una respuesta o una denegación llegan en ~1 ms.</summary>
+    private static readonly TimeSpan PullProbeTimeout = TimeSpan.FromSeconds(2);
+
+    /// <summary>
+    /// Ejecuta una operación contra el broker <b>y</b> vigila una denegación que la invalide — ver
+    /// Denials.cs.
+    /// </summary>
+    /// <remarks>
+    /// Gana la primera: la respuesta del broker, o la denegación de alguno de los
+    /// <paramref name="subjects"/> publicados —o de la suscripción al inbox, sin la cual la respuesta
+    /// no podría llegar nunca—. Una denegación llega en milisegundos; sin esta carrera, el mismo fallo
+    /// es un timeout de 5 a 10 s.
+    /// </remarks>
+    /// <exception cref="PermissionDeniedException">El broker denegó alguno de esos subjects.</exception>
+    internal async Task<T> GuardAsync<T>(
+        IReadOnlyCollection<string> subjects,
+        Func<CancellationToken, Task<T>> operation,
+        string attempt,
+        CancellationToken cancellationToken)
+    {
+        // Sin suscripción al inbox ninguna respuesta puede llegar: no tiene sentido esperarla.
+        if (_denials.InboxDenial is { } inbox)
+        {
+            throw Denied(inbox, attempt);
+        }
+
+        using var watch = _denials.StartWatch(d =>
+            d.Action == DeniedAction.Publish
+                ? subjects.Contains(d.Subject)
+                : d.Subject.StartsWith(_inboxPrefix + ".", StringComparison.Ordinal));
+        using var cts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+
+        var work = operation(cts.Token);
+        var first = await Task.WhenAny(work, watch.Denied).ConfigureAwait(false);
+        if (ReferenceEquals(first, work))
+        {
+            return await work.ConfigureAwait(false);
+        }
+
+        // Gana la denegación. La operación se cancela y su fallo (que será un timeout o una
+        // cancelación) se observa para que no quede como excepción sin atender.
+        await cts.CancelAsync().ConfigureAwait(false);
+        _ = work.ContinueWith(
+            static t => _ = t.Exception,
+            CancellationToken.None,
+            TaskContinuationOptions.OnlyOnFaulted | TaskContinuationOptions.ExecuteSynchronously,
+            TaskScheduler.Default);
+        throw Denied(await watch.Denied.ConfigureAwait(false), attempt);
+    }
+
+    private PermissionDeniedException Denied(Denial denial, string attempt) =>
+        new(
+            _options.Service,
+            denial.Action == DeniedAction.Publish ? DeniedOperation.Publish : DeniedOperation.Subscribe,
+            denial.Subject,
+            attempt);
+
+    /// <summary>
+    /// Una denegación que NO tiene a nadie esperándola: un <c>ack</c>, un WIP o el pull de un
+    /// consumidor que ya estaba en marcha. Son publicaciones sueltas: sin esto no dejan rastro.
+    /// </summary>
+    /// <remarks>
+    /// Sin permiso de ack, cada evento se procesa bien y se REENTREGA cada <c>ack_wait</c> para
+    /// siempre, sin ningún error; sin permiso de pull, el consumidor no recibe nada y parece sano. Dos
+    /// fallos de configuración que se manifiestan como «no pasa nada». Se avisa UNA vez por subject
+    /// — 06-security.md §3.7.
+    /// </remarks>
+    private void ReportDenial(Denial denial)
+    {
+        if (!_denials.FirstTime(denial))
+        {
+            return;
+        }
+
+        var subject = denial.Normalized();
+        var efecto = subject.StartsWith("$JS.ACK.", StringComparison.Ordinal)
+            ? " Sin permiso de ack, cada evento se procesa y se REENTREGA cada ack_wait, sin fin y sin error."
+            : subject.StartsWith("$JS.API.CONSUMER.MSG.NEXT.", StringComparison.Ordinal)
+                ? " Sin permiso de pull, el consumidor no recibe nada y parece sano."
+                : string.Empty;
+
+        _options.Logger?.Error(
+            "[flux] el broker denegó " + (denial.Action == DeniedAction.Publish ? "publicar en" : "suscribirse a") +
+            " \"" + subject + "\" a \"" + _options.Service + "\": falta ese permiso en su ACL." + efecto +
+            " (06-security.md §3)");
+    }
+
+    private static bool IsNotFound(NatsJSApiException e, ResourceKind kind) =>
+        e.Error.ErrCode == (kind == ResourceKind.Stream ? 10059 : 10014) ||
+        (e.Error.Code == 404 && e.Error.ErrCode == 0);
 
     // ─── ciclo de vida ───────────────────────────────────────────────────────
 
@@ -1160,6 +1590,13 @@ public sealed class FluxBus : IAsyncDisposable
         {
             await subscription.UnsubscribeAsync().ConfigureAwait(false);
         }
+
+        foreach (var stop in _tracked.Values.ToList())
+        {
+            await stop().ConfigureAwait(false);
+        }
+
+        _tracked.Clear();
 
         _subscriptions.Clear();
         _metrics.ConnectionState(Flux.ConnectionState.Disconnected);

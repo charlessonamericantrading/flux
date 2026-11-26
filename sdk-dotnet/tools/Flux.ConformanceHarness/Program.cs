@@ -21,7 +21,7 @@ internal static class Program
     /// Lo que el arnés responde. <c>Bytes</c> y <c>Code</c> son excluyentes; <c>Detail</c>
     /// es informativo y el runner no lo compara.
     /// </summary>
-    private sealed record Resultado(bool Ok, string? Bytes = null, string? Code = null, string? Detail = null);
+    private sealed record Resultado(bool Ok, string? Bytes = null, string? Code = null, string? Detail = null, string? Subject = null, string? Id = null);
 
     private static int Main()
     {
@@ -121,6 +121,53 @@ internal static class Program
                 Envelope.ParseEvent(Convert.FromBase64String(Texto(entrada, "bytes")!));
                 return new Resultado(true);
 
+            // El `id` determinista de un hecho importado (01-envelope.md §2.6.1; conformance/cases/cross-sdk-external-id.json).
+            // `externalKey: { repeat, times }` se expande para no pegar 513 caracteres en el caso. Un rechazo es `{ ok: false }` sin código.
+            case "external-id":
+                return IdExterno(entrada.TryGetProperty("input", out var plana) ? plana : entrada);
+
+            // ─── Estado replicado (capacidad `state`) ─────────────────────────────────────────
+            case "state-build":
+                return Ok(Envelope.Serialize(StateProtocol.BuildEvent(EntradaDeEstado(entrada))));
+
+            case "state-tombstone":
+                return Ok(Envelope.Serialize(StateProtocol.BuildTombstone(new StateProtocol.TombstoneInput
+                {
+                    Contract = Texto(entrada, "contract")!,
+                    TenantId = Texto(entrada, "tenantId")!,
+                    Key = Texto(entrada, "key")!,
+                    Id = Texto(entrada, "id")!,
+                    Source = Texto(entrada, "source")!,
+                    Time = Texto(entrada, "time")!,
+                    CorrelationId = Texto(entrada, "correlationid")!,
+                    ProducerVersion = Texto(entrada, "producerversion")!,
+                    AggregateVersion = entrada.GetProperty("aggregateVersion"),
+                    CausationId = Texto(entrada, "causationid"),
+                    TraceParent = Texto(entrada, "traceparent"),
+                    TraceState = Texto(entrada, "tracestate"),
+                })));
+
+            case "state-subject":
+                return new Resultado(
+                    true,
+                    Subject: StateProtocol.Subject(Texto(entrada, "contract")!, Texto(entrada, "tenantId")!, Texto(entrada, "key")!));
+
+            case "state-dlq":
+            {
+                var original = EntradaDeEstado(entrada.GetProperty("original"));
+                var d = entrada.GetProperty("dlq");
+                var evento = StateProtocol.BuildEvent(original);
+                return Ok(Envelope.Serialize(StateProtocol.ToDlqEvent(evento, new StateProtocol.DlqInfo(
+                    original.Key,
+                    entrada.GetProperty("revision").GetInt64(),
+                    d.GetProperty("reason").Deserialize<DlqReason>(Envelope.JsonOptions),
+                    d.GetProperty("attempts").GetInt32(),
+                    Texto(d, "consumer")!,
+                    Texto(d, "error")!,
+                    // `dlqtime` lo fija el vector; el SDK lo normaliza a la forma canónica (o lo rechaza).
+                    Texto(d, "dlqtime")!))));
+            }
+
             default:
                 return new Resultado(false, Code: "UNSUPPORTED_OP", Detail: op);
         }
@@ -157,6 +204,62 @@ internal static class Program
             TraceState = Texto(e, "tracestate"),
         });
 
+    /// <summary>
+    /// La entrada plana de <c>state-build</c>. El arnés NO rellena nada: <c>id</c> y <c>time</c> vienen dados, y <c>dataschema</c> NO
+    /// viene: lo deriva el SDK del contrato (es parte de lo que se compara).
+    /// </summary>
+    /// <remarks>
+    /// Una clasificación que no es del protocolo se pasa como un valor fuera del enum: es el SDK quien la rechaza, EN SU ORDEN de
+    /// validación (10-state.md §3.6). Convertirla aquí con una excepción propia haría ganar a la clasificación sobre un defecto
+    /// anterior, que es justo el error que el orden de los vectores existe para cazar.
+    /// </remarks>
+    private static StateProtocol.EventInput EntradaDeEstado(JsonElement e) =>
+        new()
+        {
+            Contract = Texto(e, "contract")!,
+            TenantId = Texto(e, "tenantId")!,
+            Key = Texto(e, "key")!,
+            Id = Texto(e, "id")!,
+            Source = Texto(e, "source")!,
+            Time = Texto(e, "time")!,
+            CorrelationId = Texto(e, "correlationid")!,
+            ProducerVersion = Texto(e, "producerversion")!,
+            Classification = Clasificacion(Texto(e, "classification")),
+            Data = e.GetProperty("data"),
+            CausationId = Texto(e, "causationid"),
+            TraceParent = Texto(e, "traceparent"),
+            TraceState = Texto(e, "tracestate"),
+        };
+
+    private static DataClassification? Clasificacion(string? texto) =>
+        texto switch
+        {
+            null => null,
+            "public" => DataClassification.Public,
+            "internal" => DataClassification.Internal,
+            "confidential" => DataClassification.Confidential,
+            "restricted" => DataClassification.Restricted,
+            _ => (DataClassification)(-1),
+        };
+
+    private static Resultado IdExterno(JsonElement e)
+    {
+        try
+        {
+            var clave = e.TryGetProperty("externalKey", out var k)
+                ? k.ValueKind == JsonValueKind.Object
+                    ? string.Concat(Enumerable.Repeat(k.GetProperty("repeat").GetString()!, k.GetProperty("times").GetInt32()))
+                    : k.GetString()!
+                : null!;
+            var id = ExternalId.Of(Texto(e, "source")!, clave, Envelope.ParseTime(Texto(e, "time")!));
+            return new Resultado(true, Id: id);
+        }
+        catch (Exception ex) when (ex is not OutOfMemoryException)
+        {
+            return new Resultado(false);
+        }
+    }
+
     private static IEventSigner Firmante(JsonElement signing) =>
         Ed25519Signing.CreateSigner(new SigningOptions
         {
@@ -183,7 +286,13 @@ internal static class Program
     /// código genérico haría pasar por idénticos SDKs que clasifican distinto.
     /// </remarks>
     private static string CodigoDe(Exception e) =>
-        e is ClassifiedException c ? c.FluxCode : e.GetType().Name;
+        e switch
+        {
+            ClassifiedException c => c.FluxCode,
+            // Los constructores puros del sobre (`state-build`…) rechazan con el código del parser o de la capacidad.
+            EnvelopeInputException i => i.Code,
+            _ => e.GetType().Name,
+        };
 
     /// <summary>
     /// Escribe el resultado como UN objeto JSON en stdout, y nada más.
@@ -205,6 +314,16 @@ internal static class Program
             if (resultado.Bytes is not null)
             {
                 writer.WriteString("bytes", resultado.Bytes);
+            }
+
+            if (resultado.Subject is not null)
+            {
+                writer.WriteString("subject", resultado.Subject);
+            }
+
+            if (resultado.Id is not null)
+            {
+                writer.WriteString("id", resultado.Id);
             }
 
             if (resultado.Code is not null)

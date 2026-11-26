@@ -145,8 +145,12 @@ public sealed record ValidationOptions
 /// </remarks>
 public sealed class SchemaValidationException : ClassifiedException
 {
-    /// <summary>Código estable para métricas y alertas — 08-observability.md §2.2.</summary>
-    public const string CodeValue = "SCHEMA_VALIDATION_FAILED";
+    /// <summary>
+    /// Código estable para métricas y alertas — 08-observability.md §2.2, 04-errors.md §6. Es <c>INVALID_SCHEMA</c>, el de Node y Rust y el
+    /// que citan las capacidades <c>state</c> y <c>rpc</c> (el error que contesta quien responde lleva este código): hasta la Fase 6 este
+    /// SDK usaba <c>SCHEMA_VALIDATION_FAILED</c> —igual que Java—, que no está en ningún sitio de la spec.
+    /// </summary>
+    public const string CodeValue = "INVALID_SCHEMA";
 
     /// <summary>Construye la excepción.</summary>
     /// <param name="subject">Subject del evento.</param>

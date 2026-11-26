@@ -52,7 +52,14 @@
       SDK nuevo no debería nacer sobre él, igual que el SDK de Node usa @nats-io/* y no el
       paquete monolítico `nats`.
     -->
-    <PackageReference Include="NATS.Net" Version="2.5.*" />
+    <!--
+      Versión EXACTA, no `2.5.*`: lo que el SDK construye encima es lo MEDIDO contra esta versión
+      (docs/plan-v1.1/PLAN.md, A-210 a A-213): que NATS.Net no entregue las denegaciones de permisos
+      más que por su ILogger, que la primera conexión falle rápido y con qué cadena de causas, que
+      `TlsMode.Auto` degrade a texto plano… Un parche nuevo puede cambiar cualquiera de ellos, y los
+      tests de integración están para detectarlo ANTES de que se actualice, no para descubrirlo.
+    -->
+    <PackageReference Include="NATS.Net" Version="2.5.16" />
 
     <!--
       System.Text.Json viene en el framework compartido de .NET 8; se referencia explícito

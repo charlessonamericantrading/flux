@@ -58,6 +58,75 @@ public enum ConsumeOutcome
     InvalidSignature,
 }
 
+/// <summary>Etiqueta <c>outcome</c> de <c>flux_state_writes_total</c> — 08-observability.md §2.4.</summary>
+public enum StateWriteOutcome
+{
+    /// <summary><c>applied: true</c>.</summary>
+    Ok,
+
+    /// <summary>La versión no avanzaba: NO es un error.</summary>
+    Stale,
+
+    /// <summary><c>STATE_CONFLICT</c>: el chequeo de secuencia agotó sus tres intentos.</summary>
+    Conflict,
+
+    /// <summary><c>MISSING_AGGREGATE_VERSION</c>, o <c>data</c> no cumple su esquema.</summary>
+    InvalidSchema,
+}
+
+/// <summary>Etiqueta <c>outcome</c> de <c>flux_rpc_client_requests_total</c> — 08-observability.md §2.5. Uno por llamada.</summary>
+public enum RpcClientOutcome
+{
+    /// <summary>Llegó una respuesta válida.</summary>
+    Ok,
+
+    /// <summary><c>RPC_UNAVAILABLE</c>.</summary>
+    Unavailable,
+
+    /// <summary><c>RPC_TIMEOUT</c>.</summary>
+    Timeout,
+
+    /// <summary>Llegó un error <c>retryable</c>.</summary>
+    Retryable,
+
+    /// <summary>Llegó un error <c>permanent</c>; incluye <c>PERMISSION_DENIED</c>, <c>STALE_REQUEST</c>, <c>RPC_MESSAGE_TOO_LARGE</c> y un fallo de firma.</summary>
+    Permanent,
+
+    /// <summary><c>INVALID_SCHEMA</c>, al construir la petición o al validar la respuesta.</summary>
+    InvalidSchema,
+
+    /// <summary><c>RPC_INVALID_REPLY</c>.</summary>
+    InvalidReply,
+}
+
+/// <summary>
+/// Etiqueta <c>outcome</c> de <c>flux_rpc_server_requests_total</c> — 08-observability.md §2.5. Uno por petición recibida.
+/// <see cref="Poison"/> es lo que debe despertar a alguien: la petición no se pudo interpretar, o no traía subject de respuesta.
+/// </summary>
+public enum RpcServerOutcome
+{
+    /// <summary>El handler respondió.</summary>
+    Ok,
+
+    /// <summary>El handler lanzó un error reintentable.</summary>
+    Retryable,
+
+    /// <summary>El handler lanzó un error permanente, o la respuesta no cabía.</summary>
+    Permanent,
+
+    /// <summary>La petición no se pudo interpretar.</summary>
+    Poison,
+
+    /// <summary><c>data</c> no cumple su esquema.</summary>
+    InvalidSchema,
+
+    /// <summary>Firma ausente, inválida o con clave desconocida.</summary>
+    InvalidSignature,
+
+    /// <summary><c>STALE_REQUEST</c>.</summary>
+    StaleRequest,
+}
+
 /// <summary>Valores de <c>flux_connection_state</c> — §2.1.</summary>
 public enum ConnectionState
 {
@@ -223,6 +292,29 @@ public interface IMetricsSink
     /// <summary><c>flux_connection_state</c>. Sin etiquetas — §2.</summary>
     /// <param name="state">Estado de la conexión.</param>
     void ConnectionState(ConnectionState state);
+
+    /// <summary>
+    /// <c>flux_state_writes_total{contract,outcome}</c> — la capacidad <c>state</c> (08-observability.md §2.4). Fuera de las siete de todo
+    /// SDK L2, y con implementación por defecto vacía para no romper a quien ya implementó la interfaz.
+    /// </summary>
+    void StateWrite(string contract, StateWriteOutcome outcome)
+    {
+    }
+
+    /// <summary><c>flux_rpc_client_requests_total{operation,outcome}</c> — la capacidad <c>rpc</c> (08-observability.md §2.5).</summary>
+    void RpcClientRequest(string operation, RpcClientOutcome outcome)
+    {
+    }
+
+    /// <summary><c>flux_rpc_server_requests_total{operation,outcome}</c> — la capacidad <c>rpc</c> (08-observability.md §2.5).</summary>
+    void RpcServerRequest(string operation, RpcServerOutcome outcome)
+    {
+    }
+
+    /// <summary><c>flux_rpc_duration_seconds{operation,role}</c>; <paramref name="role"/> es <c>client</c> o <c>server</c>.</summary>
+    void RpcDuration(string operation, string role, double seconds)
+    {
+    }
 }
 
 /// <summary>
@@ -366,6 +458,22 @@ public sealed class InMemoryMetrics : IMetricsSink
     public void ConnectionState(ConnectionState state) =>
         Set("flux_connection_state", (int)state);
 
+    /// <inheritdoc />
+    public void StateWrite(string contract, StateWriteOutcome outcome) =>
+        Increment("flux_state_writes_total", ("contract", contract), ("outcome", Wire(outcome)));
+
+    /// <inheritdoc />
+    public void RpcClientRequest(string operation, RpcClientOutcome outcome) =>
+        Increment("flux_rpc_client_requests_total", ("operation", operation), ("outcome", Wire(outcome)));
+
+    /// <inheritdoc />
+    public void RpcServerRequest(string operation, RpcServerOutcome outcome) =>
+        Increment("flux_rpc_server_requests_total", ("operation", operation), ("outcome", Wire(outcome)));
+
+    /// <inheritdoc />
+    public void RpcDuration(string operation, string role, double seconds) =>
+        Observe("flux_rpc_duration_seconds", seconds, ("operation", operation), ("role", role));
+
     /// <summary>
     /// El formato de exposición de texto de Prometheus. Sírvelo tal cual en
     /// <c>/metrics</c>.
@@ -387,6 +495,9 @@ public sealed class InMemoryMetrics : IMetricsSink
             sb.Append("# TYPE flux_events_consumed_total counter\n");
             sb.Append("# TYPE flux_events_dlq_total counter\n");
             sb.Append("# TYPE flux_events_retried_total counter\n");
+            sb.Append("# TYPE flux_state_writes_total counter\n");
+            sb.Append("# TYPE flux_rpc_client_requests_total counter\n");
+            sb.Append("# TYPE flux_rpc_server_requests_total counter\n");
             foreach (var (key, value) in _counters)
             {
                 sb.Append(key).Append(' ').Append(value.ToString(CultureInfo.InvariantCulture)).Append('\n');
@@ -402,6 +513,7 @@ public sealed class InMemoryMetrics : IMetricsSink
             }
 
             sb.Append("# TYPE flux_event_handler_duration_seconds histogram\n");
+            sb.Append("# TYPE flux_rpc_duration_seconds histogram\n");
             foreach (var (key, histogram) in _histograms)
             {
                 // IndexOf(char) es ordinal por definición: no admite —ni necesita— un
@@ -576,6 +688,39 @@ public sealed class InMemoryMetrics : IMetricsSink
         ConsumeOutcome.InvalidSchema => "invalid_schema",
         ConsumeOutcome.InvalidSignature => "invalid_signature",
         _ => "desconocido",
+    };
+
+    private static string Wire(StateWriteOutcome outcome) => outcome switch
+    {
+        StateWriteOutcome.Ok => "ok",
+        StateWriteOutcome.Stale => "stale",
+        StateWriteOutcome.Conflict => "conflict",
+        StateWriteOutcome.InvalidSchema => "invalid_schema",
+        _ => throw new ArgumentOutOfRangeException(nameof(outcome), outcome, null),
+    };
+
+    private static string Wire(RpcClientOutcome outcome) => outcome switch
+    {
+        RpcClientOutcome.Ok => "ok",
+        RpcClientOutcome.Unavailable => "unavailable",
+        RpcClientOutcome.Timeout => "timeout",
+        RpcClientOutcome.Retryable => "retryable",
+        RpcClientOutcome.Permanent => "permanent",
+        RpcClientOutcome.InvalidSchema => "invalid_schema",
+        RpcClientOutcome.InvalidReply => "invalid_reply",
+        _ => throw new ArgumentOutOfRangeException(nameof(outcome), outcome, null),
+    };
+
+    private static string Wire(RpcServerOutcome outcome) => outcome switch
+    {
+        RpcServerOutcome.Ok => "ok",
+        RpcServerOutcome.Retryable => "retryable",
+        RpcServerOutcome.Permanent => "permanent",
+        RpcServerOutcome.Poison => "poison",
+        RpcServerOutcome.InvalidSchema => "invalid_schema",
+        RpcServerOutcome.InvalidSignature => "invalid_signature",
+        RpcServerOutcome.StaleRequest => "stale_request",
+        _ => throw new ArgumentOutOfRangeException(nameof(outcome), outcome, null),
     };
 
     private static string Wire(DlqReason reason) => reason switch

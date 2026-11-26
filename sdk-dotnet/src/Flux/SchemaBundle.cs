@@ -31,11 +31,21 @@ public sealed class SchemaBundle
 {
     private SchemaBundle(
         IReadOnlyDictionary<string, string> subjects,
-        IReadOnlyDictionary<string, string> schemas)
+        IReadOnlyDictionary<string, string> schemas,
+        IReadOnlyDictionary<string, string> state,
+        IReadOnlyDictionary<string, (string Request, string Reply)> rpc)
     {
         Subjects = subjects;
         Schemas = schemas;
+        State = state;
+        Rpc = rpc;
     }
+
+    /// <summary>contrato de estado (<c>clientes.cliente.v1</c>) → URI del esquema de versión más alta de su mayor (10-state.md §10).</summary>
+    public IReadOnlyDictionary<string, string> State { get; }
+
+    /// <summary>operación (<c>clientes.cliente.v1.obtener</c>) → URI del esquema de la petición y de la respuesta, de la versión más alta de su mayor (11-request-reply.md §11.1).</summary>
+    public IReadOnlyDictionary<string, (string Request, string Reply)> Rpc { get; }
 
     /// <summary>subject → URI del esquema con el MINOR más alto de su mayor.</summary>
     public IReadOnlyDictionary<string, string> Subjects { get; }
@@ -115,7 +125,33 @@ public sealed class SchemaBundle
                     "Regenéralo con `node scripts/bundle-schemas.mjs`", nameof(json));
             }
 
-            return new SchemaBundle(subjects, schemas);
+            var state = new Dictionary<string, string>(StringComparer.Ordinal);
+            if (root.TryGetProperty("state", out var stateNode) && stateNode.ValueKind == JsonValueKind.Object)
+            {
+                foreach (var property in stateNode.EnumerateObject())
+                {
+                    if (property.Value.ValueKind == JsonValueKind.String)
+                    {
+                        state[property.Name] = property.Value.GetString()!;
+                    }
+                }
+            }
+
+            var rpc = new Dictionary<string, (string Request, string Reply)>(StringComparer.Ordinal);
+            if (root.TryGetProperty("rpc", out var rpcNode) && rpcNode.ValueKind == JsonValueKind.Object)
+            {
+                foreach (var property in rpcNode.EnumerateObject())
+                {
+                    if (property.Value.ValueKind == JsonValueKind.Object &&
+                        property.Value.TryGetProperty("request", out var request) && request.ValueKind == JsonValueKind.String &&
+                        property.Value.TryGetProperty("reply", out var reply) && reply.ValueKind == JsonValueKind.String)
+                    {
+                        rpc[property.Name] = (request.GetString()!, reply.GetString()!);
+                    }
+                }
+            }
+
+            return new SchemaBundle(subjects, schemas, state, rpc);
         }
     }
 
@@ -137,4 +173,12 @@ public sealed class SchemaBundle
     /// <returns>La URI, o <see langword="null"/>.</returns>
     public string? SchemaUriFor(string subject) =>
         Subjects.TryGetValue(subject, out var uri) ? uri : null;
+
+    /// <summary>La URI de <c>dataschema</c> de un contrato de estado, o <see langword="null"/> si el bundle no lo conoce. Sin red.</summary>
+    public string? StateSchemaUriFor(string contract) =>
+        State.TryGetValue(contract, out var uri) ? uri : null;
+
+    /// <summary>La URI de <c>dataschema</c> de la petición o de la respuesta de una operación, o <see langword="null"/>. Sin red.</summary>
+    public string? RpcSchemaUriFor(string operation, bool reply) =>
+        Rpc.TryGetValue(operation, out var uris) ? (reply ? uris.Reply : uris.Request) : null;
 }
