@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$comment": "Constantes verificables del flux Event Protocol v1. Pensado para que un agente o un generador de código VALIDE en vez de recordar. La prosa normativa vive en specification/ y llms-full.txt; si algo diverge, manda la prosa.",
   "protocol": "flux",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "specUrl": "https://raw.githubusercontent.com/charlessonamericantrading/flux/main/llms-full.txt",
   "envelope": "CloudEvents/1.0",
   "transport": "nats-jetstream",
@@ -53,7 +53,8 @@
         "/",
         "\\",
         " "
-      ]
+      ],
+      "statePattern": "^STATE_[A-Z0-9_]+$"
     },
     "durableConsumer": {
       "format": "<servicio>__<subject con . sustituido por _>",
@@ -81,6 +82,27 @@
     "service": {
       "pattern": "^[a-z0-9]+(-[a-z0-9]+)*$",
       "$comment": "NATS aceptaria un durable como FacturacionAPI__pedidos_… sin error. El SDK DEBE validar el nombre de servicio en connect(), o el incumplimiento del patron de durableConsumer solo se descubre al parsear nombres en una herramienta."
+    },
+    "reservedDomains": {
+      "names": [
+        "dlq",
+        "state",
+        "rpc",
+        "system"
+      ],
+      "errorCode": "RESERVED_DOMAIN",
+      "spec": "specification/02-naming.md §1.3",
+      "appliesTo": [
+        "publish",
+        "subscribe",
+        "put",
+        "get",
+        "delete",
+        "watch",
+        "manifest",
+        "schemas"
+      ],
+      "$comment": "Cada nombre es un espacio de nombres del protocolo y un dominio con ese nombre colisiona con el EN EL BROKER: con STATE_CLIENTES (state.clientes.>) creado, EVT_STATE (state.>) falla con 'subjects overlap with an existing stream' (err 10065), y lo mismo EVT_DLQ (dlq.>) junto a DLQ_PEDIDOS (dlq.pedidos.>) — A-43. dlq no estaba reservado en v1.0 y deberia. publish() NO PUEDE escribir en state., rpc. ni dlq.: un evento ahi no pasaria por el chequeo de secuencia del estado (A-45)."
     }
   },
   "cloudevents": {
@@ -383,7 +405,7 @@
     },
     "codePattern": "^[A-Z][A-Z0-9]*(_[A-Z0-9]+)*$",
     "codes": {
-      "$comment": "Codigos de error ESTABLES de las capacidades opcionales (specification/04-errors.md §5). El codigo agrupa el panel (flux_events_dlq_total{code}) y encabeza dlqerror, asi que la aplicacion NO puede sustituirlo. Cada uno declara su capacidad: scripts/check-sdk-codes.mjs comprueba que todo SDK que la declara (capabilities.sdks) lo contiene en su codigo. Los codigos de la firma estan en signing.poisonCodes. Los tres con phase=connect son los de connect() (04-errors.md §5.3, security.sdk.firstConnect.stableCodes): los dos SDKs que declaran security los emiten, y todos son PERMANENT.",
+      "$comment": "Codigos de error ESTABLES de las capacidades opcionales (specification/04-errors.md §5). El codigo agrupa el panel (flux_events_dlq_total{code}) y encabeza dlqerror, asi que la aplicacion NO puede sustituirlo. Cada uno declara su capacidad: scripts/check-sdk-codes.mjs comprueba que todo SDK que la declara (capabilities.sdks) lo contiene en su codigo. Los codigos de la firma estan en signing.poisonCodes. Los tres con phase=connect son los de connect() (04-errors.md §5.3, security.sdk.firstConnect.stableCodes): los dos SDKs que declaran security los emiten, y todos son PERMANENT. Los seis codigos de la capacidad state (specification/04-errors.md §6) son una lista CERRADA: un caso que no encaje en ninguno es un hueco de la spec, no un codigo nuevo que cada SDK inventa.",
       "NOT_PROVISIONED": {
         "class": "permanent",
         "capability": "security",
@@ -473,6 +495,119 @@
           "option"
         ],
         "messageMustSay": "que reintentar no lo arregla"
+      },
+      "INVALID_TENANT_FOR_STATE": {
+        "class": "permanent",
+        "capability": "state",
+        "spec": "specification/04-errors.md §6",
+        "thrownBy": [
+          "put",
+          "get",
+          "delete",
+          "watch"
+        ],
+        "emittedWhen": "el tenant no cumple state.tenant.pattern con state.tenant.maxLength como maximo, o no se puede resolver ninguno: en estado NO hay tenant por defecto (ni 'system' implicito)",
+        "failsBeforeNetwork": true,
+        "messageMustName": [
+          "tenant",
+          "option-or-connect-tenantId"
+        ],
+        "messageMustNeverInclude": [
+          "data-values"
+        ]
+      },
+      "INVALID_STATE_KEY": {
+        "class": "permanent",
+        "capability": "state",
+        "spec": "specification/04-errors.md §6",
+        "thrownBy": [
+          "put",
+          "get",
+          "delete"
+        ],
+        "emittedWhen": "la clave no cumple state.key.pattern: un punto, un comodin, un espacio, vacia, de mas de 128 caracteres o que empieza por '_' (reservado al protocolo). El broker NO lo valida (A-41): acepta '*', '>', 'a.b' y 2000 caracteres",
+        "failsBeforeNetwork": true,
+        "messageMustName": [
+          "key",
+          "pattern"
+        ],
+        "messageMustNeverInclude": [
+          "data-values"
+        ]
+      },
+      "MISSING_AGGREGATE_VERSION": {
+        "class": "permanent",
+        "capability": "state",
+        "spec": "specification/04-errors.md §6",
+        "thrownBy": [
+          "put",
+          "delete"
+        ],
+        "alsoWhenConsuming": true,
+        "emittedWhen": "data no tiene aggregateVersion, o no es un entero >= 1 y <= 2^53 - 1: null, cadena, decimal (tambien 7.0), 0, negativo o mayor. Se comprueba SIEMPRE, con o sin validacion L3",
+        "failsBeforeNetwork": true,
+        "metricOutcome": "invalid_schema",
+        "messageMustName": [
+          "field"
+        ],
+        "messageMustNeverInclude": [
+          "data-values"
+        ]
+      },
+      "STATE_SUBJECT_MISMATCH": {
+        "class": "poison",
+        "capability": "state",
+        "spec": "specification/04-errors.md §6",
+        "thrownBy": [
+          "watch",
+          "get"
+        ],
+        "emittedWhen": "el tenantid, el subject (CloudEvents) o el type del sobre no coinciden con el subject de NATS en el que llego la entrada. El mensaje es legible pero miente sobre su identidad: un productor roto u hostil",
+        "action": "term+dlq+alert",
+        "neverApplied": true,
+        "metricOutcome": "poison",
+        "dlqKeyIs": "la-del-subject-de-nats",
+        "messageMustName": [
+          "attribute",
+          "envelope-value",
+          "subject-value"
+        ]
+      },
+      "STATE_CONFLICT": {
+        "class": "retryable",
+        "capability": "state",
+        "spec": "specification/04-errors.md §6",
+        "thrownBy": [
+          "put",
+          "delete"
+        ],
+        "emittedWhen": "el chequeo de secuencia (Nats-Expected-Last-Subject-Sequence) agoto sus 3 intentos: alguien escribio la misma clave entre la lectura y la publicacion, las tres veces",
+        "metricOutcome": "conflict",
+        "messageMustName": [
+          "key",
+          "attempts"
+        ]
+      },
+      "RESERVED_DOMAIN": {
+        "class": "permanent",
+        "capability": "state",
+        "spec": "specification/04-errors.md §6",
+        "thrownBy": [
+          "publish",
+          "subscribe",
+          "put",
+          "get",
+          "delete",
+          "watch"
+        ],
+        "emittedWhen": "un subject o un contrato usa un dominio de naming.reservedDomains",
+        "failsBeforeNetwork": true,
+        "appliesToEverySdk": true,
+        "$commentScope": "El rechazo en publish() lo exige la Fase 6 a los siete SDKs; hoy solo lo comprueba check-sdk-codes.mjs en quien declara `state`, porque el codigo cuelga de esa capacidad.",
+        "messageMustName": [
+          "domain",
+          "reserved-list"
+        ]
       }
     }
   },
@@ -645,13 +780,19 @@
         ]
       }
     },
-    "piiInPayload": "forbidden",
+    "piiInPayload": {
+      "event": "forbidden",
+      "state": "allowed-if-confidential-with-x-pii",
+      "$comment": "El evento lleva referencias (clienteId) y nunca PII: un log append-only no puede satisfacer el derecho de supresion. El estado lleva el DATO, clasificado confidential, con x-pii en los campos del esquema, y es BORRABLE: state.delete sustituye el valor por una lapida y el anterior sale del stream (A-34). `restricted` NO se admite en estado en 1.1. Normativo en specification/06-security.md §5.1 y 10-state.md §7. La primitiva de peticion/respuesta (fase 3) anadira la suya."
+    },
     "retentionByClassification": {
       "public": "30d",
       "internal": "30d",
       "confidential": "7d",
       "restricted": "24h"
-    }
+    },
+    "retentionAppliesTo": "event-streams",
+    "$commentRetention": "La tabla retentionByClassification es la de los streams de EVENTOS. Un STATE_<DOM> no caduca (max_age 0): el estado vive hasta que se borra con una lapida."
   },
   "conformanceLevels": {
     "L1": [
@@ -715,6 +856,21 @@
           "denials-visible"
         ],
         "without": "no es compatible con la configuracion segura (specification/06-security.md): con el inbox por defecto el broker le deniega la suscripcion a su propio inbox y su primera peticion falla"
+      },
+      "state": {
+        "spec": "specification/10-state.md",
+        "evidence": "sdk-files",
+        "$commentEvidence": "Como `security`: cada SDK que la declara cita en `evidence` los ficheros que la ejecutan contra un nats-server real con los permisos exactos de estado que genera gen-acl.mjs; deben existir y, entre todos, nombrar cada codigo de la capacidad (check-sdk-codes.mjs). ADEMAS la integracion exigira que el SDK reproduzca los vectores de conformance/harness (state-build, state-tombstone, state-subject, state-dlq) y de conformance/cases/cross-sdk-state-envelope.json byte a byte: eso aun NO lo comprueba check-sdk-codes.mjs, que solo admite un tipo de evidencia por capacidad. NINGUN SDK declara `state` hasta que existan esos tests.",
+        "requires": [
+          "put-delete-get-watch",
+          "byte-exact-envelope-tombstone-dlq",
+          "cas-conflict-codes-10071-and-10164",
+          "six-state-error-codes",
+          "reserved-domains-rejected-in-publish",
+          "bundle-state-index",
+          "broker-cycle-100-keys-both-directions"
+        ],
+        "without": "no escribe ni lee estado replicado: para leer un dato que guarda otro sistema tiene que llamarle por HTTP. Sigue siendo conforme"
       }
     },
     "sdks": {
@@ -940,7 +1096,11 @@
       "invalid_schema",
       "invalid_signature"
     ],
-    "$commentMandatoryOutcomes": "NO son opcionales, y se emiten tambien cuando publish() LANZA. Un publish que falla sin dejar rastro en las metricas hace invisible el volumen de contratos rotos: la aplicacion ve una excepcion, pero el panel del ecosistema no ve nada. La excepcion sirve al desarrollador que la provoca; la metrica, a quien opera el ecosistema."
+    "$commentMandatoryOutcomes": "NO son opcionales, y se emiten tambien cuando publish() LANZA. Un publish que falla sin dejar rastro en las metricas hace invisible el volumen de contratos rotos: la aplicacion ve una excepcion, pero el panel del ecosistema no ve nada. La excepcion sirve al desarrollador que la provoca; la metrica, a quien opera el ecosistema.",
+    "capabilityMetrics": {
+      "state": "state.metrics",
+      "$comment": "Las SIETE de `metrics` son las de todo SDK L2 y las suites de los SDKs cuentan exactamente siete (assertCount(7), expuestas == set(metrics)): la de una capacidad opcional NO va ahi sino en el bloque de su capacidad. specification/08-observability.md §2.4."
+    }
   },
   "multitenancy": {
     "spec": "specification/09-multitenancy.md",
@@ -984,5 +1144,426 @@
       "nunca etiquetar metricas por tenantid (si en trazas)",
       "un evento NO DEBE contener datos de mas de un tenant"
     ]
+  },
+  "state": {
+    "status": "optional-extension-of-v1.1",
+    "spec": "specification/10-state.md",
+    "capability": "state",
+    "$comment": "El valor ACTUAL de un agregado, publicado por su dueno y replicado a quien lo observa. Sustituye GET /recurso/123, la carga inicial y el polling de datos. Cada afirmacion sobre el broker es una observacion A-31..A-50 del Apendice A del plan v1.1, ejecutable en conformance/cases/state-broker.json. Si algo diverge, manda la prosa de 10-state.md.",
+    "stream": {
+      "format": "STATE_<DOMINIO>",
+      "pattern": "^STATE_[A-Z0-9_]+$",
+      "subjects": "state.<dominio>.>",
+      "storage": "file",
+      "retention": "limits",
+      "maxMsgsPerSubject": 1,
+      "allowDirect": true,
+      "maxAge": 0,
+      "discard": "old",
+      "duplicateWindow": "2m",
+      "replicas": 3,
+      "replicasProduction": 3,
+      "replicasSdkDefault": 1,
+      "existsOnlyIfDomainHasState": true,
+      "provisioning": "iac-in-production",
+      "sdkQueriesStreamInfo": false,
+      "auditedByDoctor": [
+        "maxMsgsPerSubject",
+        "allowDirect",
+        "maxAge",
+        "discard"
+      ],
+      "$comment": "max_msgs_per_subject 1 + discard old es lo que convierte un log en un mapa: el mensaje nuevo SACA al anterior (A-31). Con discard new + discard_new_per_subject el broker RECHAZARIA la segunda escritura (err 10077): seria un create-only, no un estado (A-46). allow_direct habilita DIRECT.GET; sin el, get y el paso 1 de put reciben 'sin respuesta' (A-32). max_age 0: el estado no caduca. duplicate_window 2m como los eventos, pero NO interviene en las escrituras: el chequeo de secuencia se evalua ANTES que el de duplicados (A-33). Los cuatro de auditedByDoctor, mal puestos, no dan error y rompen la semantica. El SDK NO consulta el stream de estado con STREAM.INFO (lista claves y tenants: A-39) ni lo crea por defecto."
+    },
+    "subject": {
+      "format": "state.<dominio>.<agregado>.v<major>.<tenant>.<clave>",
+      "tokens": 6,
+      "pattern": "^state\\.[a-z0-9]+(-[a-z0-9]+)*\\.[a-z0-9]+(-[a-z0-9]+)*\\.v[1-9][0-9]*\\.[a-z0-9]+(-[a-z0-9]+)*\\.[A-Za-z0-9][A-Za-z0-9_-]{0,127}$",
+      "valid": [
+        "state.clientes.cliente.v1.acme.cli-1",
+        "state.logistica.linea-envio.v2.acme-corp.Env_00-9"
+      ],
+      "invalid": [
+        "state.clientes.cliente.v1.acme",
+        "state.clientes.cliente.v1.acme.cli.1",
+        "State.clientes.cliente.v1.acme.cli-1",
+        "state.clientes.cliente.v1.Acme.cli-1",
+        "state.clientes.cliente.v1.acme.*",
+        "state.clientes.cliente.v1.acme._reservada"
+      ],
+      "$comment": "El tenant va en el subject para que el BROKER lo confine (A-38) y para que dos tenants con la misma clave no se pisen: un stream de estado guarda un valor por subject. NO contradice el rechazo del Modelo C (09-multitenancy.md §2): otro espacio de nombres, con su propio stream, que no toca la regla de 4 tokens de los eventos."
+    },
+    "contract": {
+      "format": "<dominio>.<agregado>.v<major>",
+      "pattern": "^[a-z0-9]+(-[a-z0-9]+)*\\.[a-z0-9]+(-[a-z0-9]+)*\\.v[1-9][0-9]*$",
+      "valid": [
+        "clientes.cliente.v1",
+        "logistica.linea-envio.v2"
+      ],
+      "invalid": [
+        "clientes.cliente",
+        "clientes.cliente.v1.creado",
+        "state.clientes.cliente.v1",
+        "Clientes.cliente.v1"
+      ],
+      "$comment": "El subject sin `state.`, sin tenant y sin clave. Es lo que recibe watch(), lo que indexa bundle.state y lo que va en la etiqueta `contract` de las metricas."
+    },
+    "key": {
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$",
+      "maxLength": 128,
+      "caseSensitive": true,
+      "reservedPrefix": "_",
+      "autoEncoding": "forbidden",
+      "errorCode": "INVALID_STATE_KEY",
+      "valid": [
+        "cli-1",
+        "Cli_1",
+        "a",
+        "0"
+      ],
+      "invalid": [
+        "",
+        "_reservada",
+        "a.b",
+        "a b",
+        "*",
+        ">",
+        "café",
+        "-uno"
+      ],
+      "brokerValidates": false,
+      "pii": "forbidden",
+      "$comment": "Un unico token de NATS. El broker NO valida nada de esto (A-41): acepta '*', '>', 'a.b' (dos tokens: la entrada quedaria fuera del filtro de todos los observadores, sin error), 'cafe' y 2000 caracteres; solo rechaza los espacios. Una clave sin validar es un subject fantasma. Sin codificacion automatica: dos escapes distintos serian dos claves distintas para el mismo agregado. El prefijo `_` queda reservado al protocolo (decidido provisionalmente): endurecer la regla mas tarde seria incompatible, relajarla no. La clave es un identificador opaco, nunca PII: es visible en los metadatos del stream (A-39) y en los logs."
+    },
+    "tenant": {
+      "pattern": "^[a-z0-9]+(-[a-z0-9]+)*$",
+      "maxLength": 64,
+      "default": "none",
+      "resolutionOrder": [
+        "call-option",
+        "event-in-progress",
+        "connection-tenantId"
+      ],
+      "errorCode": "INVALID_TENANT_FOR_STATE",
+      "valid": [
+        "acme",
+        "acme-corp",
+        "system",
+        "t0"
+      ],
+      "invalid": [
+        "",
+        "Acme",
+        "acme_corp",
+        "acme corp",
+        "-acme",
+        "acme-",
+        "acme--corp",
+        "acme.corp"
+      ],
+      "$comment": "El tenant de un EVENTO es cualquier cadena (01-envelope.md §3.1); el de un ESTADO, no. maxLength 64 sale de que el durable de un observador lleva el tenant en el nombre y NATS limita los nombres de consumidor a 255 (A-42). Sin valor por defecto: un evento sin tenant cae en `system`; un estado no, porque aqui el tenant es una direccion y un tenant equivocado es un dato guardado en otro sitio. El patron es puro (sin lookahead, que Rust `regex` no admite); la longitud va aparte."
+    },
+    "type": {
+      "value": {
+        "format": "com.flux.state.<dominio>.<agregado>.v<major>",
+        "pattern": "^com\\.flux\\.state\\.[a-z0-9]+(-[a-z0-9]+)*\\.[a-z0-9]+(-[a-z0-9]+)*\\.v[1-9][0-9]*$",
+        "example": "com.flux.state.clientes.cliente.v1"
+      },
+      "tombstone": {
+        "format": "com.flux.state.<dominio>.<agregado>.deleted.v<major>",
+        "pattern": "^com\\.flux\\.state\\.[a-z0-9]+(-[a-z0-9]+)*\\.[a-z0-9]+(-[a-z0-9]+)*\\.deleted\\.v[1-9][0-9]*$",
+        "example": "com.flux.state.clientes.cliente.deleted.v1",
+        "$comment": "`deleted` en ingles viene del plan (§2.3) mientras el esquema se llama `eliminado`: mezcla de idiomas heredada, marcada como decision del dueno en el informe de la fase."
+      },
+      "derivedFromSubject": true
+    },
+    "envelope": {
+      "subjectAttributeIsKey": true,
+      "tenantidEqualsSubjectToken": true,
+      "subjectEqualsKeyToken": true,
+      "typeMatchesContract": true,
+      "partitionkey": "key",
+      "newRootAttributes": [],
+      "mismatchCode": "STATE_SUBJECT_MISMATCH",
+      "mismatchClass": "poison",
+      "attributeOrder": "declaration-order-with-data-last",
+      "$comment": "La identidad de una entrada esta en el subject de NATS; el sobre la repite para quien lo lea fuera del broker. Si discrepan uno de los dos miente y quien consume no sabe cual: es un mensaje roto, no un dato con un tenant raro. No hay atributos nuevos en el sobre: todo lo propio del estado esta en el subject, en el type y en data. Ejemplos byte a byte en 10-state.md §2.6 y conformance/cases/cross-sdk-state-envelope.json."
+    },
+    "classification": {
+      "allowed": [
+        "public",
+        "internal",
+        "confidential"
+      ],
+      "forbidden": [
+        "restricted"
+      ],
+      "putDefault": "confidential",
+      "tombstone": "internal",
+      "forbiddenCode": "INVALID_DATACLASSIFICATION",
+      "$comment": "Sin classification explicita, un put usa confidential, no el valor por defecto de la conexion: un estado es donde se permite que viva el dato personal, y equivocarse hacia arriba cuesta un log redactado mientras que hacia abajo cuesta PII en un log o en una DLQ. restricted (24 h de retencion) no cabe en un almacen que no caduca. En consumo, un mensaje de estado con restricted es POISON."
+    },
+    "aggregateVersion": {
+      "required": true,
+      "type": "integer",
+      "minimum": 1,
+      "maximum": 9007199254740991,
+      "errorCode": "MISSING_AGGREGATE_VERSION",
+      "checkedWithoutValidation": true,
+      "decimalIsInvalid": true,
+      "equalVersionIs": "stale",
+      "survivesDeletes": true,
+      "$comment": "Lo pone el DUENO (el contador monotonico de su agregado), no el SDK. 2^53-1 es el mayor entero que Node, y todo lo que use double, representa sin perder precision. Una version igual a la actual tampoco avanza: dos escrituras con la misma version son, por contrato, el mismo dato. El contador sobrevive a los borrados: una clave borrada y recreada continua desde la version de su lapida."
+    },
+    "tombstone": {
+      "dataschema": "https://schemas.internal/system/state/eliminado/1.0.0.json",
+      "schemaPath": "schemas/system/state/eliminado/1.0.0.json",
+      "dataclassification": "internal",
+      "data": [
+        "aggregateVersion"
+      ],
+      "carriesVersion": true,
+      "permanent": true,
+      "replacesPreviousValue": true,
+      "recreateRequires": "aggregateVersion-strictly-greater",
+      "deleteOfAbsentKey": "writes-tombstone",
+      "getReturnsNull": true,
+      "$comment": "El valor anterior SALE del stream al entrar la lapida (A-34). La lapida lleva version porque put la lee (paso 1) para decidir si una escritura nueva es stale. Recrear una clave borrada es posible con una version estrictamente mayor: el CAS funciona contra la secuencia de la lapida y con expected=0 falla (A-34). Compactar lapidas queda fuera de alcance en 1.1. get de una clave con lapida devuelve null, igual que de una inexistente."
+    },
+    "write": {
+      "conditional": true,
+      "expectedHeader": "Nats-Expected-Last-Subject-Sequence",
+      "msgIdHeader": "Nats-Msg-Id",
+      "expectedForNewKey": 0,
+      "maxAttempts": 3,
+      "conflictErrCodes": [
+        10071,
+        10164
+      ],
+      "sameIdAndBytesAcrossAttempts": true,
+      "recognizeOwnWriteById": true,
+      "publishViaCoreForbidden": true,
+      "readsViaDirectGet": true,
+      "outcomes": [
+        "ok",
+        "stale"
+      ],
+      "result": [
+        "applied",
+        "outcome",
+        "revision"
+      ],
+      "conflictCode": "STATE_CONFLICT",
+      "unreadableCurrentValue": "overwrite",
+      "mandatoryDelayBetweenAttempts": false,
+      "steps": [
+        "validate-and-build-once",
+        "direct-get-last-message",
+        "own-write-by-id-is-ok",
+        "version-not-greater-is-stale",
+        "publish-with-expected-sequence-and-msg-id",
+        "conflict-reread-max-3"
+      ],
+      "$comment": "10071 'wrong last sequence: N' (un nodo, o un cluster sin carrera) y 10164 'wrong last sequence' (cluster, CARRERA, sin numero) son los DOS un conflicto de secuencia (A-33, A-49): un SDK que solo reconozca el 10071 pasa sus pruebas contra un nodo y falla en produccion porque trata un conflicto corriente como un error desconocido y no reintenta. El chequeo de secuencia se evalua ANTES que el de duplicados: un reenvio con el mismo Nats-Msg-Id y la misma S da el error de secuencia, no `duplicate` (A-33), y por eso existe el paso 1b (reconocer la propia escritura por el id, que el broker conserva en las cabeceras del mensaje almacenado: A-32). Un publish rechazado por secuencia NO gasta el Nats-Msg-Id (A-33). Un publish de CORE a un subject de estado lo captura el stream sin acuse y sin chequeo (A-45): siempre por JetStream. Un valor ilegible no bloquea la clave: se sobrescribe con el CAS sobre su secuencia (decidido provisionalmente)."
+    },
+    "read": {
+      "api": "$JS.API.DIRECT.GET.STATE_<DOM>.<subject>",
+      "notFoundStatus": 404,
+      "streamMissingOrDirectOff": "no-responders",
+      "bodyFormAllowedToServices": false,
+      "bodyOnSubjectFormIsRejected": 408,
+      "getReturnsNullForTombstone": true,
+      "replicaReadsMayBeStale": true,
+      "replicaReadsMeasuredStale": false,
+      "$comment": "DIRECT.GET por subject (A-32): 404 'Message Not Found' si no hay valor; si el stream no existe o no tiene allow_direct no contesta nadie ('no responders') y los dos casos se ven igual. La forma por subject RECHAZA una peticion con cuerpo (408 Bad Request, A-38): la forma de cuerpo ($JS.API.DIRECT.GET.<stream> + {seq}) lee cualquier mensaje y ninguna ACL la ve, asi que no puede colarse por un permiso de subject y no se concede nunca. Con replicas, cualquier replica puede contestar: un get justo despues de un put PUEDE devolver el valor anterior. Medido en 3 nodos locales: 400 de 400 lecturas inmediatas correctas (A-49) — eso NO demuestra que no ocurra sobre una red real."
+    },
+    "watch": {
+      "deliverPolicy": "last_per_subject",
+      "consumerConfig": "consumer",
+      "filter": "state.<dominio>.<agregado>.v<major>.<tenant>.*",
+      "filterWithoutTenant": "state.<dominio>.<agregado>.v<major>.*.*",
+      "withoutTenantAllowedInStrict": false,
+      "connectionTenantAlwaysFilters": true,
+      "durable": {
+        "format": "<servicio>__state_<dominio>_<agregado>_v<major>[__<tenant>]",
+        "pattern": "^[a-z0-9]+(-[a-z0-9]+)*__state_[a-z0-9]+(_[a-z0-9]+)+_v[1-9][0-9]*(__[a-z0-9]+(_[a-z0-9]+)*)?$",
+        "tenantSuffix": "__<tenant con - sustituido por _>",
+        "example": "tienda-web__state_clientes_cliente_v1__acme",
+        "valid": [
+          "tienda-web__state_clientes_cliente_v1",
+          "tienda-web__state_clientes_cliente_v1__acme",
+          "tienda-web__state_logistica_linea_envio_v2__acme_corp"
+        ],
+        "invalid": [
+          "tienda-web__state_clientes_v1",
+          "tienda-web__clientes_cliente_v1",
+          "tienda-web.state_clientes_cliente_v1",
+          "Tienda__state_clientes_cliente_v1",
+          "tienda-web__state_clientes_cliente_v1__",
+          "tienda-web__state_clientes_cliente_v1__acme-corp"
+        ]
+      },
+      "entry": [
+        "key",
+        "tenantId",
+        "deleted",
+        "data",
+        "aggregateVersion",
+        "revision"
+      ],
+      "entryDataWhenDeleted": "null",
+      "ackAfterHandlerReturns": true,
+      "replacedMessagesAreNotRedelivered": true,
+      "usesStreamInfoOnState": false,
+      "resync": "flux state resync",
+      "onSynced": {
+        "invocations": "once-per-watch",
+        "emptyStream": "immediately-before-any-entry",
+        "firesWhen": "delivery-metadata-pending-is-0-and-all-started-handlers-finished",
+        "retryableFailureDelaysIt": false,
+        "guaranteesNoLaterEntries": false
+      },
+      "$comment": "Un durable compartido REPARTE los mensajes entre quienes lo usan (A-47): por eso el tenant va en el nombre. Un consumidor que estuvo caido recibe solo el ultimo valor de cada clave (A-35). Un valor reemplazado mientras esta en vuelo NO se reentrega: el nak de la revision 10 y la entrada de la 20 dejan al broker sin la 10 (A-36). El watch no necesita STREAM.INFO.STATE_<DOM>: CONSUMER.INFO distingue 'consumidor no existe' (10014) de 'stream no existe' (10059) (A-48). num_pending de un consumidor last_per_subject es el numero de claves del filtro, lapidas incluidas, y los metadatos `pending` de cada entrega bajan hasta 0 en la ultima (A-35). onSynced: num_pending solo NO basta (no cuenta lo entregado y sin terminar). La entrada lleva tenantId, que no estaba en el plan: un watch sin tenant recibe entradas de todos y la clave sola mezclaria los tenants en la copia local."
+    },
+    "dlq": {
+      "subject": {
+        "format": "dlq.state.<dominio>.<agregado>.v<major>",
+        "tokens": 5,
+        "pattern": "^dlq\\.state\\.[a-z0-9]+(-[a-z0-9]+)*\\.[a-z0-9]+(-[a-z0-9]+)*\\.v[1-9][0-9]*$",
+        "example": "dlq.state.clientes.cliente.v1",
+        "valid": [
+          "dlq.state.clientes.cliente.v1"
+        ],
+        "invalid": [
+          "dlq.state.clientes.cliente.v1.acme.cli-1",
+          "dlq.clientes.cliente.v1.creado",
+          "dlq.state.clientes.cliente",
+          "state.clientes.cliente.v1"
+        ]
+      },
+      "stream": "DLQ_<DOMINIO>",
+      "streamSubjectsWhenDomainHasState": [
+        "dlq.<dominio>.>",
+        "dlq.state.<dominio>.>"
+      ],
+      "streamSubjectsWhenDomainHasNoState": [
+        "dlq.<dominio>.>"
+      ],
+      "dataReplacedBy": [
+        "key",
+        "revision"
+      ],
+      "dataNeverCopied": true,
+      "unreadableMessageBodyNeverCopied": true,
+      "dlqerrorNeverContainsDataValues": true,
+      "dropsSignature": true,
+      "msgId": "dlq-<id>-<dlqconsumer>",
+      "replay": "forbidden",
+      "recovery": "flux state resync",
+      "readerDurable": {
+        "format": "<servicio>__dlq_state_<dominio>",
+        "pattern": "^[a-z0-9]+(-[a-z0-9]+)*__dlq_state_[a-z0-9]+(_[a-z0-9]+)*$",
+        "filter": "dlq.state.<dominio>.>",
+        "example": "crm-api__dlq_state_clientes"
+      },
+      "$comment": "Sin tenant ni clave en el subject para que no se multiplique. El evento de DLQ de estado NO lleva el dato: data pasa a {key, revision}, porque la DLQ guarda 90 dias y un dato personal ya borrado seguiria vivo ahi tres meses. El stream DLQ_<DOM> captura dlq.state.<dom>.> SOLO si el dominio tiene STATE_<DOM> (decidido provisionalmente: 1.1 es aditiva y no se le pide un cambio a quien no usa estado); ampliar los subjects de un stream con datos es posible y no pierde mensajes (A-44). El estado NO se reproduce desde la DLQ: republicar un valor viejo pisaria uno nuevo, y ya no tiene ni el dato; flux dlq replay DEBE rechazar dlq.state.> y la recuperacion es flux state resync (borrar y recrear el durable: el broker entrega otra vez el ultimo valor de cada clave, A-37)."
+    },
+    "schemaPath": {
+      "format": "schemas/state/<dominio>/<agregado>/<major>.<minor>.<patch>.json",
+      "immutableOncePublished": true,
+      "mustDeclare": {
+        "aggregateVersion": {
+          "type": "integer",
+          "minimum": 1,
+          "required": true
+        },
+        "dataRootType": "object"
+      },
+      "bundleIndex": "state",
+      "bundleIndexMaps": "<dominio>.<agregado>.v<major> -> URI del esquema de version mas alta de su mayor",
+      "systemSchemas": "schemas/system/*: van en `schemas` del bundle, fuera de `subjects` y de `state`"
+    },
+    "acl": {
+      "$comment": "Lo que un servicio necesita para el estado, MEDIDO contra un broker con una ACL escrita a mano (A-38 a A-40, A-48) y lo que gen-acl.mjs debe producir (clave `watches`). Extiende security.acl: NO la sustituye ni relaja su lista cerrada, y security.acl.neverGrantedPattern debe exceptuar la forma por subject de ESTADO de DIRECT.GET (y SOLO esa: la forma de cuerpo, y cualquier comodin por encima del tenant, siguen denegados). Un permiso que no encaje en ninguno de estos patrones ni en security.acl.permissionPatterns es un error del generador.",
+      "ownerPublish": "^state\\.[a-z0-9]+(-[a-z0-9]+)*\\.>$",
+      "ownerDirectGet": "^\\$JS\\.API\\.DIRECT\\.GET\\.STATE_[A-Z0-9_]+\\.state\\.[a-z0-9]+(-[a-z0-9]+)*\\.>$",
+      "observerDirectGet": "^\\$JS\\.API\\.DIRECT\\.GET\\.STATE_[A-Z0-9_]+\\.state\\.[a-z0-9]+(-[a-z0-9]+)*\\.[a-z0-9]+(-[a-z0-9]+)*\\.v[1-9][0-9]*\\.([a-z0-9]+(-[a-z0-9]+)*|\\*)\\.\\*$",
+      "consumerInfo": "^\\$JS\\.API\\.CONSUMER\\.INFO\\.STATE_[A-Z0-9_]+\\.[a-z0-9]+(-[a-z0-9]+)*__state_[a-z0-9]+(_[a-z0-9]+)+_v[1-9][0-9]*(__[a-z0-9]+(_[a-z0-9]+)*)?$",
+      "consumerNext": "^\\$JS\\.API\\.CONSUMER\\.MSG\\.NEXT\\.STATE_[A-Z0-9_]+\\.[a-z0-9]+(-[a-z0-9]+)*__state_[a-z0-9]+(_[a-z0-9]+)+_v[1-9][0-9]*(__[a-z0-9]+(_[a-z0-9]+)*)?$",
+      "ack": "^\\$JS\\.ACK\\.STATE_[A-Z0-9_]+\\.[a-z0-9]+(-[a-z0-9]+)*__state_[a-z0-9]+(_[a-z0-9]+)+_v[1-9][0-9]*(__[a-z0-9]+(_[a-z0-9]+)*)?\\.>$",
+      "consumerCreate": "^\\$JS\\.API\\.CONSUMER\\.CREATE\\.STATE_[A-Z0-9_]+\\.[a-z0-9]+(-[a-z0-9]+)*__state_[a-z0-9]+(_[a-z0-9]+)+_v[1-9][0-9]*(__[a-z0-9]+(_[a-z0-9]+)*)?\\.state\\.[a-z0-9]+(-[a-z0-9]+)*\\.[a-z0-9]+(-[a-z0-9]+)*\\.v[1-9][0-9]*\\.([a-z0-9]+(-[a-z0-9]+)*|\\*)\\.\\*$",
+      "dlqPublish": "^dlq\\.state\\.[a-z0-9]+(-[a-z0-9]+)*\\.[a-z0-9]+(-[a-z0-9]+)*\\.v[1-9][0-9]*$",
+      "dlqReaderCreate": "^\\$JS\\.API\\.CONSUMER\\.CREATE\\.DLQ_[A-Z0-9_]+\\.[a-z0-9]+(-[a-z0-9]+)*__dlq_state_[a-z0-9]+(_[a-z0-9]+)*\\.dlq\\.state\\.[a-z0-9]+(-[a-z0-9]+)*\\.>$",
+      "devOnlyPatterns": [
+        "consumerCreate",
+        "dlqReaderCreate"
+      ],
+      "observerStreamInfoState": "never",
+      "observerPermissions": [
+        "consumerInfo",
+        "consumerNext",
+        "ack",
+        "observerDirectGet",
+        "dlqPublish",
+        "security.acl.permissionPatterns.streamInfo (solo DLQ_<DOM>)"
+      ],
+      "ownerPermissions": [
+        "ownerPublish",
+        "ownerDirectGet",
+        "consumerInfo (durable dlq_state)",
+        "consumerNext (durable dlq_state)",
+        "ack (durable dlq_state)"
+      ],
+      "$commentStreamInfo": "STREAM.INFO con `subjects_filter` en el cuerpo devuelve TODOS los subjects del stream con su recuento, es decir todas las claves y todos los tenants (A-39): con ese unico permiso un servicio confinado a `acme` conoce los clientes de `globex`. Sin el, put, get y watch funcionan igual (A-38, A-48). El dueno PUEDE tenerlo: ya ve todos sus tenants. Lo que si queda visible para un observador es STREAM.INFO.DLQ_<DOM>: los subjects de DLQ (cinco tokens, sin clave ni tenant) y sus recuentos.",
+      "$commentCreate": "El filtro de un consumidor no se puede ampliar por el cuerpo: con CREATE.<S>.<d>.<filtro>, un filter_subject distinto da 10131 y un filter_subjects da 10137, y tampoco hereda el del subject si el cuerpo no trae ninguno (A-40). Un `*` final en el permiso admite tambien un filtro por UNA clave: mas estrecho, inocuo."
+    },
+    "metrics": {
+      "flux_state_writes_total": {
+        "type": "counter",
+        "labels": [
+          "contract",
+          "outcome"
+        ],
+        "outcomes": [
+          "ok",
+          "stale",
+          "conflict",
+          "invalid_schema"
+        ],
+        "contractLabelPattern": "^[a-z0-9]+(-[a-z0-9]+)*\\.[a-z0-9]+(-[a-z0-9]+)*\\.v[1-9][0-9]*$",
+        "countsOperations": [
+          "put",
+          "delete"
+        ],
+        "outcomeMeaning": {
+          "ok": "applied: true",
+          "stale": "la version no avanzaba: NO es un error",
+          "conflict": "STATE_CONFLICT: el chequeo de secuencia agoto sus 3 intentos",
+          "invalid_schema": "MISSING_AGGREGATE_VERSION, o data no cumple su esquema (L3)"
+        },
+        "emittedAlsoWhenThrowing": [
+          "invalid_schema"
+        ],
+        "notCounted": [
+          "INVALID_STATE_KEY",
+          "INVALID_TENANT_FOR_STATE",
+          "RESERVED_DOMAIN",
+          "transport-errors"
+        ]
+      },
+      "forbiddenLabels": [
+        "tenantid",
+        "tenant",
+        "key",
+        "id",
+        "correlationid"
+      ],
+      "reusedConsumptionMetrics": {
+        "subject": "state.<contrato>",
+        "consumer": "durable-without-tenant-suffix",
+        "consumerPendingIsSumOfDurables": true
+      },
+      "$comment": "specification/08-observability.md §2.4. `contract` esta acotado (tantos como contratos de estado declarados). NUNCA la clave ni el tenant: la clave tiene una serie por cada agregado del dominio y el tenant una por cada cliente de la plataforma. El `consumer` de las metricas de consumo es el durable SIN el sufijo de tenant: con el, cada tenant nuevo crearia series nuevas. Un watch con un durable por tenant publica flux_consumer_pending como la SUMA de los suyos: varios durables con las mismas etiquetas se pisarian entre si."
+    }
   }
 }

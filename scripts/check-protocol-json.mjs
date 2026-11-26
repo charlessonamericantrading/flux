@@ -161,6 +161,119 @@ const CASES = [
      "$JS.API.CONSUMER.MSG.NEXT.EVT_PEDIDOS.facturacion-api__pedidos_pedido_v1_creado",
      "$JS.ACK.EVT_PEDIDOS.facturacion-api__pedidos_pedido_v1_creado.>",
      "pedidos.>", "dlq.pedidos.pedido.v1.creado", "_INBOX.pedidos-api.>"]],
+
+  // ── Estado replicado — specification/10-state.md ─────────────────────────────────────────
+  // Cada patrón, en los dos sentidos. Los de ACL son los que gen-acl.mjs debe cumplir cuando
+  // genere permisos de estado; lo ancho («para que funcione») tiene que FALLAR aquí.
+  ["naming.stream.statePattern",
+    ["STATE_CLIENTES", "STATE_LOGISTICA_INVERSA"],
+    ["STATE.CLIENTES", "state_clientes", "EVT_CLIENTES", "DLQ_CLIENTES", "STATE_", "STATE CLIENTES"]],
+  ["state.stream.pattern",
+    ["STATE_CLIENTES", "STATE_LOGISTICA_INVERSA"],
+    ["STATE.CLIENTES", "state_clientes", "EVT_CLIENTES", "STATE_"]],
+
+  ["state.subject.pattern",
+    ["state.clientes.cliente.v1.acme.cli-1", "state.logistica.linea-envio.v2.acme-corp.Env_00-9",
+     "state.clientes.cliente.v1.system.0", "state.clientes.cliente.v1.acme." + "a".repeat(128)],
+    ["state.clientes.cliente.v1.acme",                    // sin clave: 5 tokens
+     "state.clientes.cliente.v1.acme.cli.1",              // un punto en la clave: 7 tokens (el broker lo admite: A-41)
+     "State.clientes.cliente.v1.acme.cli-1",              // NATS distingue mayúsculas: subject fantasma
+     "state.clientes.cliente.v1.Acme.cli-1",              // tenant en mayúsculas
+     "state.clientes.cliente.v1.acme_corp.cli-1",         // tenant con guion bajo
+     "state.clientes.cliente.v1.acme.*", "state.clientes.cliente.v1.acme.>",   // comodines: el broker los acepta (A-41)
+     "state.clientes.cliente.v1.acme._reservada",         // prefijo `_` reservado
+     "state.clientes.cliente.v1.acme.-uno",
+     "state.clientes.cliente.v1.acme." + "a".repeat(129), // 129 caracteres
+     "state.clientes.cliente.v0.acme.k", "state.clientes.cliente.acme.cli-1",
+     "pedidos.pedido.v1.creado", "dlq.state.clientes.cliente.v1", "state.clientes.cliente.v1.acme.café"]],
+
+  ["state.contract.pattern",
+    ["clientes.cliente.v1", "logistica.linea-envio.v2"],
+    ["clientes.cliente", "clientes.cliente.v1.creado", "state.clientes.cliente.v1", "Clientes.cliente.v1", "clientes.cliente.v0", "clientes.cliente.1"]],
+
+  ["state.key.pattern",
+    ["cli-1", "Cli_1", "a", "0", "a".repeat(128)],
+    ["", "_reservada", "-uno", "a.b", "a b", "*", ">", "café", "a".repeat(129), "a\n"]],
+
+  ["state.tenant.pattern",
+    ["acme", "acme-corp", "system", "t0"],
+    ["", "Acme", "acme_corp", "acme corp", "-acme", "acme-", "acme--corp", "acme.corp", "acme\n"]],
+
+  ["state.type.value.pattern",
+    ["com.flux.state.clientes.cliente.v1", "com.flux.state.logistica.linea-envio.v2"],
+    ["com.flux.state.clientes.cliente.deleted.v1", "com.flux.clientes.cliente.creado.v1", "com.flux.state.clientes.v1", "state.clientes.cliente.v1"]],
+  ["state.type.tombstone.pattern",
+    ["com.flux.state.clientes.cliente.deleted.v1", "com.flux.state.logistica.linea-envio.deleted.v2"],
+    ["com.flux.state.clientes.cliente.v1", "com.flux.state.clientes.cliente.eliminado.v1", "com.flux.state.clientes.cliente.deleted", "com.flux.clientes.cliente.deleted.v1"]],
+
+  // El durable de un watch: tres partes separadas por `__`, y el tenant con sus guiones a `_`.
+  ["state.watch.durable.pattern",
+    ["tienda-web__state_clientes_cliente_v1", "tienda-web__state_clientes_cliente_v1__acme",
+     "tienda-web__state_logistica_linea_envio_v2__acme_corp"],
+    ["tienda-web__state_clientes_v1",                     // falta el agregado
+     "tienda-web__clientes_cliente_v1",                   // es el durable de un evento, no el de estado
+     "tienda-web.state_clientes_cliente_v1", "Tienda__state_clientes_cliente_v1",
+     "tienda-web__state_clientes_cliente_v1__",           // sufijo de tenant vacío
+     "tienda-web__state_clientes_cliente_v1__acme-corp",  // el guion del tenant pasa a `_`
+     "tienda-web__state_clientes_cliente_v1__Acme"]],
+
+  ["state.dlq.subject.pattern",
+    ["dlq.state.clientes.cliente.v1", "dlq.state.logistica.linea-envio.v2"],
+    ["dlq.state.clientes.cliente.v1.acme.cli-1",           // la DLQ de estado NO lleva tenant ni clave
+     "dlq.clientes.cliente.v1.creado", "dlq.state.clientes.cliente", "state.clientes.cliente.v1", "dlq.state.clientes.>"]],
+  ["state.dlq.readerDurable.pattern",
+    ["crm-api__dlq_state_clientes", "crm-api__dlq_state_logistica_inversa"],
+    ["crm-api__dlq_clientes", "crm-api__dlq_state", "CrmApi__dlq_state_clientes", "crm-api__state_clientes_cliente_v1"]],
+
+  ["state.metrics.flux_state_writes_total.contractLabelPattern",
+    ["clientes.cliente.v1", "logistica.linea-envio.v2"],
+    ["clientes.cliente.v1.acme", "clientes.cliente.v1.acme.cli-1", "acme", "state.clientes.cliente.v1"]],
+
+  // ACL de estado — 10-state.md §8. El dueño escribe y lee lo suyo; el observador, solo su tenant.
+  ["state.acl.ownerPublish",
+    ["state.clientes.>", "state.linea-envio.>"],
+    [">", "state.>", "state.clientes.cliente.>", "state.*.>", "clientes.>", "dlq.state.clientes.>", "state.clientes.cliente.v1.acme.cli-1"]],
+  ["state.acl.ownerDirectGet",
+    ["$JS.API.DIRECT.GET.STATE_CLIENTES.state.clientes.>"],
+    ["$JS.API.DIRECT.GET.>", "$JS.API.DIRECT.GET.STATE_CLIENTES", "$JS.API.DIRECT.GET.STATE_CLIENTES.>",
+     "$JS.API.DIRECT.GET.STATE_CLIENTES.state.>", "$JS.API.DIRECT.GET.EVT_PEDIDOS.pedidos.>",
+     "$JS.API.DIRECT.GET.STATE_CLIENTES.state.clientes.cliente.v1.acme.cli-1"]],
+  ["state.acl.observerDirectGet",
+    ["$JS.API.DIRECT.GET.STATE_CLIENTES.state.clientes.cliente.v1.acme.*",
+     "$JS.API.DIRECT.GET.STATE_CLIENTES.state.clientes.cliente.v1.*.*"],
+    ["$JS.API.DIRECT.GET.>", "$JS.API.DIRECT.GET.STATE_CLIENTES",                // la forma de CUERPO: ninguna ACL ve el cuerpo (A-38)
+     "$JS.API.DIRECT.GET.STATE_CLIENTES.>", "$JS.API.DIRECT.GET.STATE_CLIENTES.state.clientes.>",
+     "$JS.API.DIRECT.GET.STATE_CLIENTES.state.clientes.cliente.v1.>",
+     "$JS.API.DIRECT.GET.STATE_CLIENTES.state.clientes.cliente.v1.*",             // sin la clave: otra forma
+     "$JS.API.DIRECT.GET.STATE_CLIENTES.state.clientes.cliente.v1.acme.>",
+     "$JS.API.DIRECT.GET.STATE_CLIENTES.state.clientes.cliente.v1.acme.cli-1",    // una clave concreta: no es un permiso de contrato
+     "$JS.API.DIRECT.GET.EVT_PEDIDOS.pedidos.pedido.v1.*.*", "$JS.API.STREAM.MSG.GET.STATE_CLIENTES"]],
+  ["state.acl.consumerInfo",
+    ["$JS.API.CONSUMER.INFO.STATE_CLIENTES.tienda-web__state_clientes_cliente_v1__acme"],
+    ["$JS.API.CONSUMER.INFO.STATE_CLIENTES.>", "$JS.API.CONSUMER.INFO.STATE_CLIENTES.*", "$JS.API.CONSUMER.INFO.STATE_CLIENTES",
+     "$JS.API.CONSUMER.INFO.EVT_PEDIDOS.tienda-web__state_clientes_cliente_v1", "$JS.API.STREAM.INFO.STATE_CLIENTES"]],
+  ["state.acl.consumerNext",
+    ["$JS.API.CONSUMER.MSG.NEXT.STATE_CLIENTES.tienda-web__state_clientes_cliente_v1"],
+    ["$JS.API.CONSUMER.MSG.NEXT.STATE_CLIENTES.>", "$JS.API.CONSUMER.MSG.NEXT.>", "$JS.API.CONSUMER.MSG.NEXT.STATE_CLIENTES"]],
+  ["state.acl.ack",
+    ["$JS.ACK.STATE_CLIENTES.tienda-web__state_clientes_cliente_v1__acme.>"],
+    ["$JS.ACK.>", "$JS.ACK.STATE_CLIENTES.>", "$JS.ACK.STATE_CLIENTES.tienda-web__state_clientes_cliente_v1__acme"]],
+  ["state.acl.consumerCreate",
+    ["$JS.API.CONSUMER.CREATE.STATE_CLIENTES.tienda-web__state_clientes_cliente_v1__acme.state.clientes.cliente.v1.acme.*",
+     "$JS.API.CONSUMER.CREATE.STATE_CLIENTES.tienda-web__state_clientes_cliente_v1.state.clientes.cliente.v1.*.*"],
+    ["$JS.API.CONSUMER.CREATE.STATE_CLIENTES.tienda-web__state_clientes_cliente_v1__acme.state.clientes.cliente.v1.acme.>",
+     "$JS.API.CONSUMER.CREATE.STATE_CLIENTES.tienda-web__state_clientes_cliente_v1__acme.state.clientes.>",
+     "$JS.API.CONSUMER.CREATE.STATE_CLIENTES.tienda-web__state_clientes_cliente_v1__acme.state.clientes.cliente.v1.acme",
+     "$JS.API.CONSUMER.CREATE.STATE_CLIENTES.>", "$JS.API.CONSUMER.DURABLE.CREATE.STATE_CLIENTES.tienda-web__state_clientes_cliente_v1__acme.state.clientes.cliente.v1.acme.*"]],
+  ["state.acl.dlqPublish",
+    ["dlq.state.clientes.cliente.v1"],
+    ["dlq.state.>", "dlq.state.clientes.>", "dlq.state.clientes.cliente.v1.acme.cli-1", "dlq.clientes.cliente.v1.creado"]],
+  ["state.acl.dlqReaderCreate",
+    ["$JS.API.CONSUMER.CREATE.DLQ_CLIENTES.crm-api__dlq_state_clientes.dlq.state.clientes.>"],
+    ["$JS.API.CONSUMER.CREATE.DLQ_CLIENTES.crm-api__dlq_state_clientes.dlq.state.>",
+     "$JS.API.CONSUMER.CREATE.DLQ_CLIENTES.crm-api__dlq_state_clientes.dlq.>",
+     "$JS.API.CONSUMER.CREATE.DLQ_CLIENTES.crm-api__dlq_clientes.dlq.state.clientes.>",
+     "$JS.API.CONSUMER.CREATE.EVT_CLIENTES.crm-api__dlq_state_clientes.dlq.state.clientes.>"]],
 ];
 
 // ─── Los tres códigos de connect() — 04-errors.md §5.3 ───────────────────────────────────────
@@ -220,6 +333,183 @@ function fallosDeConnect(doc) {
   if (den.mustFailSubscribeWith !== "PERMISSION_DENIED" || !cs.PERMISSION_DENIED) f.push("security.sdk.denials.mustFailSubscribeWith debe ser PERMISSION_DENIED, que debe existir en errors.codes");
   if (!den.mustLog?.includes("ack") || !den.mustLog?.includes("pull")) f.push('security.sdk.denials.mustLog debe incluir "ack" y "pull": se registran los dos');
   if (JSON.stringify(den.mustLogOnly) !== JSON.stringify(["ack"])) f.push('security.sdk.denials.mustLogOnly debe ser ["ack"]: lo único que SOLO puede salir por el logger');
+  return f;
+}
+
+// ─── Estado replicado — specification/10-state.md ───────────────────────────────────────────
+// Como `fallosDeConnect`: una función PURA sobre el documento, que se ejecuta sobre el protocol.json
+// real (cero fallos) y sobre copias estropeadas a propósito (cada una DEBE dar al menos uno). Una
+// invariante que solo se ha visto en verde no demuestra nada.
+const CODIGOS_ESTADO = {
+  INVALID_TENANT_FOR_STATE: "permanent",
+  INVALID_STATE_KEY: "permanent",
+  MISSING_AGGREGATE_VERSION: "permanent",
+  STATE_SUBJECT_MISMATCH: "poison",
+  STATE_CONFLICT: "retryable",
+  RESERVED_DOMAIN: "permanent",
+};
+const DOMINIOS_RESERVADOS = ["dlq", "state", "rpc", "system"];
+
+/** @returns {string[]} */
+function fallosDeEstado(doc) {
+  const f = [];
+  const st = doc.state;
+  if (!st) return ["falta el bloque `state` (10-state.md)"];
+  const cs = doc.errors?.codes ?? {};
+  const eq = (a, b) => JSON.stringify(a) === JSON.stringify(b);
+  const re = (src) => { try { return new RegExp(src); } catch { return /(?!)/; } };
+
+  if (doc.version !== "1.1.0") f.push(`version debe ser "1.1.0" (la fase 2 la sube), es ${JSON.stringify(doc.version)}`);
+
+  // 04-errors.md §6: la lista de códigos es CERRADA, con su clase, y todos cuelgan de la capacidad `state`.
+  for (const [c, clase] of Object.entries(CODIGOS_ESTADO)) {
+    if (!cs[c]) { f.push(`errors.codes.${c}: falta (04-errors.md §6)`); continue; }
+    if (cs[c].class !== clase) f.push(`errors.codes.${c}.class debe ser "${clase}", es ${JSON.stringify(cs[c].class)}`);
+    if (cs[c].capability !== "state") f.push(`errors.codes.${c}.capability debe ser "state"`);
+  }
+  const deEstado = Object.entries(cs).filter(([k, v]) => !k.startsWith("$") && v?.capability === "state").map(([k]) => k).sort();
+  if (!eq(deEstado, Object.keys(CODIGOS_ESTADO).sort())) f.push(`los códigos de la capacidad state son una lista CERRADA de seis; hay [${deEstado.join(", ")}]`);
+  // El único POISON de estado es el de identidad: miente sobre su tenant o su clave.
+  if (cs.STATE_SUBJECT_MISMATCH?.action !== "term+dlq+alert") f.push('errors.codes.STATE_SUBJECT_MISMATCH.action debe ser "term+dlq+alert" (es POISON)');
+  if (cs.STATE_SUBJECT_MISMATCH?.neverApplied !== true) f.push("errors.codes.STATE_SUBJECT_MISMATCH.neverApplied debe ser true: la entrada no se aplica");
+  if (!doc.capabilities?.definitions?.state) f.push("capabilities.definitions.state: falta la definición de la capacidad (con su evidencia)");
+  else if (doc.capabilities.definitions.state.evidence !== "sdk-files") f.push('capabilities.definitions.state.evidence debe ser "sdk-files", como `security`');
+
+  // 02-naming.md §1.3: dominios reservados.
+  const rd = doc.naming?.reservedDomains;
+  if (!eq([...(rd?.names ?? [])].sort(), [...DOMINIOS_RESERVADOS].sort())) f.push(`naming.reservedDomains.names debe ser ${JSON.stringify(DOMINIOS_RESERVADOS)}`);
+  if (rd?.errorCode !== "RESERVED_DOMAIN" || !cs.RESERVED_DOMAIN) f.push("naming.reservedDomains.errorCode debe ser RESERVED_DOMAIN, que debe existir en errors.codes");
+  // …y la reserva NO la hace el patrón del subject: la hace RESERVED_DOMAIN. Si un día el patrón los
+  // rechazara, un SDK dejaría de dar el código estable y daría «subject inválido».
+  const subj = re(doc.naming?.subject?.pattern ?? "");
+  for (const dom of DOMINIOS_RESERVADOS) {
+    if (!subj.test(`${dom}.agregado.v1.creado`)) f.push(`naming.subject.pattern debería aceptar sintácticamente "${dom}.agregado.v1.creado": la reserva la hace RESERVED_DOMAIN, no el patrón`);
+  }
+
+  // 10-state.md §2.1: la configuración del stream. Mal puestas, estas cuatro NO dan error y rompen la semántica.
+  const sm = st.stream ?? {};
+  if (sm.maxMsgsPerSubject !== 1) f.push("state.stream.maxMsgsPerSubject debe ser 1: es lo que convierte el stream en un mapa (A-31)");
+  if (sm.allowDirect !== true) f.push("state.stream.allowDirect debe ser true: sin él get y el paso 1 de put no reciben respuesta (A-32)");
+  if (sm.maxAge !== 0) f.push("state.stream.maxAge debe ser 0: el estado no caduca");
+  if (sm.discard !== "old") f.push('state.stream.discard debe ser "old": con "new" el broker rechazaría la segunda escritura (A-46)');
+  if (sm.sdkQueriesStreamInfo !== false) f.push("state.stream.sdkQueriesStreamInfo debe ser false: STREAM.INFO lista claves y tenants (A-39)");
+  if (!eq([...(sm.auditedByDoctor ?? [])].sort(), ["allowDirect", "discard", "maxAge", "maxMsgsPerSubject"])) f.push("state.stream.auditedByDoctor debe listar las cuatro: allowDirect, discard, maxAge, maxMsgsPerSubject");
+
+  // El subject: 6 tokens, y su formato los cuenta.
+  const fmtSubject = st.subject?.format ?? "";
+  if (st.subject?.tokens !== 6 || fmtSubject.split(".").length !== 6) f.push(`state.subject: debe tener 6 tokens (tokens=${st.subject?.tokens}, formato con ${fmtSubject.split(".").length})`);
+  const fmtDlq = st.dlq?.subject?.format ?? "";
+  if (st.dlq?.subject?.tokens !== 5 || fmtDlq.split(".").length !== 5) f.push(`state.dlq.subject: debe tener 5 tokens, sin tenant ni clave (tokens=${st.dlq?.subject?.tokens}, formato con ${fmtDlq.split(".").length})`);
+  // Los ejemplos del propio documento pasan y fallan donde dicen.
+  for (const [ruta, nodo] of [["state.subject", st.subject], ["state.contract", st.contract], ["state.key", st.key], ["state.tenant", st.tenant],
+                              ["state.watch.durable", st.watch?.durable], ["state.dlq.subject", st.dlq?.subject]]) {
+    const r = re(nodo?.pattern ?? "");
+    for (const v of nodo?.valid ?? []) if (!r.test(v)) f.push(`${ruta}.valid: el patrón rechaza ${JSON.stringify(v)}`);
+    for (const v of nodo?.invalid ?? []) if (r.test(v)) f.push(`${ruta}.invalid: el patrón acepta ${JSON.stringify(v)}`);
+  }
+  // La clave: el prefijo reservado lo hace cumplir el patrón, y su longitud sale de él.
+  if (st.key?.reservedPrefix !== "_" || re(st.key?.pattern ?? "").test("_x")) f.push("state.key: el prefijo `_` está reservado al protocolo y el patrón no debe admitir una clave que empiece por él");
+  if (!(st.key?.pattern ?? "").includes(`{0,${(st.key?.maxLength ?? 0) - 1}}`)) f.push(`state.key.maxLength (${st.key?.maxLength}) no sale del patrón`);
+  if (st.key?.maxLength !== 128) f.push("state.key.maxLength debe ser 128");
+  if (st.key?.caseSensitive !== true || st.key?.pii !== "forbidden") f.push("state.key: es sensible a mayúsculas y nunca PII");
+  if (st.tenant?.maxLength !== 64) f.push("state.tenant.maxLength debe ser 64: el durable lleva el tenant y NATS limita los nombres de consumidor a 255 (A-42)");
+  if (st.tenant?.default !== "none") f.push('state.tenant.default debe ser "none": en estado no hay tenant por defecto');
+  // El durable de un watch no puede confundirse con el de un evento ni con el de DLQ.
+  const durEvento = re(doc.naming?.durableConsumer?.pattern ?? "");
+  const durEstado = re(st.watch?.durable?.pattern ?? "");
+  if (durEstado.test("facturacion-api__pedidos_pedido_v1_creado")) f.push("state.watch.durable.pattern acepta el durable de un evento");
+  // …pero SÍ es un durable de NATS (sin puntos, `<servicio>__<resto>`): el patrón general lo acepta.
+  for (const v of st.watch?.durable?.valid ?? []) {
+    if (!durEvento.test(v)) f.push(`naming.durableConsumer.pattern rechaza el durable de estado ${JSON.stringify(v)}: un durable de estado también es un durable`);
+  }
+
+  // El sobre: la identidad está en el subject; el sobre solo la repite.
+  const env = st.envelope ?? {};
+  if (env.tenantidEqualsSubjectToken !== true || env.subjectEqualsKeyToken !== true || env.typeMatchesContract !== true) f.push("state.envelope: tenantid, subject y type DEBEN coincidir con el subject de NATS");
+  if (env.mismatchCode !== "STATE_SUBJECT_MISMATCH" || env.mismatchClass !== "poison") f.push("state.envelope: la discrepancia es POISON con STATE_SUBJECT_MISMATCH");
+  if (!eq(env.newRootAttributes, [])) f.push("state.envelope.newRootAttributes debe ser []: el estado no añade atributos al sobre (01-envelope.md §3.4)");
+  if (env.attributeOrder !== doc.cloudevents?.attributeOrder) f.push("state.envelope.attributeOrder debe ser el de cloudevents.attributeOrder: data va siempre el último");
+
+  // Clasificación: restricted no se admite en estado; lo admitido es un subconjunto de lo que existe.
+  const cl = st.classification ?? {};
+  const enumCe = doc.cloudevents?.requiredExtensions?.dataclassification?.enum ?? [];
+  if (!cl.forbidden?.includes("restricted") || cl.allowed?.includes("restricted")) f.push("state.classification: `restricted` NO se admite en estado");
+  if (!(cl.allowed ?? []).every((c) => enumCe.includes(c))) f.push("state.classification.allowed contiene un valor que no existe en cloudevents.requiredExtensions.dataclassification");
+  if (cl.putDefault !== "confidential" || !cl.allowed?.includes(cl.putDefault)) f.push("state.classification.putDefault debe ser confidential (equivocarse hacia arriba cuesta un log redactado)");
+  if (cl.tombstone !== "internal" || st.tombstone?.dataclassification !== "internal") f.push("la lápida es siempre internal");
+  if (doc.security?.piiInPayload?.event !== "forbidden" || !doc.security?.piiInPayload?.state) f.push("security.piiInPayload debe distinguir por primitiva: event=forbidden y state");
+
+  // La versión del agregado: entero >= 1, comprobado siempre, y con el máximo que Node representa.
+  const av = st.aggregateVersion ?? {};
+  if (av.required !== true || av.type !== "integer" || av.minimum !== 1) f.push("state.aggregateVersion debe ser un entero >= 1 y obligatorio");
+  if (av.maximum !== Number.MAX_SAFE_INTEGER) f.push("state.aggregateVersion.maximum debe ser 2^53 - 1 (9007199254740991): el mayor entero que Node representa sin perder precisión");
+  if (av.checkedWithoutValidation !== true) f.push("state.aggregateVersion.checkedWithoutValidation debe ser true: es una regla del protocolo, no del esquema");
+  if (st.schemaPath?.mustDeclare?.aggregateVersion?.required !== true) f.push("state.schemaPath.mustDeclare.aggregateVersion debe ser required");
+
+  // La lápida: fija, con versión, permanente.
+  const tb = st.tombstone ?? {};
+  if (tb.dataschema !== "https://schemas.internal/system/state/eliminado/1.0.0.json") f.push("state.tombstone.dataschema debe ser https://schemas.internal/system/state/eliminado/1.0.0.json");
+  if (tb.dataschema?.replace("https://schemas.internal/", "schemas/") !== tb.schemaPath) f.push("state.tombstone.schemaPath debe ser la ruta del $id de su dataschema");
+  if (!eq(tb.data, ["aggregateVersion"]) || tb.carriesVersion !== true) f.push("state.tombstone.data debe ser [aggregateVersion]: la lápida lleva versión porque put la lee");
+  if (tb.permanent !== true || tb.replacesPreviousValue !== true) f.push("state.tombstone: permanente en 1.1, y sustituye al valor anterior");
+  if (tb.recreateRequires !== "aggregateVersion-strictly-greater") f.push("state.tombstone.recreateRequires: recrear una clave borrada exige una versión estrictamente mayor");
+  if (!re(st.type?.tombstone?.pattern ?? "").test("com.flux.state.clientes.cliente.deleted.v1") || re(st.type?.value?.pattern ?? "").test("com.flux.state.clientes.cliente.deleted.v1")) f.push("state.type: el patrón de la lápida y el del valor no se distinguen");
+
+  // La escritura condicional: el corazón.
+  const w = st.write ?? {};
+  if (w.conditional !== true || w.expectedHeader !== "Nats-Expected-Last-Subject-Sequence" || w.msgIdHeader !== "Nats-Msg-Id") f.push("state.write: condicional, con Nats-Expected-Last-Subject-Sequence y Nats-Msg-Id");
+  if (w.expectedForNewKey !== 0) f.push("state.write.expectedForNewKey debe ser 0 (A-33)");
+  if (w.maxAttempts !== 3) f.push("state.write.maxAttempts debe ser 3");
+  // Un SDK que solo reconoce el 10071 pasa contra un nodo y falla en un cluster (A-49).
+  if (!eq([...(w.conflictErrCodes ?? [])].sort((a, b) => a - b), [10071, 10164])) f.push("state.write.conflictErrCodes debe ser [10071, 10164]: el 10164 es el conflicto de una carrera en un cluster y sin él un SDK no reintenta (A-49)");
+  if (w.sameIdAndBytesAcrossAttempts !== true || w.recognizeOwnWriteById !== true) f.push("state.write: el mismo id y los mismos bytes en todos los intentos, y reconocer la propia escritura por el id (un acuse perdido no es un stale)");
+  if (w.publishViaCoreForbidden !== true) f.push("state.write.publishViaCoreForbidden debe ser true: un publish de core sobrescribe sin condición (A-45)");
+  if (!eq(w.outcomes, ["ok", "stale"]) || !eq(w.result, ["applied", "outcome", "revision"])) f.push('state.write: outcomes ["ok","stale"] y resultado ["applied","outcome","revision"]');
+  if (w.conflictCode !== "STATE_CONFLICT" || !cs.STATE_CONFLICT) f.push("state.write.conflictCode debe ser STATE_CONFLICT, que debe existir en errors.codes");
+  if (w.unreadableCurrentValue !== "overwrite") f.push("state.write.unreadableCurrentValue debe ser overwrite: un valor ilegible no puede bloquear la clave para siempre");
+
+  // Lectura y watch.
+  const rd2 = st.read ?? {};
+  if (rd2.bodyFormAllowedToServices !== false) f.push("state.read.bodyFormAllowedToServices debe ser false: la forma de cuerpo de DIRECT.GET lee cualquier mensaje y ninguna ACL la ve (A-38)");
+  const wt = st.watch ?? {};
+  if (wt.deliverPolicy !== "last_per_subject") f.push('state.watch.deliverPolicy debe ser "last_per_subject"');
+  if (!eq(wt.entry, ["key", "tenantId", "deleted", "data", "aggregateVersion", "revision"])) f.push("state.watch.entry debe ser [key, tenantId, deleted, data, aggregateVersion, revision]");
+  if (wt.replacedMessagesAreNotRedelivered !== true || wt.usesStreamInfoOnState !== false) f.push("state.watch: un valor reemplazado no se reentrega, y no usa STREAM.INFO.STATE_<DOM>");
+  if (wt.onSynced?.emptyStream !== "immediately-before-any-entry" || wt.onSynced?.invocations !== "once-per-watch") f.push("state.watch.onSynced: con el stream vacío se invoca de inmediato, una vez por watch");
+
+  // La DLQ de estado: sin dato, sin firma, sin replay.
+  const dq = st.dlq ?? {};
+  if (!eq(dq.dataReplacedBy, ["key", "revision"]) || dq.dataNeverCopied !== true) f.push("state.dlq.dataReplacedBy debe ser [key, revision]: un dato personal borrado no puede seguir 90 días en la DLQ");
+  if (dq.replay !== "forbidden" || dq.recovery !== "flux state resync") f.push("state.dlq: el estado no se reproduce desde la DLQ; la recuperación es flux state resync");
+  if (dq.dropsSignature !== true || dq.dlqerrorNeverContainsDataValues !== true || dq.unreadableMessageBodyNeverCopied !== true) f.push("state.dlq: sin firma, sin valores en dlqerror y sin el cuerpo de un mensaje ilegible");
+  if (!eq(dq.streamSubjectsWhenDomainHasNoState, ["dlq.<dominio>.>"])) f.push("state.dlq.streamSubjectsWhenDomainHasNoState: un dominio sin estado conserva el DLQ_<DOM> de la 1.0 (1.1 es aditiva)");
+
+  // ACL: lo concedible de estado, sin STREAM.INFO.STATE y con el tenant fijado.
+  const acl = st.acl ?? {};
+  if (acl.observerStreamInfoState !== "never") f.push('state.acl.observerStreamInfoState debe ser "never": STREAM.INFO con subjects_filter lista claves y tenants (A-39)');
+  if (!eq(acl.devOnlyPatterns, ["consumerCreate", "dlqReaderCreate"])) f.push("state.acl.devOnlyPatterns debe ser [consumerCreate, dlqReaderCreate]");
+  if (!re(acl.observerDirectGet ?? "").test("$JS.API.DIRECT.GET.STATE_X.state.x.y.v1.acme.*") || re(acl.observerDirectGet ?? "").test("$JS.API.DIRECT.GET.STATE_X")) f.push("state.acl.observerDirectGet: la forma por subject con el tenant fijado sí, la de cuerpo nunca");
+  // Los permisos de estado no pueden solaparse con los de eventos: serían dos categorías para un permiso.
+  for (const [k, v] of Object.entries(doc.security?.acl?.permissionPatterns ?? {})) {
+    if (k.startsWith("$")) continue;
+    for (const ej of ["$JS.API.CONSUMER.INFO.STATE_CLIENTES.tienda-web__state_clientes_cliente_v1", "$JS.ACK.STATE_CLIENTES.tienda-web__state_clientes_cliente_v1.>"]) {
+      if (re(v).test(ej)) f.push(`security.acl.permissionPatterns.${k} concede un permiso de estado (${ej}): los de estado van en state.acl`);
+    }
+  }
+
+  // Observabilidad: la métrica de estado NO va entre las siete (las suites de los SDKs cuentan siete).
+  const ms = doc.observability?.metrics ?? {};
+  if (Object.keys(ms).length !== 7) f.push(`observability.metrics debe tener SIETE métricas (las suites de los SDKs cuentan siete y comparan con las expuestas); tiene ${Object.keys(ms).length}. La de estado va en state.metrics`);
+  const mw = st.metrics?.flux_state_writes_total;
+  if (!eq(mw?.labels, ["contract", "outcome"])) f.push("state.metrics.flux_state_writes_total.labels debe ser [contract, outcome]");
+  if (!eq(mw?.outcomes, ["ok", "stale", "conflict", "invalid_schema"])) f.push("state.metrics.flux_state_writes_total.outcomes debe ser [ok, stale, conflict, invalid_schema]");
+  for (const prohibida of doc.observability?.forbiddenLabels ?? []) {
+    if ((mw?.labels ?? []).includes(prohibida)) f.push(`state.metrics.flux_state_writes_total usa la etiqueta prohibida "${prohibida}"`);
+  }
+  for (const prohibida of ["tenantid", "key"]) {
+    if (!(st.metrics?.forbiddenLabels ?? []).includes(prohibida)) f.push(`state.metrics.forbiddenLabels debe incluir "${prohibida}": nunca la clave ni el tenant`);
+  }
+  if (st.metrics?.reusedConsumptionMetrics?.consumer !== "durable-without-tenant-suffix") f.push("state.metrics.reusedConsumptionMetrics.consumer: el durable SIN el sufijo de tenant (con él, cada tenant crea series)");
   return f;
 }
 
@@ -310,6 +600,7 @@ for (const codigo of ["NOT_PROVISIONED", "PERMISSION_DENIED", ...CODIGOS_CONNECT
   if (p.errors.codes[codigo]?.capability !== "security") fallos.push(`errors.codes.${codigo}.capability debe ser "security"`);
 }
 fallos.push(...fallosDeConnect(p));
+fallos.push(...fallosDeEstado(p));
 if (!Object.hasOwn(p.errors.codes, p.security.provisioning.notProvisionedErrorCode)) fallos.push("security.provisioning.notProvisionedErrorCode no está en errors.codes");
 if (!Object.hasOwn(capDefs, p.security.sdk.capability)) fallos.push(`security.sdk.capability "${p.security.sdk.capability}" no está en capabilities.definitions`);
 
@@ -389,10 +680,82 @@ if (!dlqDurables.length || !dlqDurables.every((d) => new RegExp(acl.dlqReaderDur
   }
 }
 
+// Autocomprobación de `fallosDeEstado`: cada copia estropeada DEBE dar un fallo, o la invariante no
+// vigila nada. Son las equivocaciones reales que 10-state.md existe para impedir.
+let mutacionesEstado = 0;
+{
+  const mutaciones = {
+    "volver a la versión 1.0.0": (d) => { d.version = "1.0.0"; },
+    "quitar un código de estado": (d) => { delete d.errors.codes.STATE_CONFLICT; },
+    "STATE_SUBJECT_MISMATCH como PERMANENT": (d) => { d.errors.codes.STATE_SUBJECT_MISMATCH.class = "permanent"; },
+    "STATE_CONFLICT como PERMANENT": (d) => { d.errors.codes.STATE_CONFLICT.class = "permanent"; },
+    "un séptimo código de estado": (d) => { d.errors.codes.OTRO_CODIGO_DE_ESTADO = { class: "permanent", capability: "state" }; },
+    "una capacidad state sin definir": (d) => { delete d.capabilities.definitions.state; },
+    "quitar un dominio reservado": (d) => { d.naming.reservedDomains.names = ["state", "rpc", "system"]; },
+    "max_msgs_per_subject de 5": (d) => { d.state.stream.maxMsgsPerSubject = 5; },
+    "sin allow_direct": (d) => { d.state.stream.allowDirect = false; },
+    "el estado caduca": (d) => { d.state.stream.maxAge = 2592000; },
+    "discard new": (d) => { d.state.stream.discard = "new"; },
+    "el SDK consulta STREAM.INFO del estado": (d) => { d.state.stream.sdkQueriesStreamInfo = true; },
+    "el subject de estado con 5 tokens": (d) => { d.state.subject.format = "state.<dominio>.<agregado>.v<major>.<clave>"; },
+    "la clave admite un punto": (d) => { d.state.key.pattern = "^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$"; },
+    "la clave admite el prefijo reservado": (d) => { d.state.key.pattern = "^[A-Za-z0-9_][A-Za-z0-9_-]{0,127}$"; },
+    "el tenant admite mayúsculas": (d) => { d.state.tenant.pattern = "^[A-Za-z0-9]+(-[A-Za-z0-9]+)*$"; },
+    "el tenant sin límite": (d) => { d.state.tenant.maxLength = 255; },
+    "tenant por defecto": (d) => { d.state.tenant.default = "system"; },
+    "el durable de estado acepta el de un evento": (d) => { d.state.watch.durable.pattern = "^[a-z0-9-]+__[a-z0-9_]+$"; },
+    "tenantid del sobre sin atarlo al subject": (d) => { d.state.envelope.tenantidEqualsSubjectToken = false; },
+    "un atributo raíz nuevo en el sobre": (d) => { d.state.envelope.newRootAttributes = ["tenantkey"]; },
+    "restricted admitido en estado": (d) => { d.state.classification.allowed.push("restricted"); },
+    "sin restricted prohibido": (d) => { d.state.classification.forbidden = []; },
+    "la clasificación por defecto baja a internal": (d) => { d.state.classification.putDefault = "internal"; },
+    "aggregateVersion que admite 0": (d) => { d.state.aggregateVersion.minimum = 0; },
+    "aggregateVersion solo con validación L3": (d) => { d.state.aggregateVersion.checkedWithoutValidation = false; },
+    "la lápida con otro dataschema": (d) => { d.state.tombstone.dataschema = "https://schemas.internal/system/state/deleted/1.0.0.json"; },
+    "la lápida sin versión": (d) => { d.state.tombstone.data = []; d.state.tombstone.carriesVersion = false; },
+    "recrear sin exigir versión mayor": (d) => { d.state.tombstone.recreateRequires = "anything"; },
+    "put sin condición": (d) => { d.state.write.conditional = false; },
+    "solo el 10071 como conflicto": (d) => { d.state.write.conflictErrCodes = [10071]; },
+    "solo el 10164 como conflicto": (d) => { d.state.write.conflictErrCodes = [10164]; },
+    "un id nuevo en cada intento": (d) => { d.state.write.sameIdAndBytesAcrossAttempts = false; },
+    "sin reconocer la propia escritura": (d) => { d.state.write.recognizeOwnWriteById = false; },
+    "publicar por core": (d) => { d.state.write.publishViaCoreForbidden = false; },
+    "5 intentos": (d) => { d.state.write.maxAttempts = 5; },
+    "un valor ilegible bloquea la clave": (d) => { d.state.write.unreadableCurrentValue = "fail"; },
+    "la forma de cuerpo de DIRECT.GET concedible": (d) => { d.state.read.bodyFormAllowedToServices = true; },
+    "watch con deliver_policy all": (d) => { d.state.watch.deliverPolicy = "all"; },
+    "la entrada sin tenantId": (d) => { d.state.watch.entry = ["key", "deleted", "data", "aggregateVersion", "revision"]; },
+    "un valor reemplazado se reentrega": (d) => { d.state.watch.replacedMessagesAreNotRedelivered = false; },
+    "onSynced espera a una entrada en un stream vacío": (d) => { d.state.watch.onSynced.emptyStream = "waits-for-first-entry"; },
+    "la DLQ de estado conserva el dato": (d) => { d.state.dlq.dataReplacedBy = ["key", "revision", "data"]; },
+    "el estado se reproduce desde la DLQ": (d) => { d.state.dlq.replay = "allowed"; },
+    "la DLQ de estado conserva la firma": (d) => { d.state.dlq.dropsSignature = false; },
+    "la DLQ de un dominio sin estado cambia": (d) => { d.state.dlq.streamSubjectsWhenDomainHasNoState = ["dlq.<dominio>.>", "dlq.state.<dominio>.>"]; },
+    "el subject de DLQ de estado lleva tenant": (d) => { d.state.dlq.subject.format = "dlq.state.<dominio>.<agregado>.v<major>.<tenant>"; },
+    "el observador recibe STREAM.INFO del estado": (d) => { d.state.acl.observerStreamInfoState = "granted"; },
+    "DIRECT.GET de observador sin tenant fijado": (d) => { d.state.acl.observerDirectGet = "^\\$JS\\.API\\.DIRECT\\.GET\\.STATE_[A-Z0-9_]+\\.>$"; },
+    "CONSUMER.CREATE de estado concedido por defecto": (d) => { d.state.acl.devOnlyPatterns = ["dlqReaderCreate"]; },
+    "la métrica de estado entre las siete": (d) => { d.observability.metrics.flux_state_writes_total = { type: "counter", labels: ["contract", "outcome"] }; },
+    "la métrica de estado con tenant como etiqueta": (d) => { d.state.metrics.flux_state_writes_total.labels = ["contract", "tenantid", "outcome"]; },
+    "un outcome de estado de más": (d) => { d.state.metrics.flux_state_writes_total.outcomes.push("error"); },
+    "el consumer de estado con el sufijo de tenant": (d) => { d.state.metrics.reusedConsumptionMetrics.consumer = "durable-with-tenant-suffix"; },
+    "PII permitida en el evento": (d) => { d.security.piiInPayload.event = "allowed"; },
+    "piiInPayload otra vez sin distinguir primitivas": (d) => { d.security.piiInPayload = "forbidden"; },
+  };
+  const base = fallosDeEstado(p);
+  if (base.length) fallos.push(`autocomprobación: fallosDeEstado ya falla sobre el protocol.json real (${base.length}); no se puede autocomprobar`);
+  for (const [nombre, estropea] of Object.entries(mutaciones)) {
+    const copia = structuredClone(p);
+    estropea(copia);
+    if (!fallosDeEstado(copia).length) fallos.push(`autocomprobación: la mutación «${nombre}» NO la detecta fallosDeEstado`);
+  }
+  mutacionesEstado = Object.keys(mutaciones).length;
+}
+
 if (fallos.length) {
   console.error(`\n✗ ${fallos.length} problema(s) en protocol.json\n`);
   for (const f of fallos) console.error(`  ✗ ${f}`);
   process.exit(1);
 }
 
-console.log(`✓ protocol.json coherente (${CASES.length} patrones + invariantes numéricas, de códigos y de capacidades)`);
+console.log(`✓ protocol.json coherente (${CASES.length} patrones + invariantes numéricas, de códigos, de capacidades y de estado · autocomprobación de estado: ${mutacionesEstado} mutaciones, todas detectadas)`);
