@@ -28,6 +28,7 @@ import {
   StorageType,
   type ConsumerConfig,
   type JetStreamClient,
+  type ConsumerMessages,
   type JetStreamManager,
   type JsMsg,
 } from "@nats-io/jetstream";
@@ -42,7 +43,7 @@ import {
   type DataClassification,
   type FluxEvent,
 } from "./envelope.js";
-import { ErrorClass, PermanentError, PoisonError, isClassifiedError, type Classification } from "./errors.js";
+import { ErrorClass, PoisonError, isClassifiedError, type Classification } from "./errors.js";
 import type { MetricsSink } from "./metrics.js";
 import {
   CONSUMER_DEFAULTS,
@@ -63,6 +64,7 @@ import {
 import type { Signer } from "./signing.js";
 import {
   InvalidDataClassificationError,
+  InvalidStateContractError,
   InvalidStateKeyError,
   InvalidTenantForStateError,
   MissingAggregateVersionError,
@@ -70,7 +72,7 @@ import {
   StateConflictError,
   StateSubjectMismatchError,
 } from "./state-errors.js";
-import { SchemaValidationError, stateSchemaUriFor } from "./validation.js";
+import { SchemaNotFoundError, SchemaValidationError, stateSchemaUriFor } from "./validation.js";
 
 // ═════════════════════════════════════════════════════════════════════════════════════════
 // 1. Constantes y reglas del protocolo — protocol.json → `state`
@@ -109,26 +111,17 @@ export const STATE_SCHEMA_BASE = "https://schemas.internal";
 export const STATE_CLASSIFICATIONS: readonly DataClassification[] = ["public", "internal", "confidential"];
 /** Un `put` sin `classification` usa ESTA, no la de la conexión (10-state.md §3.6). */
 export const STATE_DEFAULT_CLASSIFICATION: DataClassification = "confidential";
+/**
+ * Lo que sigue al código en el `dlqerror` de un error que **no es de flux** (10-state.md §6): el
+ * mensaje de un driver de base de datos puede citar la fila entera, y la DLQ guarda 90 días. La
+ * misma frase que Rust y que `protocol.json` → `state.dlq.dlqerrorFixedPhrase`.
+ */
+export const UNCLASSIFIED_DLQ_ERROR =
+  "error sin clasificar de la aplicación; el mensaje se omite para no copiar datos a la DLQ (10-state.md §6)";
 
 // ═════════════════════════════════════════════════════════════════════════════════════════
 // 2. Validación — se hace SIEMPRE, antes de abrir ninguna petición
 // ═════════════════════════════════════════════════════════════════════════════════════════
-
-/**
- * Un contrato que no es `<dominio>.<agregado>.v<major>`. PERMANENT, pero **sin código estable**:
- * la lista de 04-errors.md §6 es cerrada y no tiene uno para esto (es un hueco de la spec, y se
- * ha reportado como tal; no es un código que este SDK pueda inventar).
- */
-export class InvalidStateContractError extends PermanentError {
-  constructor(readonly contract: unknown, motivo: string) {
-    super(
-      `contrato de estado inválido ${typeof contract === "string" ? JSON.stringify(contract) : `(${typeof contract})`}: ${motivo}. ` +
-        `Un contrato es \`<dominio>.<agregado>.v<major>\` —el subject del estado sin \`state.\`, sin ` +
-        `tenant y sin clave—, en minúsculas y kebab-case (10-state.md §2.2).`,
-    );
-    this.name = "InvalidStateContractError";
-  }
-}
 
 export interface ParsedStateContract {
   readonly contract: string;
@@ -138,8 +131,8 @@ export interface ParsedStateContract {
 }
 
 /**
- * Valida un contrato. Primero el dominio reservado (`RESERVED_DOMAIN`), después la forma: el
- * orden de 10-state.md §3.6.
+ * Valida un contrato. Primero el dominio reservado (`RESERVED_DOMAIN`), después la forma
+ * (`INVALID_STATE_CONTRACT`): el orden de 10-state.md §3.6.
  */
 export function parseStateContract(contract: unknown): ParsedStateContract {
   if (typeof contract !== "string") throw new InvalidStateContractError(contract, "debe ser una cadena");
@@ -520,16 +513,25 @@ export interface StateGetOptions {
 
 export interface StateWatchOptions {
   /**
-   * Filtra por este tenant (y el durable lleva su sufijo). Si no, el del evento en curso y, si no,
-   * el de `connect()` —que **siempre** filtra, también si vale `system`: aquí es un tenant como
-   * cualquier otro—. Sin ninguno se observan todos, salvo con `tenantIsolation: "strict"`.
+   * Filtra por este tenant (y el durable lleva su sufijo). Si no, el de `connect()` —que
+   * **siempre** filtra, también si vale `system`: aquí es un tenant como cualquier otro—. Sin
+   * ninguno se observan todos, salvo con `tenantIsolation: "strict"`.
+   *
+   * **Nunca el del evento en curso** (a diferencia de `put`, `delete` y `get`): un `watch` no corre
+   * dentro de un handler, se abre al arrancar y vive tanto como el servicio, y heredar el tenant
+   * del evento que se esté procesando haría que su filtro dependiera de qué evento llegó primero
+   * (10-state.md §2.4).
+   *
+   * **Un tenant por `watch`**, y cada llamada es un durable. Un servicio que observa N tenants
+   * llama N veces, y cada llamada recibe su `onSynced`; combinarlas es de la aplicación
+   * (10-state.md §5.5).
    */
   tenantId?: string;
   /**
-   * Se invoca UNA vez por `watch()` —no una por tenant ni por reconexión— cuando el handler ya
-   * ha procesado todo lo que había pendiente al abrirlo: la señal de «mi réplica local ya puede
-   * contestar lecturas». Con el contrato vacío (o el durable al día), de inmediato y antes de
-   * entregar nada. **No** promete que no lleguen entradas después.
+   * Se invoca UNA vez por `watch()` —no una por reconexión, ni de nuevo tras un `flux state
+   * resync`— cuando el handler ya ha procesado todo lo que había pendiente al abrirlo: la señal
+   * de «mi réplica local ya puede contestar lecturas». Con el contrato vacío (o el durable al
+   * día), de inmediato y antes de entregar nada. **No** promete que no lleguen entradas después.
    */
   onSynced?: () => void;
 }
@@ -997,7 +999,8 @@ export class StateClient {
     // Una denegación de un intento anterior sobre este durable no debe condenar a este.
     const pull = `$JS.API.CONSUMER.MSG.NEXT.${stream}.${durable}`;
     this.#h.clearDenied(pull);
-    const messages = await consumer.consume();
+    // `let`: si el durable se borra mientras el watch vive (`flux state resync`), se reabre (#consume).
+    let messages = await consumer.consume();
 
     const configurado = opts.pendingPollMs ?? 0;
     const pollMs = configurado === 0 ? 15_000 : configurado; // 0 → default; negativo → desactivado (08 §2.3)
@@ -1027,21 +1030,7 @@ export class StateClient {
     // entregado y sin confirmar sigue pendiente de procesar.
     if (found.numPending === 0 && found.numAckPending === 0) w.sync.immediate();
 
-    void (async () => {
-      for await (const m of messages) {
-        if (stopped) break;
-        try {
-          await this.#dispatch(m, w);
-        } catch (e) {
-          // Un fallo inesperado de #dispatch rompería el `for await` y el watch dejaría de
-          // consumir EN SILENCIO, con la conexión viva: un consumidor muerto que parece vivo.
-          this.#h.options.logger?.error(
-            `[flux] fallo inesperado despachando el estado ${w.subjectLabel}: ${e instanceof Error ? e.message : String(e)}. ` +
-              `El mensaje no se confirma y será reentregado.`,
-          );
-        }
-      }
-    })();
+    void this.#consume(w, requested as unknown as Record<string, unknown>, messages, (m) => (messages = m), () => stopped);
 
     // La petición de mensajes es un publish sin respuesta: si el broker la deniega no hay
     // excepción y el watch queda inerte, aparentemente sano (A-20). Como en subscribe().
@@ -1066,6 +1055,112 @@ export class StateClient {
         untrack();
       },
     };
+  }
+
+  // ─── el bucle de consumo, y su reapertura ──────────────────────────────────
+
+  /**
+   * El bucle de un `watch`: entrega cada mensaje a `#dispatch` y, si el durable se **borra** mientras
+   * el watch vive (`flux state resync`: borrar y recrear), **reabre el consumo**.
+   *
+   * Por qué hace falta. Al borrar el durable, el broker contesta al pull pendiente `409 Consumer
+   * Deleted` y nats.js lo notifica (`consumer_deleted`)… y **no vuelve a pedir** hasta que detecta la
+   * falta de latidos (`heartbeats_missed`: dos latidos de 15 s, más el reintento). Medido con
+   * nats-server 2.14.5 y nats.js 3.4.0: **43 s** entre recrear el durable y la primera entrada de la
+   * foto nueva (10-state.md §5.2). Aquí se repite el pull al recibir `consumer_deleted`: se vuelve a
+   * consultar el durable por su nombre —`CONSUMER.INFO`, que el observador ya tiene; **no** hace falta
+   * `CONSUMER.CREATE`— y se vuelve a consumir. `onSynced` no se invoca de nuevo.
+   */
+  async #consume<T>(
+    w: WatchState<T>,
+    requested: Record<string, unknown>,
+    first: ConsumerMessages,
+    swap: (m: ConsumerMessages) => void,
+    isStopped: () => boolean,
+  ): Promise<void> {
+    let messages = first;
+    while (!isStopped()) {
+      let deleted = false;
+      const current = messages;
+      void (async () => {
+        try {
+          for await (const s of current.status()) {
+            if (s.type === "consumer_deleted") {
+              deleted = true;
+              current.stop(); // termina el `for await` de abajo: se reabre
+              return;
+            }
+          }
+        } catch {
+          /* el iterador de estado termina con el consumo */
+        }
+      })();
+      for await (const m of current) {
+        if (isStopped()) break;
+        try {
+          await this.#dispatch(m, w);
+        } catch (e) {
+          // Un fallo inesperado de #dispatch rompería el `for await` y el watch dejaría de
+          // consumir EN SILENCIO, con la conexión viva: un consumidor muerto que parece vivo.
+          this.#h.options.logger?.error(
+            `[flux] fallo inesperado despachando el estado ${w.subjectLabel}: ${e instanceof Error ? e.message : String(e)}. ` +
+              `El mensaje no se confirma y será reentregado.`,
+          );
+        }
+      }
+      if (isStopped() || !deleted) return;
+      const reopened = await this.#reopen(w, requested, isStopped);
+      if (!reopened) return;
+      messages = reopened;
+      swap(reopened);
+    }
+  }
+
+  /**
+   * Vuelve a abrir el consumo de un durable que se borró bajo el watch. Reintenta con backoff
+   * (100 ms … 5 s) hasta que el durable exista —`flux state resync` lo recrea a continuación— o el
+   * watch pare. Comprueba la configuración como al abrir: un durable recreado con otro filtro
+   * entregaría las claves de otro tenant sin ningún error, y ese no se consume.
+   */
+  async #reopen<T>(
+    w: WatchState<T>,
+    requested: Record<string, unknown>,
+    isStopped: () => boolean,
+  ): Promise<ConsumerMessages | null> {
+    const logger = this.#h.options.logger;
+    logger?.warn(
+      `[flux] el durable ${w.durable} se borró con el watch de ${w.subjectLabel} abierto (¿\`flux state resync\`?): ` +
+        `se vuelve a abrir el consumo cuando exista de nuevo.`,
+    );
+    let ultimo = "";
+    for (let intento = 1; !isStopped(); intento++) {
+      try {
+        const consumer = await this.#h.js.consumers.get(w.stream, w.durable); // CONSUMER.INFO
+        const info = await consumer.info(true);
+        this.#assertConfigHonored(w.durable, requested, info.config as unknown as Record<string, unknown>);
+        const messages = await consumer.consume();
+        if (isStopped()) {
+          messages.stop();
+          return null;
+        }
+        logger?.warn(`[flux] consumo de ${w.durable} reabierto (intento ${intento}): se entregará la foto otra vez.`);
+        return messages;
+      } catch (e) {
+        // `consumer not found` (10014): el resync está entre el borrado y la creación. Se espera. Se avisa la primera
+        // vez, cada 10 intentos y SIEMPRE que la causa cambia (un durable recreado con otra configuración no es «aún no existe»).
+        const motivo = e instanceof Error ? e.message : String(e);
+        if (intento === 1 || intento % 10 === 0 || motivo !== ultimo) {
+          logger?.warn(`[flux] no se pudo reabrir el consumo de ${w.durable} (intento ${intento}): ${motivo}. Se reintenta.`);
+          ultimo = motivo;
+        }
+        // `unref`: un servicio que se cierra con el durable aún sin recrear no debe quedarse hasta 5 s por este temporizador.
+        await new Promise<void>((r) => setTimeout(r, Math.min(5_000, 100 * 2 ** Math.min(intento - 1, 6))).unref());
+      }
+    }
+    // Se pidió parar (`close()`, `unsubscribe()`) mientras se esperaba al durable: se dice, para que un reintento
+    // que se detiene no sea indistinguible de uno que sigue colgado.
+    logger?.warn(`[flux] el watch de ${w.subjectLabel} se detuvo sin haber podido reabrir el consumo de ${w.durable}`);
+    return null;
   }
 
   // ─── despacho de una entrada ───────────────────────────────────────────────
@@ -1142,7 +1237,7 @@ export class StateClient {
       // guarda 90 días y en estado `data` es dato personal.
       const dlqerror = isClassifiedError(e)
         ? `${c.code}: ${e.message}`
-        : `${c.code}: error sin clasificar de la aplicación; el mensaje se omite para no copiar datos a la DLQ (10-state.md §6)`;
+        : `${c.code}: ${UNCLASSIFIED_DLQ_ERROR}`;
       const info = {
         reason,
         attempts: attempt,
@@ -1367,9 +1462,12 @@ export class StateClient {
     return t;
   }
 
-  /** `watch`: igual, pero sin ninguno es legítimo (se observan todos), salvo `strict`. */
+  /**
+   * `watch`: la opción y `connect()`, **sin el evento en curso** (un `watch` no corre dentro de un
+   * handler: 10-state.md §2.4). Sin ninguno es legítimo (se observan todos), salvo `strict`.
+   */
   #watchTenant(option: string | undefined): string | undefined {
-    const t = option !== undefined ? option : (currentContext()?.tenantid ?? this.#h.options.tenantId);
+    const t = option !== undefined ? option : this.#h.options.tenantId;
     if (t === undefined) return undefined;
     assertStateTenant(t);
     return t;
@@ -1438,9 +1536,15 @@ export class StateClient {
       return fn();
     } catch (e) {
       // `invalid_schema` se emite también cuando la llamada lanza: una excepción sirve a quien la
-      // provoca, y la métrica a quien opera el ecosistema. Los demás errores de la llamada
-      // (clave, tenant, dominio reservado, clasificación) son de programación y NO se cuentan.
-      if (e instanceof MissingAggregateVersionError || e instanceof SchemaValidationError) {
+      // provoca, y la métrica a quien opera el ecosistema. Es todo fallo de L3 —también el esquema
+      // ausente del bundle en modo estricto (`SCHEMA_NOT_FOUND`), igual que en `publish()`— y
+      // `MISSING_AGGREGATE_VERSION`. Los demás errores de la llamada (contrato, clave, tenant,
+      // dominio reservado, clasificación) son de programación y NO se cuentan.
+      if (
+        e instanceof MissingAggregateVersionError ||
+        e instanceof SchemaValidationError ||
+        e instanceof SchemaNotFoundError
+      ) {
         this.#h.metrics.stateWrite?.(contract, "invalid_schema");
       }
       throw e;

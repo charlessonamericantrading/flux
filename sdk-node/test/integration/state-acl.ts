@@ -58,8 +58,8 @@ export function permisosDeEstado(s: ServicioEstado): Permisos {
   for (const dom of s.owns ?? []) {
     publish.add(`state.${dom}.>`);
     publish.add(`$JS.API.DIRECT.GET.${STATE_STREAM(dom)}.state.${dom}.>`);
-    // A propósito NO `STREAM.INFO.STATE_<DOM>`: el dueño PUEDE tenerlo (ya ve todos sus tenants) pero
-    // el SDK no lo usa, y concederlo «por si acaso» es lo que A-39 desaconseja.
+    // A propósito NO `STREAM.INFO.STATE_<DOM>`: el dueño TAMPOCO lo recibe (10-state.md §8). El SDK no lo usa,
+    // y concederlo «por si acaso» es lo que A-39 desaconseja.
   }
 
   for (const dom of s.readsDlq ?? []) {
