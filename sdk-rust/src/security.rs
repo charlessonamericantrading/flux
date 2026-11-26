@@ -351,6 +351,44 @@ impl DenialLog {
         self.wake.send_replace(seq);
     }
 
+    /// La marca de ahora: lo que `since` y [`DenialLog::subscription_denial`] comparan. Tómala
+    /// **antes** de la operación cuya denegación quieres ver.
+    pub(crate) fn mark(&self) -> u64 {
+        self.state().seq
+    }
+
+    /// Espera, hasta `within`, una denegación de **suscripción** al subject exacto `subject`
+    /// posterior a `from`. `None` si no llega.
+    ///
+    /// Una suscripción denegada **no lanza**: el servidor la descarta y avisa aparte con
+    /// `-ERR 'Permissions Violation for Subscription to "<subject>"'` (con ` using queue "<grupo>"`
+    /// al final si la suscripción lleva grupo de cola; medido en 2.14.5) —A-73—. `async-nats` 0.50
+    /// no ofrece un viaje de ida y vuelta (su `flush()` solo vacía el búfer de escritura), así que no
+    /// hay forma de saber que el servidor ya contestó: esperar el aviso hasta un tope es lo único
+    /// posible para quien no tiene permiso de publicar en ningún sitio, como es el caso del dueño de
+    /// una operación (11-request-reply.md §7.1).
+    pub(crate) async fn subscription_denial(
+        &self,
+        from: u64,
+        subject: &str,
+        within: std::time::Duration,
+    ) -> Option<Denial> {
+        // Primero suscribirse y después mirar: así no hay hueco por el que se cuele un aviso.
+        let mut rx = self.wake.subscribe();
+        let deadline = tokio::time::Instant::now() + within;
+        loop {
+            if let Some(d) = self.since(from, |d| {
+                d.action == DeniedAction::Subscribe && d.subject == subject
+            }) {
+                return Some(d);
+            }
+            match tokio::time::timeout_at(deadline, rx.changed()).await {
+                Ok(Ok(())) => {}
+                _ => return None,
+            }
+        }
+    }
+
     /// Primera denegación posterior a `from` que cumple `matches`.
     fn since(&self, from: u64, matches: impl Fn(&Denial) -> bool) -> Option<Denial> {
         self.state()

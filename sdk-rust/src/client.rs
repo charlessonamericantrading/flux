@@ -49,7 +49,7 @@ use crate::protocol::{
 };
 use crate::security::{
     connect_error_detail, fatal_connect_kind, parse_violation, validate_nkey_seed, Denial,
-    DenialLog, FatalConnect, TlsOptions,
+    DenialLog, DeniedAction, FatalConnect, TlsOptions,
 };
 
 // ─── Observabilidad ──────────────────────────────────────────────────────────
@@ -729,6 +729,9 @@ pub(crate) struct BusInner {
     pub(crate) inbox_prefix: String,
     /// `flux_consumer_pending` de los `watch` de estado: la suma de sus durables — 10-state.md §9.
     pub(crate) state_pending: crate::state::PendingSum,
+    /// Los responders de petición/respuesta vivos: `close()` los para, en orden, antes de cerrar —
+    /// 11-request-reply.md §5.5.
+    pub(crate) rpc: crate::rpc::RpcRegistry,
 }
 
 /// El cliente de flux: publica y consume eventos.
@@ -858,11 +861,12 @@ pub async fn connect(mut opts: ConnectOptions) -> Result<Bus, FluxError> {
                     };
                     if let Some(denial) = parse_violation(&text) {
                         if let Some(log) = &logger {
+                            let pista = denial_hint(&denial);
                             log(
                                 LogLevel::Error,
                                 &format!(
                                     "[flux] el broker denegó {}: la ACL del servicio no lo \
-                                     concede (06-security.md §3)",
+                                     concede (06-security.md §3).{pista}",
                                     denial.describe()
                                 ),
                             );
@@ -920,6 +924,7 @@ pub async fn connect(mut opts: ConnectOptions) -> Result<Bus, FluxError> {
             denials,
             inbox_prefix: inbox,
             state_pending: crate::state::PendingSum::default(),
+            rpc: crate::rpc::RpcRegistry::default(),
         }),
     })
 }
@@ -1083,7 +1088,9 @@ impl Bus {
 
     /// Detiene las suscripciones y drena la conexión.
     ///
-    /// Drena en vez de cerrar: los acks pendientes no se pierden en silencio.
+    /// Drena en vez de cerrar: los acks pendientes no se pierden en silencio. Los **responders** de
+    /// petición/respuesta se paran antes —dejar de escuchar y esperar a lo que está en vuelo, hasta
+    /// 25 s—: cerrar la conexión de golpe pierde la petición que se atiende.
     ///
     /// # Errores
     ///
@@ -1096,6 +1103,9 @@ impl Bus {
         for s in stops {
             let _ = s.send(true);
         }
+        // Los que responden peticiones, ANTES de cerrar: dejar de escuchar, esperar a lo que está en
+        // vuelo y solo entonces drenar. Cerrar de golpe pierde lo que se atiende (A-62, 11-request-reply.md §5.5).
+        self.inner.rpc.stop_all().await;
         self.inner
             .metrics
             .connection_state(ConnectionState::Disconnected);
@@ -2370,6 +2380,18 @@ fn is_stream_not_found(e: &async_nats::jetstream::context::GetStreamError) -> bo
         e.kind(),
         GetStreamErrorKind::JetStream(je) if je.error_code() == ErrorCode::STREAM_NOT_FOUND
     )
+}
+
+/// Una pista para el log cuando lo denegado es **publicar en un inbox**: es lo que hace un dueño al
+/// CONTESTAR una petición, y sin `allow_responses` en su ACL quien llama solo ve un timeout (A-68,
+/// 11-request-reply.md §7.2).
+fn denial_hint(denial: &Denial) -> &'static str {
+    if denial.action == DeniedAction::Publish && denial.subject.starts_with("_INBOX.") {
+        " Si es la respuesta a una petición, a la ACL del dueño le falta `allow_responses` (mejor \
+         `{ max: 1, expires: 30s }`): quien llama verá un RPC_TIMEOUT (11-request-reply.md §7.2)."
+    } else {
+        ""
+    }
 }
 
 pub(crate) fn permission_denied(operation: String, denial: &Denial) -> FluxError {

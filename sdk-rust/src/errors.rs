@@ -301,6 +301,35 @@ pub const STATE_CONFLICT_CODE: &str = "STATE_CONFLICT";
 /// `system`) — 04-errors.md §6. **PERMANENT.**
 pub const RESERVED_DOMAIN_CODE: &str = "RESERVED_DOMAIN";
 
+// ─── Los seis códigos de la capacidad `rpc` — 04-errors.md §7 ────────────────
+
+/// Código estable: nadie escucha la operación — el broker contestó `no responders` —
+/// 04-errors.md §7. **RETRYABLE**, inmediato.
+pub const RPC_UNAVAILABLE_CODE: &str = "RPC_UNAVAILABLE";
+
+/// Código estable: no llegó respuesta en el timeout — 04-errors.md §7. **RETRYABLE** y
+/// **ambiguo**: la operación PUEDE haberse ejecutado.
+pub const RPC_TIMEOUT_CODE: &str = "RPC_TIMEOUT";
+
+/// Código estable: con la firma en `require`, el `time` de la petición se aleja más de 300 s del
+/// reloj de quien responde — 04-errors.md §7. **PERMANENT.** Lo emite **quien responde**, en un
+/// error `com.flux.rpc.error.v1`; quien llama lo recibe como un [`FluxError::Permanent`] con este
+/// código.
+pub const STALE_REQUEST_CODE: &str = "STALE_REQUEST";
+
+/// Código estable: lo que llegó no es la respuesta a ESTA petición — 04-errors.md §7.
+/// **PERMANENT.**
+pub const RPC_INVALID_REPLY_CODE: &str = "RPC_INVALID_REPLY";
+
+/// Código estable: el mensaje no cabe en el mínimo entre 1 MiB y el `max_payload` del broker —
+/// 04-errors.md §7. **PERMANENT.** En la respuesta lo emite quien responde, en un error.
+pub const RPC_MESSAGE_TOO_LARGE_CODE: &str = "RPC_MESSAGE_TOO_LARGE";
+
+/// Código estable: la llamada o el registro de `respond` está mal formado y se sabe sin red
+/// (operación fuera del patrón, `timeout` fuera de rango, `data` que no es un objeto) —
+/// 04-errors.md §7. **PERMANENT.**
+pub const INVALID_RPC_CALL_CODE: &str = "INVALID_RPC_CALL";
+
 /// Por qué el broker rechazó la conexión inicial: el `reason` de
 /// [`FluxError::ConnectionRejected`]. Los mismos dos valores que `reason` en el SDK de Node.
 ///
@@ -684,6 +713,94 @@ pub enum FluxError {
         subject: String,
     },
 
+    // ─── Petición/respuesta — 11-request-reply.md, 04-errors.md §7 ───────────────
+    //
+    // Seis variantes propias, por la misma razón que las de estado: el código es el que agrupa el
+    // panel (`flux_rpc_client_requests_total`) y la aplicación no puede sustituirlo.
+    /// Nadie escucha la operación: el broker contestó `no responders` (estado 503) en milisegundos —
+    /// 11-request-reply.md §4.3.
+    ///
+    /// Exige que la conexión haya anunciado `headers` y `no_responders` en CONNECT (`async-nats`
+    /// 0.50 lo hace siempre); sin ello quien llama solo vería un timeout (A-57). Una operación sin
+    /// handler da este error **solo** porque el SDK de quien responde se suscribe al subject exacto
+    /// de la operación y nunca a `rpc.<dominio>.>` (A-64).
+    ///
+    /// **RETRYABLE**, inmediato.
+    #[error("{}", format_rpc_unavailable(.operation))]
+    RpcUnavailable {
+        /// El nombre de la operación (`clientes.cliente.v1.obtener`), sin `rpc.`.
+        operation: String,
+    },
+
+    /// No llegó una respuesta a tiempo — 11-request-reply.md §4.3.
+    ///
+    /// **Ambiguo**: la operación PUEDE haberse ejecutado (A-61, A-62, A-63, A-70), de ahí que quien
+    /// responde deduplique por el `id` de la petición. **RETRYABLE.**
+    #[error("{}", format_rpc_timeout(.operation, *.timeout_ms))]
+    RpcTimeout {
+        /// El nombre de la operación.
+        operation: String,
+        /// El timeout de ese intento, en milisegundos.
+        timeout_ms: u64,
+    },
+
+    /// Con la firma en `require`, el `time` de la petición se aleja más de la ventana del reloj de
+    /// quien responde — 11-request-reply.md §7.4.
+    ///
+    /// Lo construye **quien responde** para contestar con un error; quien llama recibe un
+    /// [`FluxError::Permanent`] con el código `STALE_REQUEST`. **PERMANENT.**
+    #[error("{}", format_stale_request(.time, *.window_secs, .now))]
+    StaleRequest {
+        /// El `time` de la petición, tal como llegó.
+        time: String,
+        /// La ventana, en segundos (300).
+        window_secs: i64,
+        /// La hora local de quien responde.
+        now: String,
+    },
+
+    /// Lo que llegó no es la respuesta a esta petición — 11-request-reply.md §4.3.
+    ///
+    /// Es un incidente (un productor roto, un stream mal puesto, algo hostil), no un fallo que
+    /// esperar. **PERMANENT.**
+    #[error("{}", format_rpc_invalid_reply(.operation, .reason, *.stream_ack))]
+    RpcInvalidReply {
+        /// El nombre de la operación.
+        operation: String,
+        /// Cuál de las cinco comprobaciones falló, sin citar valores de `data`.
+        reason: String,
+        /// `true` si el cuerpo parece el acuse de JetStream `{"stream":…,"seq":…}` (A-18, A-67).
+        stream_ack: bool,
+    },
+
+    /// El mensaje no cabe en el mínimo entre 1 MiB y el `max_payload` del broker —
+    /// 11-request-reply.md §4.4, §5.4. **PERMANENT.**
+    ///
+    /// En la petición lo lanza quien llama **antes de abrir nada**; en la respuesta lo detecta quien
+    /// responde y contesta con un error de este código, porque si intentara publicarla la librería
+    /// lanzaría **en quien responde** y quien llama solo vería un timeout (A-65).
+    #[error("{}", format_rpc_too_large(.what, *.bytes, *.limit))]
+    RpcMessageTooLarge {
+        /// Qué no cabe: `la petición` o `la respuesta`.
+        what: String,
+        /// Los bytes serializados.
+        bytes: usize,
+        /// El límite efectivo.
+        limit: usize,
+    },
+
+    /// La llamada, o el registro de `respond`, está mal formada y se sabe **sin red** —
+    /// 11-request-reply.md §6. **PERMANENT.**
+    ///
+    /// Tres equivocaciones de quien programa con un solo código: la operación no cumple el patrón,
+    /// el timeout no es un entero entre 1 y 25 000 ms, o `data` no es un objeto. Un dominio
+    /// reservado **no** es esto: es [`FluxError::ReservedDomain`]. No se cuenta en ninguna métrica.
+    #[error("{}", format_invalid_rpc_call(.reason))]
+    InvalidRpcCall {
+        /// Qué está mal y cuál es la regla.
+        reason: String,
+    },
+
     /// Fallo de transporte: conexión, publicación, creación de stream o de consumidor.
     ///
     /// Una conexión inicial rechazada por la credencial o por el TLS **no** es esto: es
@@ -763,14 +880,81 @@ fn format_state_conflict(key: &str, attempts: u32) -> String {
 }
 
 fn format_reserved_domain(domain: &str, subject: &str) -> String {
+    let prefijo_rpc = if domain == "rpc" {
+        " Si es la operación de una petición, quita el prefijo `rpc.`: lo pone el SDK \
+         (`clientes.cliente.v1.obtener`, no `rpc.clientes.cliente.v1.obtener`)."
+    } else {
+        ""
+    };
     format!(
         "el dominio `{domain}` de {subject:?} está reservado: {} son espacios de nombres del \
          protocolo y no pueden ser un dominio (un `EVT_{}` colisionaría con ellos en el broker, y \
          un `publish()` a `state.…` llegaría al stream de estado sin el chequeo de secuencia — \
-         10-state.md §2.7). Elige otro nombre para el dominio",
+         10-state.md §2.7).{prefijo_rpc} Elige otro nombre para el dominio",
         RESERVED_DOMAINS.join(", "),
         domain.to_uppercase()
     )
+}
+
+fn format_rpc_unavailable(operation: &str) -> String {
+    format!(
+        "nadie escucha la operación `{operation}`: el broker contestó `no responders` al instante. \
+         Comprueba que el servicio dueño está desplegado y atiende exactamente esa operación \
+         (`respond(\"{operation}\")`: una suscripción por operación y versión mayor) y que la ACL \
+         de este servicio concede publicar en `rpc.{operation}`. Un dueño sin permiso de \
+         suscripción a su dominio parece, desde aquí, un servicio caído. Es RETRYABLE y no cuesta \
+         el timeout: durante un despliegue se resuelve solo (11-request-reply.md §4.3)"
+    )
+}
+
+fn format_rpc_timeout(operation: &str, timeout_ms: u64) -> String {
+    format!(
+        "la operación `{operation}` no respondió en {timeout_ms} ms. La operación PUEDE haberse \
+         ejecutado (un responder lento la ejecuta y su respuesta llega tarde; uno que muere con la \
+         petición la pierde): el que responde deduplica por el `id` de la petición y un reintento \
+         reutiliza el mismo `id` (`RequestOptions::with_retries`). Si la operación es lenta de \
+         verdad, sube el timeout (máximo 25 000 ms); si es la ACL, el aviso llega como \
+         `PERMISSION_DENIED` (11-request-reply.md §4.2, §4.5)"
+    )
+}
+
+fn format_stale_request(time: &str, window_secs: i64, now: &str) -> String {
+    format!(
+        "el `time` de la petición ({time}) se aleja más de {window_secs} s de la hora de este \
+         servicio ({now}). Con la firma en `require`, quien responde rechaza una petición fuera de \
+         esa ventana —por delante o por detrás—, porque la firma por sí sola no impide reenviar una \
+         petición capturada. Revisa que los relojes estén sincronizados (NTP): con uno desviado \
+         toda llamada falla igual. No se reintenta (11-request-reply.md §7.4)"
+    )
+}
+
+fn format_rpc_invalid_reply(operation: &str, reason: &str, stream_ack: bool) -> String {
+    let pista = if stream_ack {
+        " El cuerpo parece el acuse de JetStream `{\"stream\":…,\"seq\":…}`: algún stream captura \
+         `rpc.>` y contesta a cada petición con su acuse, y además guarda la petición. Ejecuta \
+         `flux doctor` (11-request-reply.md §8)."
+    } else {
+        ""
+    };
+    format!(
+        "lo que llegó como respuesta a `{operation}` no es la respuesta a esta petición: {reason}. \
+         Es un incidente (un productor roto, un stream mal puesto o algo hostil), no un fallo que \
+         esperar: no se reintenta.{pista} (11-request-reply.md §4.3)"
+    )
+}
+
+fn format_rpc_too_large(what: &str, bytes: usize, limit: usize) -> String {
+    format!(
+        "{what} serializada ocupa {bytes} bytes y el límite es {limit} (el menor entre 1 MiB y el \
+         `max_payload` que anuncia el broker; las cabeceras cuentan). Aplica claim-check \
+         (`{{ uri, sha256, bytes }}`, 01-envelope.md §7) o pagina con un cursor en `data`. Si fuera \
+         la respuesta quien no cupiese, quien llama solo vería un timeout: por eso quien responde \
+         lo comprueba y contesta con este error (11-request-reply.md §4.4, §5.4)"
+    )
+}
+
+fn format_invalid_rpc_call(reason: &str) -> String {
+    format!("llamada de petición/respuesta inválida: {reason} (11-request-reply.md §2.2, §4.2)")
 }
 
 fn format_mismatch(durable: &str, diffs: &[ConfigDifference]) -> String {
@@ -954,14 +1138,27 @@ impl FluxError {
             | Self::InvalidTenantForState { .. }
             | Self::InvalidStateKey { .. }
             | Self::MissingAggregateVersion { .. }
-            | Self::ReservedDomain { .. } => Some(ErrorClass::Permanent),
+            | Self::ReservedDomain { .. }
+            // Los cuatro de petición/respuesta que no se arreglan reintentando — 04-errors.md §7:
+            // la misma petición (mismo `time`, mismos bytes) da lo mismo.
+            | Self::StaleRequest { .. }
+            | Self::RpcInvalidReply { .. }
+            | Self::RpcMessageTooLarge { .. }
+            | Self::InvalidRpcCall { .. } => Some(ErrorClass::Permanent),
             // POISON y no PERMANENT: el mensaje es legible pero miente sobre su identidad, y un
             // productor que lo hace está roto o es hostil. Es lo que 04-errors.md §1.3 pide
             // despertar a alguien por.
             Self::Poison(_) | Self::StateSubjectMismatch { .. } => Some(ErrorClass::Poison),
             // El conflicto es del entorno —otra instancia escribe la misma clave—, no de la
             // llamada: un reintento relee y suele resolverlo.
-            Self::Retryable(_) | Self::StateConflict { .. } => Some(ErrorClass::Retryable),
+            //
+            // `RPC_UNAVAILABLE` y `RPC_TIMEOUT` también: el fallo es del entorno —nadie escucha
+            // ahora, o no contestó a tiempo— y un handler de eventos que los recibe reentrega con el
+            // backoff de siempre (04-errors.md §7).
+            Self::Retryable(_)
+            | Self::StateConflict { .. }
+            | Self::RpcUnavailable { .. }
+            | Self::RpcTimeout { .. } => Some(ErrorClass::Retryable),
             _ => None,
         }
     }
@@ -990,6 +1187,13 @@ impl FluxError {
             Self::StateSubjectMismatch { .. } => return Some(STATE_SUBJECT_MISMATCH_CODE),
             Self::StateConflict { .. } => return Some(STATE_CONFLICT_CODE),
             Self::ReservedDomain { .. } => return Some(RESERVED_DOMAIN_CODE),
+            // Los seis de petición/respuesta: el código agrupa el panel, no la aplicación.
+            Self::RpcUnavailable { .. } => return Some(RPC_UNAVAILABLE_CODE),
+            Self::RpcTimeout { .. } => return Some(RPC_TIMEOUT_CODE),
+            Self::StaleRequest { .. } => return Some(STALE_REQUEST_CODE),
+            Self::RpcInvalidReply { .. } => return Some(RPC_INVALID_REPLY_CODE),
+            Self::RpcMessageTooLarge { .. } => return Some(RPC_MESSAGE_TOO_LARGE_CODE),
+            Self::InvalidRpcCall { .. } => return Some(INVALID_RPC_CALL_CODE),
             _ => {}
         }
         let f = self.failure()?;
