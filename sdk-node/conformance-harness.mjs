@@ -6,10 +6,21 @@
  * Lee UNA operación por stdin, escribe UN resultado por stdout, sale con 0 siempre.
  * Deliberadamente delgado: toda lógica aquí es lógica que no está en el SDK y que el
  * runner, por tanto, no verifica.
+ *
+ * Es el arnés de REFERENCIA: su salida fija lo esperado. Además de `build`, `dlq`, `sign`,
+ * `verify` y `parse`, implementa las cuatro operaciones de la capacidad `state` (`state-build`,
+ * `state-tombstone`, `state-subject` y `state-dlq`), que el runner solo ejecuta en los SDKs que la
+ * declaran en protocol.json.
  */
 
 import { buildEvent, serialize, parseEvent, toDlqEvent } from "./dist/envelope.js";
 import { createSigner, createVerifier } from "./dist/signing.js";
+import {
+  buildStateDlqEvent,
+  buildStateEvent,
+  buildStateTombstone,
+  stateSubject,
+} from "./dist/state.js";
 
 const leerStdin = () =>
   new Promise((res) => {
@@ -38,6 +49,29 @@ function construir(e) {
     ...(e.traceparent !== undefined && { traceparent: e.traceparent }),
     ...(e.tracestate !== undefined && { tracestate: e.tracestate }),
   });
+}
+
+/**
+ * Estado replicado (specification/10-state.md): lo mismo, el arnés NO rellena nada. `id` y `time`
+ * vienen del vector. `dataschema` NO viene: lo deriva el SDK del contrato, que es parte de lo que
+ * se compara.
+ */
+function construirEstado(e) {
+  return {
+    contract: e.contract,
+    tenantId: e.tenantId,
+    key: e.key,
+    id: e.id,
+    source: e.source,
+    time: e.time,
+    correlationid: e.correlationid,
+    producerversion: e.producerversion,
+    classification: e.classification,
+    data: e.data,
+    ...(e.causationid !== undefined && { causationid: e.causationid }),
+    ...(e.traceparent !== undefined && { traceparent: e.traceparent }),
+    ...(e.tracestate !== undefined && { tracestate: e.tracestate }),
+  };
 }
 
 const b64 = (bytes) => Buffer.from(bytes).toString("base64");
@@ -87,6 +121,47 @@ async function ejecutar(entrada) {
     case "parse":
       parseEvent(new Uint8Array(Buffer.from(entrada.bytes, "base64")));
       return { ok: true };
+
+    // ─── Estado replicado (capacidad `state`) ───────────────────────────────────────────
+    case "state-build":
+      return { ok: true, bytes: b64(serialize(buildStateEvent(construirEstado(entrada)))) };
+
+    case "state-tombstone":
+      return {
+        ok: true,
+        bytes: b64(
+          serialize(
+            buildStateTombstone({
+              contract: entrada.contract,
+              tenantId: entrada.tenantId,
+              key: entrada.key,
+              id: entrada.id,
+              source: entrada.source,
+              time: entrada.time,
+              correlationid: entrada.correlationid,
+              producerversion: entrada.producerversion,
+              aggregateVersion: entrada.aggregateVersion,
+              ...(entrada.causationid !== undefined && { causationid: entrada.causationid }),
+              ...(entrada.traceparent !== undefined && { traceparent: entrada.traceparent }),
+              ...(entrada.tracestate !== undefined && { tracestate: entrada.tracestate }),
+            }),
+          ),
+        ),
+      };
+
+    case "state-subject":
+      return { ok: true, subject: stateSubject(entrada.contract, entrada.tenantId, entrada.key) };
+
+    case "state-dlq": {
+      const d = entrada.dlq;
+      const ev = buildStateDlqEvent({
+        original: construirEstado(entrada.original),
+        revision: entrada.revision,
+        // `dlqtime` lo fija el vector, como en `dlq`.
+        dlq: { reason: d.reason, attempts: d.attempts, consumer: d.consumer, error: d.error, dlqtime: d.dlqtime },
+      });
+      return { ok: true, bytes: b64(serialize(ev)) };
+    }
 
     default:
       return { ok: false, code: "UNSUPPORTED_OP", detail: entrada.op };
