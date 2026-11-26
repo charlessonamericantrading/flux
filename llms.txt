@@ -8,7 +8,7 @@
 
 Si solo vas a cargar un fichero, carga
 [llms-full.txt](https://raw.githubusercontent.com/charlessonamericantrading/flux/main/llms-full.txt)
-— es la especificación entera (~45 KB) en un solo documento.
+— es la especificación entera (~110 KB) en un solo documento.
 
 ## Empieza aquí
 

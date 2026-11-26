@@ -8,11 +8,29 @@ Un SDK está **terminado** cuando pasa esta suite. No cuando su autor lo dice.
 
 ```
 conformance/
+├── run.mjs                 ← runner contra un NATS real (`npm test`): habla NATS directamente
+├── cross-sdk.mjs           ← runner cruzado: los mismos vectores en los siete SDKs, byte a byte
+├── harnesses.json          ← cómo se invoca el arnés de cada SDK; `pending` = no verificado
+├── harness/
+│   ├── README.md           ← el contrato del arnés: una operación por stdin, un resultado por stdout
+│   ├── vectors.json        ← los vectores que ejecutan los siete arneses
+│   ├── keys.json           ← claves de TEST para los vectores de firma
+│   └── build-java.mjs      ← construye el arnés de Java (javac + jar)
 ├── cases/
-│   ├── broker-invariants.json   ← invariantes de NATS de las que depende el protocolo
-│   └── consumer-config.json     ← la config canónica sobrevive al servidor sin alterarse
+│   ├── broker-invariants.json              ← invariantes de NATS de las que depende el protocolo
+│   ├── consumer-config.json                ← la config canónica sobrevive al servidor sin alterarse
+│   ├── nak-delay-ignored-with-backoff.json ← con backoff, el delay de un nak solo cuenta la primera vez
+│   ├── cross-sdk-envelope.json             ← el envelope es idéntico byte a byte entre SDKs
+│   └── cross-sdk-dlq-envelope.json         ← ídem para el evento de DLQ
+├── package.json            ← dependencias de `run.mjs` (cliente NATS)
 └── README.md
 ```
+
+`run.mjs` ejecuta las comprobaciones de `broker-invariants` y `consumer-config`; las lleva
+escritas en el código y los JSON las documentan (norma, porqué y medición). Los
+`cross-sdk-*` son fixtures que leen los tests de Rust y copian los de Java y .NET. La
+medición de `nak-delay-ignored-with-backoff` está documentada, pero **ningún runner la
+ejecuta todavía**.
 
 ## Por qué existe
 
@@ -51,8 +69,12 @@ Contrastado contra **nats-server 2.14.5** el 2026-08-20:
 ## Ejecutar
 
 ```bash
+# broker — necesita un NATS con JetStream
 docker compose up -d
-docker compose exec nats-box nats stream ls
+(cd conformance && npm install && npm test)
+
+# sdk — sin broker (prepara antes cada SDK, como hace el job `cross-sdk` de CI)
+node conformance/cross-sdk.mjs                 # --only rust,php · --verbose
 ```
 
 Sin Docker, `nats-server` es un binario único sin instalación:
@@ -61,14 +83,17 @@ Sin Docker, `nats-server` es un binario único sin instalación:
 
 ## Niveles
 
-| Nivel | Qué comprueba | Necesita |
-|---|---|---|
-| **broker** | Que las suposiciones sobre NATS siguen siendo ciertas | solo el `nats` CLI |
-| **sdk** | Que una implementación cumple el protocolo | el SDK a probar |
+| Nivel | Qué comprueba | Necesita | Se ejecuta con |
+|---|---|---|---|
+| **broker** | Que las suposiciones sobre NATS siguen siendo ciertas | Node y un NATS con JetStream | `run.mjs` |
+| **sdk** | Que los siete SDKs construyen, firman y parsean **los mismos bytes** | los SDKs a probar; ningún broker | `cross-sdk.mjs` |
 
-Los casos `broker` corren hoy. Los casos `sdk` se definen aquí como datos y su runner
-llega con el primer SDK — deliberadamente en ese orden, para que el runner no herede
-las suposiciones de una implementación concreta.
+Los dos niveles corren hoy. `run.mjs` habla NATS directamente, sin pasar por ningún SDK:
+un runner construido sobre un SDK heredaría justo las suposiciones que debe verificar. El
+runner `sdk` invoca el arnés de cada SDK (`<sdk>/conformance-harness.*`, contrato en
+[`harness/README.md`](harness/README.md)) con los mismos vectores y compara las salidas
+byte a byte; el SDK de Node es la referencia que fija lo esperado. Un SDK en `pending` de
+`harnesses.json` se reporta como **no verificado**, nunca se salta en silencio.
 
 ## Añadir un caso
 

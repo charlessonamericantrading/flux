@@ -32,7 +32,7 @@
 ## 0. Carga el contrato antes de escribir código
 
 Si vas a tocar código que publica o consume eventos, **primero descarga la spec
-completa** (un solo fichero, ~100 KB, sin auth):
+completa** (un solo fichero, ~110 KB, sin auth):
 
 ```
 https://raw.githubusercontent.com/charlessonamericantrading/flux/main/llms-full.txt
@@ -92,7 +92,7 @@ https://raw.githubusercontent.com/charlessonamericantrading/flux/main/protocol.j
 10. **Los tipos son exactos.** `{"tenantid": 42}` es POISON, no el tenant `"42"`.
     Desactiva la coerción de tu deserializador.
 
-11. **UTF-8 literal, sin escapes `\u`.** `café`, no `café`. Ambos son JSON válido
+11. **UTF-8 literal, sin escapes `\u`.** `café`, no `caf\u00e9`. Ambos son JSON válido
     y **no son los mismos bytes**.
 
 ---
@@ -506,7 +506,7 @@ que ahorras.
 ### 1.1 UTF-8 literal, sin escapes `\u`
 
 El JSON **DEBE** emitirse en UTF-8 con los caracteres no-ASCII **literales**. `"café"`
-se serializa como `café`, no como `café`.
+se serializa como `café`, no como `caf\u00e9`.
 
 Ambas formas son JSON válido y se parsean al mismo string, pero **no son los mismos
 bytes** — y §6 explica por qué eso importa. El encoder por defecto de
@@ -1735,8 +1735,12 @@ En v1, el aislamiento de tenant es **responsabilidad del consumidor**: filtrar p
 ofrecer un filtro declarativo en `subscribe()` para que ese filtrado no dependa de que
 cada handler se acuerde.
 
-> Aislamiento real por tenant (account o subject prefix por tenant) queda en **fase 4**.
-> Se documenta aquí para que nadie asuma que ya existe.
+> El aislamiento **duro** entre tenants, el que aplica el broker y no una convención del
+> SDK, es el Modelo B de [09-multitenancy.md](09-multitenancy.md): una account de NATS
+> por tenant (`gen-acl.mjs --tenants` genera la configuración). El default de v1, el
+> filtrado en consumidor, **no** resiste a un servicio legítimo comprometido. El prefijo
+> de subject por tenant (Modelo C) se rechazó en v1: rompe la regla de 4 tokens.
+> No hay fase pendiente: lo que falta es elegir modelo según la amenaza.
 
 ## 5. Clasificación de datos
 

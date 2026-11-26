@@ -29,7 +29,7 @@ que ahorras.
 ### 1.1 UTF-8 literal, sin escapes `\u`
 
 El JSON **DEBE** emitirse en UTF-8 con los caracteres no-ASCII **literales**. `"café"`
-se serializa como `café`, no como `café`.
+se serializa como `café`, no como `caf\u00e9`.
 
 Ambas formas son JSON válido y se parsean al mismo string, pero **no son los mismos
 bytes** — y §6 explica por qué eso importa. El encoder por defecto de
