@@ -259,6 +259,15 @@ Reglas nuevas. Todas tienen evidencia en el Apéndice A.
   > existe **al arrancar** (descubrirlo con el primer evento envenenado es el peor momento) y
   > sin el permiso lanza `PermissionDeniedError`; y cada permiso de la lista se probó
   > **quitándolo** (`sdk-node/test/integration/acl.test.ts`).
+
+  Medido también en el SDK de Rust *(A-28)*:
+  - `$JS.API.INFO` **no lo usa el SDK de Rust** (medido con un sniffer sobre el flujo completo).
+    El cliente de Node sí lo emite con `jetstreamManager()` (A-3): confírmalo allí antes de
+    quitarlo de la lista de Node.
+  - `$JS.API.CONSUMER.CREATE.…` es **prescindible** si `flux provision` crea el consumidor:
+    el SDK intenta crear, ve la denegación, consulta el que existe (`CONSUMER.INFO`) y lo usa.
+  - `$JS.API.CONSUMER.INFO.…` solo lo usan el sondeo de `flux_consumer_pending` (si hay
+    métricas) y ese camino de «consumidor ya aprovisionado».
 - **Nunca a un servicio:** `$JS.API.CONSUMER.DURABLE.CREATE.*` (el filtro va en el cuerpo
   y ninguna ACL lo ve), `$JS.API.STREAM.MSG.GET.*`, y crear, modificar, borrar o purgar
   streams. *(A-5, A-6)*
@@ -276,6 +285,13 @@ Reglas nuevas. Todas tienen evidencia en el Apéndice A.
   > o el `backoff` de su consumidor. `gen-acl.mjs --dev` lo concede, solo sobre el durable
   > propio y con su filtro exacto, para arrancar sin `flux provision`. Los SDKs hacen *info
   > antes de crear* (Fase 1.4 y 6).
+
+  **Ojo: el broker no contesta a una petición
+  denegada** (A-28): el SDK tiene que escuchar los `-ERR 'Permissions Violation…'` de la
+  conexión y competirlos con la respuesta, o el síntoma es un timeout de 5–30 s. Falta
+  además un segundo código, `PERMISSION_DENIED`, para cuando ni siquiera hay permiso de
+  *consultar* el recurso (una ACL de la v1): `NOT_PROVISIONED` se reserva para «el recurso
+  falta y no puedo crearlo». Los dos son PERMANENT.
 
 Añade a `AGENTS.md` §8 dos trampas: «los permisos de subject no gobiernan JetStream» y
 «`_INBOX.>` común = cualquiera lo lee todo».
@@ -357,6 +373,8 @@ inbox `_INBOX.>` común y el broker se lo denegaría). La tabla de capacidades d
 | `NOT_PROVISIONED` | Si falta el stream o el consumidor y crear está denegado. **Node:** `NotProvisionedError`, PERMANENT. Una petición de la API denegada llega en ~1 ms como `RequestError` con `cause: PermissionViolationError` *(A-21)*: reconócela por la `cause`, no por el texto. |
 | Primera conexión | **Añadido tras medir *(A-24)*.** Con `waitOnFirstConnect` el cliente NATS reintenta **cualquier** error sin límite: un certificado que no verifica deja `connect()` esperando para siempre, sin error. El SDK debe esperar a un broker caído y **fallar** ante lo que no se arregla esperando (TLS que no verifica, credenciales rechazadas, TLS pedido y no ofrecido). Node: `ConnectionRejectedError`. |
 | Denegaciones asíncronas | **Añadido tras medir *(A-19, A-20)*.** `ack` y el pull son publicaciones sueltas: si se deniegan no hay excepción. Sin vigilarlas, un ack denegado reentrega para siempre y un pull denegado deja un consumidor inerte «sano». Node: `subscribe()` lanza si el pull se deniega; el ack solo puede avisar por `logger`. |
+| `NOT_PROVISIONED` (Rust) | Si falta el stream o el consumidor y crear está denegado. Más `PERMISSION_DENIED` si ni consultar está permitido. En `async-nats` la denegación solo llega como `Event::ServerError` (A-28) |
+| Conexión inicial (Rust) | **Rust:** `retry_on_initial_connect` de `async-nats` reintenta para siempre y sin distinguir causas, así que una credencial rechazada o un TLS que no encaja dejaban un servicio mudo hasta el primer timeout. `connect()` espera ahora al broker, pero devuelve al instante lo que reintentar no arregla. **Comprueba el mismo patrón en el resto de SDKs** (`waitOnFirstConnect` en Node) |
 
 #### 1.5 Suite de seguridad — `conformance/security.mjs` + `conformance/cases/security-acl.json`
 
@@ -831,7 +849,11 @@ Reproducible: [`evidencia/ejecutar.sh`](evidencia/ejecutar.sh).
 | A-25 | Usuario con `subscribe: { allow: [] }` | **Sin restricción**: una lista vacía no deniega. La variante «sin inbox propio» de la matriz de tests no fallaba hasta sustituir la lista vacía por el inbox de otro servicio |
 | A-26 | SDK de Node con la candidata exacta | `subscribe()` falla con `Permissions Violation for Publish to "$JS.API.STREAM.INFO.DLQ_PEDIDOS"`: falta ese permiso en `candidata.conf` |
 | A-27 | Consumidor aprovisionado por `ops`, servicio **sin** `CONSUMER.CREATE` | Funciona si el SDK pregunta antes de crear (`CONSUMER.INFO`); sin consumidor y sin ese permiso: `NotProvisionedError`, en milisegundos y no tras un timeout |
-
+| A-28 | SDK de Rust (`async-nats` 0.50) con una publicación denegada por la ACL: ¿qué ve quien la hizo? | **Nada**: el servidor descarta el mensaje y manda `-ERR 'Permissions Violation for Publish to "…"'` por la conexión; la petición espera a su timeout. Solo es observable como `Event::ServerError(ServerError::Other(texto))`. El log **del servidor** dice otra cosa: `Publish Violation - Subject "…"`. Fuente: `sdk-rust/tests/security.rs` |
+| A-29 | SDK de Rust bajo permisos exactos: subjects que publica un consumidor y un dueño en un flujo completo (publicar, consumir, ack, WIP, nak, term, DLQ, sondeo) | `STREAM.INFO.EVT_<D>`, `STREAM.INFO.DLQ_<D>` (¡no estaba en la candidata!), `CONSUMER.CREATE.<S>.<d>.<subject>`, `CONSUMER.INFO.<S>.<d>`, `CONSUMER.MSG.NEXT.<S>.<d>`, `$JS.ACK.<S>.<d>.<…>`, `dlq.<subject>`; ninguno de `$JS.API.INFO`. Toda petición responde bajo `_INBOX.<servicio>.` incluida la del pull (`MSG.NEXT`) |
+| A-30 | Fallos de conexión inicial en `async-nats`: credencial rechazada, CA que no firmó, TLS exigido sin TLS en el broker, mTLS sin certificado de cliente | `AuthorizationViolation` el primero; **los tres de TLS llegan como `ConnectErrorKind::Io`** con un `io::Error InvalidData` dentro (`UnknownIssuer`, `InvalidContentType`, `CertificateRequired`), no como `Tls` |
 A-19 a A-27 los reproduce `sdk-node/test/integration/` (`acl.test.ts`, `auth.test.ts`,
 `tls.test.ts`), contra nats-server 2.14.5 y `@nats-io/*` 3.4.0. Les falta su caso en
 `conformance/cases/` (Fase 1.5): son observaciones del broker, no solo del SDK de Node.
+A-28 a A-30 los reproduce `sdk-rust/tests/security.rs`, contra nats-server 2.14.5 y
+`async-nats` 0.50. Tampoco tienen aún su caso en `conformance/cases/`.
