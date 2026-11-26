@@ -20,6 +20,15 @@ export type {
 } from "./client.js";
 
 export {
+  NotProvisionedError,
+  PermissionDeniedError,
+  ConnectionRejectedError,
+  InvalidCredentialsError,
+  InvalidTlsOptionsError,
+} from "./security.js";
+export type { Credentials, TlsOptions } from "./security.js";
+
+export {
   ErrorClass,
   RetryableError,
   PermanentError,
