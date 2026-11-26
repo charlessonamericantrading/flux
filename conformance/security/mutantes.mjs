@@ -46,7 +46,7 @@ export const MUTANTES = [
     archivo: MANIFEST,
     de: "grupo(`Llama a ${op}: publica en el subject EXACTO de la operación`, [`rpc.${op}`]);",
     a: "grupo(`Llama a ${op}: publica en el subject EXACTO de la operación`, [`rpc.${domainOf(op)}.>`]);",
-    debenFallar: ["S21"],
+    debenFallar: ["S21", "S30"],
   },
   {
     nombre: "caller-rpc-all",
@@ -54,7 +54,7 @@ export const MUTANTES = [
     archivo: MANIFEST,
     de: "grupo(`Llama a ${op}: publica en el subject EXACTO de la operación`, [`rpc.${op}`]);",
     a: "grupo(`Llama a ${op}: publica en el subject EXACTO de la operación`, [`rpc.>`]);",
-    debenFallar: ["S21"],
+    debenFallar: ["S21", "S30"],
   },
   {
     nombre: "caller-without-permission",
@@ -62,7 +62,7 @@ export const MUTANTES = [
     archivo: MANIFEST,
     de: "grupo(`Llama a ${op}: publica en el subject EXACTO de la operación`, [`rpc.${op}`]);",
     a: "void op;",
-    debenFallar: ["S21", "S27"],
+    debenFallar: ["S21", "S27", "S30"],
   },
   {
     nombre: "owner-rpc-all",
@@ -70,7 +70,7 @@ export const MUTANTES = [
     archivo: MANIFEST,
     de: "const subscribe = [`_INBOX.${servicio.name}.>`, ...dominiosRpc.map((d) => `rpc.${d}.>`)];",
     a: "const subscribe = [`_INBOX.${servicio.name}.>`, ...(dominiosRpc.length ? [\"rpc.>\"] : [])];",
-    debenFallar: ["S22"],
+    debenFallar: ["S22", "S30"],
   },
   {
     nombre: "owner-without-subscribe",
@@ -78,7 +78,7 @@ export const MUTANTES = [
     archivo: MANIFEST,
     de: "const subscribe = [`_INBOX.${servicio.name}.>`, ...dominiosRpc.map((d) => `rpc.${d}.>`)];",
     a: "const subscribe = [`_INBOX.${servicio.name}.>`];",
-    debenFallar: ["S21", "S26", "S27"],
+    debenFallar: ["S21", "S26", "S27", "S30"],
   },
   {
     nombre: "caller-gets-domain-subscription",
@@ -86,7 +86,7 @@ export const MUTANTES = [
     archivo: MANIFEST,
     de: "const subscribe = [`_INBOX.${servicio.name}.>`, ...dominiosRpc.map((d) => `rpc.${d}.>`)];",
     a: "const subscribe = [`_INBOX.${servicio.name}.>`, ...[...new Set([...atendidas, ...llamadas].map(domainOf))].sort().map((d) => `rpc.${d}.>`)];",
-    debenFallar: ["S22"],
+    debenFallar: ["S22", "S30"],
   },
   {
     nombre: "shared-inbox",
@@ -94,7 +94,7 @@ export const MUTANTES = [
     archivo: MANIFEST,
     de: "const subscribe = [`_INBOX.${servicio.name}.>`, ...dominiosRpc.map((d) => `rpc.${d}.>`)];",
     a: "const subscribe = [`_INBOX.>`, ...dominiosRpc.map((d) => `rpc.${d}.>`)];",
-    debenFallar: ["S23"],
+    debenFallar: ["S23", "S30"],
   },
   {
     nombre: "no-allow-responses",
@@ -102,7 +102,7 @@ export const MUTANTES = [
     archivo: MANIFEST,
     de: "const allowResponses = atendidas.length ? { ...RPC_ALLOW_RESPONSES } : null;",
     a: "const allowResponses = null;",
-    debenFallar: ["S21", "S24", "S27", "S28"],
+    debenFallar: ["S21", "S24", "S27", "S28", "S30"],
   },
   {
     nombre: "no-allow-responses-in-conf",
@@ -110,7 +110,7 @@ export const MUTANTES = [
     archivo: GEN,
     de: "  if (perm.allowResponses) {",
     a: "  if (false) {",
-    debenFallar: ["S21", "S24", "S27", "S28"],
+    debenFallar: ["S21", "S24", "S27", "S28", "S30"],
   },
   {
     nombre: "allow-responses-max-3",
@@ -118,7 +118,7 @@ export const MUTANTES = [
     archivo: MANIFEST,
     de: 'export const RPC_ALLOW_RESPONSES = Object.freeze({ max: 1, expires: "30s" });',
     a: 'export const RPC_ALLOW_RESPONSES = Object.freeze({ max: 3, expires: "30s" });',
-    debenFallar: ["S24"],
+    debenFallar: ["S24", "S34"],
   },
   {
     nombre: "owner-publishes-on-inboxes",
@@ -126,7 +126,7 @@ export const MUTANTES = [
     archivo: MANIFEST,
     de: "  const dominiosRpc = [...new Set(atendidas.map(domainOf))].sort();",
     a: '  const dominiosRpc = [...new Set(atendidas.map(domainOf))].sort();\n  if (atendidas.length) grupo("mutante: publicar en cualquier inbox", ["_INBOX.>"]);',
-    debenFallar: ["S24"],
+    debenFallar: ["S24", "S34"],
   },
   {
     nombre: "no-expires",

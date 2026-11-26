@@ -15,6 +15,7 @@ import { randomUUID } from "node:crypto";
 
 import net from "node:net";
 
+import { EscenarioSdk, validarEscenario } from "./sdk-escenario.mjs";
 import {
   connect,
   dec,
@@ -80,6 +81,7 @@ export function validarCaso(caso, vocabulario) {
     for (const k of def.args ?? []) {
       if (paso[k] === undefined) throw new Error(`${donde(i)} (${paso.op}): falta el argumento obligatorio «${k}»`);
     }
+    if (paso.op === "sdk_script") validarEscenario(paso, donde(i));
     if (def.needsActor && paso.as === undefined) {
       throw new Error(`${donde(i)} (${paso.op}): falta \`as\` (quién lo hace)`);
     }
@@ -123,7 +125,7 @@ function resolverRefs(valor, guardados) {
 
 /** Todos los actores que un paso menciona (`as`, `spy`, `victim`, `caller` y los `owners` de un ciclo). */
 export function actoresDe(paso) {
-  return [...["as", "spy", "victim", "caller"].map((k) => paso[k]), ...(paso.owners ?? [])].filter((a) => a !== undefined);
+  return [...["as", "spy", "victim", "caller"].map((k) => paso[k]), ...(paso.owners ?? []), ...(paso.agents ?? []).map((a) => a.as)].filter((a) => a !== undefined);
 }
 
 // ─── Actores ─────────────────────────────────────────────────────────────────
@@ -198,6 +200,10 @@ function coincide(esperado, real) {
     if ("gte" in esperado) return typeof real === "number" && real >= esperado.gte;
     if ("not" in esperado) return !coincide(esperado.not, real);
     if ("present" in esperado) return (real !== undefined && real !== null) === esperado.present;
+    // Sobre una LISTA de cadenas (el log de un SDK, las violaciones del servidor): alguna casa / ninguna casa.
+    if ("anyMatch" in esperado) return Array.isArray(real) && real.some((x) => new RegExp(esperado.anyMatch).test(String(x)));
+    if ("noneMatch" in esperado) return Array.isArray(real) && !real.some((x) => new RegExp(esperado.noneMatch).test(String(x)));
+    if ("in" in esperado) return esperado.in.some((e) => igual(e, real));
   }
   return igual(esperado, real);
 }
@@ -255,6 +261,25 @@ export function clasificarPeticion(e) {
 /** Una operación que no se puede ejecutar en este modo (p. ej. con `--acl`): no es un fallo. */
 export class Omitido extends Error {}
 
+/**
+ * La identidad (nkey o usuario) con la que entra un actor: la del servicio, la de `ops` o la de una VARIANTE suya con
+ * permisos estropeados a propósito. La comparten el intérprete (clientes en bruto) y los escenarios con SDKs reales.
+ */
+export function identidadDeActor(ctx, a) {
+  let ident;
+  if (a.service === "ops") {
+    ident = ctx.identidades.get("ops");
+  } else if (esVariante(a)) {
+    ident = ctx.variantes.get(claveVariante(a));
+    if (!ident) throw new Omitido("una variante de permisos necesita los que genera gen-acl.mjs (no aplica con --acl)");
+    if (ident.error) throw new Error(`no se pudo construir la variante: ${ident.error}`);
+  } else {
+    ident = ctx.identidades.get(a.service);
+    if (!ident) throw new Error(`el servicio «${a.service}» no está en el manifiesto`);
+  }
+  return ident;
+}
+
 // ─── El intérprete ───────────────────────────────────────────────────────────
 
 export class Interprete {
@@ -284,7 +309,9 @@ export class Interprete {
     const pasos = [];
     try {
       for (const paso of caso.steps) {
-        pasos.push(await this.#ejecutarPaso(paso, estado));
+        // Un escenario con SDKs reales da un paso por cada paso de su guion (cada uno con su `expect`).
+        if (paso.op === "sdk_script") pasos.push(...(await this.#escenarioSdk(paso, estado)));
+        else pasos.push(await this.#ejecutarPaso(paso, estado));
       }
     } finally {
       for (const a of estado.actores.values()) await a.nc.close().catch(() => {});
@@ -293,6 +320,19 @@ export class Interprete {
     const omitidos = pasos.filter((p) => p.omitido).length;
     // Un caso con TODOS los pasos omitidos no ha comprobado nada: se dice, no se da por bueno.
     return { id: caso.id, ok, pasos, omitidos, omitido: omitidos === pasos.length ? "todos los pasos omitidos" : undefined };
+  }
+
+  /** `sdk_script`: ver `sdk-escenario.mjs`. */
+  async #escenarioSdk(paso, estado) {
+    if (paso.onlyWith === "generated-acl" && !this.ctx.generada) {
+      return [{ id: paso.id, descripcion: paso.title ?? "sdk_script", ok: true, omitido: "necesita los permisos que genera gen-acl.mjs (no aplica con --acl)" }];
+    }
+    const escenario = new EscenarioSdk(this.ctx, identidadDeActor, normalizarActor);
+    try {
+      return await escenario.ejecutar(expandir(paso, { marker: estado.marker }), { marker: estado.marker, evaluar });
+    } catch (e) {
+      return [{ id: paso.id, descripcion: paso.title ?? "sdk_script", ok: false, observado: { outcome: "error" }, fallos: [e?.message ?? String(e)] }];
+    }
   }
 
   async #ejecutarPaso(paso, estado) {
@@ -355,17 +395,7 @@ export class Interprete {
     const clave = JSON.stringify(a);
     if (estado.actores.has(clave)) return estado.actores.get(clave);
 
-    let ident;
-    if (a.service === "ops") {
-      ident = this.ctx.identidades.get("ops");
-    } else if (esVariante(a)) {
-      ident = this.ctx.variantes.get(claveVariante(a));
-      if (!ident) throw new Omitido("una variante de permisos necesita los que genera gen-acl.mjs (no aplica con --acl)");
-      if (ident.error) throw new Error(`no se pudo construir la variante: ${ident.error}`);
-    } else {
-      ident = this.ctx.identidades.get(a.service);
-      if (!ident) throw new Error(`el servicio «${a.service}» no está en el manifiesto`);
-    }
+    const ident = identidadDeActor(this.ctx, a);
     const inbox = a.inbox ?? (a.service === "ops" ? "default" : "private");
     const inboxPrefix = inbox === "default" ? undefined : inbox === "private" ? `_INBOX.${a.service}` : inbox;
     const nc = await conectar(this.ctx.url, {
