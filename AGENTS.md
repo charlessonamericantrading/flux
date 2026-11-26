@@ -12,7 +12,7 @@
 ## 0. Carga el contrato antes de escribir código
 
 Si vas a tocar código que publica o consume eventos, **primero descarga la spec
-completa** (un solo fichero, ~100 KB, sin auth):
+completa** (un solo fichero, ~110 KB, sin auth):
 
 ```
 https://raw.githubusercontent.com/charlessonamericantrading/flux/main/llms-full.txt
@@ -72,7 +72,7 @@ https://raw.githubusercontent.com/charlessonamericantrading/flux/main/protocol.j
 10. **Los tipos son exactos.** `{"tenantid": 42}` es POISON, no el tenant `"42"`.
     Desactiva la coerción de tu deserializador.
 
-11. **UTF-8 literal, sin escapes `\u`.** `café`, no `café`. Ambos son JSON válido
+11. **UTF-8 literal, sin escapes `\u`.** `café`, no `caf\u00e9`. Ambos son JSON válido
     y **no son los mismos bytes**.
 
 ---

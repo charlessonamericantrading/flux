@@ -107,8 +107,12 @@ En v1, el aislamiento de tenant es **responsabilidad del consumidor**: filtrar p
 ofrecer un filtro declarativo en `subscribe()` para que ese filtrado no dependa de que
 cada handler se acuerde.
 
-> Aislamiento real por tenant (account o subject prefix por tenant) queda en **fase 4**.
-> Se documenta aquí para que nadie asuma que ya existe.
+> El aislamiento **duro** entre tenants, el que aplica el broker y no una convención del
+> SDK, es el Modelo B de [09-multitenancy.md](09-multitenancy.md): una account de NATS
+> por tenant (`gen-acl.mjs --tenants` genera la configuración). El default de v1, el
+> filtrado en consumidor, **no** resiste a un servicio legítimo comprometido. El prefijo
+> de subject por tenant (Modelo C) se rechazó en v1: rompe la regla de 4 tokens.
+> No hay fase pendiente: lo que falta es elegir modelo según la amenaza.
 
 ## 5. Clasificación de datos
 
