@@ -287,10 +287,22 @@ public final class Classifier {
      * final. Esa ultima linea es la decision de politica de verdad.
      */
     public Classification classify(Throwable error) {
+        return classifyDetailed(error).classification();
+    }
+
+    /**
+     * Una clasificacion y si el clasificador la RECONOCIO (un error tipado de flux, una regla de la aplicacion, un status
+     * HTTP, un error de red transitorio o un timeout) o cayo en la politica de lo desconocido. Quien responde a una peticion lo
+     * necesita: lo reconocido viaja con su clase y su codigo, y lo desconocido con un mensaje generico (11-request-reply.md §5.3).
+     */
+    public record Detailed(Classification classification, boolean recognized) {
+    }
+
+    public Detailed classifyDetailed(Throwable error) {
         if (error == null) {
             // No deberia ocurrir —el runtime solo clasifica errores— pero devolver una
             // clase falsa seria peor que devolver algo inerte.
-            return new Classification(ErrorClass.PERMANENT, "NIL_ERROR");
+            return new Detailed(new Classification(ErrorClass.PERMANENT, "NIL_ERROR"), true);
         }
 
         // 1. Un error tipado de flux siempre gana: la aplicacion sabe mas que el SDK.
@@ -302,14 +314,14 @@ public final class Classifier {
                     : fe instanceof RetryAfterAware ra && fe.errorClass() == ErrorClass.RETRYABLE
                             ? ra.retryAfter()
                             : null;
-            return new Classification(fe.errorClass(), fe.code(), retryAfter, null);
+            return new Detailed(new Classification(fe.errorClass(), fe.code(), retryAfter, null), true);
         }
 
         // 2. Reglas de la aplicacion.
         for (Rule rule : rules) {
             Optional<Classification> result = rule.apply(error);
             if (result.isPresent()) {
-                return result.get();
+                return new Detailed(result.get(), true);
             }
         }
 
@@ -319,12 +331,12 @@ public final class Classifier {
             int status = http.get().httpStatus();
             boolean retryable = RETRYABLE_HTTP_STATUS.contains(status);
             if (!retryable) {
-                return new Classification(ErrorClass.PERMANENT, "HTTP_" + status);
+                return new Detailed(new Classification(ErrorClass.PERMANENT, "HTTP_" + status), true);
             }
             Duration retryAfter = FluxErrors.findCause(error, RetryAfterAware.class)
                     .map(RetryAfterAware::retryAfter)
                     .orElse(null);
-            return new Classification(ErrorClass.RETRYABLE, "HTTP_" + status, retryAfter, null);
+            return new Detailed(new Classification(ErrorClass.RETRYABLE, "HTTP_" + status, retryAfter, null), true);
         }
 
         // 4. Errores de sistema: red y DNS son transitorios por definicion.
@@ -339,7 +351,7 @@ public final class Classifier {
         for (Class<? extends Throwable> type : TRANSIENT_NETWORK) {
             Optional<? extends Throwable> found = FluxErrors.findCause(error, type);
             if (found.isPresent()) {
-                return new Classification(ErrorClass.RETRYABLE, found.get().getClass().getSimpleName());
+                return new Detailed(new Classification(ErrorClass.RETRYABLE, found.get().getClass().getSimpleName()), true);
             }
         }
 
@@ -349,7 +361,7 @@ public final class Classifier {
                 ErrorClass timeoutClass = timeoutPolicy == TimeoutPolicy.PERMANENT
                         ? ErrorClass.PERMANENT
                         : ErrorClass.RETRYABLE;
-                return new Classification(timeoutClass, "TIMEOUT");
+                return new Detailed(new Classification(timeoutClass, "TIMEOUT"), true);
             }
         }
 
@@ -357,9 +369,9 @@ public final class Classifier {
         //    nadie previo. El default acotado da al transitorio una segunda oportunidad sin
         //    regalarle 51 minutos de cola al sistematico — 04-errors.md §2.1.
         return switch (unknownErrorPolicy) {
-            case PERMANENT -> new Classification(ErrorClass.PERMANENT, "UNKNOWN");
-            case RETRYABLE -> new Classification(ErrorClass.RETRYABLE, "UNKNOWN");
-            case RETRYABLE_BOUNDED -> Classification.retryableBounded("UNKNOWN", unknownRetryBudget);
+            case PERMANENT -> new Detailed(new Classification(ErrorClass.PERMANENT, "UNKNOWN"), false);
+            case RETRYABLE -> new Detailed(new Classification(ErrorClass.RETRYABLE, "UNKNOWN"), false);
+            case RETRYABLE_BOUNDED -> new Detailed(Classification.retryableBounded("UNKNOWN", unknownRetryBudget), false);
         };
     }
 }

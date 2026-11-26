@@ -1188,7 +1188,8 @@
         "capabilities": [
           "signing",
           "security",
-          "state"
+          "state",
+          "rpc"
         ],
         "evidence": {
           "security": [
@@ -1199,6 +1200,10 @@
           "state": [
             "sdk-java/src/test/java/com/flux/StateIntegrationTest.java",
             "sdk-java/src/test/java/com/flux/StateUnitTest.java"
+          ],
+          "rpc": [
+            "sdk-java/src/test/java/com/flux/RpcIntegrationTest.java",
+            "sdk-java/src/test/java/com/flux/RpcUnitTest.java"
           ]
         }
       },

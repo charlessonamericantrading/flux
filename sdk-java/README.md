@@ -7,10 +7,10 @@ se comporta exactamente como en L2 y no arrastra ninguna dependencia de más.
 El contrato normativo vive en [`specification/`](../specification/); si algo de este
 README diverge de la spec, manda la spec.
 
-**Capacidades opcionales** (`protocol.json` → `capabilities.sdks.java`): `signing`, `security` y `state`. Las dos últimas se
-declaran **solo** porque sus pruebas se ejecutan contra un `nats-server` real con los permisos que genera `scripts/gen-acl.mjs`
-y los streams que crea `flux provision` (§Seguridad, §Estado replicado), y porque los vectores cruzados de `state` dan los
-**mismos bytes y códigos** que Node y Rust.
+**Capacidades opcionales** (`protocol.json` → `capabilities.sdks.java`): `signing`, `security`, `state` y `rpc`. Las tres
+últimas se declaran **solo** porque sus pruebas se ejecutan contra un `nats-server` real con los permisos que genera
+`scripts/gen-acl.mjs` y los streams que crea `flux provision` (§Seguridad, §Estado replicado, §Petición/respuesta), y porque los
+vectores cruzados de `state` y `rpc` dan los **mismos bytes y códigos** que Node y Rust.
 
 ```xml
 <dependency>
@@ -468,6 +468,63 @@ subject contra los del sobre; discrepar es POISON), `restricted` no se admite, `
 esquema. Lo que falla va a `dlq.state.<contrato>` con el sobre original **sin su dato** (`data = { key, revision }`) y sin firma;
 un mensaje ilegible se sintetiza desde el subject y **no se copia su cuerpo**.
 
+## Petición/respuesta (`rpc`)
+
+Pedir algo a **un único responsable** y esperar la respuesta ([`11-request-reply.md`](../specification/11-request-reply.md)).
+Va por **core NATS**: no se guarda, no se reentrega y no la ve otro servicio.
+
+```java
+// quien llama
+JsonNode r = bus.request("clientes.cliente.v1.calcular-descuento",
+        Map.of("clienteId", "cli-1", "totalCents", 10_000, "moneda", "EUR"),
+        new FluxRpc.RequestOptions().timeoutMs(2_000).retries(1));            // desde un handler: bus.request(ctx.eventContext(), …)
+
+// quien responde
+FluxRpc.Responder r = bus.respond("clientes.cliente.v1.calcular-descuento", (data, ctx) -> {
+    if (!permitido(ctx.tenantId())) throw new FluxErrors.PermanentException("no autorizado", "TENANT_NO_AUTORIZADO");
+    return Map.of("descuentoCents", data.get("totalCents").intValue() / 10, "moneda", "EUR");
+});
+r.stop();    // o bus.close(): para a los que responden y ESPERA a lo que está en vuelo antes de cerrar la conexión
+```
+
+Una suscripción por operación **al subject exacto** (nunca `rpc.<dominio>.>`) con el **nombre del servicio como grupo de cola**:
+dos instancias se reparten las peticiones, y una operación que nadie atiende da `RPC_UNAVAILABLE` (`no responders`) al instante.
+Los errores del handler viajan con su clase y su código (`PermanentException`/`RetryableException`: **los suyos**); uno que el
+clasificador reconoce, con su clase y un mensaje genérico; uno desconocido, `permanent UNKNOWN` «error interno del servicio»: su
+texto va al log de quien responde, **no** a quien llama (puede llevar datos personales). Cada reintento (`retries`, solo ante
+`RPC_UNAVAILABLE` y `RPC_TIMEOUT`) reutiliza el **mismo `id` y los mismos bytes**. Las cinco comprobaciones de la respuesta
+(`11-request-reply.md` §4.3, con su excepción única §4.3.4), el tamaño (`min(1 MiB, max_payload)`), `STALE_REQUEST` (300 s,
+**solo** con la firma en `require`) y la parada ordenada están cubiertos por
+[`RpcIntegrationTest`](src/test/java/com/flux/RpcIntegrationTest.java), contra un broker real y con permisos exactos.
+
+Lo que `jnats` 2.20.5 hace por su cuenta y cómo se rodea:
+
+- **`no responders` y el timeout de limpieza son la misma `CancellationException`** (A-203). La limpieza por defecto es de 5 s:
+  una llamada con `timeoutMs: 7000` daría `RPC_UNAVAILABLE` a los 5 s. `connect()` la fija en 60 s (más que los 25 s máximos), así
+  que el único timeout es el de la llamada.
+- **Una petición denegada espera su timeout** (A-201): se compite con el aviso de denegación, que se registra **antes** de
+  lanzarla; y se vigila también la suscripción al inbox (sin permiso las respuestas no llegan, y core NATS no avisa).
+- **`respond()` sin permiso de suscripción no lanza al suscribirse** (la suscripción queda activa y muda): un PING/PONG y la
+  espera a que los callbacks alcancen los `-ERR` leídos (A-202). Falla al arrancar con `PERMISSION_DENIED` y no deja la operación
+  registrada.
+- **Un `Dispatcher` entrega en un solo hilo** (A-208): los handlers corren en un pool propio con tope por operación (256), y el
+  exceso espera en la cola de la suscripción. La parada es el **drenaje del `Dispatcher` de cada operación** y la espera a los
+  handlers en vuelo (≤ 25 s), **no** `Connection.drain`, que cierra la conexión con handlers en vuelo y pierde su respuesta (A-83).
+
+## Lo que este SDK NO cubre (todavía)
+
+Dicho aquí para que nadie lo descubra en producción:
+
+- **El 10164 solo está probado sin broker.** El código de API que da un cluster bajo carrera (A-49) se reconoce y se prueba con una
+  respuesta fabricada (`StateUnitTest`) y con un conflicto fabricado en un nodo (`StateIntegrationTest.conflictoDeterminista`, que
+  da el 10071). **No se ha ejecutado contra un cluster de tres nodos ni con `replicas: 3`**: la lectura de réplica de §3.7 de
+  `10-state.md` (un `get` justo después de un `put` puede ver el valor anterior) no tiene prueba propia en Java.
+- **Sin participante de Java en la interoperabilidad entre SDKs.** `conformance/interop-rpc.mjs` y `conformance/security/` (los
+  casos S30 a S34 con `sdk_script`) comparan **Node y Rust**; Java no figura. Lo que sí está: los vectores cruzados de bytes y
+  códigos con Node (`node conformance/cross-sdk.mjs --only node,java --exigir state,rpc`) y los 93 ajustes.
+- **Solo Linux** se ha ejecutado en CI; `mutantes.mjs` usa `timeout` (coreutils) para matar una librería que se cuelga, y en
+  Windows cae al `spawnSync` sin límite.
+
 ## Diferencias con los SDKs de referencia (Node y Go)
 
 El envelope, el naming, la taxonomía de errores y la config de consumidor son
@@ -854,6 +911,7 @@ Jackson emite bien. Ahora `serialize` escribe vía `writeValueAsString(...).getB
 | `InMemoryMetrics.java` | Recolector sin dependencias con salida en formato Prometheus |
 | `TenantIsolationException.java` | Suscripción sin filtro de tenant con el aislamiento en estricto |
 | `FluxState.java` · `StateEnvelope.java` · `StateErrors.java` | La capacidad `state`: `put`/`delete`/`get`/`watch` (el cliente, que habla con el broker), y el sobre, los nombres y los siete códigos (funciones **puras**, las que comparan los vectores cruzados) |
+| `FluxRpc.java` · `RpcEnvelope.java` · `RpcErrors.java` | La capacidad `rpc`: `request` y `respond` (el cliente), y el sobre, los nombres y los seis códigos (puros) |
 | `Security.java` · `SecurityErrors.java` · `TlsOptions.java` | La capacidad `security`: TLS verificado (host incluido), credenciales, el inbox privado, la clasificación de la primera conexión y los cinco códigos |
 | `Denials.java` · `FluxListener.java` | Lo que `jnats` notifica por callbacks: las denegaciones de permisos (competidas con la respuesta, con el aviso registrado antes de lanzar la operación) y la cuenta de `-ERR` que las espera |
 | `ExternalId.java` · `CanonicalTime.java` · `Text.java` · `ReservedDomainException.java` | El `id` determinista de un hecho importado (`externalKey`), `time` canónico, longitudes en puntos de código y los dominios reservados |
@@ -871,7 +929,7 @@ node conformance/cross-sdk.mjs --only node,java --verbose
 ```
 
 Las pruebas de unidad no requieren un broker. **Las de integración sí** (`SecurityIntegrationTest`, `TlsIntegrationTest`,
-`StateIntegrationTest`): arrancan un `nats-server` real con TLS, los permisos que genera
+`StateIntegrationTest`, `RpcIntegrationTest`): arrancan un `nats-server` real con TLS, los permisos que genera
 `scripts/gen-acl.mjs` de `examples/services.json` y los streams y durables que crea `flux provision`, de modo que **quitar un
 permiso se nota**. Necesitan `node`, `openssl`, `npm install` en `cli/` y el binario de `nats-server`:
 
@@ -910,10 +968,11 @@ Cubren:
   `outcome="invalid_signature"` sin tocar el `dlqreason`;
 - **aislamiento de tenant** — `STRICT` sin tenant lanza, `"system"` no cuenta como filtro,
   precedencia suscripción → conexión;
-- **seguridad y estado** — los códigos de cada capacidad en su situación y en **ninguna otra**; contra el broker real y con
-  permisos exactos: el ciclo, cada permiso que se quita, `NOT_PROVISIONED`, la primera conexión con una CA que no firmó, un host
-  fuera de los SAN, una credencial rechazada y mTLS; las 100 claves con `onSynced`, las lápidas, el conflicto de secuencia
-  fabricado y tres escritores en carrera, el `resync`, la DLQ de estado y L3 con el bundle real;
+- **seguridad, estado y petición/respuesta** — los códigos de cada capacidad en su situación y en **ninguna otra**; contra el
+  broker real y con permisos exactos: el ciclo, cada permiso que se quita, `NOT_PROVISIONED`, la primera conexión con una CA que
+  no firmó, un host fuera de los SAN, una credencial rechazada y mTLS; las 100 claves con `onSynced`, las lápidas, el conflicto
+  de secuencia fabricado y tres escritores en carrera, el `resync`, la DLQ de estado; las cinco comprobaciones de una respuesta,
+  los reintentos con el mismo `id`, los tamaños, `STALE_REQUEST`, la parada ordenada y L3 con el bundle real;
 - **validación L3** — los mismos casos que `sdk-node/test/validation.test.ts` (requerido
   ausente, tipo incorrecto, campo desconocido, patrón incumplido, **todos** los errores a la
   vez, esquema ausente del bundle, `warn` que avisa sin lanzar, `off` que no compila nada),

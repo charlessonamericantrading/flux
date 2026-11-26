@@ -268,6 +268,27 @@ public record FluxEvent(
                 dlqreason, dlqattempts, dlqconsumer, dlqerror, dlqtime, data);
     }
 
+    /** Copia sin {@code causationid}: el error de una peticion que no se pudo leer y cuyo {@code id} no es citable (11-request-reply.md §5.2). */
+    FluxEvent withoutCausationid() {
+        return new FluxEvent(specversion, id, source, type, time, datacontenttype, dataschema,
+                aggregateId, correlationid, tenantid, producerversion, dataclassification,
+                null, partitionkey, traceparent, tracestate,
+                signkeyid, signature,
+                dlqreason, dlqattempts, dlqconsumer, dlqerror, dlqtime, data);
+    }
+
+    /**
+     * Copia con otro {@code dataschema} y otro {@code data}: lo que el validador mira y nada mas. Lo usa la peticion/respuesta
+     * para validar contra el esquema DE LA OPERACION (la peticion llega con el suyo y la respuesta se valida con el de su lado).
+     */
+    FluxEvent withSchemaAndData(String newDataschema, JsonNode newData) {
+        return new FluxEvent(specversion, id, source, type, time, datacontenttype, newDataschema,
+                aggregateId, correlationid, tenantid, producerversion, dataclassification,
+                causationid, partitionkey, traceparent, tracestate,
+                signkeyid, signature,
+                dlqreason, dlqattempts, dlqconsumer, dlqerror, dlqtime, newData);
+    }
+
     /**
      * Copia sin {@code signature}, conservando {@code signkeyid}.
      *

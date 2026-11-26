@@ -619,6 +619,8 @@ public final class FluxBus implements AutoCloseable {
     private final ThreadLocal<String> signatureFailure = new ThreadLocal<>();
     /** Estado replicado — la capacidad {@code state}. */
     private final FluxState state;
+    /** Peticion/respuesta — la capacidad {@code rpc}. */
+    private final FluxRpc rpc;
     private final Set<Subscription> subscriptions =
             Collections.newSetFromMap(new ConcurrentHashMap<>());
     private final Set<String> ensuredStreams = ConcurrentHashMap.newKeySet();
@@ -684,6 +686,7 @@ public final class FluxBus implements AutoCloseable {
                         })
                         : null;
         this.state = new FluxState(this);
+        this.rpc = new FluxRpc(this);
         this.metrics.connectionState(MetricsSink.ConnectionState.CONNECTED);
     }
 
@@ -842,7 +845,40 @@ public final class FluxBus implements AutoCloseable {
         return state;
     }
 
-    // ─── lo que comparte state (package-private) ──────────────────────
+    /**
+     * Llama a una operacion y espera su respuesta — la capacidad {@code rpc} (specification/11-request-reply.md). Ver
+     * {@link FluxRpc#request}.
+     */
+    public com.fasterxml.jackson.databind.JsonNode request(String operation, Object data) {
+        return rpc.request(EventContext.ROOT, operation, data, new FluxRpc.RequestOptions());
+    }
+
+    public com.fasterxml.jackson.databind.JsonNode request(String operation, Object data, FluxRpc.RequestOptions options) {
+        return rpc.request(EventContext.ROOT, operation, data, options);
+    }
+
+    /** Una llamada hecha desde un handler: continua la cadena de correlacion del evento (o de la peticion) en curso. */
+    public com.fasterxml.jackson.databind.JsonNode request(EventContext parent, String operation, Object data,
+                                                           FluxRpc.RequestOptions options) {
+        return rpc.request(parent, operation, data, options);
+    }
+
+    /** Lo mismo, con la respuesta ya convertida a {@code type}. */
+    public <R> R request(EventContext parent, String operation, Object data, FluxRpc.RequestOptions options,
+                         Class<R> type) {
+        return rpc.request(parent, operation, data, options, type);
+    }
+
+    /** Atiende una operacion. Ver {@link FluxRpc#respond}. */
+    public FluxRpc.Responder respond(String operation, FluxRpc.Handler handler) {
+        return rpc.respond(operation, handler, new FluxRpc.RespondOptions());
+    }
+
+    public FluxRpc.Responder respond(String operation, FluxRpc.Handler handler, FluxRpc.RespondOptions options) {
+        return rpc.respond(operation, handler, options);
+    }
+
+    // ─── lo que comparten state y rpc (package-private) ──────────────────────
 
     /** Firma el evento si hay clave. Es lo ULTIMO antes de serializar: la firma cubre el sobre completo (07-signing.md §5). */
     FluxEvent sign(FluxEvent event) {
@@ -866,6 +902,11 @@ public final class FluxBus implements AutoCloseable {
         }
     }
 
+    /** {@code true} si hay validacion L3. */
+    boolean hasValidator() {
+        return validator != null;
+    }
+
     /** Informa si la conexion sigue viva. Es el healthcheck que exige 03-delivery.md §6. */
     public boolean isConnected() {
         return connection.getStatus() == Connection.Status.CONNECTED;
@@ -874,6 +915,9 @@ public final class FluxBus implements AutoCloseable {
     /** Detiene las suscripciones y drena la conexion. */
     @Override
     public void close() {
+        // Primero los que RESPONDEN: dejar de escuchar, esperar a lo que esta en vuelo y SOLO entonces cerrar. Un `drain()` de la
+        // conexion entera con un handler en vuelo pierde su respuesta (A-62, A-83): se drena cada suscripcion por su cuenta.
+        rpc.stopAll();
         for (Subscription s : new ArrayList<>(subscriptions)) {
             s.unsubscribe();
         }

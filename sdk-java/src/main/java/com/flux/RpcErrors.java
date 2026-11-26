@@ -275,6 +275,30 @@ public final class RpcErrors {
         }
     }
 
+    /**
+     * {@code INVALID_SCHEMA} de una peticion o de una respuesta. El mensaje DICE cual: quien llama recibe el mismo
+     * {@code INVALID_SCHEMA} en los dos casos y debe saber a quien arreglar (11-request-reply.md §5.2). Cita rutas, nunca valores.
+     */
+    public static final class RpcSchemaException extends SchemaValidationException {
+        private static final long serialVersionUID = 1L;
+        private final String side;
+
+        public RpcSchemaException(String side, String operation, String dataschema, List<String> errors) {
+            super("la " + side + " de \"" + operation + "\" no cumple " + dataschema + ": " + String.join(", ", errors)
+                    + ". " + (side.equals("peticion")
+                            ? "El fallo es de quien llama: arregla los datos de la peticion, o actualiza su bundle de esquemas."
+                            : "El fallo es de quien responde (o los dos tienen bundles de esquemas distintos): el orden de "
+                                    + "despliegue es primero quien responde."),
+                    operation, dataschema, errors);
+            this.side = side;
+        }
+
+        /** {@code peticion} o {@code respuesta}. */
+        public String side() {
+            return side;
+        }
+    }
+
     /** Los seis codigos propios, en el orden de 04-errors.md §7. */
     static final List<String> CODES = List.of(
             "RPC_UNAVAILABLE", "RPC_TIMEOUT", "STALE_REQUEST", "RPC_INVALID_REPLY",

@@ -150,6 +150,25 @@ public final class Validation {
          *                                   esquema.
          */
         void check(FluxEvent event, String subject);
+
+        /**
+         * El fallo de validacion SIN lanzarlo ni registrarlo, o {@code null} si el evento cumple: lo que necesita quien debe
+         * DECIDIR que hacer con el fallo —el que responde a una peticion lo contesta como un error, y no lanza— y contar
+         * {@code invalid_schema} tambien en modo {@link Mode#WARN}, donde {@link #check} solo registra.
+         */
+        default RuntimeException failure(FluxEvent event, String subject) {
+            try {
+                check(event, subject);
+                return null;
+            } catch (RuntimeException e) {
+                return e;
+            }
+        }
+
+        /** El modo con el que se creo. */
+        default Mode mode() {
+            return Mode.STRICT;
+        }
     }
 
     /**
