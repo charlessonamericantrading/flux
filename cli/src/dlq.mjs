@@ -7,6 +7,7 @@
 
 import { createInterface } from "node:readline/promises";
 import { c, OK, FAIL, WARN, fmtAge, reasonColor, table } from "./ui.mjs";
+import { resumenDlqEstado } from "./state-model.mjs";
 
 const DLQ_EXTENSIONS = ["dlqreason", "dlqattempts", "dlqconsumer", "dlqerror", "dlqtime"];
 const dec = new TextDecoder();
@@ -27,8 +28,12 @@ async function readDlq(js, jsm, stream, { limit = 500, subject } = {}) {
 
   const events = [];
   try {
+    // Se piden los que HAY (`num_pending` del consumidor recién creado, con su filtro), no
+    // `limit`: un fetch de 500 sobre una DLQ de 3 espera su `expires` entero (5 s) por si llegan más.
+    const hay = Math.min(limit, consumer.num_pending);
+    if (hay === 0) return events;
     const c2 = await js.consumers.get(stream, consumer.name);
-    const batch = await c2.fetch({ max_messages: limit, expires: 5000 });
+    const batch = await c2.fetch({ max_messages: hay, expires: 5000 });
     for await (const m of batch) {
       try {
         events.push({ seq: m.seq, subject: m.subject, event: JSON.parse(dec.decode(m.data)) });
@@ -102,7 +107,7 @@ export async function dlqList(js, jsm, domain, { limit }) {
 
 // ─── inspect ─────────────────────────────────────────────────────────────────
 
-export async function dlqInspect(js, jsm, domain, { subject, limit }) {
+export async function dlqInspect(js, jsm, domain, { subject, limit, showData }) {
   const stream = `DLQ_${domain.replace(/-/g, "_").toUpperCase()}`;
   const events = await readDlq(js, jsm, stream, {
     limit,
@@ -124,8 +129,25 @@ export async function dlqInspect(js, jsm, domain, { subject, limit }) {
     console.log(`  id          ${event.id}  ${c.gray(fmtAge(event.dlqtime ?? event.time))}`);
     console.log(`  correlation ${event.correlationid ?? c.gray("—")}`);
     console.log(`  productor   ${event.source} ${c.gray(`v${event.producerversion ?? "?"}`)}`);
-    if (event.dataclassification === "restricted" || event.dataclassification === "confidential") {
-      // No se imprime el payload de datos sensibles: la terminal acaba en un log.
+    if (s.startsWith("dlq.state.")) {
+      // DLQ de estado: su `data` es { key, revision } (10-state.md §6), no el dato, así que se
+      // enseña aunque el sobre conserve `confidential`; y se da la ÚNICA recuperación válida.
+      const r = resumenDlqEstado(event);
+      console.log(
+        r.ok
+          ? `  estado      clave ${c.bold(r.key)} · revisión ${r.revision} · tenant ${event.tenantid ?? "?"}`
+          : `  estado      ${c.red(`data con campos de más (${r.extra.join(", ")}): viola 10-state.md §6, no se imprime`)}`,
+      );
+      const servicio = (event.dlqconsumer ?? "").split("__")[0];
+      console.log(
+        c.gray(
+          `  recuperar   flux state resync ${servicio || "<servicio>"} ${s.replace(/^dlq\.state\./, "")}` +
+            `${event.tenantid ? ` --tenant ${event.tenantid}` : ""}   (el estado no se reproduce: dlq replay lo rechaza)`,
+        ),
+      );
+    } else if (!showData && (event.dataclassification === "restricted" || event.dataclassification === "confidential")) {
+      // No se imprime el payload de datos sensibles: la terminal acaba en un log. (`--show-data`
+      // se anunciaba aquí pero la función no lo leía: nunca llegaba a imprimirse.)
       console.log(
         `  data        ${c.yellow(`[oculto: dataclassification=${event.dataclassification}]`)} ` +
           c.gray("usa --show-data si de verdad lo necesitas"),
@@ -138,17 +160,62 @@ export async function dlqInspect(js, jsm, domain, { subject, limit }) {
 
 // ─── replay ──────────────────────────────────────────────────────────────────
 
+/**
+ * El estado NO se reproduce desde la DLQ (10-state.md §6, PLAN 2.5): republicar un valor viejo
+ * pisaría uno más nuevo —la DLQ guarda el FALLO, no el estado—, y ahora ni siquiera tiene el
+ * dato (su `data` es `{ key, revision }`). La recuperación es `flux state resync`, que entrega
+ * de nuevo el último valor de cada clave por el camino normal: lo ACTUAL, no lo que había
+ * cuando falló.
+ *
+ * Sin esto, `replay` derivaría el destino de `type` y publicaría
+ * `state.clientes.v1.cliente`: una clave fantasma en el stream de estado.
+ */
+const MENSAJE_ESTADO =
+  "dlq replay no reproduce estado (dlq.state.>)\n" +
+  "  Republicar un valor viejo pisaría uno nuevo, y la DLQ de estado ni siquiera lo guarda:\n" +
+  "  su data es { key, revision }, no el dato (10-state.md §6).\n" +
+  "  Para recuperar un observador que perdió su copia:\n" +
+  "    flux state resync <servicio> <contrato> [--tenant t]\n" +
+  "  Entrega otra vez el último valor de cada clave por el camino normal: aplica lo ACTUAL.";
+
+const esDeEstado = (event, subject) =>
+  /^dlq\.state\./.test(subject ?? "") || /^com\.flux\.state\./.test(event?.type ?? "");
+
 export async function dlqReplay(js, jsm, domain, { subject, limit, confirm, yes }) {
+  // Antes de leer nada: ni `--subject dlq.state.…` / `state.…`, ni el «dominio» `state`.
+  if (domain === "state" || /^(dlq\.)?state(\.|$)/.test(subject ?? "")) throw new Error(MENSAJE_ESTADO);
+
   const stream = `DLQ_${domain.replace(/-/g, "_").toUpperCase()}`;
+  // Sin --subject se reproduce `dlq.<dominio>.>` y NO el stream entero: un DLQ_<DOM> de un
+  // dominio con estado captura además `dlq.state.<dom>.>`, que no se reproduce.
   const filtro = subject
     ? subject.startsWith("dlq.") ? subject : `dlq.${subject}`
-    : undefined;
+    : `dlq.${domain}.>`;
 
   const events = await readDlq(js, jsm, stream, { limit, subject: filtro });
+
+  // Los mensajes de estado que haya en esta DLQ se NOMBRAN, no se callan: quien reproduce «todo»
+  // debe saber que hay observadores con fallos pendientes que esto no arregla.
+  let deEstado = events?.filter((e) => esDeEstado(e.event, e.subject)).length ?? 0;
+  if (!subject) {
+    const i = await jsm.streams
+      .info(stream, { subjects_filter: `dlq.state.${domain}.>` })
+      .catch(() => null);
+    deEstado += Object.values(i?.state.subjects ?? {}).reduce((a, n) => a + n, 0);
+  }
+  if (deEstado) {
+    console.log(
+      `${WARN} ${deEstado} mensaje(s) de la DLQ de estado (dlq.state.${domain}.>) NO se reproducen: ` +
+        `${c.cyan("flux state resync <servicio> <contrato> [--tenant t]")} recupera lo actual (10-state.md §6)`,
+    );
+  }
+
   if (!events?.length) return console.log(`${OK} nada que reproducir en ${stream}`);
 
-  const reproducibles = events.filter((e) => e.event && e.event.dlqreason !== "poison");
-  const poison = events.length - reproducibles.length;
+  const reproducibles = events.filter(
+    (e) => e.event && e.event.dlqreason !== "poison" && !esDeEstado(e.event, e.subject),
+  );
+  const poison = events.filter((e) => !e.event || e.event.dlqreason === "poison").length;
 
   console.log(
     `${reproducibles.length} evento(s) reproducibles` +
