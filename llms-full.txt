@@ -814,7 +814,7 @@ constructor **normaliza** lo que le dan a la forma canónica o lo **rechaza**:
   `INVALID_RPC_CALL` ([04-errors.md §7](04-errors.md)).
 
 Node copiaba lo que le daban y Rust lo normalizaba: el mismo `time` daba dos secuencias de bytes. Los vectores
-`ajuste-*-time-*` lo fijan.
+`ajuste-*-time-*` lo fijan para Node y Rust; **pendiente en Python, Go, Java, .NET y PHP** (Fase 6): hoy no los recorren.
 
 ### 2.3 Comparación de nombres de atributo: case-sensitive
 
@@ -996,7 +996,9 @@ literal:
   sustituto escapado es el carácter; `"`, `\` y U+0000–U+001F siguen escapados.
 - Los **números**, como los escribe cada lenguaje, **sin tocarlos** (§2.5): `4995` sale `4995`.
 
-Un constructor reescribe lo que recibe a esta forma; un SDK que consume y reenvía conserva los bytes (§2.5).
+Un constructor reescribe lo que recibe a esta forma; un SDK que consume y reenvía conserva los bytes (§2.5). Node y Rust la
+cumplen y la fijan los vectores `ajuste-data-*`; **pendiente en Python, Go, Java, .NET y PHP** (Fase 6): no se han medido contra
+esos vectores y no se garantiza que escriban esta forma.
 
 **Qué NO se admite en `data`** porque no tiene forma común entre lenguajes —no hay vector que lo iguale y **nada** garantiza que
 dos SDKs coincidan—, así que si los bytes importan (firma, replay, dedupe por hash) **no lo uses**:
@@ -1159,6 +1161,10 @@ logistica.envio.v1.entrega-fallida
   ([05-compatibility.md](05-compatibility.md))—, y con el tope el valor cabe en cualquier entero de cualquier lenguaje. El
   tope vive en **todo** patrón que lleva la versión (el `type`, el contrato de estado, la operación de petición/respuesta, los
   permisos de la ACL): `protocol.json` → `naming.subject.majorVersion` y la comprobación `check-protocol-json.mjs`.
+  **Estado por SDK:** los siete SDKs llevan el tope en su patrón de subject y su test de unidad rechaza `v99999`; Node,
+  Rust y `flux call` lo llevan además en el `type`, el estado y la operación de petición/respuesta. El resto de lo decidido
+  al medir Node contra Rust (`dlqerror` en bytes, `data` canónico, `time` normalizado, atributos vacíos, UTF-8 estricto…)
+  está **pendiente en Python, Go, Java, .NET y PHP** (Fase 6): ver los apartados que lo dicen.
 - El plural del dominio y el singular del agregado son deliberados: leído en voz alta,
   `pedidos.pedido` es "el agregado *pedido*, del dominio *pedidos*".
 
@@ -1873,8 +1879,8 @@ principio y es lo que agrupa el panel. Sin esta regla, tres SDKs daban tres cort
 contaba 1024 unidades UTF-16 —2693 bytes con 1500 `é`—, Rust 1024 bytes, Python puntos de código y Go runas), y el
 **mismo** evento muerto no tenía los mismos bytes en la DLQ, que es de lo que depende el replay verbatim
 ([01-envelope.md §6](01-envelope.md)). Los vectores `ajuste-dlqerror-*` de
-[`conformance/harness/vectors.json`](../conformance/harness/vectors.json) lo fijan para Node y Rust; **el resto de SDKs
-debe alinearse** con ellos.
+[`conformance/harness/vectors.json`](../conformance/harness/vectors.json) lo fijan para Node y Rust; **pendiente en
+Python, Go, Java, .NET y PHP** (Fase 6), que deben alinearse con ellos.
 
 `dlqattempts` es el número de entrega en que el evento murió, **no** una propiedad de
 su clase. Un PERMANENT suele registrar `1` porque no gasta reintentos, pero si el

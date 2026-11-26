@@ -48,6 +48,10 @@ logistica.envio.v1.entrega-fallida
   ([05-compatibility.md](05-compatibility.md))—, y con el tope el valor cabe en cualquier entero de cualquier lenguaje. El
   tope vive en **todo** patrón que lleva la versión (el `type`, el contrato de estado, la operación de petición/respuesta, los
   permisos de la ACL): `protocol.json` → `naming.subject.majorVersion` y la comprobación `check-protocol-json.mjs`.
+  **Estado por SDK:** los siete SDKs llevan el tope en su patrón de subject y su test de unidad rechaza `v99999`; Node,
+  Rust y `flux call` lo llevan además en el `type`, el estado y la operación de petición/respuesta. El resto de lo decidido
+  al medir Node contra Rust (`dlqerror` en bytes, `data` canónico, `time` normalizado, atributos vacíos, UTF-8 estricto…)
+  está **pendiente en Python, Go, Java, .NET y PHP** (Fase 6): ver los apartados que lo dicen.
 - El plural del dominio y el singular del agregado son deliberados: leído en voz alta,
   `pedidos.pedido` es "el agregado *pedido*, del dominio *pedidos*".
 

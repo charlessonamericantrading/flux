@@ -26,7 +26,7 @@
         "maxDigits": 4,
         "max": 9999,
         "leadingZeros": false,
-        "$comment": "La version mayor son de 1 a 4 digitos: v1...v9999 (02-naming.md §1). Sin tope, Node escribia `v100000000000000000000` en el type (el numero pasaba por `Number`) y Rust rechazaba lo que no cupiese en un `u32`: el mismo subject, dos veredictos. Cada patron de este fichero que lleva la version (subject, type, estado, operacion, ACL) lleva el tope `[1-9][0-9]{0,3}`; check-protocol-json.mjs lo comprueba en todos. Los ejemplos `valid`/`invalid` de abajo NO incluyen v10000: los recorren los tests de todos los SDKs y los de Python, Go, Java, .NET y PHP aun no aplican el tope."
+        "$comment": "La version mayor son de 1 a 4 digitos: v1...v9999 (02-naming.md §1). Sin tope, Node escribia `v100000000000000000000` en el type (el numero pasaba por `Number`) y Rust rechazaba lo que no cupiese en un `u32`: el mismo subject, dos veredictos. Cada patron de este fichero que lleva la version (subject, type, estado, operacion, ACL) lleva el tope `[1-9][0-9]{0,3}`; check-protocol-json.mjs lo comprueba en todos. Los ejemplos `valid`/`invalid` de abajo NO incluyen v10000; cada SDK lo prueba en su propio test (`v9999` se acepta, `v99999` y `v10000` se rechazan). Los siete SDKs llevan el tope en su patron de subject (Python, Go, Java, .NET y PHP solo ahi: el resto de lo decidido al medir Node contra Rust esta pendiente en esos cinco, Fase 6)."
       },
       "valid": [
         "pedidos.pedido.v1.creado",

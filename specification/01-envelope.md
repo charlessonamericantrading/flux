@@ -124,7 +124,7 @@ constructor **normaliza** lo que le dan a la forma canónica o lo **rechaza**:
   `INVALID_RPC_CALL` ([04-errors.md §7](04-errors.md)).
 
 Node copiaba lo que le daban y Rust lo normalizaba: el mismo `time` daba dos secuencias de bytes. Los vectores
-`ajuste-*-time-*` lo fijan.
+`ajuste-*-time-*` lo fijan para Node y Rust; **pendiente en Python, Go, Java, .NET y PHP** (Fase 6): hoy no los recorren.
 
 ### 2.3 Comparación de nombres de atributo: case-sensitive
 
@@ -306,7 +306,9 @@ literal:
   sustituto escapado es el carácter; `"`, `\` y U+0000–U+001F siguen escapados.
 - Los **números**, como los escribe cada lenguaje, **sin tocarlos** (§2.5): `4995` sale `4995`.
 
-Un constructor reescribe lo que recibe a esta forma; un SDK que consume y reenvía conserva los bytes (§2.5).
+Un constructor reescribe lo que recibe a esta forma; un SDK que consume y reenvía conserva los bytes (§2.5). Node y Rust la
+cumplen y la fijan los vectores `ajuste-data-*`; **pendiente en Python, Go, Java, .NET y PHP** (Fase 6): no se han medido contra
+esos vectores y no se garantiza que escriban esta forma.
 
 **Qué NO se admite en `data`** porque no tiene forma común entre lenguajes —no hay vector que lo iguale y **nada** garantiza que
 dos SDKs coincidan—, así que si los bytes importan (firma, replay, dedupe por hash) **no lo uses**:

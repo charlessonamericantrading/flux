@@ -174,8 +174,8 @@ principio y es lo que agrupa el panel. Sin esta regla, tres SDKs daban tres cort
 contaba 1024 unidades UTF-16 —2693 bytes con 1500 `é`—, Rust 1024 bytes, Python puntos de código y Go runas), y el
 **mismo** evento muerto no tenía los mismos bytes en la DLQ, que es de lo que depende el replay verbatim
 ([01-envelope.md §6](01-envelope.md)). Los vectores `ajuste-dlqerror-*` de
-[`conformance/harness/vectors.json`](../conformance/harness/vectors.json) lo fijan para Node y Rust; **el resto de SDKs
-debe alinearse** con ellos.
+[`conformance/harness/vectors.json`](../conformance/harness/vectors.json) lo fijan para Node y Rust; **pendiente en
+Python, Go, Java, .NET y PHP** (Fase 6), que deben alinearse con ellos.
 
 `dlqattempts` es el número de entrega en que el evento murió, **no** una propiedad de
 su clase. Un PERMANENT suele registrar `1` porque no gasta reintentos, pero si el

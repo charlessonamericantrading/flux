@@ -287,6 +287,15 @@ alineados todavía: lo comprueban los tests unitarios de Node (`sdk-node/test/aj
 | Error del handler con un mensaje solo de espacios | lo envía | lo sustituye por «error del servicio» | se sustituye por «el servicio rechazó la petición» | los dos |
 | `id` de una petición ilegible que se cita como `causationid` | hasta 256 caracteres, con controles | hasta 128, sin controles | **128 caracteres, sin controles** (§5.2) | los dos |
 
+### Qué SDKs llevan lo decidido
+
+`ajustesSdks` es hoy **Node y Rust** (y `flux call` para §4.3.4 y la versión mayor). De los otros cinco SDKs —Python, Go,
+Java, .NET y PHP— solo llevan el **tope de 1 a 4 dígitos de la versión mayor, y solo en su patrón de subject**
+(`SUBJECT_PATTERN`/`SubjectPattern`), con un caso `v99999` rechazado y `v9999` aceptado en su test de unidad: sus tests
+comparan o recorren `protocol.json`, así que el patrón no podía quedarse atrás. **Todo lo demás está pendiente en esos
+cinco SDKs (Fase 6)**: `dlqerror` en bytes, `data` canónico, `time` normalizado, atributos vacíos, UTF-8 estricto, tipos de
+lo opcional y el código de los errores de construcción. Al alinearlos, se añaden a `ajustesSdks`.
+
 ### Lo que no se admite
 
 Diferencias de **lenguaje**, no de SDK: ningún vector las iguala, porque ningún SDK puede evitarlas. Están en la spec
