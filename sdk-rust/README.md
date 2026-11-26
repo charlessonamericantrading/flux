@@ -486,12 +486,26 @@ Matices que la tabla no dice:
 
 - **`$JS.API.STREAM.INFO.DLQ_<DOM>`** lo exige `subscribe()`: comprueba que la DLQ existe
   antes de empezar, para no descubrir en el primer fallo que no hay dónde enrutarlo.
-- **`$JS.API.CONSUMER.INFO…`** lo usan el sondeo de `flux_consumer_pending` (solo si hay
-  `metrics`) y el camino de «consumidor ya aprovisionado» de abajo. Sin el permiso el sondeo
-  no rompe nada, pero el broker deniega una petición cada 15 s.
+- **`$JS.API.CONSUMER.INFO…` es imprescindible**: `subscribe()` **pregunta primero** si el
+  consumidor existe y solo lo crea si no. Sin el permiso, `subscribe()` falla con
+  `PERMISSION_DENIED` nombrando ese subject (no se sabe si falta, así que tampoco es
+  `NOT_PROVISIONED`). Lo usa además el sondeo de `flux_consumer_pending` (solo si hay `metrics`).
 - **`$JS.API.CONSUMER.CREATE…` es prescindible en producción.** Si el consumidor lo crea
-  `flux provision`, la ACL puede omitirlo: el SDK intenta crear, ve la denegación, consulta el
-  que ya existe y lo usa (`assert_config_honored` sigue comparando su config con la canónica).
+  `flux provision`, el SDK lo encuentra con `INFO` y lo usa sin intentar crear nada
+  (`assert_config_honored` sigue comparando su config con la canónica). **Antes** intentaba
+  crear primero y absorbía la denegación: funcionaba, pero cada arranque dejaba en el log del
+  servidor un `Publish Violation - Subject "$JS.API.CONSUMER.CREATE…"`. Ahora un servicio
+  aprovisionado, sin `CREATE`, arranca con **cero** violaciones
+  (`c_info_antes_de_crear_en_los_dos_sentidos`). Con el permiso y sin consumidor, lo crea.
+- **`$JS.API.CONSUMER.MSG.NEXT…` (el pull) también hace fallar `subscribe()` si falta**, con
+  `PERMISSION_DENIED`. El broker no contesta a un pull denegado, así que sin esto el
+  consumidor se quedaría inerte y parecería sano: el peor modo de fallo. Se comprueba
+  **antes** de arrancar el bucle de consumo, con una petición propia —un JSON truncado, `{`,
+  que el servidor contesta `400` sin entregar ni apuntar nada—, porque el `flush()` de
+  `async-nats` no hace ida y vuelta y su primer pull sale de una tarea de fondo sin orden
+  respecto a quien llama (medido: sin la comprobación, `subscribe()` devolvía `Ok` a los
+  ~4 ms y la denegación se registraba ~2 ms después). Un permiso que se pierda *después*
+  de suscribirse ya no puede devolverse como `Result`: solo lo registra el `logger`.
 - **`$JS.API.INFO`, `STREAM.CREATE` y `STREAM.MSG.GET` no los usa el SDK.** Un `$JS.API.INFO`
   en una ACL candidata sobra.
 - **El ack va por `$JS.ACK.<stream>.<d>.>`**, y el mismo permiso cubre `+ACK`, `+WPI`
@@ -512,6 +526,7 @@ denegación llega en milisegundos.
 |---|---|---|---|
 | El stream o el consumidor **no existe** y la ACL no concede crearlo | `FluxError::NotProvisioned` | `NOT_PROVISIONED` | PERMANENT |
 | Ni siquiera hay permiso para **consultar** el recurso, o para publicar en un subject | `FluxError::PermissionDenied` | `PERMISSION_DENIED` | PERMANENT |
+| **No se puede pedir mensajes** del consumidor (`CONSUMER.MSG.NEXT`): `subscribe()` falla en vez de dejar un consumidor inerte | `FluxError::PermissionDenied` | `PERMISSION_DENIED` | PERMANENT |
 
 `NOT_PROVISIONED` nombra el recurso y dice que en producción se aprovisiona con
 `flux provision`; no es un timeout. Las dos son PERMANENT por la misma razón que un 403:
@@ -520,11 +535,39 @@ ACL de la v1, y al publicar en un dominio ajeno (`solo el servicio dueño del do
 en él`). Ninguna expone un tipo de NATS: el texto de la denegación es el del servidor, para
 poder buscarlo tal cual en su log.
 
-⚠️ **Lo que no se puede convertir en `Result`:** un `subscribe()` que ya devolvió `Ok` y
-después pierde el permiso de `MSG.NEXT` o de `$JS.ACK` no tiene a quién devolver el error: el
-ack es un `publish` sin respuesta. Esas denegaciones llegan por el `logger`
-(`[flux] el broker denegó Publish to "$JS.ACK.…"`), y el síntoma en el broker es un mensaje
-que sigue pendiente y se reentrega. Configura siempre `with_logger`.
+⚠️ **Lo que no se puede convertir en `Result`:** el `ack` (y `nak`, `term` y WIP, que publican
+en el mismo `$JS.ACK.…`) es un `publish` sin respuesta, y un `subscribe()` que ya devolvió
+`Ok` y después pierde el permiso de `MSG.NEXT` tampoco tiene a quién devolver el error. Esas
+denegaciones llegan por el `logger` (`[flux] el broker denegó Publish to "$JS.ACK.…"`), y el
+síntoma en el broker es un mensaje que sigue pendiente y se reentrega. Configura siempre
+`with_logger`.
+
+### Los errores de `connect()`
+
+[04-errors.md §5.3](../specification/04-errors.md). Tres códigos estables, **todos PERMANENT**
+(`FluxError::class()` es `Permanent` y `code()` devuelve el literal):
+
+| Variante | `code()` | Cuándo |
+|---|---|---|
+| `FluxError::ConnectionRejected { reason, .. }` | `CONNECTION_REJECTED` | El broker **contestó** y rechazó la primera conexión por algo que esperar no arregla. `reason` es `RejectionReason::Auth` (rechazó la credencial) o `RejectionReason::Tls` (el certificado no verifica, se exigió TLS y no lo ofrece, o exige certificado de cliente) |
+| `FluxError::InvalidCredentials(texto)` | `INVALID_CREDENTIALS` | Una credencial mal formada, detectada **antes de abrir ningún socket**: vacía, un `.creds` ilegible o sin JWT y semilla, una semilla que no es `SU…` |
+| `FluxError::InvalidTlsOptions(texto)` | `INVALID_TLS_OPTIONS` | Una opción TLS mal formada, también **sin red**: un fichero ilegible o que no es PEM, o un certificado de cliente sin su clave (o al revés) |
+
+Se distinguen porque lo que hay que revisar es distinto: las dos últimas son *lo que pasaste a
+`connect()`*; la primera es *lo que hay en el broker* (o un certificado que no encaja), con la
+opción bien formada. Una credencial bien formada pero equivocada es `CONNECTION_REJECTED`,
+nunca `INVALID_CREDENTIALS`; y un broker que aún no ha arrancado **no es ninguno de los
+tres**: `connect()` espera. `FluxError::Config` y `FluxError::Transport` siguen existiendo
+para lo demás (un servicio sin nombre, una lista de servidores que no se entiende) y **no**
+llevan código. `code()` es lo que se lee —`match err.code()`— y no hace falta ramificar por
+variante; las constantes están exportadas: `flux::CONNECTION_REJECTED_CODE`,
+`flux::INVALID_CREDENTIALS_CODE` y `flux::INVALID_TLS_OPTIONS_CODE`.
+
+> **Cambio respecto a versiones anteriores.** Un `.creds` ilegible, una semilla mal formada o
+> una CA que no es PEM eran `FluxError::Config`, y una credencial o un TLS rechazados eran
+> `FluxError::Transport`. Ahora son las variantes de arriba. `FluxError` es `#[non_exhaustive]`
+> (un `match` ya necesitaba un brazo `_`), pero quien comparara con `Config`/`Transport` para
+> esos casos debe pasar a `code()`.
 
 ### TLS
 
@@ -541,8 +584,12 @@ let opts = flux::ConnectOptions::new("tls://nats.interno:4222", "pedidos-api", "
   claro—. `with_required(false)` solo para el docker-compose de desarrollo.
 - Una **CA propia sustituye** a las raíces del sistema, no las amplía: con una CA propia,
   solo esa CA es de fiar.
-- Los ficheros se comprueban **antes de tocar la red** (existen, son PEM): un fichero
-  equivocado es `FluxError::Config`, no un handshake que falla con un error que no lo dice.
+- Las opciones se comprueban **antes de tocar la red** (los ficheros existen y son PEM; un
+  certificado de cliente va con su clave): una equivocación es `FluxError::InvalidTlsOptions`
+  (`INVALID_TLS_OPTIONS`), no un handshake que falla con un error que no lo dice. Un
+  certificado que el broker no acepta —CA ausente o equivocada, host fuera de los SAN,
+  caducado— es otra cosa: `FluxError::ConnectionRejected` con `RejectionReason::Tls`, y el
+  mensaje lleva la causa de `rustls` (`certificate not valid for name …`).
 - Se traducen a `require_tls`, `add_root_certificates` y `add_client_certificate` de
   `async-nats`; ningún tipo de `rustls` ni de NATS aparece en la API.
 
@@ -559,11 +606,14 @@ let opts = flux::ConnectOptions::new("tls://nats.interno:4222", "pedidos-api", "
 | `Token(token)` | Token estático |
 | `UserPassword { user, password }` | Usuario y contraseña |
 
-- **Un valor mal formado falla en `connect()`, antes de tocar la red**, y sin volcar el
-  secreto en el mensaje: un `.creds` ilegible o sin las dos secciones, una semilla que no es
-  de usuario (`SA…`, `SO…`), un fichero que no existe. `Debug` de las credenciales nunca
-  imprime secretos.
+- **Un valor mal formado falla en `connect()`, antes de tocar la red**, con
+  `FluxError::InvalidCredentials` (`INVALID_CREDENTIALS`) y sin volcar el secreto en el
+  mensaje: un token, usuario o contraseña vacíos (casi siempre una variable de entorno sin
+  definir; si no quieres autenticarte, `Credentials::None`), un `.creds` ilegible o sin las
+  dos secciones, una semilla que no es de usuario (`SA…`, `SO…`), un fichero que no existe.
+  `Debug` de las credenciales nunca imprime secretos.
 - **Una credencial bien formada pero rechazada también falla en `connect()`**, con
+  `FluxError::ConnectionRejected` (`CONNECTION_REJECTED`, `RejectionReason::Auth`):
   `rechazó la credencial de este servicio`. Antes el SDK usaba `retry_on_initial_connect` de
   `async-nats`, que reintenta **para siempre y sin distinguir causas**: una contraseña
   equivocada o una CA que no encaja se volvían un servicio que arranca, pasa el healthcheck y
@@ -576,7 +626,7 @@ let opts = flux::ConnectOptions::new("tls://nats.interno:4222", "pedidos-api", "
 ### Qué está verificado y cómo
 
 ```bash
-NATS_SERVER=/ruta/a/nats-server cargo test --test security   # 23 tests, ~16 s
+NATS_SERVER=/ruta/a/nats-server cargo test --test security   # 30 tests, ~16 s
 ```
 
 Cada test arranca su propio broker en un puerto libre (rango `FLUX_TEST_PORT_BASE`, por defecto
@@ -588,11 +638,13 @@ lo que usa CI, para que un job verde no pueda significar «no se ejecutó nada»
 |---|---|
 | Publicar, suscribir, ack, WIP, DLQ por permanente y reintento, de extremo a extremo bajo permisos exactos, sin una denegación | `a_*` |
 | Con los permisos de la ACL antigua falla **claro y rápido**, y con los exactos la misma operación funciona | `b_*` |
-| `NOT_PROVISIONED` (stream, consumidor), consumidor aprovisionado sin permiso de crear, y creación con permiso | `c_*` |
+| `NOT_PROVISIONED` (stream, consumidor), consumidor aprovisionado sin permiso de crear **y sin una violación en el log del servidor**, creación con permiso (preguntando antes), y `PERMISSION_DENIED` sin permiso de consultar | `c_*` |
 | Sin concesión sobre un dominio: ni lo recibe, ni espía el inbox ajeno; con el `_INBOX.>` antiguo **sí** lo lee | `d_*` |
 | Aislamiento estricto de tenant bajo la ACL: los eventos ajenos se descartan **con ack** | `e_*` |
 | Autenticación nkey, usuario/contraseña, token —correctas e incorrectas— y `.creds` | `f_*` |
 | TLS con CA propia, mTLS, TLS exigido contra un broker sin TLS | `tls_*` |
+| Sin permiso de pull, `subscribe()` falla con `PERMISSION_DENIED` y no deja bucle; con él funciona y la sonda no se lleva ningún mensaje; y la premisa del broker (`400` a un pull truncado, nada sacado; un pull válido sí saca) | `g_*` |
+| Cada código de `connect()` en **todas** sus situaciones —22 filas, 10 de ellas contra brokers reales— y en ninguna otra, con su motivo y su causa | `h_*` |
 
 ⚠️ **`.creds`**: verificado contra un broker en **modo operador/JWT** real
 (`f_creds_contra_un_broker_en_modo_operador_jwt`): operador, cuenta con JetStream y usuario con

@@ -160,6 +160,18 @@ describe("credenciales → autenticador", () => {
     assert.throws(() => buildAuthenticator({ pass: "p" }), InvalidCredentialsError);
   });
 
+  test("el error lleva el código estable INVALID_CREDENTIALS (04-errors.md §5.3)", () => {
+    // El código es lo que agrupa los fallos en la DLQ y en las métricas: si cambia, o si dos
+    // SDKs emiten uno distinto para lo mismo, agrupar por causa deja de funcionar.
+    for (const mal of [{ user: "u" }, { token: "" }, { token: 42 } as never]) {
+      assert.throws(
+        () => buildAuthenticator(mal),
+        (e: Error & { code?: string }) =>
+          e instanceof InvalidCredentialsError && e.code === "INVALID_CREDENTIALS",
+      );
+    }
+  });
+
   test("un valor vacío no es «sin credencial»: lanza", () => {
     for (const mal of [{ token: "" }, { token: "  " }, { user: "", pass: "p" }, { nkeySeed: "" }]) {
       assert.throws(() => buildAuthenticator(mal), InvalidCredentialsError);
@@ -250,6 +262,14 @@ describe("TLS → opciones del cliente", () => {
     const key = fichero("c2.key", "key");
     assert.throws(() => buildTls({ certFile: cert }), /van juntos/);
     assert.throws(() => buildTls({ keyFile: key }), InvalidTlsOptionsError);
+  });
+
+  test("el error lleva el código estable INVALID_TLS_OPTIONS (04-errors.md §5.3)", () => {
+    assert.throws(
+      () => buildTls({ certFile: fichero("c3.pem", "cert") }),
+      (e: Error & { code?: string }) =>
+        e instanceof InvalidTlsOptionsError && e.code === "INVALID_TLS_OPTIONS",
+    );
   });
 
   test("`null` NO se admite: en el cliente NATS significa «no uses TLS»", () => {

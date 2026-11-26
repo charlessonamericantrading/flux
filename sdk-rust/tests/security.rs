@@ -28,7 +28,7 @@ use std::time::{Duration, Instant};
 use async_nats::jetstream::{self, consumer, stream};
 use flux::{
     connect, ConnectOptions, Credentials, Delivery, ErrorClass, Event, FluxError, LogFn, LogLevel,
-    PublishOptions, SubscribeOptions, TenantIsolation, TlsOptions,
+    PublishOptions, RejectionReason, SubscribeOptions, TenantIsolation, TlsOptions,
 };
 use futures::StreamExt;
 use serde_json::json;
@@ -1094,7 +1094,8 @@ async fn c_consumidor_no_aprovisionado_y_sin_permiso_de_crear() {
 }
 
 /// Producción con `flux provision`: la infraestructura crea el consumidor y la ACL del
-/// servicio **omite** `CONSUMER.CREATE`. El SDK usa el que existe y el flujo funciona.
+/// servicio **omite** `CONSUMER.CREATE`. El SDK usa el que existe y el flujo funciona, **sin
+/// una sola denegación** —ni en su logger ni en el log del servidor—: pregunta antes de crear.
 #[tokio::test]
 async fn c_consumidor_aprovisionado_se_usa_sin_permiso_de_crear() {
     let bin = broker_bin!();
@@ -1135,14 +1136,167 @@ async fn c_consumidor_aprovisionado_se_usa_sin_permiso_de_crear() {
 
     assert!(wait_for(Duration::from_secs(5), || !calls.lock().unwrap().is_empty()).await);
     tokio::time::sleep(Duration::from_millis(500)).await;
-    // La única «denegación» tolerada es la del CREATE que el SDK intentó antes de caer en
-    // el consumidor existente: es el diseño. Ninguna más.
-    let otras: Vec<String> = denials(&lines)
-        .into_iter()
-        .filter(|l| !l.contains("CONSUMER.CREATE"))
-        .collect();
-    assert!(otras.is_empty(), "{otras:?}");
+    // Ninguna denegación. Antes se toleraba la del `CONSUMER.CREATE` que el SDK intentaba
+    // ANTES de preguntar y que el broker dejaba en su log en cada arranque.
+    assert!(denials(&lines).is_empty(), "{:?}", denials(&lines));
+    assert!(
+        broker.violations().is_empty(),
+        "el broker registró violaciones: {:?}",
+        broker.violations()
+    );
     assert_eq!(consumer_state(&ops, "facturacion-api", SUBJECT).await.0, 0);
+}
+
+/// Los permisos que el SDK PUBLICÓ al suscribirse, de la consola del testigo.
+fn publicados_por(seen: &Arc<Mutex<Vec<Seen>>>, servicio: &str) -> Vec<String> {
+    let inbox = format!("_INBOX.{servicio}.");
+    seen.lock()
+        .unwrap()
+        .iter()
+        .filter(|m| m.reply.starts_with(&inbox))
+        .map(|m| m.subject.clone())
+        .collect()
+}
+
+/// «Info antes de crear» (06-security.md §3.4), en los dos sentidos y **sin depender de lo que
+/// diga la ACL**: lo que importa es lo que el SDK publica.
+///
+/// 1. Consumidor aprovisionado, ACL sin CREATE: ninguna violación en el log del servidor.
+/// 2. Consumidor aprovisionado y ACL CON permiso de crear: **no** crea —el permiso existe,
+///    pero el consumidor también, y crear sobre uno existente no hace falta—.
+/// 3. Consumidor sin aprovisionar y ACL con permiso de crear: pregunta (no existe) y LUEGO
+///    lo crea, con la configuración canónica.
+#[tokio::test]
+async fn c_info_antes_de_crear_en_los_dos_sentidos() {
+    let bin = broker_bin!();
+    let durable = flux::durable_name("facturacion-api", SUBJECT).expect("durable");
+    let info = format!("$JS.API.CONSUMER.INFO.EVT_PEDIDOS.{durable}");
+    let create = format!("$JS.API.CONSUMER.CREATE.EVT_PEDIDOS.{durable}.{SUBJECT}");
+
+    // — 1. y 2. Aprovisionado: con y sin permiso de crear. —
+    for (con_create, nombre) in [
+        (false, "sin permiso de crear"),
+        (true, "con permiso de crear"),
+    ] {
+        let perms = if con_create {
+            Perms::consumer("facturacion-api", SUBJECT)
+        } else {
+            Perms::consumer("facturacion-api", SUBJECT).without("$JS.API.CONSUMER.CREATE.")
+        };
+        let broker = Broker::start(&bin, "", &accounts(&[pw_user("facturacion-api", &perms)]));
+        let ops = ops(&broker).await;
+        provision_streams(&ops, &["pedidos"]).await;
+        provision_consumer(&ops, "facturacion-api", SUBJECT).await;
+        let seen = sniff(&ops).await;
+
+        let (log, lines) = capture_log();
+        let bus = connect(opts(&broker, "facturacion-api").with_logger(log))
+            .await
+            .expect("conexión");
+        let sub = bus
+            .subscribe(SUBJECT, |_e: Event, _d| async { Ok(()) })
+            .await
+            .unwrap_or_else(|e| panic!("{nombre}: subscribe() sobre el aprovisionado: {e:?}"));
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        sub.unsubscribe();
+
+        let publicados = publicados_por(&seen, "facturacion-api");
+        assert!(
+            publicados.contains(&info),
+            "{nombre}: debe preguntar por el consumidor: {publicados:?}"
+        );
+        assert!(
+            !publicados
+                .iter()
+                .any(|s| s.starts_with("$JS.API.CONSUMER.CREATE.")),
+            "{nombre}: el consumidor existe, no hay nada que crear: {publicados:?}"
+        );
+        assert!(
+            broker.violations().is_empty(),
+            "{nombre}: el broker registró violaciones: {:?}",
+            broker.violations()
+        );
+        assert!(
+            denials(&lines).is_empty(),
+            "{nombre}: {:?}",
+            denials(&lines)
+        );
+    }
+
+    // — 3. Sin aprovisionar y con permiso de crear: pregunta y luego crea. —
+    let perms = Perms::consumer("facturacion-api", SUBJECT);
+    let broker = Broker::start(&bin, "", &accounts(&[pw_user("facturacion-api", &perms)]));
+    let ops = ops(&broker).await;
+    provision_streams(&ops, &["pedidos"]).await;
+    let seen = sniff(&ops).await;
+    let bus = connect(opts(&broker, "facturacion-api"))
+        .await
+        .expect("conexión");
+    let sub = bus
+        .subscribe(SUBJECT, |_e: Event, _d| async { Ok(()) })
+        .await
+        .expect("con permiso de crear y sin consumidor, lo crea");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    sub.unsubscribe();
+
+    let publicados = publicados_por(&seen, "facturacion-api");
+    let pos = |subject: &str| publicados.iter().position(|s| s == subject);
+    let (i_info, i_create) = (pos(&info), pos(&create));
+    assert!(
+        i_info.is_some() && i_create.is_some() && i_info < i_create,
+        "debe preguntar y LUEGO crear: {publicados:?}"
+    );
+    assert!(broker.violations().is_empty(), "{:?}", broker.violations());
+    // El consumidor existe y lleva la configuración canónica (03-delivery.md §2).
+    let stream = jetstream::new(ops.clone())
+        .get_stream("EVT_PEDIDOS")
+        .await
+        .expect("stream");
+    let creado = stream
+        .consumer_info(&durable)
+        .await
+        .expect("lo creó el SDK");
+    assert_eq!(creado.config.ack_wait, flux::DEFAULT_ACK_WAIT);
+    assert_eq!(
+        creado.config.max_deliver,
+        i64::from(flux::DEFAULT_MAX_DELIVER)
+    );
+    assert_eq!(creado.config.backoff, flux::CANONICAL_BACKOFF.to_vec());
+}
+
+/// Si ni siquiera puede **consultar** el consumidor, no sabe si falta: es `PERMISSION_DENIED`
+/// —nombrando el subject de la consulta—, no `NOT_PROVISIONED`. Aunque el consumidor exista y
+/// aunque la ACL conceda crear: sin la consulta no hay forma de preguntar antes de crear.
+#[tokio::test]
+async fn c_sin_permiso_de_consultar_el_consumidor_es_permission_denied() {
+    let bin = broker_bin!();
+    let perms = Perms::consumer("facturacion-api", SUBJECT).without("$JS.API.CONSUMER.INFO.");
+    let broker = Broker::start(&bin, "", &accounts(&[pw_user("facturacion-api", &perms)]));
+    let ops = ops(&broker).await;
+    provision_streams(&ops, &["pedidos"]).await;
+    provision_consumer(&ops, "facturacion-api", SUBJECT).await;
+
+    let bus = connect(opts(&broker, "facturacion-api"))
+        .await
+        .expect("conexión");
+    let t = Instant::now();
+    let err = tokio::time::timeout(
+        Duration::from_secs(4),
+        bus.subscribe(SUBJECT, |_e: Event, _d| async { Ok(()) }),
+    )
+    .await
+    .expect("NO debe colgarse")
+    .unwrap_err();
+    assert!(t.elapsed() < Duration::from_secs(3), "{:?}", t.elapsed());
+    assert!(matches!(err, FluxError::PermissionDenied { .. }), "{err:?}");
+    assert_eq!(err.code(), Some("PERMISSION_DENIED"));
+    let durable = flux::durable_name("facturacion-api", SUBJECT).expect("durable");
+    assert!(
+        err.to_string().contains(&format!(
+            "Publish to \"$JS.API.CONSUMER.INFO.EVT_PEDIDOS.{durable}\""
+        )),
+        "{err}"
+    );
 }
 
 /// El contrario: si la ACL SÍ concede crear (desarrollo, o una ACL amplia), nada falla ni
@@ -1530,6 +1684,23 @@ async fn connect_debe_fallar(o: ConnectOptions) -> FluxError {
     r.expect_err("connect() debía fallar")
 }
 
+/// El error lleva el código estable `codigo` (04-errors.md §5.3) y es PERMANENT.
+fn assert_code(err: &FluxError, codigo: &str) {
+    assert_eq!(err.code(), Some(codigo), "{err:?}");
+    assert_eq!(err.class(), Some(ErrorClass::Permanent), "{err:?}");
+}
+
+/// El broker contestó y rechazó la conexión: `CONNECTION_REJECTED` con ese motivo. Y no es
+/// ninguno de los otros dos códigos de `connect()` —que son opciones mal formadas, detectadas
+/// sin red—.
+fn assert_rejected(err: &FluxError, reason: RejectionReason) {
+    match err {
+        FluxError::ConnectionRejected { reason: r, .. } => assert_eq!(*r, reason, "{err:?}"),
+        otro => panic!("debía ser ConnectionRejected({reason}), es {otro:?}"),
+    }
+    assert_code(err, "CONNECTION_REJECTED");
+}
+
 #[tokio::test]
 async fn f_usuario_y_contrasena() {
     let bin = broker_bin!();
@@ -1556,7 +1727,7 @@ async fn f_usuario_y_contrasena() {
         },
     ))
     .await;
-    assert!(matches!(err, FluxError::Transport { .. }), "{err:?}");
+    assert_rejected(&err, RejectionReason::Auth);
     assert!(err.to_string().contains("rechazó la credencial"), "{err}");
     assert!(
         !err.to_string().contains("equivocada"),
@@ -1569,11 +1740,13 @@ async fn f_usuario_y_contrasena() {
         },
     ))
     .await;
+    assert_rejected(&err, RejectionReason::Auth);
     assert!(err.to_string().contains("rechazó la credencial"), "{err}");
 
     // Sin credencial en un broker que la exige.
     let err =
         connect_debe_fallar(opts(&broker, "pedidos-api").with_credentials(Credentials::None)).await;
+    assert_rejected(&err, RejectionReason::Auth);
     assert!(err.to_string().contains("rechazó la credencial"), "{err}");
 }
 
@@ -1622,6 +1795,7 @@ async fn f_nkey() {
     // Lo incorrecto 1: una semilla bien formada pero de una clave que el broker no conoce.
     let otra = nkeys::KeyPair::new_user().seed().expect("semilla");
     let err = connect_debe_fallar(o(Credentials::NkeySeed(otra.clone()))).await;
+    assert_rejected(&err, RejectionReason::Auth);
     assert!(err.to_string().contains("rechazó la credencial"), "{err}");
     assert!(
         !err.to_string().contains(&otra),
@@ -1646,7 +1820,8 @@ async fn f_nkey() {
         .await
         .expect("debe fallar antes de intentar conectar")
         .unwrap_err();
-        assert!(matches!(err, FluxError::Config(_)), "{err:?}");
+        assert!(matches!(err, FluxError::InvalidCredentials(_)), "{err:?}");
+        assert_code(&err, "INVALID_CREDENTIALS");
         if !malo.is_empty() {
             assert!(
                 !err.to_string().contains(malo),
@@ -1657,7 +1832,8 @@ async fn f_nkey() {
     let err = connect(sin_broker(Credentials::NkeyFile("/no/existe.nk".into())))
         .await
         .unwrap_err();
-    assert!(matches!(err, FluxError::Config(_)), "{err:?}");
+    assert!(matches!(err, FluxError::InvalidCredentials(_)), "{err:?}");
+    assert_code(&err, "INVALID_CREDENTIALS");
 }
 
 #[tokio::test]
@@ -1675,6 +1851,7 @@ async fn f_token() {
         .await
         .expect("token correcto");
     let err = connect_debe_fallar(o(Credentials::Token("equivocado".into()))).await;
+    assert_rejected(&err, RejectionReason::Auth);
     assert!(err.to_string().contains("rechazó la credencial"), "{err}");
 }
 
@@ -1704,7 +1881,12 @@ async fn f_un_creds_mal_formado_falla_en_alto() {
             .await
             .expect("debe fallar antes de intentar conectar")
             .unwrap_err();
-        assert!(matches!(err, FluxError::Config(_)), "{}: {err:?}", p.display());
+        assert!(
+            matches!(err, FluxError::InvalidCredentials(_)),
+            "{}: {err:?}",
+            p.display()
+        );
+        assert_code(&err, "INVALID_CREDENTIALS");
         assert!(err.to_string().contains(".creds"), "{err}");
     }
 }
@@ -1880,6 +2062,7 @@ async fn f_creds_contra_un_broker_en_modo_operador_jwt() {
             .with_credentials(Credentials::CredsFile(p))
     };
     let err = connect_debe_fallar(o(mezclada)).await;
+    assert_rejected(&err, RejectionReason::Auth);
     assert!(err.to_string().contains("rechazó la credencial"), "{err}");
 
     // Lo incorrecto 2: un JWT emitido por una cuenta que el operador no conoce.
@@ -1888,6 +2071,7 @@ async fn f_creds_contra_un_broker_en_modo_operador_jwt() {
         creds_text(&ajena, &ajena, &u, &u, Some(&perms)),
     );
     let err = connect_debe_fallar(o(ajeno)).await;
+    assert_rejected(&err, RejectionReason::Auth);
     assert!(err.to_string().contains("rechazó la credencial"), "{err}");
 }
 
@@ -1942,6 +2126,30 @@ impl Pki {
             ExtendedKeyUsagePurpose::ServerAuth,
         );
         firmar("cliente", vec![], ExtendedKeyUsagePurpose::ClientAuth);
+        // Firmados por la MISMA CA, pero que no valen para este broker: uno de otro host y otro
+        // caducado. La CA que los firmó es de fiar, así que el fallo es del certificado, no de
+        // la cadena: es lo que distingue «host fuera de los SAN» y «caducado» de «CA ausente».
+        firmar(
+            "servidor-otro-host",
+            vec![SanType::DnsName(
+                "otro-host.example".try_into().expect("dns"),
+            )],
+            ExtendedKeyUsagePurpose::ServerAuth,
+        );
+        {
+            let key = KeyPair::generate().expect("clave");
+            let mut p = CertificateParams::new(Vec::<String>::new()).expect("params");
+            p.subject_alt_names = vec![SanType::IpAddress("127.0.0.1".parse().expect("ip"))];
+            p.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+            p.not_before = rcgen::date_time_ymd(2020, 1, 1);
+            p.not_after = rcgen::date_time_ymd(2021, 1, 1);
+            p.distinguished_name = DistinguishedName::new();
+            p.distinguished_name
+                .push(DnType::CommonName, "servidor-caducado");
+            let cert = p.signed_by(&key, &ca, &ca_key).expect("firma");
+            std::fs::write(dir.join("servidor-caducado.pem"), cert.pem()).expect("cert");
+            std::fs::write(dir.join("servidor-caducado.key"), key.serialize_pem()).expect("key");
+        }
         std::fs::write(dir.join("ca.pem"), ca.pem()).expect("ca");
 
         // Una SEGUNDA CA, ajena: para comprobar que una CA que no firmó el certificado del
@@ -1967,10 +2175,16 @@ impl Pki {
 
     /// Configuración TLS del servidor; `verify` exige certificado de cliente (mTLS).
     fn server_conf(&self, verify: bool) -> String {
+        self.server_conf_con("servidor", verify)
+    }
+
+    /// Como [`Self::server_conf`], con el certificado de servidor `cert` (`servidor`,
+    /// `servidor-otro-host`, `servidor-caducado`).
+    fn server_conf_con(&self, cert: &str, verify: bool) -> String {
         format!(
             "tls {{ cert_file: \"{}\", key_file: \"{}\", ca_file: \"{}\", verify: {verify}, timeout: 2 }}",
-            self.f("servidor.pem").display(),
-            self.f("servidor.key").display(),
+            self.f(&format!("{cert}.pem")).display(),
+            self.f(&format!("{cert}.key")).display(),
             self.f("ca.pem").display()
         )
     }
@@ -2025,23 +2239,28 @@ async fn tls_con_ca_propia() {
 
     // Lo incorrecto 1: sin CA propia, el certificado del broker no es de fiar.
     let err = connect_debe_fallar(tls_opts(&broker.url()).with_tls(TlsOptions::new())).await;
-    assert!(matches!(err, FluxError::Transport { .. }), "{err:?}");
+    assert_rejected(&err, RejectionReason::Tls);
     assert!(err.to_string().contains("TLS"), "{err}");
+    // La causa de verdad viaja en el mensaje: el certificado de un emisor desconocido.
+    assert!(err.to_string().contains("UnknownIssuer"), "{err}");
 
     // Lo incorrecto 2: una CA que no firmó ese certificado.
     let err = connect_debe_fallar(
         tls_opts(&broker.url()).with_tls(TlsOptions::new().with_ca_file(pki.f("otra-ca.pem"))),
     )
     .await;
+    assert_rejected(&err, RejectionReason::Tls);
     assert!(err.to_string().contains("TLS"), "{err}");
 
-    // Lo incorrecto 3: la CA no existe / no es un PEM → error de CONFIGURACIÓN, sin red.
+    // Lo incorrecto 3: la CA no existe / no es un PEM → INVALID_TLS_OPTIONS, sin red. Es una
+    // opción mal formada, no un rechazo del broker: son dos códigos y dos remedios.
     for malo in [pki.f("no-existe.pem"), pki.f("servidor.key")] {
         let err =
             connect(tls_opts("nats://127.0.0.1:1").with_tls(TlsOptions::new().with_ca_file(malo)))
                 .await
                 .unwrap_err();
-        assert!(matches!(err, FluxError::Config(_)), "{err:?}");
+        assert!(matches!(err, FluxError::InvalidTlsOptions(_)), "{err:?}");
+        assert_code(&err, "INVALID_TLS_OPTIONS");
     }
 }
 
@@ -2058,7 +2277,7 @@ async fn tls_exigido_contra_un_broker_sin_tls_falla() {
         tls_opts(&broker.url()).with_tls(TlsOptions::new().with_ca_file(pki.f("ca.pem"))),
     )
     .await;
-    assert!(matches!(err, FluxError::Transport { .. }), "{err:?}");
+    assert_rejected(&err, RejectionReason::Tls);
 
     // El contrario: sin `with_tls` el mismo broker en texto plano funciona (desarrollo).
     connect(tls_opts(&broker.url()))
@@ -2108,7 +2327,7 @@ async fn tls_mutuo_con_certificado_de_cliente() {
         tls_opts(&broker.url()).with_tls(TlsOptions::new().with_ca_file(pki.f("ca.pem"))),
     )
     .await;
-    assert!(matches!(err, FluxError::Transport { .. }), "{err:?}");
+    assert_rejected(&err, RejectionReason::Tls);
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
@@ -2167,4 +2386,556 @@ async fn connect_espera_al_broker_que_aun_no_ha_arrancado() {
     r.expect("connect() debe terminar al aparecer el broker")
         .expect("join")
         .expect("y conectar");
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+//  (g) Un pull denegado hace fallar `subscribe()` — 06-security.md §3.7
+// ═════════════════════════════════════════════════════════════════════════════
+
+/// Sin permiso de pull (`$JS.API.CONSUMER.MSG.NEXT.<stream>.<durable>`) el broker descarta la
+/// petición y no contesta: el consumidor quedaría inerte y PARECERÍA sano. `subscribe()` debe
+/// fallar —con `PERMISSION_DENIED`, nombrando el subject— en vez de devolver `Ok`.
+///
+/// Antes de este cambio devolvía `Ok` a los ~4 ms y la denegación solo llegaba por el logger,
+/// ~2 ms después (medido contra nats-server 2.14.5).
+#[tokio::test]
+async fn g_sin_permiso_de_pull_subscribe_falla_con_permission_denied() {
+    let bin = broker_bin!();
+    let pedidos = Perms::owner("pedidos-api", "pedidos");
+    // TODO lo demás concedido: lo único que falta es pedir mensajes.
+    let facturacion =
+        Perms::consumer("facturacion-api", SUBJECT).without("$JS.API.CONSUMER.MSG.NEXT.");
+    let broker = Broker::start(
+        &bin,
+        "",
+        &accounts(&[
+            pw_user("pedidos-api", &pedidos),
+            pw_user("facturacion-api", &facturacion),
+        ]),
+    );
+    let ops = ops(&broker).await;
+    provision_streams(&ops, &["pedidos"]).await;
+
+    let (log, lines) = capture_log();
+    let productor = connect(opts(&broker, "pedidos-api"))
+        .await
+        .expect("conexión");
+    let consumidor = connect(opts(&broker, "facturacion-api").with_logger(log))
+        .await
+        .expect("conexión");
+    let calls: Calls = Arc::new(Mutex::new(Vec::new()));
+
+    let t = Instant::now();
+    let err = tokio::time::timeout(
+        Duration::from_secs(4),
+        consumidor.subscribe(SUBJECT, handler(&calls)),
+    )
+    .await
+    .expect("NO debe colgarse")
+    .expect_err("subscribe() debe fallar: un pull denegado deja el consumidor inerte");
+    assert!(
+        t.elapsed() < Duration::from_secs(3),
+        "tardó {:?}",
+        t.elapsed()
+    );
+
+    // PERMISSION_DENIED, PERMANENT, y NO NOT_PROVISIONED: el recurso existe, falta el permiso.
+    assert!(matches!(err, FluxError::PermissionDenied { .. }), "{err:?}");
+    assert_eq!(err.code(), Some("PERMISSION_DENIED"));
+    assert_eq!(err.class(), Some(ErrorClass::Permanent));
+
+    // Accionable: el subject denegado COMPLETO y sin normalizar, lo que se intentaba y dónde
+    // se arregla.
+    let durable = flux::durable_name("facturacion-api", SUBJECT).expect("durable");
+    let denegado = format!("$JS.API.CONSUMER.MSG.NEXT.EVT_PEDIDOS.{durable}");
+    let texto = err.to_string();
+    assert!(
+        texto.contains(&format!("Publish to \"{denegado}\"")),
+        "{texto}"
+    );
+    assert!(texto.contains("pedir mensajes del consumidor"), "{texto}");
+    assert!(texto.contains("inerte"), "{texto}");
+    assert!(texto.contains("06-security.md"), "{texto}");
+
+    // El logger lo registra igual (§3.7): es la única salida de un pull que se deniega DESPUÉS
+    // de suscribirse, y la sonda de `subscribe()` no la quita.
+    assert!(
+        wait_for(Duration::from_secs(2), || denials(&lines)
+            .iter()
+            .any(|l| l.contains(&denegado)))
+        .await,
+        "{:?}",
+        lines.lock().unwrap()
+    );
+    // Y el servidor lo confirma: es una violación de permisos real, no un fallo del SDK.
+    assert!(
+        broker
+            .violations()
+            .iter()
+            .any(|l| l.contains(&format!("Publish Violation - Subject \"{denegado}\""))),
+        "{:?}",
+        broker.violations()
+    );
+
+    // No quedó ningún bucle de consumo: un evento publicado ahora no llega a ningún handler.
+    productor
+        .publish(
+            SUBJECT,
+            &json!({ "pedidoId": "ped-1", "caso": "ok", "aggregateVersion": 1 }),
+        )
+        .await
+        .expect("publicación");
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    assert!(calls.lock().unwrap().is_empty(), "{:?}", calls.lock());
+    let (pendientes, suelo, _) = consumer_state(&ops, "facturacion-api", SUBJECT).await;
+    assert_eq!((pendientes, suelo), (0, 0), "nada se entregó");
+}
+
+/// El contrario, y sin él el anterior no demuestra nada: con el permiso concedido, el MISMO
+/// servicio se suscribe y consume. Además, con un evento ya pendiente **antes** de suscribirse:
+/// la sonda del permiso no puede llevárselo —si lo hiciera, el handler no lo vería hasta
+/// `ack_wait` (30 s) y esta espera de 5 s fallaría—.
+#[tokio::test]
+async fn g_con_el_permiso_de_pull_subscribe_funciona_y_la_sonda_no_se_lleva_ningun_mensaje() {
+    let bin = broker_bin!();
+    let pedidos = Perms::owner("pedidos-api", "pedidos");
+    let facturacion = Perms::consumer("facturacion-api", SUBJECT);
+    let broker = Broker::start(
+        &bin,
+        "",
+        &accounts(&[
+            pw_user("pedidos-api", &pedidos),
+            pw_user("facturacion-api", &facturacion),
+        ]),
+    );
+    let ops = ops(&broker).await;
+    provision_streams(&ops, &["pedidos"]).await;
+    // El consumidor existe ANTES de que llegue el evento: así el mensaje queda pendiente para
+    // él, esperando a quien lo pida.
+    provision_consumer(&ops, "facturacion-api", SUBJECT).await;
+
+    let productor = connect(opts(&broker, "pedidos-api"))
+        .await
+        .expect("conexión");
+    productor
+        .publish(
+            SUBJECT,
+            &json!({ "pedidoId": "ped-1", "caso": "ok", "aggregateVersion": 1 }),
+        )
+        .await
+        .expect("publicación");
+
+    let (log, lines) = capture_log();
+    let consumidor = connect(opts(&broker, "facturacion-api").with_logger(log))
+        .await
+        .expect("conexión");
+    let calls: Calls = Arc::new(Mutex::new(Vec::new()));
+    let sub = consumidor
+        .subscribe(SUBJECT, handler(&calls))
+        .await
+        .expect("con el permiso de pull concedido, subscribe() funciona");
+
+    assert!(
+        wait_for(Duration::from_secs(5), || !calls.lock().unwrap().is_empty()).await,
+        "el evento pendiente debe llegar al handler: la sonda no puede habérselo llevado"
+    );
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(
+        calls.lock().unwrap().clone(),
+        vec![("ok".to_string(), 1)],
+        "una sola entrega, a la primera"
+    );
+    let (pendientes, suelo, reentregas) = consumer_state(&ops, "facturacion-api", SUBJECT).await;
+    assert_eq!(
+        (pendientes, suelo, reentregas),
+        (0, 1, 0),
+        "confirmado y sin reentregas"
+    );
+    assert!(denials(&lines).is_empty(), "{:?}", denials(&lines));
+    sub.unsubscribe();
+}
+
+/// La premisa del broker en la que descansa la sonda, medida contra el servidor real: un pull
+/// con el cuerpo truncado `{` se contesta `400 Bad Request` **sin** sacar ningún mensaje ni
+/// apuntarse como petición pendiente… y un pull VÁLIDO sí se lleva el mensaje. Esa diferencia
+/// es la razón de que la sonda sea un JSON roto y no un pull de verdad.
+///
+/// Si una versión futura de nats-server cambiara cualquiera de las dos cosas, falla ESTE test
+/// —con el motivo— antes que el de `subscribe()`.
+#[tokio::test]
+async fn g_la_sonda_del_pull_es_inocua_y_un_pull_valido_no_lo_seria() {
+    let bin = broker_bin!();
+    let broker = Broker::start(&bin, "", &accounts(&[]));
+    let ops = ops(&broker).await;
+    provision_streams(&ops, &["pedidos"]).await;
+    provision_consumer(&ops, "facturacion-api", SUBJECT).await;
+    let js = jetstream::new(ops.clone());
+    js.publish(SUBJECT, r#"{"x":1}"#.into())
+        .await
+        .expect("publicar")
+        .await
+        .expect("acuse");
+    let durable = flux::durable_name("facturacion-api", SUBJECT).expect("durable");
+    let pull = format!("$JS.API.CONSUMER.MSG.NEXT.EVT_PEDIDOS.{durable}");
+    let info = || async {
+        js.get_stream("EVT_PEDIDOS")
+            .await
+            .expect("stream")
+            .consumer_info(&durable)
+            .await
+            .expect("info del consumidor")
+    };
+
+    // 1. La sonda: 400, y el consumidor ni se entera.
+    let r = tokio::time::timeout(
+        Duration::from_secs(2),
+        ops.request(pull.clone(), "{".into()),
+    )
+    .await
+    .expect("el servidor contesta a la sonda")
+    .expect("respuesta");
+    assert_eq!(r.status.map(|s| s.as_u16()), Some(400), "{r:?}");
+    assert!(
+        r.description
+            .as_deref()
+            .is_some_and(|d| d.starts_with("Bad Request")),
+        "{r:?}"
+    );
+    assert!(r.payload.is_empty());
+    let i = info().await;
+    assert_eq!(
+        (i.num_pending, i.num_ack_pending, i.num_waiting),
+        (1, 0, 0),
+        "la sonda no saca el mensaje ni queda esperando"
+    );
+
+    // 2. Un pull válido, en cambio, se lleva el mensaje (y queda sin ack). Se recibe por una
+    // suscripción propia y no con `request()`: las entregas de un pull llegan con el subject
+    // ORIGINAL del evento (A-22), que el multiplexor de respuestas de `async-nats` no sabe a
+    // qué petición atribuir.
+    let inbox = ops.new_inbox();
+    let mut entregas = ops.subscribe(inbox.clone()).await.expect("suscripción");
+    ops.publish_with_reply(pull, inbox, r#"{"batch":1,"no_wait":true}"#.into())
+        .await
+        .expect("pull válido");
+    let entrega = tokio::time::timeout(Duration::from_secs(2), entregas.next())
+        .await
+        .expect("un pull válido recibe el mensaje")
+        .expect("suscripción abierta");
+    assert!(
+        entrega.status.is_none() && !entrega.payload.is_empty(),
+        "un pull válido entrega el mensaje: {entrega:?}"
+    );
+    assert_eq!(info().await.num_ack_pending, 1);
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+//  (h) Los tres códigos de `connect()` — 04-errors.md §5.3
+// ═════════════════════════════════════════════════════════════════════════════
+
+/// Lo que debe producir cada situación.
+#[derive(Debug, Clone, Copy)]
+enum Espera {
+    /// `CONNECTION_REJECTED`, con este motivo: el broker contestó y lo rechazó.
+    Rechazo(RejectionReason),
+    /// `INVALID_CREDENTIALS`: opción mal formada, sin red.
+    Credenciales,
+    /// `INVALID_TLS_OPTIONS`: opción mal formada, sin red.
+    OpcionesTls,
+    /// Un error de `connect()` que NO es ninguno de los tres: sin código estable.
+    SinCodigo,
+}
+
+impl Espera {
+    fn codigo(self) -> Option<&'static str> {
+        match self {
+            Self::Rechazo(_) => Some("CONNECTION_REJECTED"),
+            Self::Credenciales => Some("INVALID_CREDENTIALS"),
+            Self::OpcionesTls => Some("INVALID_TLS_OPTIONS"),
+            Self::SinCodigo => None,
+        }
+    }
+}
+
+/// Cada código de `connect()` se produce en su situación **y en ninguna otra**: la tabla
+/// recorre TODAS las situaciones de 03-delivery.md §6.1 contra brokers reales y exige, de
+/// cada una, exactamente su código —ni uno de los otros dos, ni ninguno—. Una situación que
+/// diera el código equivocado hace fallar la fila que la nombra.
+///
+/// La fila que falta, a propósito, es «el broker aún no ha arrancado»: no es un error, se
+/// espera (`connect_espera_al_broker_que_aun_no_ha_arrancado`).
+#[tokio::test]
+async fn h_cada_codigo_de_connect_se_produce_en_su_situacion_y_en_ninguna_otra() {
+    use RejectionReason::{Auth, Tls};
+    let bin = broker_bin!();
+    let pki = Pki::new();
+    let perms = Perms::owner("pedidos-api", "pedidos");
+    let users = accounts(&[pw_user("pedidos-api", &perms)]);
+    let plano = Broker::start(&bin, "", &users);
+    let tls = Broker::start(&bin, &pki.server_conf(false), &users);
+    let mtls = Broker::start(&bin, &pki.server_conf(true), &users);
+    let otro_host = Broker::start(
+        &bin,
+        &pki.server_conf_con("servidor-otro-host", false),
+        &users,
+    );
+    let caducado = Broker::start(
+        &bin,
+        &pki.server_conf_con("servidor-caducado", false),
+        &users,
+    );
+
+    let con_ca = || TlsOptions::new().with_ca_file(pki.f("ca.pem"));
+    // `nats://127.0.0.1:1`: no hay nadie. Las opciones mal formadas deben fallar ANTES de
+    // intentar conectar, así que a quien contestara habría que esperarlo (y la fila fallaría
+    // por tiempo, no por código).
+    let sin_red = |c: Credentials, t: Option<TlsOptions>| {
+        let o = ConnectOptions::new("nats://127.0.0.1:1", "pedidos-api", "test", "1.0.0")
+            .with_credentials(c);
+        match t {
+            Some(t) => o.with_tls(t),
+            None => o,
+        }
+    };
+    let usuario = |pw: &str| Credentials::UserPassword {
+        user: "pedidos-api".into(),
+        password: pw.into(),
+    };
+    let ok_cred = || usuario("pw");
+
+    let filas: Vec<(&str, ConnectOptions, Espera)> = vec![
+        // ── CONNECTION_REJECTED, motivo `auth`: el broker contestó y no acepta la credencial.
+        (
+            "contraseña equivocada",
+            tls_opts(&plano.url()).with_credentials(usuario("equivocada")),
+            Espera::Rechazo(Auth),
+        ),
+        (
+            "usuario que el broker no conoce",
+            tls_opts(&plano.url()).with_credentials(Credentials::UserPassword {
+                user: "nadie".into(),
+                password: "pw".into(),
+            }),
+            Espera::Rechazo(Auth),
+        ),
+        (
+            "sin credencial en un broker que la exige",
+            tls_opts(&plano.url()).with_credentials(Credentials::None),
+            Espera::Rechazo(Auth),
+        ),
+        (
+            "token que el broker no acepta",
+            tls_opts(&plano.url()).with_credentials(Credentials::Token("tok".into())),
+            Espera::Rechazo(Auth),
+        ),
+        // ── CONNECTION_REJECTED, motivo `tls`: el handshake no encaja.
+        (
+            "certificado de servidor sin CA propia (raíces del sistema)",
+            tls_opts(&tls.url()).with_tls(TlsOptions::new()),
+            Espera::Rechazo(Tls),
+        ),
+        (
+            "una CA que no firmó el certificado del servidor",
+            tls_opts(&tls.url()).with_tls(TlsOptions::new().with_ca_file(pki.f("otra-ca.pem"))),
+            Espera::Rechazo(Tls),
+        ),
+        (
+            "host fuera de los SAN del certificado",
+            tls_opts(&otro_host.url()).with_tls(con_ca()),
+            Espera::Rechazo(Tls),
+        ),
+        (
+            "certificado de servidor caducado",
+            tls_opts(&caducado.url()).with_tls(con_ca()),
+            Espera::Rechazo(Tls),
+        ),
+        (
+            "TLS exigido y el broker no lo ofrece",
+            tls_opts(&plano.url()).with_tls(con_ca()),
+            Espera::Rechazo(Tls),
+        ),
+        (
+            "mTLS: el broker exige certificado de cliente y no se presenta ninguno",
+            tls_opts(&mtls.url()).with_tls(con_ca()),
+            Espera::Rechazo(Tls),
+        ),
+        // ── INVALID_CREDENTIALS: la opción está mal formada y se sabe sin red.
+        (
+            "token vacío",
+            sin_red(Credentials::Token(String::new()), None),
+            Espera::Credenciales,
+        ),
+        (
+            "contraseña en blanco",
+            sin_red(usuario("  "), None),
+            Espera::Credenciales,
+        ),
+        (
+            "semilla nkey mal formada",
+            sin_red(Credentials::NkeySeed("SUMAL".into()), None),
+            Espera::Credenciales,
+        ),
+        (
+            "semilla nkey de cuenta, no de usuario",
+            sin_red(
+                Credentials::NkeySeed(nkeys::KeyPair::new_account().seed().expect("semilla")),
+                None,
+            ),
+            Espera::Credenciales,
+        ),
+        (
+            "fichero de semilla que no existe",
+            sin_red(Credentials::NkeyFile("/no/existe.nk".into()), None),
+            Espera::Credenciales,
+        ),
+        (
+            ".creds que no existe",
+            sin_red(Credentials::CredsFile("/no/existe.creds".into()), None),
+            Espera::Credenciales,
+        ),
+        // ── INVALID_TLS_OPTIONS: la opción está mal formada y se sabe sin red.
+        (
+            "CA que no existe",
+            sin_red(
+                ok_cred(),
+                Some(TlsOptions::new().with_ca_file("/no/existe/ca.pem")),
+            ),
+            Espera::OpcionesTls,
+        ),
+        (
+            "CA que no es un PEM (una clave)",
+            sin_red(
+                ok_cred(),
+                Some(TlsOptions::new().with_ca_file(pki.f("servidor.key"))),
+            ),
+            Espera::OpcionesTls,
+        ),
+        (
+            "certificado de cliente sin su clave",
+            sin_red(
+                ok_cred(),
+                Some(TlsOptions {
+                    client_cert: Some(pki.f("cliente.pem")),
+                    ..TlsOptions::new()
+                }),
+            ),
+            Espera::OpcionesTls,
+        ),
+        (
+            "clave de cliente sin su certificado",
+            sin_red(
+                ok_cred(),
+                Some(TlsOptions {
+                    client_key: Some(pki.f("cliente.key")),
+                    ..TlsOptions::new()
+                }),
+            ),
+            Espera::OpcionesTls,
+        ),
+        // ── Ninguno de los tres: errores de `connect()` que NO deben llevar uno de estos
+        // códigos, porque no son estas situaciones.
+        (
+            "falta el nombre de servicio",
+            ConnectOptions::new(plano.url(), "", "test", "1.0.0"),
+            Espera::SinCodigo,
+        ),
+        (
+            "nombre de servicio que no es kebab-case",
+            ConnectOptions::new(plano.url(), "PedidosAPI", "test", "1.0.0"),
+            Espera::SinCodigo,
+        ),
+    ];
+
+    let mut vistos = BTreeSet::new();
+    let mut desviaciones = Vec::new();
+    for (situacion, opciones, espera) in filas {
+        let err = connect_debe_fallar(opciones).await;
+        if err.code() != espera.codigo() {
+            desviaciones.push(format!(
+                "«{situacion}»: esperaba {:?} y dio {:?} ({err:?})",
+                espera.codigo(),
+                err.code()
+            ));
+            continue;
+        }
+        match (espera, &err) {
+            (Espera::Rechazo(r), FluxError::ConnectionRejected { reason, .. }) => {
+                if *reason != r {
+                    desviaciones.push(format!("«{situacion}»: esperaba motivo {r} y dio {reason}"));
+                }
+            }
+            (Espera::Credenciales, FluxError::InvalidCredentials(_))
+            | (Espera::OpcionesTls, FluxError::InvalidTlsOptions(_))
+            | (Espera::SinCodigo, _) => {}
+            (e, otro) => desviaciones.push(format!(
+                "«{situacion}»: código {:?} pero variante {e:?} ≠ {otro:?}",
+                espera.codigo()
+            )),
+        }
+        // PERMANENT, siempre que hay código: reintentar no lo arregla.
+        if espera.codigo().is_some() {
+            assert_eq!(err.class(), Some(ErrorClass::Permanent), "«{situacion}»");
+        }
+        vistos.insert(err.code().map(str::to_string));
+    }
+    assert!(
+        desviaciones.is_empty(),
+        "situaciones que dieron un código que no les toca:\n  {}",
+        desviaciones.join("\n  ")
+    );
+    // Y los tres códigos aparecieron: una tabla que no produjera uno de ellos no lo probaría.
+    for codigo in [
+        "CONNECTION_REJECTED",
+        "INVALID_CREDENTIALS",
+        "INVALID_TLS_OPTIONS",
+    ] {
+        assert!(vistos.contains(&Some(codigo.to_string())), "{codigo}");
+    }
+}
+
+/// El mensaje de un rechazo dice la causa de verdad y no vuelca la credencial, y lo que cada
+/// causa pide revisar es distinto: eso es lo que justifica dos motivos.
+#[tokio::test]
+async fn h_el_rechazo_dice_la_causa_y_que_revisar() {
+    let bin = broker_bin!();
+    let pki = Pki::new();
+    let perms = Perms::owner("pedidos-api", "pedidos");
+    let users = accounts(&[pw_user("pedidos-api", &perms)]);
+    let plano = Broker::start(&bin, "", &users);
+    let otro_host = Broker::start(
+        &bin,
+        &pki.server_conf_con("servidor-otro-host", false),
+        &users,
+    );
+    let caducado = Broker::start(
+        &bin,
+        &pki.server_conf_con("servidor-caducado", false),
+        &users,
+    );
+    let con_ca = || TlsOptions::new().with_ca_file(pki.f("ca.pem"));
+
+    let err = connect_debe_fallar(tls_opts(&plano.url()).with_credentials(
+        Credentials::UserPassword {
+            user: "pedidos-api".into(),
+            password: "contraseña-secreta".into(),
+        },
+    ))
+    .await;
+    let texto = err.to_string();
+    assert!(texto.contains("rechazó la credencial"), "{texto}");
+    assert!(texto.contains(&plano.url()), "nombra el broker: {texto}");
+    assert!(texto.contains("Reintentar no lo arregla"), "{texto}");
+    assert!(!texto.contains("contraseña-secreta"), "{texto}");
+    assert!(!texto.contains("SAN"), "no mezcla las causas: {texto}");
+
+    // Host fuera de los SAN, y caducado: dos causas de TLS que el mensaje distingue por la
+    // causa de la librería, y que piden revisar cosas distintas.
+    let err = connect_debe_fallar(tls_opts(&otro_host.url()).with_tls(con_ca())).await;
+    let texto = err.to_string();
+    assert!(texto.contains("not valid for name"), "{texto}");
+    assert!(texto.contains("SAN"), "{texto}");
+    let err = connect_debe_fallar(tls_opts(&caducado.url()).with_tls(con_ca())).await;
+    let texto = err.to_string();
+    assert!(texto.to_lowercase().contains("expired"), "{texto}");
+    assert!(!texto.contains("rechazó la credencial"), "{texto}");
 }

@@ -265,9 +265,12 @@ Reglas nuevas. Todas tienen evidencia en el Apéndice A.
     El cliente de Node sí lo emite con `jetstreamManager()` (A-3): confírmalo allí antes de
     quitarlo de la lista de Node.
   - `$JS.API.CONSUMER.CREATE.…` es **prescindible** si `flux provision` crea el consumidor:
-    el SDK intenta crear, ve la denegación, consulta el que existe (`CONSUMER.INFO`) y lo usa.
-  - `$JS.API.CONSUMER.INFO.…` solo lo usan el sondeo de `flux_consumer_pending` (si hay
-    métricas) y ese camino de «consumidor ya aprovisionado».
+    el SDK **pregunta primero** (`CONSUMER.INFO`) y solo crea si no existe. *(Antes intentaba
+    crear primero: cada arranque dejaba una `Publish Violation` en el log del servidor aunque
+    el SDK la absorbiera.)*
+  - `$JS.API.CONSUMER.INFO.…` es **imprescindible**: lo primero que pregunta `subscribe()`; sin
+    él falla con `PERMISSION_DENIED`. Lo usa además el sondeo de `flux_consumer_pending` (si hay
+    métricas).
 - **Nunca a un servicio:** `$JS.API.CONSUMER.DURABLE.CREATE.*` (el filtro va en el cuerpo
   y ninguna ACL lo ve), `$JS.API.STREAM.MSG.GET.*`, y crear, modificar, borrar o purgar
   streams. *(A-5, A-6)*
@@ -755,6 +758,28 @@ este orden:
 Cada uno: arnés ampliado con las operaciones nuevas, vectores cruzados en verde, test de
 integración contra NATS bajo la configuración segura, columna de capacidades en el
 `README.md`.
+
+**Seguridad (Fase 1) en Go, Java, .NET, PHP y Python — dos cosas más que el inbox privado, TLS
+y credenciales.** Node y Rust ya las cumplen; los otros cinco las tienen **sin hacer ni medir**:
+
+- **(a) Medir si su primera conexión se cuelga.** El agente de la spec midió que
+  `waitOnFirstConnect` (Node, A-24) deja `connect()` esperando para siempre ante un certificado
+  que no verifica, y que `retry_on_initial_connect` (`async-nats`, A-30) deja el servicio
+  arrancado y mudo. **No midió los demás.** Go usa `RetryOnFailedConnect` y Java
+  `connectReconnectOnConnect`: hay que ejecutarlos contra un broker real con una credencial
+  rechazada, una CA que no firmó el certificado, un host fuera de los SAN y TLS exigido sin TLS
+  en el broker, y apuntar qué hace cada uno (falla, se cuelga o se queda mudo). Si no falla
+  rápido, el SDK escribe su propio bucle de espera (`03-delivery.md` §6.1). Lo medido va a
+  `conformance/cases/` y al Apéndice A.
+- **(b) Emitir los tres códigos y hacer fallar `subscribe()` ante un pull denegado.**
+  `CONNECTION_REJECTED` (motivo `auth` o `tls`), `INVALID_CREDENTIALS` e `INVALID_TLS_OPTIONS`
+  (`04-errors.md` §5.3), todos PERMANENT; y `subscribe()` con `PERMISSION_DENIED` si se deniega
+  `$JS.API.CONSUMER.MSG.NEXT.…` (`06-security.md` §3.7: **DEBE**, no DEBERÍA). El pull denegado
+  no da error y deja un consumidor inerte que parece sano; cómo detectarlo depende de si la
+  librería permite un PING/PONG (Node) o no (Rust: una petición propia al mismo subject). Cada
+  código se prueba **en los dos sentidos**: en su situación y en ninguna otra
+  (`sdk-rust/tests/security.rs`, `h_*` y `g_*`). `node scripts/check-sdk-codes.mjs` exige los
+  literales a todo SDK que declare `security`.
 
 **PHP:** `watch` y `respond` necesitan un proceso de larga duración. Documenta que en
 hosting compartido el camino es el gateway.

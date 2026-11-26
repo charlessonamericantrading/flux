@@ -380,6 +380,100 @@
       "recognizedRetryable": 6,
       "unknown": 2,
       "permanent": 1
+    },
+    "codePattern": "^[A-Z][A-Z0-9]*(_[A-Z0-9]+)*$",
+    "codes": {
+      "$comment": "Codigos de error ESTABLES de las capacidades opcionales (specification/04-errors.md §5). El codigo agrupa el panel (flux_events_dlq_total{code}) y encabeza dlqerror, asi que la aplicacion NO puede sustituirlo. Cada uno declara su capacidad: scripts/check-sdk-codes.mjs comprueba que todo SDK que la declara (capabilities.sdks) lo contiene en su codigo. Los codigos de la firma estan en signing.poisonCodes. Los tres con phase=connect son los de connect() (04-errors.md §5.3, security.sdk.firstConnect.stableCodes): los dos SDKs que declaran security los emiten, y todos son PERMANENT.",
+      "NOT_PROVISIONED": {
+        "class": "permanent",
+        "capability": "security",
+        "spec": "specification/04-errors.md §5",
+        "emittedWhen": "el stream o el consumidor durable NO existe y el broker deniega crearlo",
+        "onlyAfterCheckingItIsMissing": true,
+        "$commentCheck": "La senal medida es una PAREJA: crear -> denegado e info -> no existe (specification/06-security.md §3.6). Un CREATE denegado sobre un recurso que existe NO es un error: el SDK sigue con la consulta. Decir 'no esta aprovisionado' de algo que si lo esta manda a quien opera a buscar donde no es.",
+        "messageMustName": [
+          "resource",
+          "deniedSubject"
+        ],
+        "messageMustPointTo": [
+          "flux provision"
+        ]
+      },
+      "PERMISSION_DENIED": {
+        "class": "permanent",
+        "capability": "security",
+        "spec": "specification/04-errors.md §5",
+        "emittedWhen": "el broker deniega una operacion por permisos y no es el caso de NOT_PROVISIONED: ni siquiera se puede consultar el recurso, se publica en un subject que la ACL no concede, o se deniega una suscripcion",
+        "messageMustName": [
+          "operation",
+          "deniedSubject"
+        ],
+        "messageMustPointTo": [
+          "specification/06-security.md §3"
+        ]
+      },
+      "CONNECTION_REJECTED": {
+        "class": "permanent",
+        "capability": "security",
+        "spec": "specification/04-errors.md §5.3",
+        "phase": "connect",
+        "emittedWhen": "el broker CONTESTO y rechazo la PRIMERA conexion por algo que esperar no arregla: reason=auth (rechazo las credenciales) o reason=tls (el certificado del servidor no verifica, o se exigio TLS y no lo ofrece, o exige mTLS y no se presento certificado de cliente)",
+        "reasons": [
+          "auth",
+          "tls"
+        ],
+        "$commentReasons": "Dos motivos y no mas: la libreria de NATS no distingue mas (A-24, A-30). Los matices (certificado que no verifica / TLS no ofrecido / mTLS sin certificado) viajan en el mensaje.",
+        "failsBeforeNetwork": false,
+        "neverEmittedFor": [
+          "broker-not-started",
+          "malformed-local-options",
+          "reconnect"
+        ],
+        "messageMustName": [
+          "servers",
+          "cause"
+        ],
+        "messageMustPointTo": [
+          "credentials-and-account-user (auth)",
+          "ca-san-tls-offered-mtls (tls)"
+        ],
+        "messageMustSay": "que reintentar no lo arregla"
+      },
+      "INVALID_CREDENTIALS": {
+        "class": "permanent",
+        "capability": "security",
+        "spec": "specification/04-errors.md §5.3",
+        "phase": "connect",
+        "emittedWhen": "las opciones de credenciales estan mal formadas y se sabe sin hablar con el broker: valor vacio o de tipo equivocado, opcion desconocida, user sin pass (o al reves), mas de un metodo a la vez, .creds ilegible o sin JWT y semilla, semilla que no es de usuario (SU...)",
+        "failsBeforeNetwork": true,
+        "neverEmittedFor": [
+          "credentials-rejected-by-broker",
+          "broker-not-started"
+        ],
+        "messageMustName": [
+          "option"
+        ],
+        "messageMustNeverInclude": [
+          "credential-value"
+        ],
+        "messageMustSay": "que reintentar no lo arregla"
+      },
+      "INVALID_TLS_OPTIONS": {
+        "class": "permanent",
+        "capability": "security",
+        "spec": "specification/04-errors.md §5.3",
+        "phase": "connect",
+        "emittedWhen": "las opciones TLS estan mal formadas y se sabe sin red: opcion del tipo equivocado, opcion desconocida, ruta vacia o ilegible (o que no es PEM, en los SDKs que lo comprueban), certificado de cliente sin su clave o al reves",
+        "failsBeforeNetwork": true,
+        "neverEmittedFor": [
+          "certificate-rejected-by-broker",
+          "broker-not-started"
+        ],
+        "messageMustName": [
+          "option"
+        ],
+        "messageMustSay": "que reintentar no lo arregla"
+      }
     }
   },
   "compatibility": {
@@ -497,7 +591,59 @@
         "certFile",
         "keyFile"
       ],
-      "inboxPrefixFromServiceName": true
+      "inboxPrefixFromServiceName": true,
+      "capability": "security",
+      "firstConnect": {
+        "$comment": "specification/03-delivery.md §6.1. Medido contra nats-server 2.14.5 (plan v1.1, Apendice A-24 y A-30): waitOnFirstConnect (Node) y retry_on_initial_connect (async-nats, Rust) reintentan CUALQUIER error y sin limite. Con un certificado que no verifica, connect() se cuelga (Node) o el servicio arranca y queda mudo (Rust). El bucle de espera lo escribe el SDK, porque solo el sabe que errores son de 'aun no esta' y cuales de 'esto no cambia por esperar'.",
+        "waitsForBroker": true,
+        "failFastOn": [
+          "credentials-rejected",
+          "tls-verification-failed",
+          "tls-required-not-offered",
+          "malformed-local-options"
+        ],
+        "malformedLocalOptionsFailBeforeNetwork": true,
+        "shouldFailFastOn": [
+          "mtls-client-certificate-missing"
+        ],
+        "$commentMtls": "DEBERIA, no DEBE: async-nats lo distingue (CertificateRequired, A-30) y @nats-io/* no, solo ve un timeout (A-24).",
+        "neverDowngradesToPlaintext": true,
+        "reconnectAfterFirstSuccess": "indefinite",
+        "$commentReconnect": "Que hacer ante credenciales rechazadas en una RE-conexion (caducadas o rotadas) no esta medido y la spec no lo fija.",
+        "stableCodes": {
+          "credentials-rejected": "CONNECTION_REJECTED",
+          "tls-verification-failed": "CONNECTION_REJECTED",
+          "tls-required-not-offered": "CONNECTION_REJECTED",
+          "mtls-client-certificate-missing": "CONNECTION_REJECTED",
+          "malformed-local-options": [
+            "INVALID_CREDENTIALS",
+            "INVALID_TLS_OPTIONS"
+          ]
+        },
+        "$commentStableCodes": "specification/04-errors.md §5.3. Decidido por el coordinador del plan v1.1: tres codigos estables PERMANENT, tal como los usa el SDK de Node (ConnectionRejectedError con reason tls|auth, InvalidCredentialsError, InvalidTlsOptionsError) y como los emite ahora Rust (FluxError::ConnectionRejected, InvalidCredentials, InvalidTlsOptions). Antes divergian: Rust devolvia Transport/Config sin codigo. Una aplicacion PUEDE ramificar por ellos.",
+        "$commentFirstConnectScope": "Solo la PRIMERA conexion. Que hacer ante credenciales rechazadas en una RE-conexion no esta medido y los tres codigos no se definen para ese caso."
+      },
+      "denials": {
+        "$comment": "specification/06-security.md §3.7. El broker no contesta a una publicacion denegada: manda un -ERR aparte por la conexion (A-28).",
+        "mustFailFastNamingSubject": [
+          "jetstream-request",
+          "subscription"
+        ],
+        "mustLog": [
+          "ack",
+          "pull"
+        ],
+        "requiresConfigurableLogger": true,
+        "newMetrics": false,
+        "mustFailSubscribe": [
+          "pull"
+        ],
+        "mustFailSubscribeWith": "PERMISSION_DENIED",
+        "$commentPull": "DEBE, ya no DEBERIA (specification/06-security.md §3.7). Un pull denegado deja un consumidor inerte que parece sano: el peor modo de fallo, y se descubriria semanas despues por la ausencia de eventos. subscribe() falla con PERMISSION_DENIED nombrando el subject denegado ($JS.API.CONSUMER.MSG.NEXT.<STREAM>.<durable>) ANTES de devolver, y ademas lo registra el logger. Node lo detecta tras arrancar el bucle (un flush es un PING/PONG); Rust no puede esperar al pull de async-nats (su flush no hace ida y vuelta y el primer pull sale de una tarea de fondo) y pregunta lo mismo sobre el mismo subject con una peticion propia (medido contra nats-server 2.14.5: sin la comprobacion, subscribe() devolvia Ok a los ~4 ms y la denegacion se registraba ~2 ms despues). El ack denegado NO se puede devolver como Result (es una publicacion sin respuesta): solo lo registra el logger.",
+        "mustLogOnly": [
+          "ack"
+        ]
+      }
     },
     "piiInPayload": "forbidden",
     "retentionByClassification": {
@@ -544,6 +690,86 @@
     ],
     "$commentImplementsL3": "En Rust detras de la feature `validation` (crate jsonschema, sin resolucion HTTP); en PHP con opis/json-schema como dependencia opcional de Composer; en Python con el extra [validation] (jsonschema >= 4.18, import diferido). El coste de L3 se paga solo si se usa: sin activarlo, esos SDKs siguen siendo L2 y no arrastran el validador. Go es la excepcion: no existe el extra opcional, asi que santhosh-tekuri/jsonschema/v6 va en go.mod y lo pagan tambien los servicios en L2 (~1 MB de binario); en ejecucion sigue sin costar nada con Mode off.",
     "$commentL3Coverage": "Los SIETE SDKs implementan L3. La validacion es opt-in en todos: por extra (Python), feature (Rust), paquete aparte (.NET, con Flux.Validation), dependencia optional (Java) o suggest (PHP)."
+  },
+  "capabilities": {
+    "status": "optional-extensions-of-v1",
+    "spec": "specification/00-protocol.md §5",
+    "$comment": "Extensiones OPCIONALES que un SDK declara sin cambiar de nivel (L1-L3). Un SDK que no implementa una capacidad sigue siendo conforme, pero no es compatible con lo que esa capacidad habilita. Se declara por evidencia ejecutada, no por intencion: si hay duda sobre un SDK, no se lista. Los codigos de error de cada capacidad salen de errors.codes (campo capability) y de signing.poisonCodes. scripts/check-sdk-codes.mjs comprueba que cada SDK que la declara los contiene en su codigo, que la evidencia citada existe y que la tabla 'Estado de los SDKs' del README coincide con este bloque. Necesario y NO suficiente: que un codigo este escrito no prueba que se emita.",
+    "definitions": {
+      "signing": {
+        "spec": "specification/07-signing.md",
+        "evidence": "cross-sdk-harness",
+        "$commentEvidence": "El SDK esta registrado en conformance/harnesses.json y no figura en `pending`: conformance/cross-sdk.mjs ejecuta sus operaciones sign y verify contra los vectores de conformance/harness/vectors.json, que cubren los tres codigos de signing.poisonCodes.",
+        "without": "no firma ni verifica; un evento sin firma sigue siendo valido (modo off)"
+      },
+      "security": {
+        "spec": "specification/00-protocol.md §5",
+        "evidence": "sdk-files",
+        "$commentEvidence": "Cada SDK que la declara cita en `evidence` los ficheros que la ejecutan contra un nats-server real con permisos exactos; deben existir y, entre todos, nombrar cada codigo de la capacidad.",
+        "requires": [
+          "private-inbox",
+          "tls-own-ca",
+          "creds-and-nkey",
+          "not-provisioned-and-permission-denied",
+          "first-connect-fails-fast",
+          "denials-visible"
+        ],
+        "without": "no es compatible con la configuracion segura (specification/06-security.md): con el inbox por defecto el broker le deniega la suscripcion a su propio inbox y su primera peticion falla"
+      }
+    },
+    "sdks": {
+      "node": {
+        "capabilities": [
+          "signing",
+          "security"
+        ],
+        "evidence": {
+          "security": [
+            "sdk-node/test/integration/acl.test.ts",
+            "sdk-node/test/integration/auth.test.ts",
+            "sdk-node/test/integration/tls.test.ts",
+            "sdk-node/test/security.test.ts"
+          ]
+        }
+      },
+      "python": {
+        "capabilities": [
+          "signing"
+        ]
+      },
+      "go": {
+        "capabilities": [
+          "signing"
+        ]
+      },
+      "java": {
+        "capabilities": [
+          "signing"
+        ]
+      },
+      "dotnet": {
+        "capabilities": [
+          "signing"
+        ]
+      },
+      "rust": {
+        "capabilities": [
+          "signing",
+          "security"
+        ],
+        "evidence": {
+          "security": [
+            "sdk-rust/tests/security.rs"
+          ]
+        }
+      },
+      "php": {
+        "capabilities": [
+          "signing"
+        ]
+      }
+    },
+    "$commentSdks": "Solo Node y Rust declaran `security`: el resto usa el inbox por defecto y no acepta CA propia (plan v1.1, fase 6). `signing` la declaran los siete: los siete tienen su arnes en conformance/harnesses.json y el job `cross-sdk` compara sus operaciones sign y verify byte a byte."
   },
   "outOfScopeV1": [
     "request/reply",

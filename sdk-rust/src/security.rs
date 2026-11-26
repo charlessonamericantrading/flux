@@ -24,7 +24,7 @@ use std::sync::Mutex;
 
 use tokio::sync::watch;
 
-use crate::errors::FluxError;
+use crate::errors::{FluxError, RejectionReason};
 
 // ─── TLS ─────────────────────────────────────────────────────────────────────
 
@@ -103,11 +103,25 @@ impl TlsOptions {
         self
     }
 
-    /// Comprueba los ficheros ANTES de tocar la red.
+    /// Comprueba las opciones ANTES de tocar la red; si fallan, es
+    /// [`FluxError::InvalidTlsOptions`] (`INVALID_TLS_OPTIONS`, 04-errors.md §5.3).
     ///
-    /// `async-nats` los lee dentro de su bucle de conexión, y ahí un fichero inexistente es
-    /// un error más que se reintenta. Un error de configuración debe parar el arranque.
+    /// `async-nats` lee los ficheros dentro de su bucle de conexión, y ahí un fichero
+    /// inexistente es un error más que se reintenta. Un error de configuración debe parar el
+    /// arranque.
+    ///
+    /// Los campos son públicos, así que «certificado sin clave» **sí** se puede expresar
+    /// aunque [`Self::with_client_cert`] no lo permita: se rechaza, porque `connect()` solo
+    /// cablea el par completo y un certificado de cliente suelto se ignoraría sin decir nada
+    /// —el broker con mTLS rechazaría luego la conexión por una causa que no se ve—.
     pub(crate) fn validate(&self) -> Result<(), FluxError> {
+        if self.client_cert.is_some() != self.client_key.is_some() {
+            return Err(FluxError::InvalidTlsOptions(
+                "`client_cert` y `client_key` van juntos (certificado de cliente para mTLS): \
+                 con uno solo no hay certificado que presentar y se ignoraría sin decir nada"
+                    .to_string(),
+            ));
+        }
         if let Some(ca) = &self.ca_file {
             check_pem(ca, "la CA", &["-----BEGIN CERTIFICATE-----"])?;
         }
@@ -126,16 +140,13 @@ impl TlsOptions {
 /// Lee el fichero y comprueba que contiene al menos uno de los marcadores PEM.
 fn check_pem(path: &Path, what: &str, markers: &[&str]) -> Result<(), FluxError> {
     let text = std::fs::read_to_string(path).map_err(|e| {
-        FluxError::Config(format!(
-            "TLS: no se puede leer {what} `{}`: {e}",
-            path.display()
-        ))
+        FluxError::InvalidTlsOptions(format!("no se puede leer {what} `{}`: {e}", path.display()))
     })?;
     if markers.iter().any(|m| text.contains(m)) {
         return Ok(());
     }
-    Err(FluxError::Config(format!(
-        "TLS: {what} `{}` no parece un PEM (no contiene `{}`). Un fichero equivocado \
+    Err(FluxError::InvalidTlsOptions(format!(
+        "{what} `{}` no parece un PEM (no contiene `{}`). Un fichero equivocado \
          —o una clave en DER— haría fallar el handshake con un error que no lo dice",
         path.display(),
         markers[0]
@@ -151,7 +162,7 @@ fn check_pem(path: &Path, what: &str, markers: &[&str]) -> Result<(), FluxError>
 /// `connect()`. Nunca se incluye la semilla en el mensaje: acaba en un log.
 pub(crate) fn validate_nkey_seed(seed: &str) -> Result<(), FluxError> {
     let pair = nkeys::KeyPair::from_seed(seed).map_err(|_| {
-        FluxError::Config(
+        FluxError::InvalidCredentials(
             "la semilla nkey no es válida: debe ser una semilla de usuario (`SU…`, 58 \
              caracteres). Se omite el valor a propósito: acabaría en un log"
                 .to_string(),
@@ -160,7 +171,7 @@ pub(crate) fn validate_nkey_seed(seed: &str) -> Result<(), FluxError> {
     // 'U' = user. Una semilla de cuenta u operador (`SA…`, `SO…`) se parsea bien y el
     // broker la rechazaría después con un `authorization violation` sin explicación.
     if !pair.public_key().starts_with('U') {
-        return Err(FluxError::Config(
+        return Err(FluxError::InvalidCredentials(
             "la semilla nkey no es de usuario: una conexión se autentica con una semilla \
              `SU…`, no con la de cuenta (`SA…`) ni la de operador (`SO…`)"
                 .to_string(),
@@ -171,7 +182,16 @@ pub(crate) fn validate_nkey_seed(seed: &str) -> Result<(), FluxError> {
 
 // ─── Errores de conexión ─────────────────────────────────────────────────────
 
-/// ¿Reintentar la conexión inicial arreglaría este error?
+/// Qué fallo de la conexión inicial no se arregla reintentando.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FatalConnect {
+    /// El broker rechazó la credencial, o el handshake TLS no encaja: `CONNECTION_REJECTED`.
+    Rejected(RejectionReason),
+    /// La lista de servidores no se entiende: no es un rechazo del broker, es la entrada.
+    BadServers,
+}
+
+/// ¿Reintentar la conexión inicial arreglaría este error? `None` = sí, es transitorio.
 ///
 /// `connect()` espera al broker con reintentos —un servicio que arranca antes que el broker
 /// no debe morir en el primer intento— pero hay errores que reintentar no arregla: una
@@ -190,28 +210,43 @@ pub(crate) fn validate_nkey_seed(seed: &str) -> Result<(), FluxError> {
 /// mTLS exigido, sin certificado de cliente    AlertReceived(CertificateRequired)
 /// credencial rechazada                        kind = AuthorizationViolation
 /// ```
-pub(crate) fn is_fatal_connect_error(err: &async_nats::ConnectError) -> bool {
+pub(crate) fn fatal_connect_kind(err: &async_nats::ConnectError) -> Option<FatalConnect> {
     use async_nats::ConnectErrorKind as K;
-    let kind = err.kind();
-    if matches!(
-        kind,
-        K::AuthorizationViolation | K::Authentication | K::Tls | K::ServerParse
-    ) {
-        return true;
+    match err.kind() {
+        K::AuthorizationViolation | K::Authentication => {
+            Some(FatalConnect::Rejected(RejectionReason::Auth))
+        }
+        K::Tls => Some(FatalConnect::Rejected(RejectionReason::Tls)),
+        K::ServerParse => Some(FatalConnect::BadServers),
+        K::Io if invalid_data_cause(err).is_some() => {
+            Some(FatalConnect::Rejected(RejectionReason::Tls))
+        }
+        _ => None,
     }
-    if kind != K::Io {
-        return false;
-    }
+}
+
+/// El `io::Error` de tipo `InvalidData` de la cadena de causas, si lo hay: es como llega un
+/// fallo de `rustls` a través de `tokio-rustls`.
+fn invalid_data_cause(err: &async_nats::ConnectError) -> Option<&io::Error> {
     let mut cursor = std::error::Error::source(err);
     while let Some(e) = cursor {
-        if e.downcast_ref::<io::Error>()
-            .is_some_and(|io| io.kind() == io::ErrorKind::InvalidData)
+        if let Some(io) = e
+            .downcast_ref::<io::Error>()
+            .filter(|io| io.kind() == io::ErrorKind::InvalidData)
         {
-            return true;
+            return Some(io);
         }
         cursor = e.source();
     }
-    false
+    None
+}
+
+/// La causa de un rechazo, para el mensaje: el texto del error de TLS cuando lo hay
+/// (`invalid peer certificate: UnknownIssuer`) y el del propio error si no.
+///
+/// No lleva credenciales: son los textos de `rustls` y de la autorización, que no las citan.
+pub(crate) fn connect_error_detail(err: &async_nats::ConnectError) -> String {
+    invalid_data_cause(err).map_or_else(|| err.to_string(), ToString::to_string)
 }
 
 // ─── Denegaciones del broker ─────────────────────────────────────────────────
@@ -572,7 +607,8 @@ mod tests {
         let publica = nkeys::KeyPair::new_user().public_key();
         for malo in ["", "no-es-una-semilla", &cuenta, &publica] {
             let err = validate_nkey_seed(malo).unwrap_err();
-            assert!(matches!(err, FluxError::Config(_)), "{err:?}");
+            assert!(matches!(err, FluxError::InvalidCredentials(_)), "{err:?}");
+            assert_eq!(err.code(), Some("INVALID_CREDENTIALS"));
             let texto = err.to_string();
             if !malo.is_empty() {
                 assert!(!texto.contains(malo), "no debe volcar el valor: {texto}");
@@ -645,5 +681,126 @@ mod tests {
             .with_client_cert(&ca, &ca)
             .validate()
             .is_err());
+
+        // Todos son INVALID_TLS_OPTIONS —el código estable de 04-errors.md §5.3—, y ninguno
+        // otro: ni un `Config` genérico, ni un rechazo del broker.
+        for malo in [
+            TlsOptions::new().with_ca_file("/no/existe/ca.pem"),
+            TlsOptions::new().with_ca_file(&basura),
+            TlsOptions::new().with_client_cert(&key, &key),
+            TlsOptions::new().with_client_cert(&ca, &ca),
+        ] {
+            let err = malo.validate().unwrap_err();
+            assert!(matches!(err, FluxError::InvalidTlsOptions(_)), "{err:?}");
+            assert_eq!(err.code(), Some("INVALID_TLS_OPTIONS"));
+            assert!(err.to_string().contains("opciones TLS inválidas"), "{err}");
+        }
+    }
+
+    /// Los campos son públicos, así que un certificado de cliente sin su clave (o al revés)
+    /// SÍ se puede construir. Sin esta comprobación `connect()` lo ignoraría sin decir nada.
+    /// Y el par completo, que es lo correcto, pasa.
+    #[test]
+    fn el_certificado_de_cliente_y_su_clave_van_juntos() {
+        let dir = TmpDir::new();
+        let cert = dir.file(
+            "c.pem",
+            "-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----\n",
+        );
+        let key = dir.file(
+            "k.pem",
+            "-----BEGIN PRIVATE KEY-----\nAAAA\n-----END PRIVATE KEY-----\n",
+        );
+        let solo_cert = TlsOptions {
+            client_cert: Some(cert.clone()),
+            ..TlsOptions::new()
+        };
+        let solo_clave = TlsOptions {
+            client_key: Some(key.clone()),
+            ..TlsOptions::new()
+        };
+        for malo in [solo_cert, solo_clave] {
+            let err = malo.validate().unwrap_err();
+            assert!(matches!(err, FluxError::InvalidTlsOptions(_)), "{err:?}");
+            assert!(err.to_string().contains("van juntos"), "{err}");
+        }
+        assert!(TlsOptions::new()
+            .with_client_cert(&cert, &key)
+            .validate()
+            .is_ok());
+    }
+
+    // ── Fallos de la conexión inicial ─────────────────────────────────────────
+
+    use async_nats::{ConnectError, ConnectErrorKind as K};
+
+    fn io_invalid_data(texto: &str) -> ConnectError {
+        ConnectError::with_source(
+            K::Io,
+            io::Error::new(io::ErrorKind::InvalidData, texto.to_string()),
+        )
+    }
+
+    /// Lo que reintentar no arregla se reconoce, y con el motivo correcto: la credencial es
+    /// `Auth`; todo lo del handshake TLS —incluido el que `async-nats` etiqueta `Io`, no
+    /// `Tls` (A-30)— es `Tls`.
+    #[test]
+    fn los_fallos_que_esperar_no_arregla_se_reconocen_con_su_motivo() {
+        use RejectionReason::{Auth, Tls};
+        let rechazo = |r| Some(FatalConnect::Rejected(r));
+        assert_eq!(
+            fatal_connect_kind(&ConnectError::new(K::AuthorizationViolation)),
+            rechazo(Auth)
+        );
+        assert_eq!(
+            fatal_connect_kind(&ConnectError::new(K::Authentication)),
+            rechazo(Auth)
+        );
+        assert_eq!(fatal_connect_kind(&ConnectError::new(K::Tls)), rechazo(Tls));
+        // Los tres handshakes de A-30, tal como llegan: `Io` con un `InvalidData` dentro.
+        for texto in [
+            "invalid peer certificate: UnknownIssuer",
+            "received corrupt message of type InvalidContentType",
+            "received fatal alert: CertificateRequired",
+        ] {
+            assert_eq!(fatal_connect_kind(&io_invalid_data(texto)), rechazo(Tls));
+        }
+        assert_eq!(
+            fatal_connect_kind(&ConnectError::new(K::ServerParse)),
+            Some(FatalConnect::BadServers)
+        );
+    }
+
+    /// Lo contrario, y es lo que justifica el bucle de espera: un broker que aún no ha
+    /// arrancado (conexión rechazada, DNS, timeout) **no** es un rechazo y se espera. Sin
+    /// este caso, `connect()` moriría en el primer intento de cada despliegue.
+    #[test]
+    fn un_broker_que_aun_no_esta_no_es_un_rechazo() {
+        let refused = io::Error::from(io::ErrorKind::ConnectionRefused);
+        for transitorio in [
+            ConnectError::with_source(K::Io, refused),
+            ConnectError::with_source(K::Io, io::Error::from(io::ErrorKind::TimedOut)),
+            // Un `Io` sin causa: tampoco es un `InvalidData`.
+            ConnectError::new(K::Io),
+            ConnectError::new(K::Dns),
+            ConnectError::new(K::TimedOut),
+            ConnectError::new(K::MaxReconnects),
+        ] {
+            assert_eq!(fatal_connect_kind(&transitorio), None, "{transitorio:?}");
+        }
+    }
+
+    /// La causa del mensaje es el texto del error de TLS cuando lo hay, y el del propio error
+    /// si no.
+    #[test]
+    fn la_causa_del_rechazo_sale_del_error_de_tls() {
+        assert_eq!(
+            connect_error_detail(&io_invalid_data("invalid peer certificate: UnknownIssuer")),
+            "invalid peer certificate: UnknownIssuer"
+        );
+        assert_eq!(
+            connect_error_detail(&ConnectError::new(K::AuthorizationViolation)),
+            "authorization violation"
+        );
     }
 }
