@@ -1817,6 +1817,9 @@ where
 fn respuesta_buena(peticion: &flux::Event) -> flux::Event {
     let mut e = peticion.clone();
     e.id = uuid_nuevo();
+    // Una respuesta NO hereda la firma de la petición: firma el que responde, con lo que él diga.
+    e.signkeyid = None;
+    e.signature = None;
     e.source = "/produccion/falso".into();
     e.event_type = "com.flux.rpc.clientes.cliente.obtener.reply.v1".into();
     e.dataschema = "https://schemas.internal/rpc/clientes/cliente/obtener/reply/1.0.0.json".into();
@@ -2303,3 +2306,732 @@ fn codigos_estables() {
 
 #[allow(dead_code)]
 fn sin_usar(_: HashMap<String, String>, _: HashSet<String>) {}
+
+// ═════════════════════════════════════════════════════════════════════════════
+//  Firma Ed25519 y ventana de 300 s — §7.4 (feature `signing`)
+// ═════════════════════════════════════════════════════════════════════════════
+
+#[cfg(feature = "signing")]
+mod firma {
+    use super::*;
+    use flux::{RpcRequestInput, RpcSide, Signer, SigningOptions, VerificationMode};
+
+    /// Las claves de dos servicios y lo que cada uno necesita saber del otro.
+    struct Claves {
+        llama_priv: String,
+        llama_pub: String,
+        crm_priv: String,
+        crm_pub: String,
+    }
+
+    fn claves() -> Claves {
+        let (llama_priv, llama_pub) = flux::generate_key_pair();
+        let (crm_priv, crm_pub) = flux::generate_key_pair();
+        Claves {
+            llama_priv,
+            llama_pub,
+            crm_priv,
+            crm_pub,
+        }
+    }
+
+    fn firma_de(
+        servicio: &str,
+        propia: &str,
+        ajena: (&str, &str),
+        modo: VerificationMode,
+    ) -> SigningOptions {
+        SigningOptions::default()
+            .with_private_key(propia, format!("{servicio}-1"))
+            .with_public_key(ajena.0, ajena.1)
+            .with_verify(modo)
+    }
+
+    /// Un `llama` y un `crm` que se firman y se verifican en `require`.
+    async fn par(broker: &Broker, k: &Claves, metricas_crm: Arc<InMemoryMetrics>) -> (Bus, Bus) {
+        let crm_firma = firma_de(
+            "crm",
+            &k.crm_priv,
+            ("llama-1", &k.llama_pub),
+            VerificationMode::Require,
+        );
+        let crm = bus_con(&broker.url(), "crm", |o| {
+            o.with_signing(crm_firma).with_metrics(metricas_crm)
+        })
+        .await;
+        let llama_firma = firma_de(
+            "llama",
+            &k.llama_priv,
+            ("crm-1", &k.crm_pub),
+            VerificationMode::Require,
+        );
+        let llama = bus_con(&broker.url(), "llama", |o| o.with_signing(llama_firma)).await;
+        (llama, crm)
+    }
+
+    /// Una petición **firmada a mano** con el reloj que se quiera —lo que el SDK no hace: su `time` es el de
+    /// construirla—, publicada en bruto, y el error o la respuesta que contesta quien responde.
+    async fn peticion_firmada_a_mano(
+        broker: &Broker,
+        k: &Claves,
+        segundos: i64,
+        firmar: bool,
+    ) -> flux::Event {
+        let ops = bruto(&broker.url()).await;
+        let mut bandeja = ops.subscribe("_INBOX.ops.firma.>").await.unwrap();
+        barrera(&ops).await;
+        let id = uuid_nuevo();
+        let event = flux::build_rpc_request(RpcRequestInput {
+            operation: DESCUENTO.into(),
+            tenant_id: "acme".into(),
+            aggregate_id: None,
+            id: id.clone(),
+            source: "/produccion/llama".into(),
+            time: chrono_ahora(segundos),
+            correlationid: id,
+            causationid: None,
+            producerversion: "1.0.0".into(),
+            classification: DataClassification::Internal,
+            dataschema: flux::rpc_dataschema(BASE, DESCUENTO, RpcSide::Request).unwrap(),
+            traceparent: None,
+            tracestate: None,
+            data: serde_json::value::to_raw_value(
+                &json!({ "clienteId": "cli-1", "totalCents": 1, "moneda": "EUR" }),
+            )
+            .unwrap(),
+        })
+        .unwrap();
+        let event = if firmar {
+            Signer::new(&SigningOptions::default().with_private_key(&k.llama_priv, "llama-1"))
+                .unwrap()
+                .expect("firmante")
+                .sign(event)
+                .unwrap()
+        } else {
+            event
+        };
+        ops.publish_with_reply(
+            format!("rpc.{DESCUENTO}"),
+            "_INBOX.ops.firma.una".to_string(),
+            flux::serialize(&event).unwrap().into(),
+        )
+        .await
+        .unwrap();
+        let m = tokio::time::timeout(Duration::from_secs(2), bandeja.next())
+            .await
+            .expect("quien responde contesta SIEMPRE")
+            .unwrap();
+        flux::parse_event(&m.payload).expect("lo que contesta es un CloudEvent válido")
+    }
+
+    fn chrono_ahora(desplazamiento_s: i64) -> chrono::DateTime<chrono::Utc> {
+        chrono::Utc::now() + chrono::Duration::seconds(desplazamiento_s)
+    }
+
+    fn error_de(e: &flux::Event) -> Value {
+        assert_eq!(e.event_type, "com.flux.rpc.error.v1", "{e:?}");
+        serde_json::from_str(e.data.get()).unwrap()
+    }
+
+    async fn dueno_ok(crm: &Bus) -> Arc<AtomicUsize> {
+        let ejecutadas = Arc::new(AtomicUsize::new(0));
+        let e2 = Arc::clone(&ejecutadas);
+        crm.respond(DESCUENTO, move |_: RpcRequest, _: RpcContext| {
+            let e2 = Arc::clone(&e2);
+            async move {
+                e2.fetch_add(1, Ordering::SeqCst);
+                Ok::<Value, flux::HandlerError>(json!({ "descuentoCents": 5, "moneda": "EUR" }))
+            }
+        })
+        .await
+        .unwrap();
+        ejecutadas
+    }
+
+    /// Los dos sentidos firmados y verificados en `require`: la respuesta y el error van firmados por quien
+    /// responde, y quien llama los verifica.
+    #[tokio::test]
+    async fn firma_el_ciclo_completo_en_require_firma_y_verifica_en_los_dos_sentidos() {
+        let bin = broker_bin!();
+        let broker = Broker::con_acl(&bin);
+        let k = claves();
+        let metricas = Arc::new(InMemoryMetrics::new());
+        let (llama, crm) = par(&broker, &k, metricas.clone()).await;
+        dueno_ok(&crm).await;
+        let r = llama
+            .request(
+                DESCUENTO,
+                &json!({ "clienteId": "cli-1", "totalCents": 1, "moneda": "EUR" }),
+            )
+            .await
+            .expect("firmado y verificado en los dos sentidos");
+        assert_eq!(
+            r.signkeyid.as_deref(),
+            Some("crm-1"),
+            "la respuesta la firma quien responde"
+        );
+        assert!(r.signature.is_some());
+        // Y un error del handler también viaja firmado y se verifica.
+        let otro = bus_con(&broker.url(), "crm-exp", |o| {
+            o.with_signing(firma_de(
+                "crm-exp",
+                &k.crm_priv,
+                ("llama-1", &k.llama_pub),
+                VerificationMode::Require,
+            ))
+        })
+        .await;
+        otro.respond(OBTENER, |_: RpcRequest, _: RpcContext| async move {
+            Err::<Value, flux::HandlerError>(
+                flux::FluxError::permanent("no").with_code("NO").into(),
+            )
+        })
+        .await
+        .unwrap();
+        // `crm-exp` firma con `crm-exp-1`, que `llama` no conoce: UNKNOWN_SIGNING_KEY, con el código de la firma.
+        let e = llama
+            .request(OBTENER, &json!({ "clienteId": "cli-1" }))
+            .await
+            .unwrap_err();
+        assert_eq!(code(&e), "UNKNOWN_SIGNING_KEY", "{e}");
+        assert_eq!(
+            e.class(),
+            Some(ErrorClass::Permanent),
+            "para quien llama un fallo de firma es permanent, no poison"
+        );
+        assert_eq!(
+            metricas.counter(&format!(
+                "flux_rpc_server_requests_total{{operation=\"{DESCUENTO}\",outcome=\"ok\"}}"
+            )),
+            Some(1)
+        );
+    }
+
+    /// En `require`, quien responde rechaza una petición sin firma o con una firma que no es de quien dice.
+    #[tokio::test]
+    async fn firma_una_peticion_sin_firma_o_con_firma_ajena_se_rechaza_con_el_codigo_de_la_firma() {
+        let bin = broker_bin!();
+        let broker = Broker::con_acl(&bin);
+        let k = claves();
+        let metricas = Arc::new(InMemoryMetrics::new());
+        let (_llama, crm) = par(&broker, &k, metricas.clone()).await;
+        let ejecutadas = dueno_ok(&crm).await;
+        let sin_firma = peticion_firmada_a_mano(&broker, &k, 0, false).await;
+        let datos = error_de(&sin_firma);
+        assert_eq!(
+            (datos["class"].as_str(), datos["code"].as_str()),
+            (Some("permanent"), Some("MISSING_SIGNATURE")),
+            "{datos}"
+        );
+        assert_eq!(ejecutadas.load(Ordering::SeqCst), 0, "el handler no corrió");
+        espera(
+            || metricas.counter(&format!("flux_rpc_server_requests_total{{operation=\"{DESCUENTO}\",outcome=\"invalid_signature\"}}")) == Some(1),
+            Duration::from_secs(2),
+            "el dueño no contó invalid_signature",
+        )
+        .await;
+        // Firmada con la clave de OTRO servicio pero con el signkeyid de `llama`: la firma no verifica.
+        let k2 = claves();
+        let con_otra_clave = Claves {
+            llama_priv: k2.llama_priv.clone(),
+            ..claves()
+        };
+        let falsa = peticion_firmada_a_mano(&broker, &con_otra_clave, 0, true).await;
+        assert_eq!(error_de(&falsa)["code"], "INVALID_SIGNATURE");
+    }
+
+    /// La ventana de 300 s, simétrica y solo con `require`: una petición firmada pero vieja —una captura
+    /// reenviada— se rechaza con `STALE_REQUEST`; una de 290 s se acepta; una del futuro también se rechaza.
+    #[tokio::test]
+    async fn firma_la_ventana_de_300_s_rechaza_lo_viejo_y_lo_futuro_y_acepta_lo_reciente() {
+        let bin = broker_bin!();
+        let broker = Broker::con_acl(&bin);
+        let k = claves();
+        let metricas = Arc::new(InMemoryMetrics::new());
+        let (_llama, crm) = par(&broker, &k, metricas.clone()).await;
+        let ejecutadas = dueno_ok(&crm).await;
+        for (segundos, esperado_stale) in [
+            (-600, true),
+            (-310, true),
+            (400, true),
+            (-290, false),
+            (250, false),
+            (0, false),
+        ] {
+            let respuesta = peticion_firmada_a_mano(&broker, &k, segundos, true).await;
+            if esperado_stale {
+                let datos = error_de(&respuesta);
+                assert_eq!(
+                    (datos["class"].as_str(), datos["code"].as_str()),
+                    (Some("permanent"), Some("STALE_REQUEST")),
+                    "{segundos} s: {datos}"
+                );
+                let m = datos["message"].as_str().unwrap();
+                assert!(m.contains("300") && m.contains("NTP"), "{m}");
+            } else {
+                assert_eq!(
+                    respuesta.event_type,
+                    "com.flux.rpc.clientes.cliente.calcular-descuento.reply.v1",
+                    "{segundos} s dentro de la ventana: se atiende"
+                );
+                assert_eq!(
+                    respuesta.signkeyid.as_deref(),
+                    Some("crm-1"),
+                    "la respuesta va firmada"
+                );
+            }
+        }
+        assert_eq!(
+            ejecutadas.load(Ordering::SeqCst),
+            3,
+            "solo lo que estaba dentro de la ventana llegó al handler"
+        );
+        let stale = format!(
+            "flux_rpc_server_requests_total{{operation=\"{DESCUENTO}\",outcome=\"stale_request\"}}"
+        );
+        espera(
+            || metricas.counter(&stale) == Some(3),
+            Duration::from_secs(2),
+            "el dueño no contó stale_request",
+        )
+        .await;
+    }
+
+    /// Sin `require` no hay ventana: un `time` es un campo que cualquiera escribe y no protegería nada.
+    #[tokio::test]
+    async fn firma_sin_require_no_hay_ventana() {
+        let bin = broker_bin!();
+        let broker = Broker::con_acl(&bin);
+        let k = claves();
+        for modo in [VerificationMode::Warn, VerificationMode::Off] {
+            let firma = firma_de("crm", &k.crm_priv, ("llama-1", &k.llama_pub), modo);
+            let crm = bus_con(&broker.url(), "crm", |o| o.with_signing(firma)).await;
+            let r = crm
+                .respond(DESCUENTO, |_: RpcRequest, _: RpcContext| async move {
+                    Ok::<Value, flux::HandlerError>(json!({ "descuentoCents": 5, "moneda": "EUR" }))
+                })
+                .await
+                .unwrap();
+            let vieja = peticion_firmada_a_mano(&broker, &k, -3_600, false).await;
+            assert_eq!(
+                vieja.event_type, "com.flux.rpc.clientes.cliente.calcular-descuento.reply.v1",
+                "{modo:?}"
+            );
+            r.stop().await;
+            crm.close().await.unwrap();
+        }
+    }
+
+    /// Quien llama verifica la respuesta: una sin firma, con firma de otra clave o con una clave desconocida
+    /// no se acepta, y el código es el de la firma.
+    #[tokio::test]
+    async fn firma_quien_llama_rechaza_una_respuesta_sin_firma_o_con_firma_falsa() {
+        let bin = broker_bin!();
+        let broker = Broker::con_acl(&bin);
+        let k = claves();
+        let llama_firma = firma_de(
+            "llama",
+            &k.llama_priv,
+            ("crm-1", &k.crm_pub),
+            VerificationMode::Require,
+        );
+        let llama = bus_con(&broker.url(), "llama", |o| o.with_signing(llama_firma)).await;
+        let (otra_priv, _) = flux::generate_key_pair();
+        type Caso<'a> = (&'a str, Option<(String, &'a str)>, &'a str);
+        let casos: Vec<Caso<'_>> = vec![
+            ("sin firma", None, "MISSING_SIGNATURE"),
+            (
+                "firmada con otra clave bajo el id de `crm`",
+                Some((otra_priv.clone(), "crm-1")),
+                "INVALID_SIGNATURE",
+            ),
+            (
+                "firmada con una clave que no se conoce",
+                Some((otra_priv, "intruso-1")),
+                "UNKNOWN_SIGNING_KEY",
+            ),
+            (
+                "firmada bien por `crm`",
+                Some((k.crm_priv.clone(), "crm-1")),
+                "",
+            ),
+        ];
+        for (nombre, firmante, esperado) in casos {
+            let tarea = responder_en_bruto(&broker.url(), OBTENER, move |peticion| {
+                let e = respuesta_buena(peticion);
+                let e = match &firmante {
+                    Some((privada, id)) => {
+                        Signer::new(&SigningOptions::default().with_private_key(privada, *id))
+                            .unwrap()
+                            .unwrap()
+                            .sign(e)
+                            .unwrap()
+                    }
+                    None => e,
+                };
+                bytes_de(&e)
+            })
+            .await;
+            let r = llama
+                .request_with(
+                    OBTENER,
+                    &json!({ "clienteId": "cli-1" }),
+                    RequestOptions::default().with_timeout_ms(2_000),
+                )
+                .await;
+            tarea.abort();
+            if esperado.is_empty() {
+                assert!(r.is_ok(), "{nombre}: {r:?}");
+            } else {
+                let e = r.expect_err(nombre);
+                assert_eq!(code(&e), esperado, "{nombre}: {e}");
+                assert_eq!(e.class(), Some(ErrorClass::Permanent), "{nombre}");
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+//  Validación L3 con el bundle del repositorio — §5.2, §11 (feature `validation`)
+// ═════════════════════════════════════════════════════════════════════════════
+
+#[cfg(feature = "validation")]
+mod esquemas {
+    use super::*;
+    use flux::validation::{SchemaBundle, ValidationMode, ValidationOptions};
+
+    /// El bundle REAL del repositorio, con su índice `rpc`: si `bundle-schemas.mjs` cambia de forma, esto se entera.
+    fn bundle() -> SchemaBundle {
+        SchemaBundle::from_json(include_str!("../../schemas/bundle.json")).expect("bundle válido")
+    }
+
+    fn estricto() -> ValidationOptions {
+        ValidationOptions::strict(bundle())
+    }
+
+    #[test]
+    fn el_bundle_trae_el_indice_rpc_con_el_par_de_cada_operacion() {
+        let b = bundle();
+        let u = b.rpc_uris_for(DESCUENTO).expect("índice `rpc`");
+        assert_eq!(
+            u.request,
+            "https://schemas.internal/rpc/clientes/cliente/calcular-descuento/request/1.0.0.json"
+        );
+        assert_eq!(
+            u.reply,
+            "https://schemas.internal/rpc/clientes/cliente/calcular-descuento/reply/1.0.0.json"
+        );
+        assert!(b
+            .schemas
+            .contains_key("https://schemas.internal/system/rpc/error/1.0.0.json"));
+        assert!(b.rpc_uris_for("clientes.cliente.v1.nueva").is_none());
+        assert!(
+            b.rpc.keys().all(|k| !k.starts_with("rpc.")),
+            "el índice usa el nombre de la operación, sin `rpc.`"
+        );
+    }
+
+    fn valida(
+        servicio: &str,
+        url: &str,
+        modo: ValidationMode,
+        metricas: Option<Arc<InMemoryMetrics>>,
+    ) -> (String, String, ValidationMode, Option<Arc<InMemoryMetrics>>) {
+        (servicio.to_string(), url.to_string(), modo, metricas)
+    }
+
+    async fn con_validacion(
+        v: (String, String, ValidationMode, Option<Arc<InMemoryMetrics>>),
+    ) -> Bus {
+        let (servicio, url, modo, metricas) = v;
+        let opciones = match modo {
+            ValidationMode::Strict => estricto(),
+            ValidationMode::Warn => ValidationOptions::warn(bundle()),
+            ValidationMode::Off => ValidationOptions::default(),
+        };
+        bus_con(&url, &servicio, |o| {
+            let o = o.with_validation(opciones);
+            match metricas {
+                Some(m) => o.with_metrics(m),
+                None => o,
+            }
+        })
+        .await
+    }
+
+    /// Quien llama valida ANTES de construir el sobre y de abrir nada: todos los errores, ningún valor.
+    #[tokio::test]
+    async fn validacion_una_peticion_invalida_falla_en_quien_llama_con_todas_las_rutas_y_ningun_valor(
+    ) {
+        let bin = broker_bin!();
+        let broker = Broker::con_acl(&bin);
+        let metricas = Arc::new(InMemoryMetrics::new());
+        let llama = con_validacion(valida(
+            "llama",
+            &broker.url(),
+            ValidationMode::Strict,
+            Some(metricas.clone()),
+        ))
+        .await;
+        let espia = bruto(&broker.url()).await;
+        let mut cable = espia.subscribe("rpc.>").await.unwrap();
+        barrera(&espia).await;
+        let e = llama
+            .request(DESCUENTO, &json!({ "clienteId": "cli-1", "totalCents": "SECRETO-9990", "extra": "SECRETO-X" }))
+            .await
+            .unwrap_err();
+        assert_eq!(code(&e), "INVALID_SCHEMA", "{e}");
+        assert_eq!(e.class(), Some(ErrorClass::Permanent));
+        let msg = e.to_string();
+        assert!(msg.contains("/totalCents"), "cita la ruta: {msg}");
+        assert!(msg.contains("moneda"), "y TODAS: falta `moneda`: {msg}");
+        assert!(!msg.contains("SECRETO"), "nunca un valor: {msg}");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(150), cable.next())
+                .await
+                .is_err(),
+            "no salió nada al cable"
+        );
+        assert_eq!(
+            metricas.counter(&format!("flux_rpc_client_requests_total{{operation=\"{DESCUENTO}\",outcome=\"invalid_schema\"}}")),
+            Some(1)
+        );
+    }
+
+    /// Quien responde rechaza con TODAS las rutas y SIN invocar al handler; un valor sensible no llega al log del que llama.
+    #[tokio::test]
+    async fn validacion_quien_responde_rechaza_una_peticion_invalida_sin_invocar_al_handler() {
+        let bin = broker_bin!();
+        let broker = Broker::con_acl(&bin);
+        let metricas = Arc::new(InMemoryMetrics::new());
+        let crm = con_validacion(valida(
+            "crm",
+            &broker.url(),
+            ValidationMode::Strict,
+            Some(metricas.clone()),
+        ))
+        .await;
+        let ejecutadas = Arc::new(AtomicUsize::new(0));
+        let e2 = Arc::clone(&ejecutadas);
+        crm.respond(DESCUENTO, move |_: RpcRequest, _: RpcContext| {
+            let e2 = Arc::clone(&e2);
+            async move {
+                e2.fetch_add(1, Ordering::SeqCst);
+                Ok::<Value, flux::HandlerError>(json!({ "descuentoCents": 1, "moneda": "EUR" }))
+            }
+        })
+        .await
+        .unwrap();
+        // `llama` sin validación: la petición inválida SALE, y es quien responde quien la para.
+        let llama = bus(&broker.url(), "llama").await;
+        let e = llama
+            .request(
+                DESCUENTO,
+                &json!({ "clienteId": "cli-1", "totalCents": "SECRETO-9990", "moneda": "eur" }),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            (e.class(), e.code()),
+            (Some(ErrorClass::Permanent), Some("INVALID_SCHEMA")),
+            "{e}"
+        );
+        let msg = e.to_string();
+        assert!(msg.starts_with("la petición no cumple https://schemas.internal/rpc/clientes/cliente/calcular-descuento/request/1.0.0.json"), "{msg}");
+        assert!(
+            msg.contains("/totalCents") && msg.contains("/moneda"),
+            "TODAS las rutas: {msg}"
+        );
+        assert!(
+            !msg.contains("SECRETO") && !msg.contains("eur"),
+            "ningún valor: {msg}"
+        );
+        assert_eq!(
+            ejecutadas.load(Ordering::SeqCst),
+            0,
+            "el handler NO se invoca"
+        );
+        espera(
+            || metricas.counter(&format!("flux_rpc_server_requests_total{{operation=\"{DESCUENTO}\",outcome=\"invalid_schema\"}}")) == Some(1),
+            Duration::from_secs(2),
+            "el dueño no contó invalid_schema",
+        )
+        .await;
+    }
+
+    /// La respuesta del handler que no cumple SU esquema es un fallo de quien responde, y el mensaje lo dice.
+    #[tokio::test]
+    async fn validacion_una_respuesta_invalida_es_un_fallo_de_quien_responde() {
+        let bin = broker_bin!();
+        let broker = Broker::con_acl(&bin);
+        let crm = con_validacion(valida("crm", &broker.url(), ValidationMode::Strict, None)).await;
+        crm.respond(DESCUENTO, |_: RpcRequest, _: RpcContext| async move {
+            Ok::<Value, flux::HandlerError>(json!({ "descuentoCents": "mucho", "moneda": "EUR" }))
+        })
+        .await
+        .unwrap();
+        let llama = bus(&broker.url(), "llama").await;
+        let e = llama
+            .request(
+                DESCUENTO,
+                &json!({ "clienteId": "cli-1", "totalCents": 9990, "moneda": "EUR" }),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            (e.class(), e.code()),
+            (Some(ErrorClass::Permanent), Some("INVALID_SCHEMA")),
+            "{e}"
+        );
+        let msg = e.to_string();
+        assert!(
+            msg.starts_with("la respuesta no cumple"),
+            "dice de QUIÉN es el fallo: {msg}"
+        );
+        assert!(
+            msg.contains("/descuentoCents") && !msg.contains("mucho"),
+            "{msg}"
+        );
+    }
+
+    /// El ciclo bueno, con L3 en los dos lados, y los `dataschema` que salen del índice `rpc` del bundle.
+    #[tokio::test]
+    async fn validacion_el_ciclo_valido_usa_los_dataschema_del_indice_rpc() {
+        let bin = broker_bin!();
+        let broker = Broker::con_acl(&bin);
+        let crm = con_validacion(valida("crm", &broker.url(), ValidationMode::Strict, None)).await;
+        crm.respond(DESCUENTO, |_: RpcRequest, _: RpcContext| async move {
+            Ok::<Value, flux::HandlerError>(
+                json!({ "descuentoCents": 500, "moneda": "EUR", "motivo": "Campaña de otoño" }),
+            )
+        })
+        .await
+        .unwrap();
+        let llama =
+            con_validacion(valida("llama", &broker.url(), ValidationMode::Strict, None)).await;
+        let espia = bruto(&broker.url()).await;
+        let mut cable = espia.subscribe(format!("rpc.{DESCUENTO}")).await.unwrap();
+        barrera(&espia).await;
+        let r = llama
+            .request(DESCUENTO, &json!({ "clienteId": "cli-1", "totalCents": 9990, "moneda": "EUR", "campana": "Otoño" }))
+            .await
+            .expect("válido en los dos lados");
+        assert_eq!(r.data_as::<Value>().unwrap()["descuentoCents"], 500);
+        assert_eq!(
+            r.dataschema,
+            "https://schemas.internal/rpc/clientes/cliente/calcular-descuento/reply/1.0.0.json"
+        );
+        let visto = tokio::time::timeout(Duration::from_secs(1), cable.next())
+            .await
+            .unwrap()
+            .unwrap();
+        let peticion = flux::parse_event(&visto.payload).unwrap();
+        assert_eq!(
+            peticion.dataschema,
+            "https://schemas.internal/rpc/clientes/cliente/calcular-descuento/request/1.0.0.json"
+        );
+    }
+
+    /// Quien llama valida lo que recibe contra el esquema de la respuesta, aunque el mensaje traiga otro `dataschema`.
+    #[tokio::test]
+    async fn validacion_quien_llama_valida_la_respuesta_ajena_contra_el_esquema_de_la_operacion() {
+        let bin = broker_bin!();
+        let broker = Broker::con_acl(&bin);
+        let llama =
+            con_validacion(valida("llama", &broker.url(), ValidationMode::Strict, None)).await;
+        let tarea = responder_en_bruto(&broker.url(), DESCUENTO, |peticion| {
+            let mut e = respuesta_buena(peticion);
+            e.event_type = "com.flux.rpc.clientes.cliente.calcular-descuento.reply.v1".into();
+            // Un `dataschema` que NO es el de la operación: se valida contra el índice, no contra lo que diga el mensaje.
+            e.dataschema = "https://schemas.internal/otra/cosa/1.0.0.json".into();
+            e.data =
+                serde_json::value::to_raw_value(&json!({ "descuentoCents": -5, "moneda": "EUR" }))
+                    .unwrap();
+            bytes_de(&e)
+        })
+        .await;
+        let e = llama
+            .request(
+                DESCUENTO,
+                &json!({ "clienteId": "cli-1", "totalCents": 9990, "moneda": "EUR" }),
+            )
+            .await
+            .unwrap_err();
+        tarea.abort();
+        assert_eq!(code(&e), "INVALID_SCHEMA", "{e}");
+        assert!(matches!(e, FluxError::SchemaValidation(_)), "{e:?}");
+        assert!(e.to_string().contains("/descuentoCents"), "{e}");
+    }
+
+    /// Un servicio desplegado con un bundle que no trae su operación falla AL ARRANCAR, no con la primera petición.
+    #[tokio::test]
+    async fn validacion_respond_con_un_bundle_sin_la_operacion_falla_al_arrancar() {
+        let bin = broker_bin!();
+        let broker = Broker::con_acl(&bin);
+        let crm = con_validacion(valida("crm", &broker.url(), ValidationMode::Strict, None)).await;
+        let e = crm
+            .respond("clientes.cliente.v1.inventada", |_: RpcRequest, _: RpcContext| async move {
+                Ok::<Value, flux::HandlerError>(json!({}))
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(code(&e), "SCHEMA_NOT_FOUND", "{e}");
+        assert!(
+            e.to_string().contains("clientes.cliente.v1.inventada"),
+            "{e}"
+        );
+        // En `warn` arranca, y avisa.
+        let (log, lineas) = logger_espia();
+        let b = bus_con(&broker.url(), "crm-exp", |o| {
+            o.with_validation(ValidationOptions::warn(bundle()))
+                .with_logger(log)
+        })
+        .await;
+        b.respond("clientes.cliente.v1.inventada", |_: RpcRequest, _: RpcContext| async move { Ok::<Value, flux::HandlerError>(json!({})) })
+            .await
+            .expect("en warn arranca");
+        assert!(
+            lock(&lineas)
+                .iter()
+                .any(|l| l.contains("clientes.cliente.v1.inventada")),
+            "{:?}",
+            lock(&lineas)
+        );
+    }
+
+    /// Con `warn`, el handler corre aunque la petición no cumpla su esquema, y el fallo se cuenta igual.
+    #[tokio::test]
+    async fn validacion_con_warn_el_handler_corre_y_se_cuenta_como_invalid_schema() {
+        let bin = broker_bin!();
+        let broker = Broker::con_acl(&bin);
+        let metricas = Arc::new(InMemoryMetrics::new());
+        let crm = con_validacion(valida(
+            "crm",
+            &broker.url(),
+            ValidationMode::Warn,
+            Some(metricas.clone()),
+        ))
+        .await;
+        crm.respond(DESCUENTO, |_: RpcRequest, _: RpcContext| async move {
+            Ok::<Value, flux::HandlerError>(json!({ "descuentoCents": 1, "moneda": "EUR" }))
+        })
+        .await
+        .unwrap();
+        let llama = bus(&broker.url(), "llama").await;
+        let r = llama
+            .request(
+                DESCUENTO,
+                &json!({ "clienteId": "cli-1", "totalCents": "no" }),
+            )
+            .await;
+        assert!(r.is_ok(), "con warn la petición se atiende: {r:?}");
+        let serie = format!("flux_rpc_server_requests_total{{operation=\"{DESCUENTO}\",outcome=\"invalid_schema\"}}");
+        espera(
+            || metricas.counter(&serie) == Some(1),
+            Duration::from_secs(2),
+            "el fallo de esquema no se contó",
+        )
+        .await;
+    }
+}
