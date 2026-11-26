@@ -414,8 +414,91 @@
     "rotationMaxDays": 90,
     "accountPerEnvironment": true,
     "publishScope": "<dominio propio>.>",
-    "dlqPublishException": "dlq.<subject consumido>",
-    "subscribeScope": "explicit-grant-only",
+    "dlqPublishException": "dlq.<subject consumido exacto>",
+    "subscribeScope": "private-inbox-only",
+    "acl": {
+      "$comment": "Lo que scripts/gen-acl.mjs concede a un servicio y lo que NUNCA concede. Normativo en specification/06-security.md §3; ejecutado contra un nats-server real por scripts/verify-acl.mjs. Es una lista CERRADA: un permiso de publicacion que no encaje con ninguno de permissionPatterns es un error del generador. Los permisos de subject no gobiernan JetStream: los SDKs consumen por pull, y lo que confina es $JS.API.",
+      "inbox": {
+        "format": "_INBOX.<servicio>",
+        "permission": "_INBOX.<servicio>.>",
+        "permissionPattern": "^_INBOX\\.[a-z0-9]+(-[a-z0-9]+)*\\.>$",
+        "private": true,
+        "setBySdkFromServiceName": true,
+        "$comment": "Las entregas de un pull consumer viajan por el inbox. Con un _INBOX.> comun, un servicio sin concesion sobre un dominio lee sus eventos (medido en NATS 2.14.5, Apendice A-2 del plan v1.1). El nombre de servicio no admite puntos, asi que el prefijo de uno nunca es prefijo de otro. No es una opcion del SDK: una opcion es una forma de olvidarlo."
+      },
+      "subscribeToDomainSubjects": "never",
+      "createGrantedByDefault": false,
+      "devOnlyPatterns": [
+        "eventConsumerCreate",
+        "dlqReaderCreate"
+      ],
+      "createComment": "CONSUMER.CREATE NO se concede por defecto: en produccion los durables los crea flux provision y el SDK de Node, si le deniegan el add, cae a CONSUMER.INFO. Concederlo dejaria que un durable borrado lo recrease el propio servicio con deliver_policy all (reentrega silenciosa de hasta 30 dias de eventos) y que un servicio comprometido cambiase el ack_wait o el backoff de su consumidor. gen-acl.mjs --dev lo concede, solo sobre el durable propio y con su filtro exacto.",
+      "permissionPatterns": {
+        "$comment": "Permisos de PUBLICACION por categoria. Por cada subject exacto consumido: consumerInfo, consumerNext y ack de SU durable, y dlqPublish (y eventConsumerCreate solo con --dev). El dueno de un dominio lee su DLQ con un durable propio: consumerInfo, consumerNext y ack (y dlqReaderCreate solo con --dev). streamInfo cubre los streams que publica, los que consume y la DLQ de estos ultimos: subscribe() la comprueba y sin ese permiso falla.",
+        "accountInfo": "^\\$JS\\.API\\.INFO$",
+        "ownDomain": "^[a-z0-9]+(-[a-z0-9]+)*\\.>$",
+        "streamInfo": "^\\$JS\\.API\\.STREAM\\.INFO\\.(EVT|DLQ)_[A-Z0-9_]+$",
+        "eventConsumerCreate": "^\\$JS\\.API\\.CONSUMER\\.CREATE\\.EVT_[A-Z0-9_]+\\.[a-z0-9]+(-[a-z0-9]+)*__[a-z0-9_]+\\.[a-z0-9]+(-[a-z0-9]+)*\\.[a-z0-9]+(-[a-z0-9]+)*\\.v[1-9][0-9]*\\.[a-z0-9]+(-[a-z0-9]+)*$",
+        "dlqReaderCreate": "^\\$JS\\.API\\.CONSUMER\\.CREATE\\.DLQ_[A-Z0-9_]+\\.[a-z0-9]+(-[a-z0-9]+)*__dlq_[a-z0-9_]+\\.dlq\\.[a-z0-9]+(-[a-z0-9]+)*\\.>$",
+        "consumerInfo": "^\\$JS\\.API\\.CONSUMER\\.INFO\\.(EVT|DLQ)_[A-Z0-9_]+\\.[a-z0-9]+(-[a-z0-9]+)*__[a-z0-9_]+$",
+        "consumerNext": "^\\$JS\\.API\\.CONSUMER\\.MSG\\.NEXT\\.(EVT|DLQ)_[A-Z0-9_]+\\.[a-z0-9]+(-[a-z0-9]+)*__[a-z0-9_]+$",
+        "ack": "^\\$JS\\.ACK\\.(EVT|DLQ)_[A-Z0-9_]+\\.[a-z0-9]+(-[a-z0-9]+)*__[a-z0-9_]+\\.>$",
+        "dlqPublish": "^dlq\\.[a-z0-9]+(-[a-z0-9]+)*\\.[a-z0-9]+(-[a-z0-9]+)*\\.v[1-9][0-9]*\\.[a-z0-9]+(-[a-z0-9]+)*$"
+      },
+      "dlqReaderDurable": {
+        "format": "<servicio>__dlq_<dominio>",
+        "pattern": "^[a-z0-9]+(-[a-z0-9]+)*__dlq_[a-z0-9_]+$",
+        "$comment": "El dueno de un dominio lee su propia DLQ con un pull consumer sobre DLQ_<DOMINIO> (filtro dlq.<dominio>.>), no con una suscripcion: asi no se pierde lo que muere mientras esta caido y no hace falta ningun permiso de suscripcion sobre subjects que no son un inbox."
+      },
+      "ackSubject": {
+        "format": "$JS.ACK.<STREAM>.<durable>.<entregas>.<seq-stream>.<seq-consumidor>.<ts>.<pendientes>",
+        "tokens": 9,
+        "$comment": "Formato OBSERVADO en NATS 2.14.5 (Apendice A-3). Con un dominio de JetStream, u otra version, puede llevar tokens delante del stream: la ACL deja de coincidir y se rompe en alto, no en silencio."
+      },
+      "neverGranted": [
+        ">",
+        "$JS.API.>",
+        "$JS.API.CONSUMER.DURABLE.CREATE.>",
+        "$JS.API.STREAM.MSG.GET.>",
+        "$JS.API.DIRECT.GET.>",
+        "$JS.API.STREAM.CREATE.>",
+        "$JS.API.STREAM.UPDATE.>",
+        "$JS.API.STREAM.DELETE.>",
+        "$JS.API.STREAM.PURGE.>",
+        "$JS.API.CONSUMER.DELETE.>",
+        "$JS.API.STREAM.NAMES",
+        "$JS.API.STREAM.LIST"
+      ],
+      "neverGrantedPattern": "^(>|\\$JS\\.>|\\$JS\\.API\\.>|\\$JS\\.API\\.\\*(\\..*)?|\\$JS\\.API\\.CONSUMER\\.DURABLE\\.CREATE(\\..*)?|\\$JS\\.API\\.STREAM\\.(MSG\\.GET|MSG\\.DELETE|CREATE|UPDATE|DELETE|PURGE|NAMES|LIST|SNAPSHOT|RESTORE)(\\..*)?|\\$JS\\.API\\.CONSUMER\\.(DELETE|NAMES|LIST)(\\..*)?|\\$JS\\.API\\.DIRECT\\.GET(\\..*)?)$",
+      "neverGrantedReasons": {
+        "$JS.API.CONSUMER.DURABLE.CREATE": "API antigua: el filtro va solo en el cuerpo y ninguna ACL lo ve (A-5)",
+        "$JS.API.STREAM.MSG.GET y $JS.API.DIRECT.GET": "leen cualquier mensaje por secuencia, sin consumidor ni filtro (A-6)",
+        "$JS.API.> y >": "anulan el modelo entero: con ellos un servicio crea consumidores sobre el stream de otro dominio y lee con MSG.GET"
+      }
+    },
+    "provisioning": {
+      "$comment": "Los streams y durables los crea quien opera, no el servicio (y, por defecto, ni siquiera tiene permiso para recrear su durable: acl.createGrantedByDefault). flux provision lee el mismo manifiesto que gen-acl.mjs y crea lo que esas ACLs presuponen. Normativo en specification/06-security.md §3.6.",
+      "outsideSdkInProduction": true,
+      "tool": "flux provision",
+      "credentials": "operacion, nunca las de un servicio",
+      "idempotent": true,
+      "neverDeletes": true,
+      "neverOverwritesDifferentConfig": true,
+      "notProvisionedErrorCode": "NOT_PROVISIONED"
+    },
+    "sdk": {
+      "$comment": "Lo que un SDK DEBE poder hacer para ser compatible con la configuracion segura (specification/06-security.md §2).",
+      "credentials": [
+        "creds",
+        "nkeySeed"
+      ],
+      "tls": [
+        "caFile",
+        "certFile",
+        "keyFile"
+      ],
+      "inboxPrefixFromServiceName": true
+    },
     "piiInPayload": "forbidden",
     "retentionByClassification": {
       "public": "30d",

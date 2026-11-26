@@ -1,0 +1,48 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.internal/pedidos/pedido/cancelado/1.0.0.json",
+  "title": "pedidos.pedido.v1.cancelado",
+  "description": "Un pedido ha sido cancelado, por el cliente o por el sistema. Emitido por pedidos-api, dueño del agregado. Un consumidor que ya había reservado stock o emitido factura debe deshacerlo de forma idempotente: este evento puede llegar repetido.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["pedidoId", "clienteId", "aggregateVersion", "motivo", "reembolsoCents", "moneda"],
+  "properties": {
+    "pedidoId": {
+      "type": "string",
+      "pattern": "^ped-[0-9a-z]{3,32}$",
+      "description": "Identificador del agregado. Coincide con el atributo `subject` del CloudEvent."
+    },
+    "clienteId": {
+      "type": "string",
+      "pattern": "^cli-[0-9a-z]{3,32}$",
+      "description": "Referencia al cliente. NO se incluye PII del cliente aquí — ver 06-security.md §5.1."
+    },
+    "aggregateVersion": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Contador monotónico del agregado. El consumidor descarta eventos con versión menor o igual a la ya aplicada."
+    },
+    "motivo": {
+      "type": "string",
+      "enum": ["cliente", "sin-stock", "fraude", "pago-fallido"],
+      "x-extensible-enum": true,
+      "description": "Causa de la cancelación. Enum EXTENSIBLE: pueden añadirse valores en un MINOR, así que el consumidor DEBE tener una rama por defecto no destructiva — ver 05-compatibility.md §2.3."
+    },
+    "reembolsoCents": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Importe a reembolsar en la unidad mínima de `moneda`. Entero, nunca float. Cero si el pedido no llegó a cobrarse."
+    },
+    "moneda": {
+      "type": "string",
+      "pattern": "^[A-Z]{3}$",
+      "description": "Código ISO 4217."
+    },
+    "comentarioCliente": {
+      "type": "string",
+      "maxLength": 500,
+      "x-pii": true,
+      "description": "Texto libre del cliente al cancelar. Marcado x-pii: el SDK lo redacta en logs y fuerza dataclassification >= confidential."
+    }
+  }
+}

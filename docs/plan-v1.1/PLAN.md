@@ -253,8 +253,19 @@ Reglas nuevas. Todas tienen evidencia en el Apéndice A.
   $JS.ACK.<STREAM>.<durable>.>
   ```
 
-  Más `$JS.API.INFO` y `$JS.API.STREAM.INFO.<STREAM>` de los streams propios y consumidos.
-  *(A-3, A-4)*
+  Más `$JS.API.INFO` y `$JS.API.STREAM.INFO.<STREAM>` de los streams propios y consumidos,
+  **y de la DLQ de cada stream consumido**: `subscribe()` también consulta `DLQ_<DOM>`, y sin
+  ese permiso intenta crearlo y falla. *(A-3, A-4, A-8b)*
+
+  > **Corregido tras medir.** La versión original de este plan, y `evidencia/candidata.conf`,
+  > no incluían `STREAM.INFO.DLQ_<DOM>`. Con la candidata, el SDK de Node **no** podía
+  > suscribirse (`Permissions Violation for Publish to "$JS.API.STREAM.CREATE.DLQ_PEDIDOS"`).
+- **El dueño lee su propia DLQ con un pull consumer**, no con una suscripción a
+  `dlq.<dominio>.>`: un durable `<servicio>__dlq_<dominio>` sobre `DLQ_<DOM>`, con filtro
+  `dlq.<dominio>.>` y los mismos permisos que cualquier durable, y ninguna suscripción. El plan no lo cubría
+  (la v1 del generador le daba `sub: dlq.<dominio>.>`, que con pull consumers no sirve).
+  Alternativa descartada: la suscripción core, que solo ve los muertos en vivo y reintroduce
+  un permiso de suscripción fuera del inbox. *(A-8a)*
 - **Nunca a un servicio:** `$JS.API.CONSUMER.DURABLE.CREATE.*` (el filtro va en el cuerpo
   y ninguna ACL lo ve), `$JS.API.STREAM.MSG.GET.*`, y crear, modificar, borrar o purgar
   streams. *(A-5, A-6)*
@@ -262,7 +273,16 @@ Reglas nuevas. Todas tienen evidencia en el Apéndice A.
   aceptar una CA propia y credenciales nkey / `.creds`.
 - **Streams y consumidores se aprovisionan fuera del SDK** en producción. Si el SDK
   intenta crear y el broker lo deniega, **DEBE** fallar con un error accionable
-  (`NOT_PROVISIONED`), no con un timeout.
+  (`NOT_PROVISIONED`), no con un timeout. *(A-8b)*
+
+  > **Decidido tras medir: `CONSUMER.CREATE` NO se concede por defecto.** El plan original lo
+  > incluía en los permisos de cada durable. No es imprescindible con un durable aprovisionado
+  > (el SDK de Node, si le deniegan el `add`, cae a `CONSUMER.INFO`), y concederlo permite que
+  > un durable borrado lo recree el propio servicio con `deliver_policy: all` —reentrega
+  > silenciosa de hasta 30 días de eventos— o que un servicio comprometido cambie el `ack_wait`
+  > o el `backoff` de su consumidor. `gen-acl.mjs --dev` lo concede, solo sobre el durable
+  > propio y con su filtro exacto, para arrancar sin `flux provision`. Los SDKs hacen *info
+  > antes de crear* (Fase 1.4 y 6).
 
 Añade a `AGENTS.md` §8 dos trampas: «los permisos de subject no gobiernan JetStream» y
 «`_INBOX.>` común = cualquiera lo lee todo».
@@ -274,9 +294,43 @@ Añade a `AGENTS.md` §8 dos trampas: «los permisos de subject no gobiernan Jet
   error. Motivo: el nombre del durable es un único token y NATS no permite comodines
   dentro de un token; hay que conocer el subject exacto.
 - Emite los permisos de 1.1. La forma objetivo está escrita a mano en
-  [`evidencia/candidata.conf`](evidencia/candidata.conf).
-- `--nkeys <mapa.json>`: sustituye cada `<NKEY_DE_*>` por la clave pública real.
-- Actualiza también la rama `--tenants` (Modelo B).
+  [`evidencia/candidata.conf`](evidencia/candidata.conf), con las dos diferencias de arriba
+  (la DLQ de los streams consumidos y la DLQ propia).
+- `--nkeys <mapa.json>`: sustituye cada `<NKEY_DE_*>` por la clave pública real. Rechaza una
+  **semilla** (es un secreto), una clave repetida entre servicios (credencial compartida) y un
+  servicio sin clave.
+- Actualiza también la rama `--tenants` (Modelo B). Las claves de `--nkeys` son
+  `<servicio>@<tenant>`: NATS rechaza la misma nkey en dos accounts (*Duplicate nkey*, A-8d).
+
+**Interfaz fijada** (la suite de seguridad se construye sobre ella):
+
+```
+node scripts/gen-acl.mjs <services.json> [--bundle <bundle.json>] [--nkeys <mapa.json>]
+                         [--check] [--tenants] [--json] [--dev]
+```
+
+- `--json` imprime un array con un elemento por servicio (por servicio y tenant con
+  `--tenants`): `{ name, publish, subscribe, owns, consumes, durables }`, donde `consumes` ya
+  está **expandido** a subjects exactos y `durables` es `[{ stream, durable, filter, kind }]`
+  (`kind` ∈ `events | dlq`).
+- `--dev` añade `CONSUMER.CREATE` de cada durable propio (ver arriba). Sin él, ningún permiso
+  de `CREATE`. Una lista de permisos **nunca** sale vacía: en NATS `allow: []` significa «sin
+  restricción», no «nada» (medido).
+- La salida por defecto es un bloque `accounts { … }` **incluible** con `include`; no define
+  puerto, TLS ni JetStream de servidor. No genera el usuario de operación: quien aprovisiona lo
+  añade (p. ej. insertándolo tras `users: [`).
+- `--bundle` por defecto es el `schemas/bundle.json` **de este repositorio**, no el del
+  directorio actual.
+- Un patrón de `consumes` sin coincidencias, o un subject exacto inexistente, es un error con
+  pista; también un comodín que no sea el `>` final y dos subjects que den el mismo durable.
+- La lógica compartida con `flux provision` vive en `scripts/lib/manifest.mjs`;
+  `protocol.json` → `security.acl` fija la lista **cerrada** de permisos concedibles y la de los
+  denegables, y `check-protocol-json.mjs` comprueba que el generador la cumple.
+
+[`scripts/verify-acl.mjs`](../../scripts/verify-acl.mjs) aplica lo generado a un nats-server
+real y comprueba lo permitido y lo denegado, **la minimalidad de cada permiso** (quitando uno,
+el ciclo del servicio se rompe) y que las sondas **detectan** una ACL rota (dos mutantes
+sembrados) y la ACL v1 congelada.
 - `examples/services.json`: cada subject consumido debe existir en `schemas/`. Añade los
   esquemas de ejemplo que falten.
 
@@ -285,6 +339,16 @@ Añade a `AGENTS.md` §8 dos trampas: «los permisos de subject no gobiernan Jet
 Crea streams `EVT_`/`DLQ_` (`02-naming.md` §3.3) y los consumidores durables con la
 configuración canónica (`03-delivery.md` §2). Idempotente. Informa de diferencias. **Nunca
 borra.** Usa credenciales de operación, no de servicio.
+
+Implementado como `flux provision <services.json> [--dry-run] [--replicas n] [--bundle …]
+[--server …] [--creds …]`. Crea, además, el durable con el que cada dueño lee su DLQ. Sale con
+`1` si algún recurso existe con otra configuración (se informa y no se toca) o dio error.
+`--replicas` por defecto 1; producción, 3. Los nombres y la expansión de `consumes` los comparte
+con `gen-acl.mjs` (`scripts/lib/manifest.mjs`); las configuraciones salen de `protocol.json`.
+
+> **Corregido tras medir.** `--creds` de la CLI **no funcionaba**: se pasaba a una opción
+> `creds` que el cliente NATS ignora, y el servidor respondía *Authorization Violation* (A-8e).
+> Ahora se entrega con `credsAuthenticator`, para todos los comandos.
 
 #### 1.4 SDKs — Node y Rust ahora; el resto en la Fase 6
 
@@ -747,6 +811,12 @@ Reproducible: [`evidencia/ejecutar.sh`](evidencia/ejecutar.sh).
 | A-6 | Leer el stream con `$JS.API.STREAM.MSG.GET.…` | `Permissions Violation` |
 | A-7 | Otro servicio se suscribe a `_INBOX.>` y a `_INBOX.fx-fact.>` | Denegadas las dos |
 | A-8 | Otro servicio pide mensajes del consumidor ajeno (`CONSUMER.MSG.NEXT`) | `Permissions Violation` |
+| A-8a | El dueño de un dominio lee su DLQ con un pull consumer: `CONSUMER.CREATE.DLQ_<DOM>.<durable>.dlq.<dom>.>` exacto, y sin `STREAM.INFO` | Crea el durable y consume. Con filtro `dlq.>`, o sobre la DLQ de otro dominio: `Permissions Violation` |
+| A-8b | El SDK de Node bajo la ACL generada, quitando permisos de uno en uno (`scripts/verify-acl.mjs`) | Cada permiso es necesario **salvo `CONSUMER.CREATE`** con un durable aprovisionado (cae a `CONSUMER.INFO`). Sin `STREAM.INFO.DLQ_<DOM>`, `subscribe()` intenta `STREAM.CREATE.DLQ_<DOM>` y falla |
+| A-8c | El SDK real de Node, sin modificar, con `inboxPrefix` y autenticador nkey inyectados por `credentials` | `connect`, `subscribe`, `publish`, ruta a la DLQ y lectura de la DLQ por el dueño: todo funciona bajo la ACL generada |
+| A-8d | La misma nkey en dos accounts de una config | `nats-server` no arranca: `Duplicate nkey` |
+| A-8e | `.creds` con un JWT de relleno contra un servidor con nkeys estáticas; y la opción `creds` del cliente NATS | El `credsAuthenticator` autentica (solo importa la semilla). La opción `creds` se ignora: `Authorization Violation` |
+| A-8f | Cómo se manifiesta una denegación en `@nats-io/*` 3.4.0 | Una petición sin permiso falla en ~2 ms con `Permissions Violation for Publish`. Con el inbox por defecto, la primera petición falla en ~3 ms (`…for Subscription to "_INBOX.….*"`). Una suscripción denegada **no lanza** al suscribirse, pero su iterador **lanza** `PermissionViolationError` al consumirlo |
 | A-9 | Stream con `max_msgs_per_subject: 1`: 3 escrituras sobre 2 claves | 2 mensajes en el stream |
 | A-10 | Lectura puntual con *direct get* (`last_by_subj`) | Devuelve el último valor |
 | A-11 | Escribir con `Nats-Expected-Last-Subject-Sequence` desfasada, y crear una clave existente con `0` | `wrong last sequence: N` en ambos |

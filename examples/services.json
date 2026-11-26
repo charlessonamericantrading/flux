@@ -1,5 +1,5 @@
 {
-  "$comment": "Manifiesto de ownership del ecosistema. Alimenta scripts/gen-acl.mjs, que deriva las ACLs de NATS a partir de él. Ver specification/06-security.md §3.",
+  "$comment": "Manifiesto de ownership del ecosistema. Alimenta scripts/gen-acl.mjs, que deriva las ACLs de NATS, y `flux provision`, que crea los streams y los durables que esas ACLs presuponen. `consumes` es un subject exacto (pedidos.pedido.v1.creado) o un patrón acabado en `>` (pedidos.pedido.v1.>) que se EXPANDE contra schemas/bundle.json: cada subject resultante debe tener su esquema en schemas/, porque el nombre del durable es un único token y NATS no admite comodines dentro de un token. Un patrón sin coincidencias, o un subject exacto que no existe, es un error. Tras añadir un esquema: node scripts/bundle-schemas.mjs. Ver specification/06-security.md §3.",
   "environment": "produccion",
   "services": [
     {

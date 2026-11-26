@@ -58,11 +58,15 @@ jobs:
 
       # 05-compatibility.md §4: los esquemas publicados son inmutables.
       # Editar 1.0.0 in situ invalida todos los eventos ya emitidos que lo referencian.
+      #
+      # `schemas/bundle.json` se EXCLUYE: no es un esquema publicado sino un índice GENERADO, y
+      # añadir cualquier esquema lo regenera (su estado en el diff es `M`). Sin la exclusión,
+      # este paso fallaba en todo PR que añadiera un esquema, aunque solo hubiera adiciones.
       - name: Ningún schema existente modificado
         if: github.event_name == 'pull_request'
         run: |
           changed=$(git diff --name-status \
-            origin/${{ github.base_ref }}...HEAD -- schemas/ \
+            origin/${{ github.base_ref }}...HEAD -- schemas/ ':(exclude)schemas/bundle.json' \
             | awk '$1 == "M" || $1 ~ /^R/ { print $2 }')
           if [ -n "$changed" ]; then
             echo "✗ Schemas publicados modificados (son inmutables — añade una versión nueva):"
@@ -82,6 +86,36 @@ jobs:
       # Un dominio con dos dueños destruye la premisa de que solo el propietario
       # del agregado publica sus eventos, y nadie puede confiar ya en el .
       - run: node scripts/gen-acl.mjs examples/services.json --check
+
+  acl-verify:
+    name: ACLs generadas, contra un NATS real
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      # nats-server 2.14.5 exige Go 1.25 (su go.mod). Sin Docker y sin descargar un binario
+      # de origen dudoso: se compila la versión exacta que la spec dice haber medido.
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+      - name: Compilar nats-server 2.14.5
+        run: |
+          GOBIN="$PWD/bin" go install github.com/nats-io/nats-server/v2@v2.14.5
+          echo "NATS_SERVER=$PWD/bin/nats-server" >> "$GITHUB_ENV"
+      # Las dependencias de NATS las usan la suite (conformance/) y la CLI (cli/, para
+      # `flux provision`); verify-acl no añade ninguna.
+      - run: npm install --no-audit --no-fund
+        working-directory: conformance
+      - run: npm install --no-audit --no-fund
+        working-directory: cli
+      # H3 del plan v1.1: hasta ahora nada aplicaba los permisos generados a un broker, y por
+      # eso «funcionaban» en el papel mientras un servicio no podía consumir (H1) y leía
+      # dominios ajenos (H2). Termina con exit 0 solo si lo permitido funciona, lo denegado se
+      # deniega, cada permiso es necesario y las sondas DETECTAN una ACL rota.
+      - name: Aplicar las ACLs generadas a un nats-server real
+        run: node scripts/verify-acl.mjs
 
   protocol-json-valid:
     name: protocol.json coherente
