@@ -1,0 +1,57 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.internal/system/rpc/error/1.0.0.json",
+  "title": "system.rpc.error",
+  "description": "El error de una petición/respuesta: lo que el que responde devuelve EN LUGAR de la respuesta. Es el `dataschema` FIJO de todo error, de cualquier operación, con `type: com.flux.rpc.error.v1` y `dataclassification: internal`. `class` es binaria —`retryable` o `permanent`—: quien llama lo convierte en `RetryableError` o `PermanentError`, y un handler de eventos que llama a una operación hereda la clasificación sin hacer nada. `code` es un identificador estable (`HTTP_503`, `PEDIDO_YA_CANCELADO`), nunca el mensaje. `message` NO DEBE contener valores de `data` —cita rutas (`/totalCents`), no contenidos—: acaba en logs. `retryAfterMs` solo tiene sentido con `retryable` — 11-request-reply.md §3.3.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "class",
+    "code",
+    "message"
+  ],
+  "properties": {
+    "class": {
+      "type": "string",
+      "enum": [
+        "retryable",
+        "permanent"
+      ],
+      "description": "Qué hacer con el fallo: reintentar o no. `poison` no viaja: para quien llama, una petición que el otro lado no pudo interpretar es `permanent`."
+    },
+    "code": {
+      "type": "string",
+      "pattern": "^[A-Z][A-Z0-9]*(_[A-Z0-9]+)*$",
+      "maxLength": 64,
+      "description": "Código estable y agrupable (04-errors.md §5): MAYÚSCULAS y guiones bajos. Nunca el texto del error."
+    },
+    "message": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 1000,
+      "description": "Qué falló y cómo se arregla, para quien lee el log. Sin valores de `data` ni el texto de excepciones no clasificadas."
+    },
+    "retryAfterMs": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Sugerencia para el PRIMER reintento, en milisegundos. Solo con `class: retryable`."
+    }
+  },
+  "if": {
+    "properties": {
+      "class": {
+        "const": "permanent"
+      }
+    },
+    "required": [
+      "class"
+    ]
+  },
+  "then": {
+    "not": {
+      "required": [
+        "retryAfterMs"
+      ]
+    }
+  }
+}

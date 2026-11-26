@@ -1,0 +1,30 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.internal/rpc/clientes/cliente/calcular-descuento/reply/1.0.0.json",
+  "title": "rpc clientes.cliente.v1.calcular-descuento — respuesta",
+  "description": "La RESPUESTA de `clientes.cliente.v1.calcular-descuento`, con `type: com.flux.rpc.clientes.cliente.calcular-descuento.reply.v1`. El descuento va en la unidad mínima de la moneda de la petición. Quien escribe esta respuesta es el dueño y quienes la leen son los llamantes: añadir un valor a un enum exigiría `x-extensible-enum` (11-request-reply.md §11).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "descuentoCents",
+    "moneda"
+  ],
+  "properties": {
+    "descuentoCents": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Descuento en la unidad mínima de la moneda. Nunca un decimal."
+    },
+    "moneda": {
+      "type": "string",
+      "pattern": "^[A-Z]{3}$",
+      "description": "Moneda, ISO 4217: la de la petición."
+    },
+    "motivo": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 200,
+      "description": "Por qué se aplica ese descuento, en texto legible. Opcional."
+    }
+  }
+}

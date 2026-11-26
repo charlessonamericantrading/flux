@@ -281,6 +281,66 @@ const CASES = [
      "$JS.API.CONSUMER.CREATE.DLQ_CLIENTES.crm-api__dlq_state_clientes.dlq.>",
      "$JS.API.CONSUMER.CREATE.DLQ_CLIENTES.crm-api__dlq_clientes.dlq.state.clientes.>",
      "$JS.API.CONSUMER.CREATE.EVT_CLIENTES.crm-api__dlq_state_clientes.dlq.state.clientes.>"]],
+
+  // ── Petición/respuesta — specification/11-request-reply.md ───────────────────────────────────────
+  // Cinco tokens `rpc.<dominio>.<agregado>.v<major>.<operacion>`. El nombre de la operación (cuatro tokens, sin `rpc.`)
+  // tiene la forma sintáctica de un subject de evento; lo que los separa es el prefijo.
+  ["rpc.subject.pattern",
+    ["rpc.clientes.cliente.v1.obtener", "rpc.clientes.cliente.v1.calcular-descuento", "rpc.logistica.linea-envio.v2.reservar-stock", "rpc.a.b.v1.c"],
+    ["clientes.cliente.v1.obtener",                        // sin el prefijo: es el nombre de la operación, no su subject
+     "rpc.clientes.cliente.v1",                            // sin operación
+     "rpc.clientes.cliente.v1.obtener.x",                  // seis tokens
+     "Rpc.clientes.cliente.v1.obtener", "rpc.Clientes.cliente.v1.obtener", "rpc.clientes.cliente.v1.Obtener",
+     "rpc.clientes.cliente.v1.obtener_cliente", "rpc.clientes.cliente.v0.obtener", "rpc.clientes.cliente.1.obtener",
+     "rpc.clientes.cliente.v1.*", "rpc.clientes.cliente.v1.>", "rpc.clientes.>", "rpc.*.cliente.v1.obtener",   // comodines: el broker los acepta
+     "rpc.clientes.cliente.v1.obtener\n", "rpc.clientes.cliente.v1.",
+     "state.clientes.cliente.v1.acme.cli-1", "dlq.clientes.cliente.v1.obtener", "pedidos.pedido.v1.creado"]],
+
+  ["rpc.operation.pattern",
+    ["clientes.cliente.v1.obtener", "clientes.cliente.v1.calcular-descuento", "logistica.linea-envio.v2.reservar-stock"],
+    ["clientes.cliente.v1", "rpc.clientes.cliente.v1.obtener", "Clientes.cliente.v1.obtener", "clientes.cliente.v1.Obtener",
+     "clientes.cliente.v1.obtener_cliente", "clientes.cliente.v1.obtener.x", "clientes.cliente.v0.obtener", "clientes.cliente.v1.",
+     "clientes.cliente.v1.*", "clientes.cliente.v1.>", "clientes.cliente.v1.obtener\n", ""]],
+
+  ["rpc.operationName.pattern",
+    ["obtener", "crear", "calcular-precio", "reservar-stock", "validar-direccion", "a1"],
+    ["", "Obtener", "obtener_cliente", "obtener cliente", "obtener.cliente", "-obtener", "obtener-", "obtener--cliente", "*", ">", "obtener\n"]],
+
+  ["rpc.type.request.pattern",
+    ["com.flux.rpc.clientes.cliente.calcular-descuento.request.v1", "com.flux.rpc.logistica.linea-envio.reservar-stock.request.v2"],
+    ["com.flux.rpc.clientes.cliente.calcular-descuento.reply.v1", "com.flux.rpc.error.v1", "com.flux.clientes.cliente.creado.v1",
+     "com.flux.rpc.clientes.cliente.request.v1", "com.flux.rpc.clientes.cliente.calcular-descuento.request", "com.flux.state.clientes.cliente.v1"]],
+  ["rpc.type.reply.pattern",
+    ["com.flux.rpc.clientes.cliente.calcular-descuento.reply.v1", "com.flux.rpc.logistica.linea-envio.reservar-stock.reply.v2"],
+    ["com.flux.rpc.clientes.cliente.calcular-descuento.request.v1", "com.flux.rpc.error.v1", "com.flux.clientes.cliente.creado.v1",
+     "com.flux.rpc.clientes.cliente.reply.v1", "com.flux.rpc.clientes.cliente.calcular-descuento.reply"]],
+  ["rpc.type.error.pattern",
+    ["com.flux.rpc.error.v1"],
+    ["com.flux.rpc.error.v2", "com.flux.rpc.error", "com.flux.error.v1", "com.flux.rpc.clientes.cliente.obtener.reply.v1", "com.flux.rpc.error.v1.x"]],
+
+  ["rpc.dataschema.request.pattern",
+    ["https://schemas.internal/rpc/clientes/cliente/obtener/request/1.0.0.json", "https://schemas.internal/rpc/logistica/linea-envio/reservar-stock/request/2.3.1.json"],
+    ["https://schemas.internal/rpc/clientes/cliente/obtener/reply/1.0.0.json", "https://schemas.internal/state/clientes/cliente/1.0.0.json",
+     "https://schemas.internal/clientes/cliente/obtener/request/1.0.0.json", "https://schemas.internal/rpc/clientes/cliente/obtener/request/1.0.json",
+     "https://schemas.internal/system/rpc/error/1.0.0.json"]],
+  ["rpc.dataschema.reply.pattern",
+    ["https://schemas.internal/rpc/clientes/cliente/obtener/reply/1.0.0.json"],
+    ["https://schemas.internal/rpc/clientes/cliente/obtener/request/1.0.0.json", "https://schemas.internal/system/rpc/error/1.0.0.json",
+     "https://schemas.internal/rpc/clientes/cliente/obtener/reply/v1.json"]],
+
+  // Permisos de la petición/respuesta (medidos: A-66, A-68, A-71, A-73). Quien llama publica en el subject EXACTO de cada
+  // operación concedida; el dueño se suscribe a su dominio. Lo ancho («para que funcione») tiene que FALLAR aquí.
+  ["rpc.acl.callerPublish",
+    ["rpc.clientes.cliente.v1.obtener", "rpc.logistica.linea-envio.v2.reservar-stock"],
+    ["rpc.>", "rpc.clientes.>", "rpc.clientes.cliente.>", "rpc.clientes.cliente.v1.*", "rpc.clientes.cliente.v1.>", "rpc.*.*.*.*",
+     "clientes.cliente.v1.obtener", "rpc.clientes.cliente.v1", "rpc.clientes.cliente.v1.obtener.x", ">", "_INBOX.llama.>"]],
+  ["rpc.acl.ownerSubscribe",
+    ["rpc.clientes.>", "rpc.linea-envio.>"],
+    ["rpc.>", "rpc.*.>", ">", "rpc.clientes.cliente.>", "rpc.clientes.*", "rpc.clientes", "clientes.>", "state.clientes.>", "_INBOX.crm.>", "dlq.clientes.>"]],
+
+  ["rpc.metrics.operationLabelPattern",
+    ["clientes.cliente.v1.obtener", "logistica.linea-envio.v2.reservar-stock"],
+    ["rpc.clientes.cliente.v1.obtener", "clientes.cliente.v1", "clientes.cliente.v1.obtener.x", "Clientes.cliente.v1.obtener"]],
 ];
 
 // ─── La ACL de ESTADO y su generador — 06-security.md §3.8 ───────────────────────────────────────
@@ -736,6 +796,212 @@ function fallosDeEstado(doc) {
   return f;
 }
 
+// ─── Petición/respuesta — specification/11-request-reply.md ──────────────────────────────────────────
+// Como `fallosDeEstado`: una función PURA sobre el documento, que se ejecuta sobre el protocol.json real (cero fallos) y
+// sobre copias estropeadas a propósito (cada una DEBE dar al menos uno). Una invariante que solo se ha visto en verde no
+// demuestra nada.
+const CODIGOS_RPC = {
+  RPC_UNAVAILABLE: "retryable",
+  RPC_TIMEOUT: "retryable",
+  STALE_REQUEST: "permanent",
+  RPC_INVALID_REPLY: "permanent",
+  RPC_MESSAGE_TOO_LARGE: "permanent",
+  INVALID_RPC_CALL: "permanent",
+};
+
+/** ¿Hay algún subject concreto que casen a la vez dos patrones de NATS? `*` casa un token; `>`, uno o más al final.
+ *  Es el algoritmo de `flux doctor` (11-request-reply.md §8): el runner de conformance lo mide contra un broker. */
+function solapa(a, b) {
+  const x = a.split("."), y = b.split(".");
+  for (let i = 0; ; i++) {
+    if (x[i] === ">") return y.length > i;
+    if (y[i] === ">") return x.length > i;
+    if (i >= x.length || i >= y.length) return x.length === y.length;
+    if (x[i] === "*" || y[i] === "*" || x[i] === y[i]) continue;
+    return false;
+  }
+}
+
+/** @returns {string[]} */
+function fallosDeRpc(doc) {
+  const f = [];
+  const r = doc.rpc;
+  if (!r) return ["falta el bloque `rpc` (11-request-reply.md)"];
+  const cs = doc.errors?.codes ?? {};
+  const eq = (a, b) => JSON.stringify(a) === JSON.stringify(b);
+  const re = (src) => { try { return new RegExp(src); } catch { return /(?!)/; } };
+
+  // 04-errors.md §7: la lista de códigos es CERRADA, con su clase, y todos cuelgan de la capacidad `rpc`.
+  for (const [c, clase] of Object.entries(CODIGOS_RPC)) {
+    if (!cs[c]) { f.push(`errors.codes.${c}: falta (04-errors.md §7)`); continue; }
+    if (cs[c].class !== clase) f.push(`errors.codes.${c}.class debe ser "${clase}", es ${JSON.stringify(cs[c].class)}`);
+    if (cs[c].capability !== "rpc") f.push(`errors.codes.${c}.capability debe ser "rpc"`);
+  }
+  const deRpc = Object.entries(cs).filter(([k, v]) => !k.startsWith("$") && v?.capability === "rpc").map(([k]) => k).sort();
+  if (!eq(deRpc, Object.keys(CODIGOS_RPC).sort())) f.push(`los códigos de la capacidad rpc son una lista CERRADA de seis; hay [${deRpc.join(", ")}]`);
+  if (cs.RPC_UNAVAILABLE?.immediate !== true) f.push("errors.codes.RPC_UNAVAILABLE.immediate debe ser true: el broker lo dice en milisegundos y no se espera");
+  for (const c of ["INVALID_RPC_CALL", "RPC_MESSAGE_TOO_LARGE"]) if (cs[c]?.failsBeforeNetwork !== true) f.push(`errors.codes.${c}.failsBeforeNetwork debe ser true`);
+  if (cs.RPC_UNAVAILABLE?.failsBeforeNetwork === true) f.push("errors.codes.RPC_UNAVAILABLE no falla antes de la red: es la respuesta del broker");
+  for (const c of ["request", "respond"]) if (!(cs.RESERVED_DOMAIN?.thrownBy ?? []).includes(c)) f.push(`errors.codes.RESERVED_DOMAIN.thrownBy debe incluir «${c}»: un dominio reservado se rechaza también en las llamadas de rpc`);
+  if (!doc.capabilities?.definitions?.rpc) f.push("capabilities.definitions.rpc: falta la definición de la capacidad (con su evidencia)");
+  else if (doc.capabilities.definitions.rpc.evidence !== "sdk-files") f.push('capabilities.definitions.rpc.evidence debe ser "sdk-files", como `security` y `state`');
+  if ((doc.outOfScopeV1 ?? []).includes("request/reply")) f.push("outOfScopeV1 ya no debe incluir «request/reply»: entra en 1.1 como extensión opcional (00-protocol.md §6)");
+  if (!(doc.naming?.reservedDomains?.names ?? []).includes("rpc")) f.push("naming.reservedDomains.names debe incluir «rpc»: el subject lleva ese prefijo");
+
+  // Sin stream: core NATS.
+  const t = r.transport ?? {};
+  if (t.kind !== "core-nats" || t.stream !== "none" || t.publishViaJetStream !== false) f.push("rpc.transport: core NATS, sin stream y sin publicar por JetStream (A-56: si nadie responde, quien llama lo sabe al instante)");
+  if (t.persistence !== "none" || t.dlq !== "none" || t.replies !== 1) f.push("rpc.transport: sin persistencia, sin DLQ y UNA respuesta por petición");
+
+  // El subject: cinco tokens, y el nombre de la operación tiene la forma de un subject de evento.
+  const fmt = r.subject?.format ?? "";
+  if (r.subject?.tokens !== 5 || fmt.split(".").length !== 5 || !fmt.startsWith("rpc.")) f.push(`rpc.subject: debe tener 5 tokens y empezar por \`rpc.\` (tokens=${r.subject?.tokens}, formato «${fmt}»)`);
+  if (r.operation?.tokens !== 4 || (r.operation?.format ?? "").split(".").length !== 4) f.push("rpc.operation: el nombre de la operación tiene 4 tokens, sin `rpc.`");
+  if (r.operation?.pattern !== doc.naming?.subject?.pattern || r.operation?.equalsEventSubjectPattern !== true) f.push("rpc.operation.pattern debe ser EXACTAMENTE naming.subject.pattern: el nombre de una operación tiene la forma sintáctica de un subject de evento y lo que las separa es el prefijo `rpc.`");
+  if (r.subject?.pattern !== `^rpc\\.${(r.operation?.pattern ?? "").slice(1)}`) f.push("rpc.subject.pattern debe ser `^rpc\\.` + rpc.operation.pattern: el subject es el nombre de la operación con el prefijo");
+  for (const [ruta, nodo] of [["rpc.subject", r.subject], ["rpc.operation", r.operation], ["rpc.operationName", r.operationName]]) {
+    const rx = re(nodo?.pattern ?? "");
+    for (const v of nodo?.valid ?? []) if (!rx.test(v)) f.push(`${ruta}.valid: el patrón rechaza ${JSON.stringify(v)}`);
+    for (const v of nodo?.invalid ?? []) if (rx.test(v)) f.push(`${ruta}.invalid: el patrón acepta ${JSON.stringify(v)}`);
+  }
+  if (r.operationName?.form !== "infinitive-kebab-case") f.push("rpc.operationName.form debe ser infinitive-kebab-case: la operación va en infinitivo, el evento en pasado");
+  // Un dominio reservado no lo rechaza el patrón: lo rechaza RESERVED_DOMAIN (si no, un SDK daría «operación inválida» y no el código estable).
+  for (const d of doc.naming?.reservedDomains?.names ?? []) {
+    if (!re(r.operation?.pattern ?? "").test(`${d}.cliente.v1.obtener`)) f.push(`rpc.operation.pattern debería aceptar sintácticamente \`${d}.cliente.v1.obtener\`: lo rechaza RESERVED_DOMAIN, no el patrón`);
+  }
+
+  // Reservados: `request` y `respond` rechazan un dominio reservado antes de tocar la red, con el código estable.
+  const rv = r.reserved ?? {};
+  if (rv.domains !== "naming.reservedDomains.names" || rv.errorCode !== "RESERVED_DOMAIN" || !cs.RESERVED_DOMAIN || !eq(rv.appliesTo, ["request", "respond"]) || rv.prefixInOperationName !== "RESERVED_DOMAIN") f.push("rpc.reserved: request y respond rechazan los dominios reservados (naming.reservedDomains.names) con RESERVED_DOMAIN, y un nombre con el prefijo `rpc.` también");
+
+  // El grupo de cola y la suscripción exacta.
+  const q = r.queueGroup ?? {};
+  if (q.name !== "service-name" || q.pattern !== "naming.service.pattern") f.push("rpc.queueGroup: el grupo de cola es el NOMBRE DE SERVICIO (naming.service.pattern): dos servicios distintos son dos grupos y cada uno ejecuta la petición (A-60)");
+  if (q.subscription !== "exact-subject-per-operation" || q.wildcardSubscriptionForbidden !== true) f.push("rpc.queueGroup: una suscripción por operación, al subject EXACTO: con `rpc.<dominio>.>` una operación sin handler da timeout en vez de `no responders` (A-64)");
+
+  // Tipos y esquemas.
+  if (r.type?.error?.value !== "com.flux.rpc.error.v1" || r.type?.error?.sameForEveryOperation !== true) f.push("rpc.type.error.value debe ser com.flux.rpc.error.v1, el mismo para toda operación");
+  if (r.dataschema?.error !== "https://schemas.internal/system/rpc/error/1.0.0.json" || r.error?.dataschema !== r.dataschema?.error) f.push("rpc.dataschema.error y rpc.error.dataschema deben ser https://schemas.internal/system/rpc/error/1.0.0.json");
+  if (r.dataschema?.error?.replace("https://schemas.internal/", "schemas/") !== r.error?.schemaPath || r.schemaPath?.errorSchema !== r.error?.schemaPath) f.push("rpc.error.schemaPath y rpc.schemaPath.errorSchema deben ser la ruta del $id del dataschema del error");
+  if (!re(r.type?.error?.pattern ?? "").test("com.flux.rpc.error.v1") || re(r.type?.request?.pattern ?? "").test("com.flux.rpc.error.v1") || re(r.type?.reply?.pattern ?? "").test("com.flux.rpc.error.v1")) f.push("rpc.type: el patrón del error y los de la petición y la respuesta no se distinguen");
+  if (re(doc.naming?.type?.pattern ?? "").test("com.flux.rpc.error.v1") || re(doc.naming?.type?.pattern ?? "").test("com.flux.rpc.clientes.cliente.calcular-descuento.request.v1")) f.push("naming.type.pattern (el de los eventos) casa con un type de rpc: son espacios de nombres disjuntos");
+
+  // Los errores: clase binaria, forma, y qué se hace con lo desconocido.
+  const e = r.error ?? {};
+  if (!eq(e.classes, ["retryable", "permanent"])) f.push("rpc.error.classes debe ser [retryable, permanent]: `poison` no viaja, para quien llama una petición que el otro lado no pudo interpretar es permanent");
+  if (!eq(e.dataKeys, ["class", "code", "message", "retryAfterMs"]) || !eq(e.required, ["class", "code", "message"])) f.push("rpc.error: data es { class, code, message, retryAfterMs? } en ESE orden (el orden de claves es normativo) con los tres primeros obligatorios");
+  if (e.dataclassification !== "internal" || e.messageNeverContainsDataValues !== true) f.push("rpc.error: el error va `internal` y su mensaje nunca cita valores de data");
+  if (e.retryAfterMsOnlyWhen !== "retryable") f.push("rpc.error.retryAfterMsOnlyWhen debe ser retryable");
+  if (e.handlerErrors?.unknown !== "permanent") f.push("rpc.error.handlerErrors.unknown debe ser permanent: una llamada no tiene numero de entrega, y retryable haria que el handler de quien llama reintentase 51 minutos un bug ajeno");
+  if (e.handlerErrors?.unknownMessage !== "generic-never-the-exception-text") f.push("rpc.error.handlerErrors.unknownMessage: el texto de una excepcion no clasificada no se reenvia (puede llevar valores, rutas o PII)");
+  if (!eq(e.callerMapsTo, { retryable: "RetryableError", permanent: "PermanentError" })) f.push("rpc.error.callerMapsTo debe ser retryable → RetryableError y permanent → PermanentError");
+  if (e.codePattern !== "errors.codePattern") f.push("rpc.error.codePattern debe referir errors.codePattern (una sola fuente)");
+
+  // El timeout: por debajo del ack_wait.
+  const to = r.timeout ?? {};
+  if (to.defaultMs !== 5000 || to.maxMs !== 25000 || to.minMs !== 1) f.push("rpc.timeout debe ser 5000 por defecto, 25000 como máximo y 1 como mínimo");
+  if (!(to.maxMs < doc.consumer?.ackWaitSeconds * 1000) || to.ackWaitMs !== doc.consumer?.ackWaitSeconds * 1000 || to.maxBelowAckWait !== true) f.push("rpc.timeout.maxMs debe quedar por debajo del ack_wait (consumer.ackWaitSeconds): una llamada hecha desde un handler no debe provocar su reentrega");
+  if (to.integerOnly !== true || to.outOfRangeCode !== "INVALID_RPC_CALL" || !cs.INVALID_RPC_CALL) f.push("rpc.timeout: entero, y fuera de rango es INVALID_RPC_CALL (no se recorta en silencio), que debe existir en errors.codes");
+  if (to.attemptsPerCall !== 1) f.push("rpc.timeout.attemptsPerCall debe ser 1: `request` hace UN intento");
+
+  // Idempotencia.
+  const id = r.idempotency ?? {};
+  if (id.responderMustDeduplicateById !== true || id.retryReusesIdAndBytes !== true) f.push("rpc.idempotency: el que responde deduplica por id, y un reintento reutiliza el mismo id y los mismos bytes");
+  if (id.coreNatsDeduplicates !== false) f.push("rpc.idempotency.coreNatsDeduplicates debe ser false: duplicate_window es de JetStream (A-74)");
+  if (id.timeoutIsAmbiguous !== true) f.push("rpc.idempotency.timeoutIsAmbiguous debe ser true: un timeout no dice que la operación no se ejecutó (A-61, A-62, A-63, A-70)");
+  if (!eq(id.retryOnlyOn, ["RPC_UNAVAILABLE", "RPC_TIMEOUT"]) || id.sdkAutomaticRetries !== "optional-default-0") f.push("rpc.idempotency: reintentos opcionales, por defecto 0, y solo ante RPC_UNAVAILABLE y RPC_TIMEOUT");
+
+  // La firma: la ventana solo con `require`.
+  const sg = r.signing ?? {};
+  if (sg.staleRequestWindowSeconds !== 300 || sg.appliesOnlyWithSigningMode !== "require" || sg.symmetric !== true || sg.code !== "STALE_REQUEST") f.push("rpc.signing: ventana de 300 s, simétrica, solo con la firma en modo require, código STALE_REQUEST");
+  if (!(doc.signing?.verificationModes ?? []).includes("require")) f.push("signing.verificationModes debe incluir require: la ventana de STALE_REQUEST solo existe con él");
+  if (sg.responderDoesNotRememberIds !== true) f.push("rpc.signing.responderDoesNotRememberIds debe ser true: rechazar un id repetido rompería un reintento legítimo; la defensa es la idempotencia");
+
+  // El tamaño.
+  const sz = r.size ?? {};
+  if (sz.maxMessageBytes !== doc.data?.maxMessageBytes || sz.brokerMaxPayloadDefault !== 1048576) f.push("rpc.size.maxMessageBytes debe ser data.maxMessageBytes (1 MiB) y el max_payload por defecto del broker, 1048576 (A-65)");
+  if (sz.limitCountsHeaders !== true || sz.code !== "RPC_MESSAGE_TOO_LARGE" || !cs.RPC_MESSAGE_TOO_LARGE) f.push("rpc.size: las cabeceras cuentan, y el código es RPC_MESSAGE_TOO_LARGE");
+  if (sz.replyTooLarge !== "responder-replies-error-event") f.push("rpc.size.replyTooLarge: el que responde contesta con un error; si intentara publicarla, quien llama solo vería un timeout (A-65)");
+
+  // Sin respuestas: no responders.
+  const nr = r.noResponders ?? {};
+  if (nr.status !== 503 || nr.code !== "RPC_UNAVAILABLE" || !eq(nr.connectFlags, ["headers", "no_responders"]) || nr.withoutFlagsCallerSeesTimeout !== true) f.push("rpc.noResponders: estado 503, RPC_UNAVAILABLE, y exige las banderas headers y no_responders en CONNECT (sin ellas, timeout: A-57)");
+
+  // El sobre y las cabeceras.
+  const ev = r.envelope ?? {};
+  if (!eq(ev.newRootAttributes, [])) f.push("rpc.envelope.newRootAttributes debe ser []: la petición/respuesta no añade atributos al sobre (01-envelope.md §3.4)");
+  if (ev.attributeOrder !== doc.cloudevents?.attributeOrder) f.push("rpc.envelope.attributeOrder debe ser el de cloudevents.attributeOrder: data va siempre el último");
+  if (ev.reply?.causationid !== "request.id" || ev.reply?.correlationid !== "request.correlationid" || ev.reply?.tenantid !== "request.tenantid") f.push("rpc.envelope.reply: la respuesta hereda correlationid y tenantid y su causationid es el id de la petición");
+  if (!eq(r.headers?.required, []) || r.headers?.envelopeIsTheOnlySourceOfMetadata !== true) f.push("rpc.headers: ninguna cabecera obligatoria, y el sobre es la única fuente de traceparent, correlationid y tenantid");
+  if (r.headers?.travelMeasured !== true) f.push("rpc.headers.travelMeasured debe ser true: las cabeceras SÍ viajan (A-74) y por eso la decisión de no usarlas es deliberada");
+
+  // Quien llama y quien responde.
+  if (r.caller?.invalidReplyCode !== "RPC_INVALID_REPLY" || r.caller?.deniedCode !== "PERMISSION_DENIED" || r.caller?.deniedMustFailFast !== true) f.push("rpc.caller: una respuesta que no es de esta petición es RPC_INVALID_REPLY, y una petición denegada falla rápido con PERMISSION_DENIED (async-nats no lo hace solo: A-72)");
+  if (!eq(r.caller?.replyChecks, ["is-cloudevent", "type-is-reply-or-error", "causationid-is-request-id", "correlationid-equals", "tenantid-equals"])) f.push("rpc.caller.replyChecks: la respuesta se valida contra la petición (las cinco comprobaciones)");
+  if (r.caller?.ignoresLateReplies !== true) f.push("rpc.caller.ignoresLateReplies debe ser true: una respuesta tardía llega al inbox (A-61)");
+  if (r.responder?.oneReplyPerRequest !== true || r.responder?.tenantFilterByConnection !== false) f.push("rpc.responder: una respuesta por petición, y el responder NO filtra por el tenant de connect() (el grupo de cola no sabe de tenants)");
+  if (r.responder?.stop !== "unsubscribe-then-wait-inflight-then-close") f.push("rpc.responder.stop debe ser unsubscribe-then-wait-inflight-then-close: cerrar la conexión de golpe pierde lo que se atiende (A-62)");
+
+  // El doctor: la trampa A-18 y el algoritmo de solape, probado en los dos sentidos.
+  const dc = r.doctor ?? {};
+  if (dc.check !== "no-stream-captures-rpc" || dc.severity !== "error" || dc.provisioningNeverCreates !== "stream-whose-subjects-overlap-rpc") f.push("rpc.doctor: ningún stream captura rpc (error), y flux provision no crea ninguno");
+  const forma = dc.overlapsWith ?? "";
+  if (forma !== "rpc.*.*.*.*" || !solapa(forma, "rpc.clientes.cliente.v1.obtener")) f.push("rpc.doctor.overlapsWith debe ser rpc.*.*.*.*, la forma de todo subject de operación");
+  for (const x of dc.flagged ?? []) if (!solapa(x, forma)) f.push(`rpc.doctor.flagged: «${x}» no se solapa con ${forma}, así que el doctor no lo marcaría`);
+  for (const x of dc.notFlagged ?? []) if (solapa(x, forma)) f.push(`rpc.doctor.notFlagged: «${x}» se solapa con ${forma}, así que el doctor lo marcaría`);
+  for (const x of ["rpc.>", ">", "*.>", "rpc.*.>", "rpc.clientes.>", "*.*.*.*.*"]) if (!(dc.flagged ?? []).includes(x)) f.push(`rpc.doctor.flagged debe incluir «${x}»`);
+  for (const x of dc.withoutAckOnly ?? []) if (!solapa(x, forma)) f.push(`rpc.doctor.withoutAckOnly: «${x}» no se solapa con rpc, y entonces no es un filtro que el doctor deba marcar`);
+
+  // La ACL.
+  const ac = r.acl ?? {};
+  const pub = re(ac.callerPublish ?? "(?!)");
+  const sub = re(ac.ownerSubscribe ?? "(?!)");
+  if (!pub.test("rpc.clientes.cliente.v1.obtener")) f.push("rpc.acl.callerPublish debe aceptar el subject exacto de una operación");
+  for (const x of ac.callerNeverPublish ?? []) if (pub.test(x)) f.push(`rpc.acl.callerNeverPublish: «${x}» lo concede callerPublish`);
+  for (const x of ["rpc.>", "rpc.clientes.>"]) if (!(ac.callerNeverPublish ?? []).includes(x)) f.push(`rpc.acl.callerNeverPublish debe incluir «${x}»`);
+  if (!sub.test("rpc.clientes.>")) f.push("rpc.acl.ownerSubscribe debe aceptar rpc.<dominio>.>");
+  for (const x of ac.ownerNeverSubscribe ?? []) if (sub.test(x)) f.push(`rpc.acl.ownerNeverSubscribe: «${x}» lo concede ownerSubscribe`);
+  for (const x of [">", "rpc.>", "rpc.*.>"]) if (!(ac.ownerNeverSubscribe ?? []).includes(x)) f.push(`rpc.acl.ownerNeverSubscribe debe incluir «${x}»`);
+  if (ac.callerSubscribe !== "security.acl.inbox.permissionPattern") f.push("rpc.acl.callerSubscribe debe referir el inbox privado de security.acl.inbox (sin él, cualquiera lee las respuestas ajenas: A-71)");
+  if (ac.ownerPublishOnInboxes !== "never") f.push('rpc.acl.ownerPublishOnInboxes debe ser "never": el dueño responde con allow_responses, no con un permiso sobre inboxes (A-68)');
+  const ar = ac.ownerAllowResponses ?? {};
+  if (ar.required !== true || ar.maxReplies !== 1 || ar.defaultExpires !== "none") f.push("rpc.acl.ownerAllowResponses: obligatorio, una respuesta por petición y SIN caducidad por defecto (A-68)");
+  if (!((ar.recommendedExpiresSeconds ?? 0) * 1000 > (r.timeout?.maxMs ?? Infinity))) f.push("rpc.acl.ownerAllowResponses.recommendedExpiresSeconds debe superar el timeout máximo: no puede romper ninguna respuesta legítima");
+  // Los permisos de rpc no se confunden con los de eventos ni con lo denegable.
+  for (const [k, v] of Object.entries(doc.security?.acl?.permissionPatterns ?? {})) {
+    if (k.startsWith("$")) continue;
+    for (const ej of ["rpc.clientes.cliente.v1.obtener", "rpc.clientes.>"]) if (re(v).test(ej)) f.push(`security.acl.permissionPatterns.${k} concede un permiso de rpc (${ej}): los de rpc van en rpc.acl`);
+  }
+  if (re(doc.security?.acl?.neverGrantedPattern ?? "(?!)").test("rpc.clientes.cliente.v1.obtener")) f.push("security.acl.neverGrantedPattern caza el subject de una operación: es concedible");
+
+  // Los esquemas.
+  const sp = r.schemaPath ?? {};
+  if (sp.pairRequired !== true || sp.pairSameMajor !== true || sp.errorSchemaRequiredWithAnyRpcSchema !== true || sp.bundleIndex !== "rpc" || sp.dataRootType !== "object") f.push("rpc.schemaPath: una operación es un PAR del mismo mayor, el esquema del error es obligatorio, `data` es un objeto y el bundle tiene el índice `rpc`");
+  if (r.compatibility?.request?.extensibleEnumRequiredToAddValue !== false || r.compatibility?.reply?.extensibleEnumRequiredToAddValue !== true) f.push("rpc.compatibility: la dirección se invierte: añadir un valor a un enum de una RESPUESTA exige x-extensible-enum (leen los llamantes) y de una PETICIÓN no (lee el dueño)");
+  if (r.compatibility?.deployOrder !== "responder-first-then-callers") f.push("rpc.compatibility.deployOrder debe ser responder-first-then-callers");
+
+  // Observabilidad: las tres métricas van en su bloque, no entre las siete.
+  const ms = r.metrics ?? {};
+  const nombres = Object.keys(ms).filter((k) => k.startsWith("flux_")).sort();
+  if (!eq(nombres, ["flux_rpc_client_requests_total", "flux_rpc_duration_seconds", "flux_rpc_server_requests_total"])) f.push(`rpc.metrics debe tener exactamente flux_rpc_client_requests_total, flux_rpc_server_requests_total y flux_rpc_duration_seconds; tiene [${nombres.join(", ")}]`);
+  if (!eq(ms.flux_rpc_client_requests_total?.labels, ["operation", "outcome"]) || !eq(ms.flux_rpc_server_requests_total?.labels, ["operation", "outcome"])) f.push("rpc.metrics: los dos contadores llevan las etiquetas [operation, outcome]");
+  if (!eq(ms.flux_rpc_duration_seconds?.labels, ["operation", "role"]) || !eq(ms.flux_rpc_duration_seconds?.roles, ["client", "server"]) || ms.flux_rpc_duration_seconds?.type !== "histogram") f.push("rpc.metrics.flux_rpc_duration_seconds: histograma con [operation, role], role ∈ client | server");
+  if (ms.flux_rpc_duration_seconds?.buckets !== "observability.durationBucketsSeconds") f.push("rpc.metrics.flux_rpc_duration_seconds.buckets debe referir observability.durationBucketsSeconds (el último bucket es el ack_wait)");
+  if (!eq(ms.flux_rpc_client_requests_total?.outcomes, ["ok", "unavailable", "timeout", "retryable", "permanent", "invalid_schema", "invalid_reply"])) f.push("rpc.metrics.flux_rpc_client_requests_total.outcomes debe ser ok, unavailable, timeout, retryable, permanent, invalid_schema, invalid_reply");
+  if (!eq(ms.flux_rpc_server_requests_total?.outcomes, ["ok", "retryable", "permanent", "poison", "invalid_schema", "invalid_signature", "stale_request"])) f.push("rpc.metrics.flux_rpc_server_requests_total.outcomes debe ser ok, retryable, permanent, poison, invalid_schema, invalid_signature, stale_request");
+  for (const prohibida of [...(doc.observability?.forbiddenLabels ?? []), "tenant", "caller", "client", "service"]) {
+    if (!(ms.forbiddenLabels ?? []).includes(prohibida)) f.push(`rpc.metrics.forbiddenLabels debe incluir "${prohibida}": nunca el tenant, el id ni quién llama como etiqueta`);
+    for (const m of nombres) if ((ms[m]?.labels ?? []).includes(prohibida)) f.push(`rpc.metrics.${m} usa la etiqueta prohibida "${prohibida}"`);
+  }
+  if (Object.keys(doc.observability?.metrics ?? {}).length !== 7) f.push(`observability.metrics debe tener SIETE métricas; tiene ${Object.keys(doc.observability?.metrics ?? {}).length}. Las de rpc van en rpc.metrics`);
+  if (doc.observability?.capabilityMetrics?.rpc !== "rpc.metrics") f.push("observability.capabilityMetrics.rpc debe ser rpc.metrics");
+  if (!re(ms.operationLabelPattern ?? "").test("clientes.cliente.v1.obtener") || re(ms.operationLabelPattern ?? "").test("rpc.clientes.cliente.v1.obtener")) f.push("rpc.metrics.operationLabelPattern: el nombre de la operación, sin el prefijo rpc.");
+
+  // PII: la petición/respuesta tiene la suya.
+  if (!doc.security?.piiInPayload?.rpc || doc.security.piiInPayload.rpc === "forbidden") f.push("security.piiInPayload.rpc: el dato personal PUEDE ir como parámetro de una orden (no se persiste), con x-pii");
+  return f;
+}
+
 const fallos = [];
 
 for (const [path, deben, noDeben] of CASES) {
@@ -825,6 +1091,7 @@ for (const codigo of ["NOT_PROVISIONED", "PERMISSION_DENIED", ...CODIGOS_CONNECT
 fallos.push(...fallosDeConnect(p));
 fallos.push(...fallosDeEstado(p));
 fallos.push(...fallosDeAclDeEstado(p));
+fallos.push(...fallosDeRpc(p));
 if (!Object.hasOwn(p.errors.codes, p.security.provisioning.notProvisionedErrorCode)) fallos.push("security.provisioning.notProvisionedErrorCode no está en errors.codes");
 if (!Object.hasOwn(capDefs, p.security.sdk.capability)) fallos.push(`security.sdk.capability "${p.security.sdk.capability}" no está en capabilities.definitions`);
 
@@ -1094,10 +1361,104 @@ let mutacionesAcl = 0;
   mutacionesAcl = Object.keys(delDocumento).length + Object.keys(delGenerador).length;
 }
 
+// Autocomprobación de `fallosDeRpc`: cada copia estropeada DEBE dar un fallo, o la invariante no vigila nada. Son las
+// equivocaciones reales que 11-request-reply.md existe para impedir.
+let mutacionesRpc = 0;
+{
+  const mutaciones = {
+    "quitar un código de rpc": (d) => { delete d.errors.codes.RPC_TIMEOUT; },
+    "un séptimo código de rpc": (d) => { d.errors.codes.OTRO_CODIGO_RPC = { class: "permanent", capability: "rpc" }; },
+    "RPC_UNAVAILABLE como PERMANENT": (d) => { d.errors.codes.RPC_UNAVAILABLE.class = "permanent"; },
+    "RPC_TIMEOUT como PERMANENT": (d) => { d.errors.codes.RPC_TIMEOUT.class = "permanent"; },
+    "STALE_REQUEST como RETRYABLE": (d) => { d.errors.codes.STALE_REQUEST.class = "retryable"; },
+    "RPC_INVALID_REPLY como RETRYABLE": (d) => { d.errors.codes.RPC_INVALID_REPLY.class = "retryable"; },
+    "RPC_UNAVAILABLE esperando al timeout": (d) => { d.errors.codes.RPC_UNAVAILABLE.immediate = false; },
+    "INVALID_RPC_CALL con red": (d) => { d.errors.codes.INVALID_RPC_CALL.failsBeforeNetwork = false; },
+    "RESERVED_DOMAIN solo en publish y state": (d) => { d.errors.codes.RESERVED_DOMAIN.thrownBy = ["publish", "put"]; },
+    "una capacidad rpc sin definir": (d) => { delete d.capabilities.definitions.rpc; },
+    "request/reply otra vez fuera de alcance": (d) => { d.outOfScopeV1.push("request/reply"); },
+    "quitar rpc de los dominios reservados": (d) => { d.naming.reservedDomains.names = ["dlq", "state", "system"]; },
+    "request no rechaza los dominios reservados": (d) => { d.rpc.reserved.appliesTo = ["respond"]; },
+    "el prefijo rpc. en la operación como operación inválida": (d) => { d.rpc.reserved.prefixInOperationName = "INVALID_RPC_CALL"; },
+    "las peticiones por JetStream": (d) => { d.rpc.transport.publishViaJetStream = true; },
+    "un stream de rpc": (d) => { d.rpc.transport.stream = "RPC_CLIENTES"; },
+    "una DLQ de rpc": (d) => { d.rpc.transport.dlq = "dlq.rpc"; },
+    "el subject de rpc con 4 tokens": (d) => { d.rpc.subject.format = "rpc.<dominio>.<agregado>.<operacion>"; d.rpc.subject.tokens = 4; },
+    "el subject de rpc admite comodines": (d) => { d.rpc.subject.pattern = "^rpc\\.[a-z0-9*>-]+\\.[a-z0-9-]+\\.v[1-9][0-9]*\\.[a-z0-9-]+$"; },
+    "el subject de rpc admite mayúsculas": (d) => { d.rpc.subject.pattern = d.rpc.subject.pattern.replaceAll("a-z", "A-Za-z"); },
+    "la operación distinta de un subject de evento": (d) => { d.rpc.operation.pattern = "^[a-z]+\\.[a-z]+\\.v[1-9]\\.[a-z]+$"; },
+    "la operación admite el prefijo rpc.": (d) => { d.rpc.operation.pattern = "^(rpc\\.)?[a-z0-9]+(-[a-z0-9]+)*\\.[a-z0-9]+(-[a-z0-9]+)*\\.v[1-9][0-9]*\\.[a-z0-9]+(-[a-z0-9]+)*$"; },
+    "el nombre de operación admite guiones bajos": (d) => { d.rpc.operationName.pattern = "^[a-z0-9]+([-_][a-z0-9]+)*$"; },
+    "suscripción al comodín rpc.<dominio>.>": (d) => { d.rpc.queueGroup.subscription = "domain-wildcard"; d.rpc.queueGroup.wildcardSubscriptionForbidden = false; },
+    "el grupo de cola no es el servicio": (d) => { d.rpc.queueGroup.name = "random"; },
+    "un error con class poison": (d) => { d.rpc.error.classes = ["retryable", "permanent", "poison"]; },
+    "las claves del error en otro orden": (d) => { d.rpc.error.dataKeys = ["code", "class", "message", "retryAfterMs"]; },
+    "el error con clasificación confidential": (d) => { d.rpc.error.dataclassification = "confidential"; },
+    "un error desconocido del handler como retryable": (d) => { d.rpc.error.handlerErrors.unknown = "retryable"; },
+    "el mensaje de una excepción desconocida se reenvía": (d) => { d.rpc.error.handlerErrors.unknownMessage = "exception-text"; },
+    "el tipo del error distinto": (d) => { d.rpc.type.error.value = "com.flux.rpc.error.v2"; },
+    "el timeout por defecto de 30 s": (d) => { d.rpc.timeout.defaultMs = 30000; },
+    "el timeout máximo por encima del ack_wait": (d) => { d.rpc.timeout.maxMs = 60000; },
+    "un timeout fuera de rango que se recorta": (d) => { d.rpc.timeout.outOfRangeCode = "clamp"; },
+    "tres intentos por llamada": (d) => { d.rpc.timeout.attemptsPerCall = 3; },
+    "el responder no deduplica por id": (d) => { d.rpc.idempotency.responderMustDeduplicateById = false; },
+    "un reintento con id nuevo": (d) => { d.rpc.idempotency.retryReusesIdAndBytes = false; },
+    "core NATS deduplica": (d) => { d.rpc.idempotency.coreNatsDeduplicates = true; },
+    "reintentar ante un error permanente": (d) => { d.rpc.idempotency.retryOnlyOn = ["RPC_UNAVAILABLE", "RPC_TIMEOUT", "INVALID_SCHEMA"]; },
+    "la ventana de STALE_REQUEST de 30 s": (d) => { d.rpc.signing.staleRequestWindowSeconds = 30; },
+    "la ventana sin la firma en require": (d) => { d.rpc.signing.appliesOnlyWithSigningMode = "always"; },
+    "el SDK recuerda ids": (d) => { d.rpc.signing.responderDoesNotRememberIds = false; },
+    "el límite de mensaje de 2 MiB": (d) => { d.rpc.size.maxMessageBytes = 2097152; },
+    "las cabeceras no cuentan": (d) => { d.rpc.size.limitCountsHeaders = false; },
+    "una respuesta grande que se publica": (d) => { d.rpc.size.replyTooLarge = "publish-and-throw"; },
+    "no responders sin exigir las banderas": (d) => { d.rpc.noResponders.connectFlags = ["headers"]; },
+    "no responders con otro estado": (d) => { d.rpc.noResponders.status = 404; },
+    "un atributo raíz nuevo en el sobre": (d) => { d.rpc.envelope.newRootAttributes = ["rpcdeadline"]; },
+    "la respuesta sin causationid": (d) => { d.rpc.envelope.reply.causationid = "none"; },
+    "la respuesta con otro tenant": (d) => { d.rpc.envelope.reply.tenantid = "responder-tenant"; },
+    "cabeceras obligatorias": (d) => { d.rpc.headers.required = ["traceparent"]; },
+    "la respuesta sin validar contra la petición": (d) => { d.rpc.caller.replyChecks = ["is-cloudevent"]; },
+    "una petición denegada que espera al timeout": (d) => { d.rpc.caller.deniedMustFailFast = false; },
+    "el responder filtra por el tenant de connect": (d) => { d.rpc.responder.tenantFilterByConnection = true; },
+    "parar cerrando la conexión de golpe": (d) => { d.rpc.responder.stop = "close"; },
+    "el doctor compara con rpc.>": (d) => { d.rpc.doctor.overlapsWith = "rpc.>"; },
+    "el doctor deja pasar un comodín en medio": (d) => { d.rpc.doctor.flagged = d.rpc.doctor.flagged.filter((x) => x !== "*.>"); },
+    "el doctor marca de más": (d) => { d.rpc.doctor.notFlagged.push("rpc.>"); },
+    "el doctor solo avisa": (d) => { d.rpc.doctor.severity = "warn"; },
+    "la ACL de quien llama admite rpc.>": (d) => { d.rpc.acl.callerPublish = "^rpc\\.(.+|>)$"; },
+    "la ACL del dueño admite rpc.>": (d) => { d.rpc.acl.ownerSubscribe = "^rpc\\.([a-z0-9]+(-[a-z0-9]+)*\\.)?>$"; },
+    "el dueño con permiso de publicar en inboxes": (d) => { d.rpc.acl.ownerPublishOnInboxes = "_INBOX.>"; },
+    "inbox común para quien llama": (d) => { d.rpc.acl.callerSubscribe = "_INBOX.>"; },
+    "allow_responses con 10 respuestas": (d) => { d.rpc.acl.ownerAllowResponses.maxReplies = 10; },
+    "allow_responses que caduca antes del timeout": (d) => { d.rpc.acl.ownerAllowResponses.recommendedExpiresSeconds = 5; },
+    "una operación sin su par": (d) => { d.rpc.schemaPath.pairRequired = false; },
+    "el esquema del error opcional": (d) => { d.rpc.schemaPath.errorSchemaRequiredWithAnyRpcSchema = false; },
+    "enum de petición con extensible-enum obligatorio": (d) => { d.rpc.compatibility.request.extensibleEnumRequiredToAddValue = true; },
+    "enum de respuesta sin extensible-enum": (d) => { d.rpc.compatibility.reply.extensibleEnumRequiredToAddValue = false; },
+    "llamantes antes que el dueño": (d) => { d.rpc.compatibility.deployOrder = "callers-first"; },
+    "la métrica de rpc entre las siete": (d) => { d.observability.metrics.flux_rpc_client_requests_total = { type: "counter", labels: ["operation", "outcome"] }; },
+    "una métrica de rpc de menos": (d) => { delete d.rpc.metrics.flux_rpc_duration_seconds; },
+    "el tenant como etiqueta de rpc": (d) => { d.rpc.metrics.flux_rpc_client_requests_total.labels = ["operation", "tenantid", "outcome"]; },
+    "quién llama como etiqueta de rpc": (d) => { d.rpc.metrics.flux_rpc_server_requests_total.labels = ["operation", "caller", "outcome"]; },
+    "un outcome de cliente de menos": (d) => { d.rpc.metrics.flux_rpc_client_requests_total.outcomes = ["ok", "timeout"]; },
+    "role de la duración con otro valor": (d) => { d.rpc.metrics.flux_rpc_duration_seconds.roles = ["caller", "callee"]; },
+    "la duración sin los buckets del ack_wait": (d) => { d.rpc.metrics.flux_rpc_duration_seconds.buckets = "custom"; },
+    "PII prohibida en rpc": (d) => { d.security.piiInPayload.rpc = "forbidden"; },
+  };
+  const base = fallosDeRpc(p);
+  if (base.length) fallos.push(`autocomprobación: fallosDeRpc ya falla sobre el protocol.json real (${base.length}); no se puede autocomprobar`);
+  for (const [nombre, estropea] of Object.entries(mutaciones)) {
+    const copia = structuredClone(p);
+    estropea(copia);
+    if (!fallosDeRpc(copia).length) fallos.push(`autocomprobación: la mutación «${nombre}» NO la detecta fallosDeRpc`);
+  }
+  mutacionesRpc = Object.keys(mutaciones).length;
+}
+
 if (fallos.length) {
   console.error(`\n✗ ${fallos.length} problema(s) en protocol.json\n`);
   for (const f of fallos) console.error(`  ✗ ${f}`);
   process.exit(1);
 }
 
-console.log(`✓ protocol.json coherente (${CASES.length} patrones + invariantes numéricas, de códigos, de capacidades y de estado · autocomprobación de estado: ${mutacionesEstado} mutaciones del documento y ${mutacionesAcl} de la ACL y su generador, todas detectadas)`);
+console.log(`✓ protocol.json coherente (${CASES.length} patrones + invariantes numéricas, de códigos, de capacidades y de estado · autocomprobación de estado: ${mutacionesEstado} mutaciones del documento y ${mutacionesAcl} de la ACL y su generador · de rpc: ${mutacionesRpc} mutaciones del documento, todas detectadas)`);

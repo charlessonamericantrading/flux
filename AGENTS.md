@@ -88,6 +88,27 @@ https://raw.githubusercontent.com/charlessonamericantrading/flux/main/protocol.j
 15. **`dlq`, `state`, `rpc` y `system` no son dominios.** `publish()` los rechaza
     (`RESERVED_DOMAIN`).
 
+**Petición/respuesta** (extensión opcional, [11-request-reply.md](specification/11-request-reply.md)):
+
+16. **Una orden o un cálculo con respuesta inmediata es una petición; un dato guardado es estado.**
+    `bus.request` / `bus.respond`, nunca un `POST` o un `GET` por HTTP entre servicios propios. **Si lo que pides es un
+    dato que otro sistema guarda, es estado, no petición/respuesta.**
+17. **El que responde deduplica por el `id` de la petición**, y un reintento reutiliza el mismo `id`.
+    `RPC_TIMEOUT` **no** dice que la operación no se ejecutó.
+18. **Una suscripción por operación, al subject exacto** (`rpc.<dominio>.<agregado>.v<major>.<operacion>`, operación
+    en **infinitivo**), con el servicio como grupo de cola. Nunca `rpc.<dominio>.>`. **Ningún stream captura `rpc.>`.**
+19. **Quien llama traduce lo que ve**: `no responders` → `RPC_UNAVAILABLE`, sin respuesta → `RPC_TIMEOUT`, un error →
+    `RetryableError` / `PermanentError`. Timeout **5 s** por defecto, **25 s** como máximo.
+
+**¿Qué primitiva uso?**
+
+| Necesito… | Uso |
+|---|---|
+| Avisar de que algo pasó; que cada interesado reaccione | **Evento** (`bus.publish`) |
+| Un dato que guarda otro sistema; la carga inicial; una copia local al día | **Estado** (`state.get` / `state.watch`) |
+| Una **orden** que necesita respuesta ya; un **cálculo** con parámetros | **Petición/respuesta** (`bus.request` / `bus.respond`) |
+| Encolar trabajo sin esperar | **Evento** del que pide + un evento de resultado, unidos por `correlationid` |
+
 ---
 
 ## 2. Publicar un evento
@@ -213,6 +234,14 @@ Estas no dan error: dan comportamiento incorrecto. Un agente las comete casi sie
 | `put` solo publica | **Es condicional**: lee la secuencia (`DIRECT.GET`), no escribe si la versión no avanza y publica con `Nats-Expected-Last-Subject-Sequence`. Un `publish` de core a un subject de estado sobrescribe **sin chequeo ni acuse**. El conflicto de secuencia tiene **dos** códigos: `10071` (un nodo) y `10164` (cluster, bajo carrera): reconoce los dos o no reintentarás en producción. Reintenta con **el mismo `id`**. |
 | El estado se recupera desde la DLQ | **No se reproduce**: `dlq.state.>` no lleva el dato (`data` es `{ key, revision }`) y republicar un valor viejo pisaría uno nuevo. `flux dlq replay` lo rechaza; la recuperación es `flux state resync`. |
 | Un estado con PII es «lo mismo que un evento con PII» | No: el estado va `confidential` con `x-pii` y **se puede borrar** (`delete` sustituye el valor por una lápida). Pero el borrado **físico** en disco y las **claves** y **tenants** (visibles en `STREAM.INFO`) no los cubre: la clave es un id opaco, nunca un email. |
+| Una petición a algo que no escucha nadie espera su timeout | **No**: `no responders` llega en ~1 ms (A-56)… **si la conexión lo pidió** en CONNECT (`headers` y `no_responders`); sin ello, silencio y timeout (A-57). Y con una suscripción `rpc.<dominio>.>` el servicio *sí* tiene interés en lo que no atiende: timeout (A-64). Una suscripción **por operación, exacta**. |
+| Un stream que captura `rpc.>` es inocuo | **Contesta a cada petición con su acuse** `{"stream":…,"seq":n}`, y casi siempre antes que la respuesta real (394 de 400, A-67). El que responde ejecuta igualmente y el stream **guarda cada petición**, datos personales incluidos. Un filtro `>` solo se crea sin acuse y convierte `no responders` en un timeout. `flux doctor` lo comprueba. |
+| `RPC_TIMEOUT` = la operación no ocurrió | **Ambiguo**: un responder lento la ejecuta y su respuesta llega tarde al inbox (A-61); uno que muere con la petición la pierde (A-62); la que sale justo al irse el último, en un cluster, también (A-70). Por eso se deduplica por `id`. |
+| Una petición denegada por la ACL falla rápido | Con `@nats-io/*` sí (~1 ms, A-66); con **`async-nats` (Rust) solo da un timeout** y el `-ERR` por el evento de la conexión (A-72). El SDK escucha el aviso y lanza `PERMISSION_DENIED`. |
+| `allow_responses: true` basta y es estrecho | Admite **una** respuesta por petición y **no caduca** (A-68). Acótalo: `{ max: 1, expires: 30s }`. Sin él, el dueño no puede contestar y quien llama ve un timeout. |
+| Una respuesta de más de 1 MiB falla con un error | **Falla en silencio**: la librería lanza en quien responde y quien llama solo ve un timeout (A-65). El que responde comprueba el tamaño y contesta `RPC_MESSAGE_TOO_LARGE`. |
+| Parar un responder cerrando la conexión | **Pierde lo que atiende** (A-62). Dejar de escuchar, esperar a lo que está en vuelo y cerrar. |
+| Dos servicios que atienden la misma operación se reparten el trabajo | Cada **grupo de cola** recibe **una copia**: los dos la ejecutan y quien llama ve una sola respuesta (A-60). Solo el dueño responde. |
 
 > Las tres primeras trampas de JetStream comparten forma: **el servidor acepta la
 > petición, no devuelve error, y aplica otra cosa.** Ninguna se detecta leyendo código;
@@ -223,7 +252,7 @@ Estas no dan error: dan comportamiento incorrecto. Un agente las comete casi sie
 Opt-in. Un servicio que no las use sigue siendo conforme, pero si el proyecto ya las
 tiene activas, tu código debe respetarlas.
 
-**Capacidades por SDK:** cada SDK declara las que tiene (`signing`, `security`, `state`: columna *Capacidades* del [`README.md`](README.md)), y uno sin `security` no es compatible con las ACLs de `gen-acl.mjs` ([00-protocol.md §5](specification/00-protocol.md)). Uno sin `state` no puede escribir ni leer estado replicado.
+**Capacidades por SDK:** cada SDK declara las que tiene (`signing`, `security`, `state`, `rpc`: columna *Capacidades* del [`README.md`](README.md)), y uno sin `security` no es compatible con las ACLs de `gen-acl.mjs` ([00-protocol.md §5](specification/00-protocol.md)). Uno sin `state` no puede escribir ni leer estado replicado, y uno sin `rpc` no hace ni atiende peticiones.
 
 ### Validación L3 — [00-protocol.md §5](specification/00-protocol.md)
 
@@ -275,6 +304,34 @@ await bus.state.watch("clientes.cliente.v1", async (entrada) => {         // fot
 - Métrica `flux_state_writes_total{contract,outcome}`; **nunca** la clave ni el tenant como
   etiqueta. Esquemas en `schemas/state/…`, con `aggregateVersion` obligatoria.
 
+### Petición/respuesta — [11-request-reply.md](specification/11-request-reply.md)
+
+Una **orden o un cálculo con respuesta inmediata** entre dos servicios, por core NATS: no se persiste, no tiene stream ni
+DLQ. **Ningún SDK la declara todavía**: la spec y las herramientas llegan antes que las implementaciones.
+
+```ts
+const r = await bus.request("clientes.cliente.v1.calcular-descuento",
+  { clienteId: "cli-1", totalCents: 9990, moneda: "EUR" }, { timeoutMs: 2000 });      // → el `data` de la respuesta
+
+await bus.respond("clientes.cliente.v1.calcular-descuento", async (peticion, ctx) => {
+  return { descuentoCents: 500, moneda: peticion.moneda };          // lanzar PermanentError / RetryableError para fallar
+});
+```
+
+- Subject `rpc.<dominio>.<agregado>.v<M>.<operacion>`: **5 tokens**; el **nombre** de la operación (el que recibe la API) tiene
+  4, sin `rpc.`, y la operación va en **infinitivo** (`obtener`, `calcular-precio`), no en pasado. Sin stream.
+- **Sobre**: el CloudEvent de siempre. La respuesta **hereda** `correlationid` y `tenantid` y su `causationid` es el `id` de la
+  petición. `type`: `com.flux.rpc.<dom>.<agr>.<op>.request.v<M>` / `.reply.v<M>`. **Sin cabeceras** de NATS.
+- **Error**: `com.flux.rpc.error.v1` con `data: { class, code, message, retryAfterMs? }`; `class` es `retryable` o
+  `permanent` (`poison` no viaja). Un error **desconocido** del handler es `permanent`.
+- **Seis códigos**: `RPC_UNAVAILABLE`, `RPC_TIMEOUT` (RETRYABLE), `STALE_REQUEST`, `RPC_INVALID_REPLY`,
+  `RPC_MESSAGE_TOO_LARGE`, `INVALID_RPC_CALL` (PERMANENT) — [04-errors.md §7](specification/04-errors.md).
+- Con la firma en `require`, el que responde rechaza una petición cuyo `time` se aleje **más de 300 s** (`STALE_REQUEST`).
+- Métricas `flux_rpc_client_requests_total{operation,outcome}`, `flux_rpc_server_requests_total{operation,outcome}` y
+  `flux_rpc_duration_seconds{operation,role}`; **nunca** el tenant, el `id` ni quién llama como etiqueta. Esquemas en
+  `schemas/rpc/<dom>/<agr>/<op>/{request,reply}/…`: un **par**; en una petición añadir un valor a un enum no exige
+  `x-extensible-enum`, en una respuesta sí (la dirección se invierte).
+
 ### Firma Ed25519 — [07-signing.md](specification/07-signing.md)
 
 - Se firma `serialize(evento sin `signature` y sin extensiones `dlq*`)`. **No hay
@@ -289,7 +346,7 @@ await bus.state.watch("clientes.cliente.v1", async (entrada) => {         // fot
 ### Métricas — [08-observability.md](specification/08-observability.md)
 
 Los nombres y etiquetas son **contrato**, no decisión de cada servicio. Siete métricas
-`flux_*` (más `flux_state_writes_total` en un SDK con la capacidad `state`).
+`flux_*` (más `flux_state_writes_total` en un SDK con la capacidad `state`, y las tres `flux_rpc_*` en uno con `rpc`).
 
 - **Nunca** etiquetes por `tenantid`, `id` ni `correlationid`: un tenant nuevo no debe
   crear series temporales nuevas. En **trazas** sí.
@@ -322,6 +379,9 @@ Los nombres y etiquetas son **contrato**, no decisión de cada servicio. Siete m
 | Credenciales `.creds`/`.nk` en el repo | Están en `.gitignore` por algo. Van en el gestor de secretos. |
 | Meter el dato personal en un evento «porque el consumidor lo necesita» | Es lo que el **estado** resuelve: el evento lleva `clienteId`, el estado lleva el dato, clasificado y borrable. |
 | Leer un dato de otro servicio con `GET` por HTTP | Es **estado** (`state.get` / `state.watch`), no petición/respuesta. |
+| Una operación `obtener-cliente-por-email` que devuelve lo que otro guarda | Es una consulta a un almacén: **estado**. La petición/respuesta es para órdenes y cálculos. |
+| `rpc.clientes.cliente.v1.creado` (un evento donde va una orden) | La operación va en **infinitivo** (`crear`); el pasado es de un evento. |
+| Suscribirse a `rpc.<dominio>.>` «para atenderlo todo» | Convierte `no responders` en un timeout. Un subject exacto por operación. |
 
 ## 11. Antes de dar por terminado
 
@@ -343,6 +403,9 @@ Los nombres y etiquetas son **contrato**, no decisión de cada servicio. Siete m
 - [ ] Si escribes **estado**: `aggregateVersion` ≥ 1 en `data` y en el esquema (`schemas/state/…`);
       el dato personal con `x-pii` y `confidential`; el consumidor borra su copia al recibir una lápida
 - [ ] Ningún dominio llamado `dlq`, `state`, `rpc` ni `system`; ninguna clave o tenant como etiqueta de métrica
+- [ ] Si haces o atiendes **peticiones**: la operación en infinitivo con su **par** `request`/`reply` en `schemas/rpc/…`; el
+      handler **deduplica por el `id`** de la petición; el timeout ≤ 25 s; los errores traducidos a `RETRYABLE` / `PERMANENT`;
+      ninguna métrica etiquetada por tenant, `id` ni quién llama; ningún stream captura `rpc.>` (`flux doctor`)
 
 ---
 

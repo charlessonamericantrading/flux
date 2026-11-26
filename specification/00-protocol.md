@@ -5,8 +5,8 @@
 > **Última revisión:** 2026-11-26
 
 > **1.1 es aditiva.** Las decisiones de v1.0 no cambian; el estado replicado
-> ([10-state.md](10-state.md)) entra como **extensión opcional**, igual que la firma: un servicio
-> que solo use eventos sigue siendo conforme.
+> ([10-state.md](10-state.md)) y la petición/respuesta ([11-request-reply.md](11-request-reply.md)) entran
+> como **extensiones opcionales**, igual que la firma: un servicio que solo use eventos sigue siendo conforme.
 
 ---
 
@@ -55,8 +55,9 @@ dato.**
   siendo posible.
 
 **NO DEBE** usarse como:
-- **Comando disfrazado.** `pedidos.pedido.v1.crear` no es un evento. Si necesitas
-  request/reply, usa NATS Core request/reply — está fuera del alcance de v1.
+- **Comando disfrazado.** `pedidos.pedido.v1.crear` no es un evento. Si necesitas una orden con
+  respuesta inmediata, usa la **petición/respuesta** ([11-request-reply.md](11-request-reply.md)): una operación
+  `rpc.pedidos.pedido.v1.crear`, en infinitivo, que no es un evento ni se persiste.
 - **Transporte de blobs.** Si el payload supera **1 MiB**, publica una referencia
   (URI + checksum), no el contenido. Ver [01-envelope.md §7](01-envelope.md).
 - **Sustituto de una tabla.** Un evento no es una fila. Un evento es un cambio. Si lo que
@@ -148,6 +149,7 @@ conforme; lo que no es, es compatible con aquello que la capacidad habilita.
 | `signing` | [07-signing.md](07-signing.md) | No firma ni verifica. Un evento sin firma sigue siendo válido: el modo por defecto es `off` |
 | `security` | Esta sección, y lo que cita | **No es compatible con la configuración segura** de [06-security.md](06-security.md): con el inbox por defecto el broker le deniega la suscripción a su propio inbox y su primera petición falla |
 | `state` | [10-state.md](10-state.md) | No escribe ni lee **estado replicado** (`put`, `delete`, `get`, `watch`): para leer un dato que guarda otro sistema tiene que llamarle por HTTP. Sigue siendo conforme |
+| `rpc` | [11-request-reply.md](11-request-reply.md) | No hace ni atiende **peticiones con respuesta** (`request`, `respond`): para una orden con respuesta inmediata o un cálculo tiene que llamar por HTTP. Sigue siendo conforme |
 
 El registro de qué SDK declara qué capacidad es [`protocol.json`](../protocol.json) →
 `capabilities`, y la tabla «Estado de los SDKs» del [`README.md`](../README.md) lo muestra.
@@ -193,6 +195,18 @@ completo contra un broker real con los permisos exactos de estado, en los dos se
 `security` no es requisito, pero **sin ella el SDK no puede ejecutar** el ciclo bajo la
 configuración segura.
 
+#### `rpc`
+
+Un SDK **declara** `rpc` solo si cumple **todo** lo de [11-request-reply.md §12](11-request-reply.md): `request` y
+`respond`, **los mismos bytes** que los ejemplos de [11-request-reply.md §3.5](11-request-reply.md) para la petición, la
+respuesta y los dos errores, los **seis** códigos de [04-errors.md §7](04-errors.md), una suscripción exacta por
+operación con el grupo de cola del servicio, la conexión que pide `no responders`, una petición denegada que falla
+rápido con `PERMISSION_DENIED` y un ciclo completo contra un broker real con los permisos exactos de la
+petición/respuesta, en los dos sentidos —una operación atendida por dos instancias reparte las peticiones, y al
+parar ambas quien llama recibe `RPC_UNAVAILABLE` en menos de 100 ms—. `security` no es requisito, pero **sin ella el
+SDK no puede ejecutar** el ciclo bajo la configuración segura (el inbox privado es lo que impide leer las
+respuestas ajenas). **Ningún SDK la declara todavía**: la evidencia llega con las fases de los SDKs.
+
 Una capacidad nueva se añade aquí con su nombre, su documento normativo y la evidencia que la
 acredita, y ningún SDK la declara hasta que pasa esa evidencia.
 
@@ -200,10 +214,11 @@ acredita, y ningún SDK la declara hasta que pasa esa evidencia.
 
 Declarado explícitamente para evitar scope creep:
 
-> El **estado replicado** no está en esta lista: entra en 1.1 como extensión opcional
-> ([10-state.md](10-state.md)).
+> El **estado replicado** ([10-state.md](10-state.md)) y la **petición/respuesta**
+> ([11-request-reply.md](11-request-reply.md)) no están en esta lista: entran en 1.1 como extensiones opcionales.
+> Lo que sigue fuera de la petición/respuesta —flujos de varias respuestas, difusión, contrapresión— está declarado
+> en [11-request-reply.md §13](11-request-reply.md).
 
-- Request/reply y RPC.
 - Sagas y orquestación de procesos de larga duración.
 - Protobuf y Avro (opt-in por subject en v2).
 - Cifrado a nivel de campo.
@@ -223,3 +238,4 @@ Declarado explícitamente para evitar scope creep:
 | [08-observability.md](08-observability.md) | Métricas, trazas y alertas — normativo para L2 |
 | [09-multitenancy.md](09-multitenancy.md) | Modelos de aislamiento entre tenants |
 | [10-state.md](10-state.md) | Estado replicado — extensión **opcional**: `put`, `delete`, `get`, `watch` |
+| [11-request-reply.md](11-request-reply.md) | Petición/respuesta — extensión **opcional**: `request`, `respond`, core NATS, sin stream |

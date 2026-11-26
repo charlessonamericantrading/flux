@@ -1,0 +1,40 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.internal/rpc/clientes/cliente/obtener/reply/1.0.0.json",
+  "title": "rpc clientes.cliente.v1.obtener — respuesta",
+  "description": "La RESPUESTA de `clientes.cliente.v1.obtener`, con `type: com.flux.rpc.clientes.cliente.obtener.reply.v1`. Lleva dato personal (`nombre`, `email`), así que los campos van con `x-pii` y el que responde la clasifica `confidential`: el broker no la persiste (core NATS, sin stream) mientras ningún stream capture `rpc.>` (`flux doctor`, 11-request-reply.md §8). Quien escribe esta respuesta es el dueño y quienes la leen son los llamantes: un valor nuevo en un enum EXIGE `x-extensible-enum`.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "clienteId",
+    "nombre",
+    "email"
+  ],
+  "properties": {
+    "clienteId": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$",
+      "description": "Identificador del cliente: una referencia opaca, nunca PII. Es el mismo `clienteId` que llevan los eventos y la clave del estado de `clientes.cliente.v1`."
+    },
+    "nombre": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 200,
+      "x-pii": true,
+      "description": "Nombre completo. Dato personal: el SDK lo redacta en logs."
+    },
+    "email": {
+      "type": "string",
+      "minLength": 3,
+      "maxLength": 254,
+      "pattern": "^[^@\\s]+@[^@\\s]+$",
+      "x-pii": true,
+      "description": "Correo electrónico. Dato personal: el SDK lo redacta en logs."
+    },
+    "pais": {
+      "type": "string",
+      "pattern": "^[A-Z]{2}$",
+      "description": "País de residencia, ISO 3166-1 alfa-2. Opcional."
+    }
+  }
+}

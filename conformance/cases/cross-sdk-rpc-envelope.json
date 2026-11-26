@@ -1,0 +1,442 @@
+{
+  "case": "cross-sdk-rpc-envelope",
+  "title": "Todos los SDKs construyen la misma petición, la misma respuesta y los mismos errores de rpc, byte a byte",
+  "spec": "specification/11-request-reply.md §3, §3.5; specification/01-envelope.md §6",
+  "verifiedAgainst": "conformance/rpc-broker.mjs (reconstruye los bytes desde `event` y compara el SHA-256), JSON.stringify de Node y json.dumps(ensure_ascii=False, separators) de Python",
+  "verifiedOn": "2026-11-26",
+  "rationale": "Es la parte de la fase 3 que se compara byte a byte entre lenguajes, como cross-sdk-envelope.json y cross-sdk-state-envelope.json: la petición (con `subject` = aggregateId y `partitionkey`, y `correlationid` = su propio id al no nacer de otro evento), la respuesta (que HEREDA `correlationid`, `tenantid`, `subject` y `partitionkey` y cuyo `causationid` es el `id` de la petición) y los dos errores `com.flux.rpc.error.v1`: el de un handler y el que fabrica el SDK de quien responde. Un SDK que reordene claves, escape el no-ASCII (`Otoño`, `Campaña`, `petición`: UTF-8 literal, 01-envelope.md §1.1) o ponga `data` en otro sitio rompe el replay verbatim, la firma y la deduplicación por hash. Los vectores de la operación fijan qué es un nombre válido y el CÓDIGO estable de cada rechazo (`INVALID_RPC_CALL`, o `RESERVED_DOMAIN` si el dominio es reservado), y los del timeout el rango.",
+  "attributeOrder": [
+    "specversion",
+    "id",
+    "source",
+    "type",
+    "time",
+    "datacontenttype",
+    "dataschema",
+    "subject",
+    "correlationid",
+    "tenantid",
+    "producerversion",
+    "dataclassification",
+    "causationid",
+    "partitionkey",
+    "traceparent",
+    "tracestate",
+    "signkeyid",
+    "signature",
+    "dlqreason",
+    "dlqattempts",
+    "dlqconsumer",
+    "dlqerror",
+    "dlqtime",
+    "data"
+  ],
+  "harness": {
+    "$comment": "Las operaciones que el arnés cruzado (conformance/harness/README.md) debe aprender; ahora no existen y NINGÚN SDK declara `rpc` hasta que las ejecute. Todas son deterministas: id, time y traceparent vienen dados. `rpc-request` da `bytes` (base64) igual que `build`; `rpc-operation` da `{ok, subject}` o `{ok:false, code}`.",
+    "ops": {
+      "rpc-request": "entrada: { operation, tenantId, aggregateId?, id, source, time, correlationid, producerversion, classification, traceparent?, data } → bytes de la petición",
+      "rpc-reply": "entrada: { request: { operation, id, correlationid, tenantid, subject? }, id, source, time, producerversion, classification, traceparent?, data } → bytes de la respuesta: hereda correlationid, tenantid y subject de `request`, y causationid = request.id",
+      "rpc-error": "entrada: { request: {…}, id, source, time, producerversion, traceparent?, error: { class, code, message, retryAfterMs? } } → bytes del error com.flux.rpc.error.v1 (clasificación `internal`)",
+      "rpc-operation": "entrada: { operation } → el subject de NATS, o el código estable del rechazo",
+      "rpc-timeout": "entrada: { timeoutMs? } → los milisegundos efectivos, o INVALID_RPC_CALL"
+    }
+  },
+  "fixtures": [
+    {
+      "id": "rpc-request",
+      "title": "petición a clientes.cliente.v1.calcular-descuento, tenant acme, sobre el agregado cli-1",
+      "harnessOp": "rpc-request",
+      "input": {
+        "operation": "clientes.cliente.v1.calcular-descuento",
+        "tenantId": "acme",
+        "aggregateId": "cli-1",
+        "id": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+        "source": "/produccion/facturacion-api",
+        "time": "2026-08-20T10:41:07.318Z",
+        "correlationid": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+        "producerversion": "3.4.1",
+        "classification": "internal",
+        "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+        "data": {
+          "clienteId": "cli-1",
+          "totalCents": 9990,
+          "moneda": "EUR",
+          "campana": "Otoño"
+        }
+      },
+      "natsSubject": "rpc.clientes.cliente.v1.calcular-descuento",
+      "event": {
+        "specversion": "1.0",
+        "id": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+        "source": "/produccion/facturacion-api",
+        "type": "com.flux.rpc.clientes.cliente.calcular-descuento.request.v1",
+        "time": "2026-08-20T10:41:07.318Z",
+        "datacontenttype": "application/json",
+        "dataschema": "https://schemas.internal/rpc/clientes/cliente/calcular-descuento/request/1.0.0.json",
+        "subject": "cli-1",
+        "correlationid": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+        "tenantid": "acme",
+        "producerversion": "3.4.1",
+        "dataclassification": "internal",
+        "partitionkey": "cli-1",
+        "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+        "data": {
+          "clienteId": "cli-1",
+          "totalCents": 9990,
+          "moneda": "EUR",
+          "campana": "Otoño"
+        }
+      },
+      "bytes": 668,
+      "sha256": "43ea71ade9fb6ff81ccb7c1f93047ffebd604d602492229e452b1c97dadf83f5",
+      "base64": "eyJzcGVjdmVyc2lvbiI6IjEuMCIsImlkIjoiMDE5MjRmOTEtNWQwYi03YzFhLThlMjItOWE0YjNjMmQxZTEwIiwic291cmNlIjoiL3Byb2R1Y2Npb24vZmFjdHVyYWNpb24tYXBpIiwidHlwZSI6ImNvbS5mbHV4LnJwYy5jbGllbnRlcy5jbGllbnRlLmNhbGN1bGFyLWRlc2N1ZW50by5yZXF1ZXN0LnYxIiwidGltZSI6IjIwMjYtMDgtMjBUMTA6NDE6MDcuMzE4WiIsImRhdGFjb250ZW50dHlwZSI6ImFwcGxpY2F0aW9uL2pzb24iLCJkYXRhc2NoZW1hIjoiaHR0cHM6Ly9zY2hlbWFzLmludGVybmFsL3JwYy9jbGllbnRlcy9jbGllbnRlL2NhbGN1bGFyLWRlc2N1ZW50by9yZXF1ZXN0LzEuMC4wLmpzb24iLCJzdWJqZWN0IjoiY2xpLTEiLCJjb3JyZWxhdGlvbmlkIjoiMDE5MjRmOTEtNWQwYi03YzFhLThlMjItOWE0YjNjMmQxZTEwIiwidGVuYW50aWQiOiJhY21lIiwicHJvZHVjZXJ2ZXJzaW9uIjoiMy40LjEiLCJkYXRhY2xhc3NpZmljYXRpb24iOiJpbnRlcm5hbCIsInBhcnRpdGlvbmtleSI6ImNsaS0xIiwidHJhY2VwYXJlbnQiOiIwMC00YmY5MmYzNTc3YjM0ZGE2YTNjZTkyOWQwZTBlNDczNi0wMGYwNjdhYTBiYTkwMmI3LTAxIiwiZGF0YSI6eyJjbGllbnRlSWQiOiJjbGktMSIsInRvdGFsQ2VudHMiOjk5OTAsIm1vbmVkYSI6IkVVUiIsImNhbXBhbmEiOiJPdG/DsW8ifX0="
+    },
+    {
+      "id": "rpc-reply",
+      "title": "la respuesta a esa petición",
+      "harnessOp": "rpc-reply",
+      "input": {
+        "request": {
+          "operation": "clientes.cliente.v1.calcular-descuento",
+          "id": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+          "correlationid": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+          "tenantid": "acme",
+          "subject": "cli-1"
+        },
+        "id": "01924f91-5d0f-7e03-9b6a-1c2d3e4f5a67",
+        "source": "/produccion/crm-api",
+        "time": "2026-08-20T10:41:07.329Z",
+        "correlationid": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+        "producerversion": "2.1.0",
+        "classification": "internal",
+        "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-b7ad6b7169203331-01",
+        "data": {
+          "descuentoCents": 500,
+          "moneda": "EUR",
+          "motivo": "Campaña de otoño"
+        }
+      },
+      "natsSubject": "_INBOX.facturacion-api.<token>",
+      "event": {
+        "specversion": "1.0",
+        "id": "01924f91-5d0f-7e03-9b6a-1c2d3e4f5a67",
+        "source": "/produccion/crm-api",
+        "type": "com.flux.rpc.clientes.cliente.calcular-descuento.reply.v1",
+        "time": "2026-08-20T10:41:07.329Z",
+        "datacontenttype": "application/json",
+        "dataschema": "https://schemas.internal/rpc/clientes/cliente/calcular-descuento/reply/1.0.0.json",
+        "subject": "cli-1",
+        "correlationid": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+        "tenantid": "acme",
+        "producerversion": "2.1.0",
+        "dataclassification": "internal",
+        "causationid": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+        "partitionkey": "cli-1",
+        "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-b7ad6b7169203331-01",
+        "data": {
+          "descuentoCents": 500,
+          "moneda": "EUR",
+          "motivo": "Campaña de otoño"
+        }
+      },
+      "bytes": 703,
+      "sha256": "b164fa71fa3e2943f3cb160f1a7cf3c520b09c2d93a0a1da81eef7f17da1f01c",
+      "base64": "eyJzcGVjdmVyc2lvbiI6IjEuMCIsImlkIjoiMDE5MjRmOTEtNWQwZi03ZTAzLTliNmEtMWMyZDNlNGY1YTY3Iiwic291cmNlIjoiL3Byb2R1Y2Npb24vY3JtLWFwaSIsInR5cGUiOiJjb20uZmx1eC5ycGMuY2xpZW50ZXMuY2xpZW50ZS5jYWxjdWxhci1kZXNjdWVudG8ucmVwbHkudjEiLCJ0aW1lIjoiMjAyNi0wOC0yMFQxMDo0MTowNy4zMjlaIiwiZGF0YWNvbnRlbnR0eXBlIjoiYXBwbGljYXRpb24vanNvbiIsImRhdGFzY2hlbWEiOiJodHRwczovL3NjaGVtYXMuaW50ZXJuYWwvcnBjL2NsaWVudGVzL2NsaWVudGUvY2FsY3VsYXItZGVzY3VlbnRvL3JlcGx5LzEuMC4wLmpzb24iLCJzdWJqZWN0IjoiY2xpLTEiLCJjb3JyZWxhdGlvbmlkIjoiMDE5MjRmOTEtNWQwYi03YzFhLThlMjItOWE0YjNjMmQxZTEwIiwidGVuYW50aWQiOiJhY21lIiwicHJvZHVjZXJ2ZXJzaW9uIjoiMi4xLjAiLCJkYXRhY2xhc3NpZmljYXRpb24iOiJpbnRlcm5hbCIsImNhdXNhdGlvbmlkIjoiMDE5MjRmOTEtNWQwYi03YzFhLThlMjItOWE0YjNjMmQxZTEwIiwicGFydGl0aW9ua2V5IjoiY2xpLTEiLCJ0cmFjZXBhcmVudCI6IjAwLTRiZjkyZjM1NzdiMzRkYTZhM2NlOTI5ZDBlMGU0NzM2LWI3YWQ2YjcxNjkyMDMzMzEtMDEiLCJkYXRhIjp7ImRlc2N1ZW50b0NlbnRzIjo1MDAsIm1vbmVkYSI6IkVVUiIsIm1vdGl2byI6IkNhbXBhw7FhIGRlIG90b8OxbyJ9fQ=="
+    },
+    {
+      "id": "rpc-error-handler",
+      "title": "el handler lanza un RetryableError con retryAfterMs: el error del que responde",
+      "harnessOp": "rpc-error",
+      "input": {
+        "request": {
+          "operation": "clientes.cliente.v1.calcular-descuento",
+          "id": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+          "correlationid": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+          "tenantid": "acme",
+          "subject": "cli-1"
+        },
+        "id": "01924f91-5d11-7a62-8f0d-4e5f6a7b8c91",
+        "source": "/produccion/crm-api",
+        "time": "2026-08-20T10:41:07.331Z",
+        "correlationid": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+        "producerversion": "2.1.0",
+        "classification": "internal",
+        "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-b7ad6b7169203331-01",
+        "error": {
+          "class": "retryable",
+          "code": "HTTP_503",
+          "message": "el servicio de tarifas no responde",
+          "retryAfterMs": 5000
+        }
+      },
+      "natsSubject": "_INBOX.facturacion-api.<token>",
+      "event": {
+        "specversion": "1.0",
+        "id": "01924f91-5d11-7a62-8f0d-4e5f6a7b8c91",
+        "source": "/produccion/crm-api",
+        "type": "com.flux.rpc.error.v1",
+        "time": "2026-08-20T10:41:07.331Z",
+        "datacontenttype": "application/json",
+        "dataschema": "https://schemas.internal/system/rpc/error/1.0.0.json",
+        "subject": "cli-1",
+        "correlationid": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+        "tenantid": "acme",
+        "producerversion": "2.1.0",
+        "dataclassification": "internal",
+        "causationid": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+        "partitionkey": "cli-1",
+        "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-b7ad6b7169203331-01",
+        "data": {
+          "class": "retryable",
+          "code": "HTTP_503",
+          "message": "el servicio de tarifas no responde",
+          "retryAfterMs": 5000
+        }
+      },
+      "bytes": 677,
+      "sha256": "fdff124948254dfa3263971aec86bf4d0184db77babe44da5e0714f28fc427f8",
+      "base64": "eyJzcGVjdmVyc2lvbiI6IjEuMCIsImlkIjoiMDE5MjRmOTEtNWQxMS03YTYyLThmMGQtNGU1ZjZhN2I4YzkxIiwic291cmNlIjoiL3Byb2R1Y2Npb24vY3JtLWFwaSIsInR5cGUiOiJjb20uZmx1eC5ycGMuZXJyb3IudjEiLCJ0aW1lIjoiMjAyNi0wOC0yMFQxMDo0MTowNy4zMzFaIiwiZGF0YWNvbnRlbnR0eXBlIjoiYXBwbGljYXRpb24vanNvbiIsImRhdGFzY2hlbWEiOiJodHRwczovL3NjaGVtYXMuaW50ZXJuYWwvc3lzdGVtL3JwYy9lcnJvci8xLjAuMC5qc29uIiwic3ViamVjdCI6ImNsaS0xIiwiY29ycmVsYXRpb25pZCI6IjAxOTI0ZjkxLTVkMGItN2MxYS04ZTIyLTlhNGIzYzJkMWUxMCIsInRlbmFudGlkIjoiYWNtZSIsInByb2R1Y2VydmVyc2lvbiI6IjIuMS4wIiwiZGF0YWNsYXNzaWZpY2F0aW9uIjoiaW50ZXJuYWwiLCJjYXVzYXRpb25pZCI6IjAxOTI0ZjkxLTVkMGItN2MxYS04ZTIyLTlhNGIzYzJkMWUxMCIsInBhcnRpdGlvbmtleSI6ImNsaS0xIiwidHJhY2VwYXJlbnQiOiIwMC00YmY5MmYzNTc3YjM0ZGE2YTNjZTkyOWQwZTBlNDczNi1iN2FkNmI3MTY5MjAzMzMxLTAxIiwiZGF0YSI6eyJjbGFzcyI6InJldHJ5YWJsZSIsImNvZGUiOiJIVFRQXzUwMyIsIm1lc3NhZ2UiOiJlbCBzZXJ2aWNpbyBkZSB0YXJpZmFzIG5vIHJlc3BvbmRlIiwicmV0cnlBZnRlck1zIjo1MDAwfX0="
+    },
+    {
+      "id": "rpc-error-sdk",
+      "title": "el SDK del que responde rechaza la petición por su esquema: cita rutas, nunca valores",
+      "harnessOp": "rpc-error",
+      "input": {
+        "request": {
+          "operation": "clientes.cliente.v1.calcular-descuento",
+          "id": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+          "correlationid": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+          "tenantid": "acme",
+          "subject": "cli-1"
+        },
+        "id": "01924f91-5d13-7b85-a3e1-6a7b8c9d0e22",
+        "source": "/produccion/crm-api",
+        "time": "2026-08-20T10:41:07.333Z",
+        "correlationid": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+        "producerversion": "2.1.0",
+        "classification": "internal",
+        "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-b7ad6b7169203331-01",
+        "error": {
+          "class": "permanent",
+          "code": "INVALID_SCHEMA",
+          "message": "la petición no cumple https://schemas.internal/rpc/clientes/cliente/calcular-descuento/request/1.0.0.json: /totalCents debe ser un entero, /moneda es obligatoria"
+        }
+      },
+      "natsSubject": "_INBOX.facturacion-api.<token>",
+      "event": {
+        "specversion": "1.0",
+        "id": "01924f91-5d13-7b85-a3e1-6a7b8c9d0e22",
+        "source": "/produccion/crm-api",
+        "type": "com.flux.rpc.error.v1",
+        "time": "2026-08-20T10:41:07.333Z",
+        "datacontenttype": "application/json",
+        "dataschema": "https://schemas.internal/system/rpc/error/1.0.0.json",
+        "subject": "cli-1",
+        "correlationid": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+        "tenantid": "acme",
+        "producerversion": "2.1.0",
+        "dataclassification": "internal",
+        "causationid": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+        "partitionkey": "cli-1",
+        "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-b7ad6b7169203331-01",
+        "data": {
+          "class": "permanent",
+          "code": "INVALID_SCHEMA",
+          "message": "la petición no cumple https://schemas.internal/rpc/clientes/cliente/calcular-descuento/request/1.0.0.json: /totalCents debe ser un entero, /moneda es obligatoria"
+        }
+      },
+      "bytes": 791,
+      "sha256": "c6f80891c94a6c64defa825288f9f98201bed5824d7c6e94c58362dccbfc446d",
+      "base64": "eyJzcGVjdmVyc2lvbiI6IjEuMCIsImlkIjoiMDE5MjRmOTEtNWQxMy03Yjg1LWEzZTEtNmE3YjhjOWQwZTIyIiwic291cmNlIjoiL3Byb2R1Y2Npb24vY3JtLWFwaSIsInR5cGUiOiJjb20uZmx1eC5ycGMuZXJyb3IudjEiLCJ0aW1lIjoiMjAyNi0wOC0yMFQxMDo0MTowNy4zMzNaIiwiZGF0YWNvbnRlbnR0eXBlIjoiYXBwbGljYXRpb24vanNvbiIsImRhdGFzY2hlbWEiOiJodHRwczovL3NjaGVtYXMuaW50ZXJuYWwvc3lzdGVtL3JwYy9lcnJvci8xLjAuMC5qc29uIiwic3ViamVjdCI6ImNsaS0xIiwiY29ycmVsYXRpb25pZCI6IjAxOTI0ZjkxLTVkMGItN2MxYS04ZTIyLTlhNGIzYzJkMWUxMCIsInRlbmFudGlkIjoiYWNtZSIsInByb2R1Y2VydmVyc2lvbiI6IjIuMS4wIiwiZGF0YWNsYXNzaWZpY2F0aW9uIjoiaW50ZXJuYWwiLCJjYXVzYXRpb25pZCI6IjAxOTI0ZjkxLTVkMGItN2MxYS04ZTIyLTlhNGIzYzJkMWUxMCIsInBhcnRpdGlvbmtleSI6ImNsaS0xIiwidHJhY2VwYXJlbnQiOiIwMC00YmY5MmYzNTc3YjM0ZGE2YTNjZTkyOWQwZTBlNDczNi1iN2FkNmI3MTY5MjAzMzMxLTAxIiwiZGF0YSI6eyJjbGFzcyI6InBlcm1hbmVudCIsImNvZGUiOiJJTlZBTElEX1NDSEVNQSIsIm1lc3NhZ2UiOiJsYSBwZXRpY2nDs24gbm8gY3VtcGxlIGh0dHBzOi8vc2NoZW1hcy5pbnRlcm5hbC9ycGMvY2xpZW50ZXMvY2xpZW50ZS9jYWxjdWxhci1kZXNjdWVudG8vcmVxdWVzdC8xLjAuMC5qc29uOiAvdG90YWxDZW50cyBkZWJlIHNlciB1biBlbnRlcm8sIC9tb25lZGEgZXMgb2JsaWdhdG9yaWEifX0="
+    }
+  ],
+  "assertions": [
+    {
+      "id": "data-is-last",
+      "expr": "Object.keys(event).at(-1) === 'data'"
+    },
+    {
+      "id": "reply-causationid-is-the-request-id",
+      "expr": "reply.causationid === request.id"
+    },
+    {
+      "id": "reply-inherits-correlationid-tenantid-subject",
+      "expr": "reply.correlationid === request.correlationid && reply.tenantid === request.tenantid && reply.subject === request.subject"
+    },
+    {
+      "id": "request-correlationid-is-its-own-id-when-born-here",
+      "expr": "request.correlationid === request.id"
+    },
+    {
+      "id": "error-data-keys-in-declaration-order",
+      "expr": "Object.keys(error.data).join() starts with 'class,code,message'"
+    },
+    {
+      "id": "error-class-is-retryable-or-permanent",
+      "expr": "['retryable','permanent'].includes(error.data.class)"
+    },
+    {
+      "id": "utf8-literal-no-u-escapes",
+      "expr": "!/\\\\u[0-9a-fA-F]{4}/.test(JSON.stringify(event))"
+    },
+    {
+      "id": "no-nats-headers-needed",
+      "expr": "los bytes del cuerpo bastan: ninguna cabecera es obligatoria"
+    }
+  ],
+  "subjectVectors": [
+    {
+      "operation": "clientes.cliente.v1.obtener",
+      "natsSubject": "rpc.clientes.cliente.v1.obtener"
+    },
+    {
+      "operation": "clientes.cliente.v1.calcular-descuento",
+      "natsSubject": "rpc.clientes.cliente.v1.calcular-descuento"
+    },
+    {
+      "operation": "logistica.linea-envio.v2.reservar-stock",
+      "natsSubject": "rpc.logistica.linea-envio.v2.reservar-stock"
+    },
+    {
+      "operation": "a.b.v1.c",
+      "natsSubject": "rpc.a.b.v1.c"
+    },
+    {
+      "operation": "clientes.cliente.v1",
+      "errorCode": "INVALID_RPC_CALL",
+      "note": "faltan la operación"
+    },
+    {
+      "operation": "clientes.cliente.v1.obtener.x",
+      "errorCode": "INVALID_RPC_CALL",
+      "note": "cinco tokens"
+    },
+    {
+      "operation": "Clientes.cliente.v1.obtener",
+      "errorCode": "INVALID_RPC_CALL",
+      "note": "mayúsculas: NATS distingue y crearía un subject fantasma"
+    },
+    {
+      "operation": "clientes.cliente.v1.Obtener",
+      "errorCode": "INVALID_RPC_CALL",
+      "note": "mayúsculas en la operación"
+    },
+    {
+      "operation": "clientes.cliente.v1.obtener_cliente",
+      "errorCode": "INVALID_RPC_CALL",
+      "note": "guion bajo"
+    },
+    {
+      "operation": "clientes.cliente.v1.obtener cliente",
+      "errorCode": "INVALID_RPC_CALL",
+      "note": "espacio"
+    },
+    {
+      "operation": "clientes.cliente.v0.obtener",
+      "errorCode": "INVALID_RPC_CALL",
+      "note": "v0"
+    },
+    {
+      "operation": "clientes.cliente.v1.",
+      "errorCode": "INVALID_RPC_CALL",
+      "note": "operación vacía"
+    },
+    {
+      "operation": "clientes.cliente.v1.*",
+      "errorCode": "INVALID_RPC_CALL",
+      "note": "comodín: el broker lo aceptaría"
+    },
+    {
+      "operation": "clientes.cliente.v1.>",
+      "errorCode": "INVALID_RPC_CALL",
+      "note": "comodín"
+    },
+    {
+      "operation": "clientes.cliente.v1.obtener\n",
+      "errorCode": "INVALID_RPC_CALL",
+      "note": "salto de línea final: coincidencia completa, no `$`"
+    },
+    {
+      "operation": "",
+      "errorCode": "INVALID_RPC_CALL",
+      "note": "vacío"
+    },
+    {
+      "operation": "rpc.clientes.cliente.v1.obtener",
+      "errorCode": "RESERVED_DOMAIN",
+      "note": "con el prefijo rpc.: el dominio sería `rpc`"
+    },
+    {
+      "operation": "state.cliente.v1.obtener",
+      "errorCode": "RESERVED_DOMAIN",
+      "note": "dominio reservado"
+    },
+    {
+      "operation": "dlq.cliente.v1.obtener",
+      "errorCode": "RESERVED_DOMAIN",
+      "note": "dominio reservado"
+    },
+    {
+      "operation": "system.cliente.v1.obtener",
+      "errorCode": "RESERVED_DOMAIN",
+      "note": "dominio reservado"
+    }
+  ],
+  "timeoutVectors": [
+    {
+      "effectiveMs": 5000
+    },
+    {
+      "timeoutMs": 1,
+      "effectiveMs": 1
+    },
+    {
+      "timeoutMs": 2000,
+      "effectiveMs": 2000
+    },
+    {
+      "timeoutMs": 5000,
+      "effectiveMs": 5000
+    },
+    {
+      "timeoutMs": 25000,
+      "effectiveMs": 25000
+    },
+    {
+      "timeoutMs": 0,
+      "errorCode": "INVALID_RPC_CALL"
+    },
+    {
+      "timeoutMs": -1,
+      "errorCode": "INVALID_RPC_CALL"
+    },
+    {
+      "timeoutMs": 25001,
+      "errorCode": "INVALID_RPC_CALL"
+    },
+    {
+      "timeoutMs": 30000,
+      "errorCode": "INVALID_RPC_CALL"
+    },
+    {
+      "timeoutMs": 60000,
+      "errorCode": "INVALID_RPC_CALL"
+    },
+    {
+      "timeoutMs": 1.5,
+      "errorCode": "INVALID_RPC_CALL"
+    },
+    {
+      "timeoutMs": "5000",
+      "errorCode": "INVALID_RPC_CALL"
+    },
+    {
+      "timeoutMs": null,
+      "errorCode": "INVALID_RPC_CALL"
+    },
+    {
+      "timeoutMs": "NaN",
+      "errorCode": "INVALID_RPC_CALL"
+    }
+  ]
+}
