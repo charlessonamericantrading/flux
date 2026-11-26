@@ -16,6 +16,7 @@ import { doctor } from "./doctor.mjs";
 import { dlqList, dlqInspect, dlqReplay } from "./dlq.mjs";
 import { tail } from "./tail.mjs";
 import { comandoProvision } from "./provision.mjs";
+import { comandoState } from "./state.mjs";
 
 const SUBJECT_RE =
   /^[a-z0-9]+(-[a-z0-9]+)*\.[a-z0-9]+(-[a-z0-9]+)*\.v[1-9][0-9]*\.[a-z0-9]+(-[a-z0-9]+)*$/;
@@ -30,7 +31,13 @@ ${c.bold("COMANDOS")}
   ${c.cyan("tail")} <patrón>             Eventos en vivo (consumidor efímero, no consume)
   ${c.cyan("dlq ls")} <dominio>          Resumen de la DLQ agrupado por causa
   ${c.cyan("dlq inspect")} <dominio>     Detalle de eventos muertos
-  ${c.cyan("dlq replay")} <dominio>      Reproduce desde la DLQ (simulación por defecto)
+  ${c.cyan("dlq replay")} <dominio>      Reproduce desde la DLQ (simulación por defecto; no el estado)
+  ${c.cyan("state ls")} <contrato>       Claves de un estado replicado: revisión, tamaño, lápidas
+  ${c.cyan("state get")} <contrato> <tenant> <clave>
+                              Una clave: el sobre tal cual está en el stream
+  ${c.cyan("state resync")} <servicio> <contrato>
+                              Recupera un observador de estado: borra y recrea su durable
+                              (simulación por defecto; nunca toca el stream ni las claves)
   ${c.cyan("validate")} <subject>        Comprueba un subject contra el protocolo
   ${c.cyan("provision")} <services.json> Crea los streams y durables que exige el manifiesto
                               (idempotente, informa de diferencias, nunca borra)
@@ -41,6 +48,14 @@ ${c.bold("OPCIONES GLOBALES")}
       --creds <fichero>     Credenciales NATS (.creds)
   -v, --verbose             Más detalle
   -h, --help
+
+${c.bold("OPCIONES DE state")}
+      --tenant <t>          ls: solo ese tenant · resync: el durable de ese tenant
+      --json                ls, get: salida para máquinas
+      --show-data           get (y tail, dlq inspect): imprime el data aunque sea confidential
+      --limit <n>           ls: solo las n primeras claves
+      --confirm             resync: ejecuta (sin él, simulación)
+      --yes                 resync: no pide la confirmación interactiva
 
 ${c.bold("OPCIONES DE provision")}
       --dry-run             Muestra qué se crearía; no crea nada
@@ -54,6 +69,9 @@ ${c.bold("EJEMPLOS")}
   flux dlq ls pedidos
   flux dlq inspect pedidos --subject pedidos.pedido.v1.creado
   flux dlq replay pedidos --subject pedidos.pedido.v1.creado --confirm
+  flux state ls clientes.cliente.v1 --tenant acme
+  flux state get clientes.cliente.v1 acme cli-1
+  flux state resync tienda-web clientes.cliente.v1 --tenant acme --confirm
   flux provision examples/services.json --dry-run --creds ops.creds
   flux provision examples/services.json --replicas 3 --creds ops.creds
 
@@ -66,6 +84,8 @@ ${c.bold("PROVISION")}
 ${c.bold("SEGURIDAD")}
   El payload de eventos con dataclassification confidential o restricted NO se
   imprime: una terminal acaba en un log. Usa --show-data si de verdad lo necesitas.
+  Vale también para el estado (confidential es la clasificación por defecto de un put)
+  y para --json y --full.
 `;
 
 function parseArgs(argv) {
@@ -277,6 +297,13 @@ try {
       else if (accion === "inspect") await dlqInspect(js, jsm, dominio, o);
       else if (accion === "replay") await dlqReplay(js, jsm, dominio, o);
       else die(`acción desconocida: ${accion}. Usa ls, inspect o replay`);
+      break;
+    }
+
+    case "state": {
+      const codigo = await comandoState({ nc, jsm }, sub, rest, opts);
+      await nc.drain();
+      process.exit(codigo);
       break;
     }
 
