@@ -32,21 +32,26 @@
  *      forma documentada: H1 (no consume) y H2 (fuga por el inbox común).
  *   8. Modelo B (`--tenants`): mismos permisos, una account por tenant, aislamiento real.
  *
- * NO cubre TLS ni credenciales inválidas por TLS (caso S8 de la suite de seguridad): aquí el
- * listener es plano, sobre 127.0.0.1.
+ * Relación con la suite de seguridad (`node conformance/security.mjs`, Fase 1.5): NO es redundante.
+ * La suite verifica el contrato de seguridad de extremo a extremo —con TLS, con los SDKs de Node
+ * y de Rust— y sus casos son DATOS; este script verifica lo que ella no mira: el generador (sus
+ * errores y `--nkeys`), `flux provision`, la minimalidad de cada permiso, `--dev` y el Modelo B.
+ * Las secciones 4, 6 y 7 se solapan con los casos S2–S7 y S9 a propósito: la spec cita este
+ * script por su nombre (06-security.md §3), y se quedarán aquí hasta que la spec cite la suite.
+ * La infraestructura común (arrancar nats-server, claves, sondas) vive en
+ * scripts/lib/nats-harness.mjs, que usan los dos.
+ *
+ * NO cubre TLS ni credenciales inválidas por TLS (caso S8 de la suite): aquí el listener es
+ * plano, sobre 127.0.0.1.
  *
  * Entorno: NATS_SERVER (binario; por defecto `nats-server`), VERIFY_ACL_PORT (primer puerto a
  * probar; por defecto 4300). Los temporales viven en `os.tmpdir()` y se borran al terminar.
  */
 
-import { spawn, spawnSync } from "node:child_process";
+import { spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
-import { createRequire } from "node:module";
-import net from "node:net";
-import os from "node:os";
+import { readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
 
 import {
   dlqDurableName,
@@ -55,27 +60,48 @@ import {
   durableName,
   streamName,
 } from "./lib/manifest.mjs";
+// La infraestructura común con conformance/security.mjs: arrancar y parar nats-server, claves,
+// conexiones que vigilan las violaciones de permiso y las sondas. Ver scripts/lib/nats-harness.mjs.
+import {
+  Banco,
+  CLI,
+  EJEMPLO,
+  ROOT,
+  conUsuarios,
+  conTiempo,
+  conectar,
+  configConsumidorCanonica,
+  credsDe,
+  dec,
+  enc,
+  esViolacion,
+  gen,
+  jetstream,
+  jetstreamManager,
+  nanos,
+  nuevaClave,
+  pedir,
+  permisosJson,
+  publicarCrudo,
+  publicarJs,
+  recibirUno,
+  resumen,
+  sleep,
+  suscribirCrudo,
+  usuarioConf,
+  vigilar,
+} from "./lib/nats-harness.mjs";
 
-const ROOT = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
-const GEN = path.join(ROOT, "scripts", "gen-acl.mjs");
-const CLI = path.join(ROOT, "cli", "src", "index.mjs");
-const EJEMPLO = path.join(ROOT, "examples", "services.json");
 const NATS_SERVER = process.env.NATS_SERVER ?? "nats-server";
-
-// Las dependencias de NATS viven en conformance/: este script no añade ninguna.
-const require = createRequire(path.join(ROOT, "conformance", "package.json"));
-let connect, nkeyAuthenticator, nkeys, jetstream, jetstreamManager;
-try {
-  ({ connect, nkeyAuthenticator, nkeys } = require("@nats-io/transport-node"));
-  ({ jetstream, jetstreamManager } = require("@nats-io/jetstream"));
-} catch (e) {
-  console.error(`✗ faltan las dependencias de NATS: ${e.message}\n  Ejecuta: (cd conformance && npm install)`);
-  process.exit(2);
-}
-
-const enc = new TextEncoder();
-const dec = new TextDecoder();
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const banco = new Banco({
+  prefijo: "flux-verify-acl-",
+  puertoBase: Number(process.env.VERIFY_ACL_PORT ?? 4300),
+  puertos: 50,
+  natsServer: NATS_SERVER,
+});
+let TMP;
+const arrancar = (nombre, acl) => banco.arrancar(nombre, acl, { servidorNombre: `verify-${nombre}` });
+const parar = (child) => banco.parar(child);
 
 // ─── Informe ─────────────────────────────────────────────────────────────────
 
@@ -94,218 +120,20 @@ function afirmar(cond, texto, detalle) {
 const seccion = (t) => console.log(`\n${t}`);
 const nota = (t) => console.log(`  · ${t}`);
 
-// ─── Servidor ────────────────────────────────────────────────────────────────
-
-let TMP;
-const hijos = [];
-const puertosUsados = new Set();
-
-async function puertoLibre() {
-  const base = Number(process.env.VERIFY_ACL_PORT ?? 4300);
-  for (let p = base; p < base + 50; p++) {
-    if (puertosUsados.has(p)) continue;
-    const libre = await new Promise((ok) => {
-      const s = net.createServer();
-      s.once("error", () => ok(false));
-      s.listen(p, "127.0.0.1", () => s.close(() => ok(true)));
-    });
-    if (libre) {
-      puertosUsados.add(p);
-      return p;
-    }
-  }
-  throw new Error(`no hay un puerto libre entre ${base} y ${base + 49} (VERIFY_ACL_PORT)`);
-}
-
-/** Arranca un nats-server con JetStream que incluye `acl`. Lanza si la config no carga. */
-async function arrancar(nombre, acl) {
-  const dir = path.join(TMP, nombre);
-  await mkdir(dir, { recursive: true });
-  const port = await puertoLibre();
-  await writeFile(path.join(dir, "acl.conf"), acl);
-  const conf = path.join(dir, "server.conf");
-  await writeFile(
-    conf,
-    `host: "127.0.0.1"\nport: ${port}\nserver_name: "verify-${nombre}"\n` +
-      `jetstream { store_dir: "${path.join(dir, "js")}" }\ninclude "acl.conf"\n`,
-  );
-  const child = spawn(NATS_SERVER, ["-c", conf], { stdio: ["ignore", "pipe", "pipe"] });
-  let salida = "";
-  child.stdout.on("data", (d) => (salida += d));
-  child.stderr.on("data", (d) => (salida += d));
-  let murio = false;
-  child.once("exit", () => (murio = true));
-  hijos.push(child);
-
-  for (let i = 0; i < 100; i++) {
-    if (murio) throw new Error(`nats-server no cargó la config:\n${salida.trim()}`);
-    if (salida.includes("Server is ready")) return { dir, port, url: `nats://127.0.0.1:${port}`, child };
-    await sleep(100);
-  }
-  throw new Error(`nats-server no llegó a estar listo:\n${salida.trim()}`);
-}
-
-async function parar(child) {
-  if (child.exitCode !== null) return;
-  child.kill("SIGTERM");
-  await Promise.race([new Promise((r) => child.once("exit", r)), sleep(3000)]);
-  if (child.exitCode === null) child.kill("SIGKILL");
-}
-
 // ─── Identidades y conexiones ────────────────────────────────────────────────
-
-const nuevaClave = () => {
-  const kp = nkeys.createUser();
-  return { pub: kp.getPublicKey(), seed: kp.getSeed() };
-};
-
-/** Un `.creds` con un JWT de relleno: un servidor con nkeys estáticas solo mira la semilla. */
-const credsDe = (seed) =>
-  `-----BEGIN NATS USER JWT-----\neyJ0eXAiOiJKV1QifQ.e30.relleno\n------END NATS USER JWT------\n\n` +
-  `-----BEGIN USER NKEY SEED-----\n${dec.decode(seed)}\n------END USER NKEY SEED------\n`;
-
-const usuarioConf = (pub, publish, subscribe) =>
-  `      { nkey: "${pub}"\n        permissions: {\n` +
-  `          publish: { allow: [${publish.map((s) => `"${s}"`).join(", ")}] }\n` +
-  `          subscribe: { allow: [${subscribe.map((s) => `"${s}"`).join(", ")}] }\n        } },\n`;
-
-/** Inserta usuarios tras la línea `users: [` de la account (la `n`-ésima, desde 0). */
-function conUsuarios(acl, extra, n = 0) {
-  const marca = "    users: [";
-  const partes = acl.split(marca);
-  if (partes.length <= n + 1) throw new Error("la config generada no tiene `users: [` donde se esperaba");
-  return partes.slice(0, n + 1).join(marca) + `${marca}\n${extra}` + partes.slice(n + 1).join(marca);
-}
-
-/**
- * Conecta y guarda las violaciones de permiso que el servidor notifica. Una publicación sin
- * respuesta (un ack, un `publish` de core) no tiene otra forma de enterarse de que se denegó.
- */
-async function conectar(url, { nombre, seed, user, pass, inboxPrefix }) {
-  const violaciones = [];
-  const nc = await connect({
-    servers: url,
-    name: `verify-acl:${nombre}`,
-    timeout: 4000,
-    reconnect: false,
-    ...(seed ? { authenticator: nkeyAuthenticator(seed) } : { user, pass }),
-    ...(inboxPrefix && { inboxPrefix }),
-  });
-  (async () => {
-    for await (const s of nc.status()) {
-      if (s.type === "error") violaciones.push(String(s.error?.message ?? s.error));
-    }
-  })();
-  nc.violaciones = violaciones;
-  return nc;
-}
 
 /** Una conexión de servicio, como la haría el SDK: inbox privado `_INBOX.<servicio>`. */
 const comoServicio = (url, nombre, seed, base = nombre) =>
   conectar(url, { nombre, seed, inboxPrefix: `_INBOX.${base}` });
 
-// ─── Utilidades de sondeo ────────────────────────────────────────────────────
-
-const esViolacion = (e) => /Permissions Violation/i.test(e?.message ?? String(e));
-const resumen = (e) => (e?.message ?? String(e)).split("\n")[0].slice(0, 140);
-
-function conTiempo(promesa, ms, que) {
-  let t;
-  return Promise.race([
-    promesa,
-    new Promise((_, rj) => {
-      t = setTimeout(() => rj(new Error(`sin respuesta en ${ms} ms (${que})`)), ms);
-    }),
-  ]).finally(() => clearTimeout(t));
-}
-
-/**
- * Pide algo al broker y lo clasifica: `denegado` (violación de permiso), `respondido`
- * (llegó una respuesta, buena o de error: el permiso existe) o `otro` (timeout, sin
- * respondedores…: NO es una denegación y no debe contarse como tal).
- */
-async function pedir(nc, subject, cuerpo = {}, timeout = 1500) {
-  try {
-    const r = await nc.request(subject, enc.encode(JSON.stringify(cuerpo)), { timeout });
-    let json;
-    try {
-      json = JSON.parse(dec.decode(r.data));
-    } catch {
-      json = null;
-    }
-    return { estado: "respondido", json, error: json?.error?.description };
-  } catch (e) {
-    return esViolacion(e) ? { estado: "denegado", detalle: resumen(e) } : { estado: "otro", detalle: resumen(e) };
-  }
-}
-
-/** Publica sin esperar respuesta y mira si el servidor se quejó de ESE subject. */
-async function publicarCrudo(nc, subject) {
-  nc.publish(subject, enc.encode("{}"));
-  await nc.flush();
-  await sleep(250);
-  return nc.violaciones.some((v) => v.includes(`Publish to "${subject}"`)) ? "denegado" : "permitido";
-}
-
-async function suscribirCrudo(nc, subject) {
-  const sub = nc.subscribe(subject);
-  await nc.flush();
-  await sleep(250);
-  const denegada = nc.violaciones.some((v) => v.includes(`Subscription to "${subject}"`));
-  if (denegada) sub.unsubscribe();
-  return denegada ? "denegado" : "permitido";
-}
-
-async function publicarJs(nc, subject, cuerpo = "{}") {
-  return jetstream(nc, { timeout: 1500 }).publish(subject, enc.encode(cuerpo), { msgID: randomUUID() });
-}
-
-/**
- * Anota los mensajes de una suscripción que contengan `marca`. Si el broker DENIEGA la
- * suscripción, su iterador lanza PermissionViolationError: es lo esperado, no un fallo.
- */
-function vigilar(sub, marca, visto) {
-  (async () => {
-    try {
-      for await (const m of sub) if (dec.decode(m.data).includes(marca)) visto.push(m.subject);
-    } catch {
-      /* suscripción denegada */
-    }
-  })();
-}
-
-/** Recibe UN mensaje de un consumidor pull, o `null` si no llega en `ms`. */
-async function recibirUno(consumidor, ms = 3000) {
-  const it = await consumidor.consume({ max_messages: 1, expires: ms });
-  const t = setTimeout(() => it.stop(), ms);
-  try {
-    for await (const m of it) return m;
-    return null;
-  } finally {
-    clearTimeout(t);
-    it.stop();
-  }
-}
-
 // ─── Operación: lo que hace el usuario ops ───────────────────────────────────
 
 let CANON;
-const nanos = (ms) => Number(BigInt(ms) * 1_000_000n);
 
 /** La config canónica de consumidor que pide el SDK en subscribe(). protocol.json manda. */
 async function configConsumidor(durable, filtro) {
   CANON ??= JSON.parse(await readFile(path.join(ROOT, "protocol.json"), "utf8")).consumer;
-  return {
-    durable_name: durable,
-    filter_subject: filtro,
-    ack_policy: "explicit",
-    ack_wait: nanos(CANON.ackWaitSeconds * 1000),
-    max_deliver: CANON.maxDeliver,
-    backoff: CANON.backoffMs.map(nanos),
-    max_ack_pending: CANON.maxAckPending,
-    deliver_policy: "all",
-    replay_policy: "instant",
-  };
+  return configConsumidorCanonica(CANON, durable, filtro);
 }
 
 async function conectarOps(url, seed) {
@@ -516,11 +344,6 @@ async function ciclo({ nc, svc, ops, subjectPropio, nakTerm = false }) {
 
 // ─── El generador (sin servidor) ─────────────────────────────────────────────
 
-function gen(...args) {
-  const r = spawnSync(process.execPath, [GEN, ...args], { encoding: "utf8", cwd: ROOT });
-  return { codigo: r.status, salida: r.stdout, errores: r.stderr };
-}
-
 let nManifiesto = 0;
 async function manifiestoTemporal(obj) {
   const f = path.join(TMP, `manifiesto-${++nManifiesto}.json`);
@@ -528,8 +351,6 @@ async function manifiestoTemporal(obj) {
   return f;
 }
 
-/** Los permisos de TODOS los servicios, tal y como los afirma `--json`. */
-const permisosJson = (...args) => JSON.parse(gen(EJEMPLO, "--json", ...args).salida);
 
 async function seccionGenerador(subjectsBundle) {
   seccion("1. El generador");
@@ -750,7 +571,7 @@ async function main() {
     console.error(`✗ no se encontró nats-server ("${NATS_SERVER}"). Define NATS_SERVER con su ruta.\n  Sin Docker: GOBIN=$PWD/bin go install github.com/nats-io/nats-server/v2@v2.14.5`);
     process.exit(2);
   }
-  TMP = await mkdtemp(path.join(os.tmpdir(), "flux-verify-acl-"));
+  TMP = await banco.iniciar();
   console.log(`verify-acl — las ACLs generadas, contra un nats-server real`);
   console.log(`  ${v.stdout.trim()} · ${NATS_SERVER} · temporales en ${TMP}`);
 
@@ -1163,25 +984,7 @@ async function seccionTenants(json) {
 
 // ─── Arranque y limpieza ─────────────────────────────────────────────────────
 
-async function limpiar() {
-  for (const h of hijos) if (h.exitCode === null) h.kill("SIGKILL");
-  if (TMP) await rm(TMP, { recursive: true, force: true });
-}
-for (const sig of ["SIGINT", "SIGTERM"]) {
-  process.on(sig, async () => {
-    await limpiar();
-    process.exit(130);
-  });
-}
-// Un error no controlado NO debe dejar nats-server huérfano ni el directorio temporal en disco:
-// antes de este manejador, un fallo del propio script dejaba servidores vivos en el puerto.
-for (const ev of ["uncaughtException", "unhandledRejection"]) {
-  process.on(ev, async (e) => {
-    console.log(`\n  ✗ error no controlado: ${e?.stack ?? e}`);
-    await limpiar();
-    process.exit(1);
-  });
-}
+banco.instalarManejadores((e) => console.log(`\n  ✗ error no controlado: ${e?.stack ?? e}`));
 
 try {
   await main();
@@ -1189,7 +992,7 @@ try {
   R.fallos++;
   console.log(`\n  ✗ la verificación se interrumpió: ${e?.stack ?? e}`);
 } finally {
-  await limpiar();
+  await banco.limpiar();
 }
 
 console.log(`\n${R.fallos === 0 ? "✓" : "✗"} ${R.total} comprobaciones, ${R.fallos} fallo(s)`);
