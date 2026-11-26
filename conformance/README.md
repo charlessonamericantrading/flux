@@ -11,7 +11,7 @@ conformance/
 ├── cases/
 │   ├── broker-invariants.json   ← invariantes de NATS de las que depende el protocolo
 │   ├── consumer-config.json     ← la config canónica sobrevive al servidor sin alterarse
-│   ├── security-acl.json        ← los permisos generados, ejecutados contra un broker con TLS (S1–S14)
+│   ├── security-acl.json        ← los permisos generados, ejecutados contra un broker con TLS (S1–S20)
 │   ├── state-broker.json        ← estado replicado: lo que hace el BROKER (A-31 … A-49), con ACL y cluster
 │   ├── state-semantics.json     ← estado replicado: el algoritmo de put/delete/get y la foto de watch (A-50)
 │   └── cross-sdk-state-envelope.json ← la entrada de estado, la lápida y la DLQ de estado, byte a byte
@@ -99,7 +99,11 @@ observarse. [`security.mjs`](security.mjs) no sabe qué es S1: monta el entorno 
 desconocido en un caso, o una expectativa sobre algo que la operación no observa, es un error al
 cargar: una errata no puede degradarse a «no se comprueba nada».
 
-Los casos S1–S8 y S12–S14 hablan NATS directamente, sin ningún SDK de flux. S10 y S11 son la
+Los casos S1–S8 y S12–S20 hablan NATS directamente, sin ningún SDK de flux. S15 a S20 son los del
+**estado replicado** ([06-security.md §3.8](../specification/06-security.md)): el ciclo del dueño y de
+los observadores bajo la ACL generada, que solo el dueño escribe, que un tenant no lee el de otro, que
+nadie consulta el stream de estado más allá de lo concedido, la DLQ de estado y la minimalidad de cada
+permiso. Los pasos `save` / `{ "ref": … }` llevan la secuencia de una escritura condicional a la siguiente. S10 y S11 son la
 excepción deliberada: el SDK de Node y el de Rust, sin modificar, hacen un ciclo completo
 (publicar, consumir, ack, reintento, DLQ) **contra la ACL generada**, y el runner mira después,
 desde el broker, lo que dejaron. S9 vuelve a ejecutar S1 y S6 contra la ACL v1 congelada y exige
