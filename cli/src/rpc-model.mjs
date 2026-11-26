@@ -160,7 +160,7 @@ function mensajeOperacion(t) {
   if (t.includes("_")) problemas.push("tiene un guion bajo: solo `kebab-case` ([a-z0-9-])");
   if (tokens.includes("")) problemas.push("tiene un token vacío (dos puntos seguidos, o uno al final)");
   if (tokens.length !== 4) problemas.push(`tiene ${tokens.length} tokens y deben ser 4 (dominio, agregado, versión, operación)`);
-  else if (!/^v[1-9][0-9]*$/.test(tokens[2])) problemas.push("el tercer token es la versión mayor: `v1`, `v2`… (`v0` no existe)");
+  else if (!/^v[1-9][0-9]{0,3}$/.test(tokens[2])) problemas.push("el tercer token es la versión mayor: `v1`…`v9999` (de 1 a 4 dígitos, sin ceros a la izquierda: `v0` no existe)");
   if (!problemas.length) problemas.push("no encaja con el patrón del protocolo");
   return (
     `la operación no es válida: ${problemas.join("; ")}. ` +
@@ -425,14 +425,18 @@ export function validarRespuesta(peticion, bytes, { showData = false } = {}) {
         "Una respuesta DEBE llevar como `causationid` el `id` de la petición (11-request-reply.md §3.2).",
     );
   }
-  // 4. hereda `correlationid` y `tenantid`
-  if (e.correlationid !== peticion.correlationid) {
-    throw invalida("su `correlationid` no es el de la petición: una respuesta lo HEREDA sin modificar (11-request-reply.md §3.2).");
-  }
-  if (e.tenantid !== peticion.tenantid) {
-    throw invalida(
-      "su `tenantid` no es el de la petición: una respuesta lo hereda sin modificar. Un responder que cambia de tenant mezcla datos de dos (09-multitenancy.md).",
-    );
+  // 4. hereda `correlationid` y `tenantid`. EXCEPCIÓN ÚNICA (§4.3.4): el error de una petición que quien responde no pudo
+  // leer (§5.2) no tiene nada que heredar y lleva `correlationid` propio y `tenantid: system`; a quien llama le basta la
+  // comprobación 3 para atribuirlo y ver el código del sobre (`MALFORMED_JSON`, `INVALID_RPC_CALL`…) en vez de RPC_INVALID_REPLY.
+  if (!esErrorDeUnaPeticionIlegible(e, esError)) {
+    if (e.correlationid !== peticion.correlationid) {
+      throw invalida("su `correlationid` no es el de la petición: una respuesta lo HEREDA sin modificar (11-request-reply.md §3.2).");
+    }
+    if (e.tenantid !== peticion.tenantid) {
+      throw invalida(
+        "su `tenantid` no es el de la petición: una respuesta lo hereda sin modificar. Un responder que cambia de tenant mezcla datos de dos (09-multitenancy.md).",
+      );
+    }
   }
 
   // 5. si es un error, su `data` cumple el esquema del error
@@ -445,6 +449,15 @@ export function validarRespuesta(peticion, bytes, { showData = false } = {}) {
   }
   return { clase: "reply", evento: e };
 }
+
+/**
+ * ¿Es el error que contesta quien responde a una petición que NO pudo leer (§5.2)? Sin sobre no hay `correlationid` ni
+ * `tenantid` que heredar: el error lleva `correlationid` igual a su PROPIO `id` y `tenantid: system`. Es la única respuesta a la
+ * que quien llama no le exige heredar los dos (§4.3, comprobación 4). La forma es estrecha a propósito —un `tenantid: system`
+ * cualquiera, o un `correlationid` cualquiera, no basta— y la comprobación 3 sigue en pie: es la que la atribuye.
+ */
+export const esErrorDeUnaPeticionIlegible = (e, esError) =>
+  esError && e.tenantid === "system" && e.correlationid === e.id;
 
 /** Lo que incumple `data` del esquema del error (`schemas/system/rpc/error/1.0.0.json`): solo rutas y reglas, nunca valores. */
 export function erroresDatosError(d) {
@@ -462,7 +475,8 @@ export function erroresDatosError(d) {
   }
   if ("message" in d) {
     if (typeof d.message !== "string" || d.message === "") m.push("/message debe ser un texto no vacío");
-    else if (k.maxMensaje && d.message.length > k.maxMensaje) m.push(`/message no puede pasar de ${k.maxMensaje} caracteres`);
+    // `maxLength` de JSON Schema cuenta caracteres Unicode (puntos de código), no unidades UTF-16: mil emojis caben.
+    else if (k.maxMensaje && [...d.message].length > k.maxMensaje) m.push(`/message no puede pasar de ${k.maxMensaje} caracteres`);
   }
   if ("retryAfterMs" in d) {
     if (!Number.isInteger(d.retryAfterMs) || d.retryAfterMs < 0) m.push("/retryAfterMs debe ser un entero ≥ 0");

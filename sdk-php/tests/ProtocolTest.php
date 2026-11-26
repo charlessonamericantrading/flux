@@ -70,6 +70,13 @@ final class ProtocolTest extends TestCase
         Protocol::parseSubject('pedidos.pedido.v1.creado.retry');
     }
 
+    public function testElMayorAdmiteHastaCuatroDigitos(): void
+    {
+        // 02-naming.md §1: el tope de 4 digitos es el de protocol.json; v10000 no es un subject.
+        self::assertSame(9999, Protocol::parseSubject('pedidos.pedido.v9999.creado')->major);
+        self::assertFalse(Protocol::isValidSubject('pedidos.pedido.v10000.creado'));
+    }
+
     #[DataProvider('formasRotas')]
     public function testRechazaFormasRotas(string $subject): void
     {
@@ -290,6 +297,7 @@ final class ProtocolTest extends TestCase
         yield 'comando sin tokens' => ['pedidos.crear-pedido'];
         yield 'falta la v' => ['pedidos.pedido.1.creado'];
         yield 'el mayor empieza en 1' => ['pedidos.pedido.v0.creado'];
+        yield 'el mayor lleva de 1 a 4 digitos' => ['pedidos.pedido.v99999.creado'];
         yield 'guion bajo prohibido' => ['pedidos.pedido_v1.creado'];
         yield 'token vacio' => ['pedidos..v1.creado'];
         yield 'espacio' => ['pedidos.pedido.v1.creado '];

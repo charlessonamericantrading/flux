@@ -173,7 +173,7 @@ public static class Protocol
 
     /// <summary>Valida <c>&lt;dominio&gt;.&lt;agregado&gt;.v&lt;major&gt;.&lt;evento&gt;</c> — 02-naming.md §1.</summary>
     public static readonly Regex SubjectPattern = new(
-        @"^[a-z0-9]+(-[a-z0-9]+)*\.[a-z0-9]+(-[a-z0-9]+)*\.v[1-9][0-9]*\.[a-z0-9]+(-[a-z0-9]+)*$",
+        @"^[a-z0-9]+(-[a-z0-9]+)*\.[a-z0-9]+(-[a-z0-9]+)*\.v[1-9][0-9]{0,3}\.[a-z0-9]+(-[a-z0-9]+)*$",
         RegexOptions.CultureInvariant | RegexOptions.Compiled);
 
     /// <summary>

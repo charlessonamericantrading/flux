@@ -324,6 +324,2312 @@
     }
   ],
   "$commentVerify": "Los vectores de verify cruzan de verdad: el runner FIRMA con el SDK de referencia y pide a cada uno de los demas que VERIFIQUE esa firma. Es la unica prueba que demuestra interoperabilidad; que cada SDK verifique su propia firma solo demuestra consistencia consigo mismo.",
+  "$commentAjustes": "Los vectores de `ajustesVectors` fijan las DECISIONES de la spec tras medir lo que Node y Rust hacían distinto FUERA de los demás vectores (conformance/harness/README.md → «Ajustes»): la forma canónica de `data` (la de `JSON.stringify` de Node, con UTF-8 literal) y de `time` (3 decimales y `Z`, o rechazo), los límites de longitud en puntos de código, la versión mayor de 1 a 4 dígitos, `id` y `source` vacíos, el truncado de `dlqerror` en 1024 BYTES sin partir un carácter, y el código estable de lo que un constructor rechaza. Los ejecuta `conformance/ajustes.mjs` para los SDKs de `ajustesSdks` —hoy Node y Rust—; `cross-sdk.mjs` no los ve. Cada vector es de la operación que dice `op`, sea de estado o de petición/respuesta. `input` es la entrada del arnés SIN el `op`; `dataTexto`, si lo hay, es `data` como TEXTO CRUDO (con espacios, escapes o claves repetidas: lo que un objeto JSON no puede expresar), que `ajustes.mjs` inyecta sin reserializar. Cada vector dice qué espera: `sha256` (los bytes DECIDIDOS; los que coinciden con la spec llevan el de la spec), `expectSubject`, `expect` (el código estable del rechazo) o nada. Divergencias que NO son vectores porque ningún SDK puede evitarlas (números que un lenguaje escribe de otra manera, claves que JavaScript reordena, sustitutos UTF-16 sueltos, profundidad…): conformance/harness/README.md → «Lo que no se admite».",
+  "ajustesSdks": ["node", "rust"],
+  "ajustesVectors": [
+    {
+      "id": "ajuste-dlqerror-1500-e",
+      "spec": "04-errors.md §3",
+      "why": "Node cortaba a 1024 UNIDADES UTF-16 (2693 bytes en total) y Rust a 1024 bytes: el primer byte distinto era el 1593. La decisión del dueño: 1024 BYTES UTF-8 (512 «é»).",
+      "op": "state-dlq",
+      "input": {
+        "original": {
+          "contract": "clientes.cliente.v1",
+          "tenantId": "acme",
+          "key": "cli-1",
+          "id": "01924f8e-7c3a-7b2d-9e14-3f8a1c9d0e55",
+          "source": "/produccion/crm-api",
+          "time": "2026-08-20T10:25:39.412Z",
+          "correlationid": "01924f8e-7c3a-7b2d-9e14-3f8a1c9d0e55",
+          "producerversion": "2.1.0",
+          "classification": "confidential",
+          "data": {
+            "clienteId": "cli-1",
+            "nombre": "María Peña",
+            "email": "maria@example.com",
+            "aggregateVersion": 7
+          }
+        },
+        "revision": 41,
+        "dlq": {
+          "reason": "permanent",
+          "attempts": 1,
+          "consumer": "tienda-web__state_clientes_cliente_v1__acme",
+          "error": "éééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééééé",
+          "dlqtime": "2026-08-20T10:25:40.117Z"
+        }
+      },
+      "sha256": "1fa274b552bb391dc59c299b3f33ec91682282e69fa48c15ed263c73b09de35f"
+    },
+    {
+      "id": "ajuste-dlqerror-no-parte-un-caracter",
+      "spec": "04-errors.md §3",
+      "why": "1023 «a» + «é» son 1025 bytes: la «é» (2 bytes) no cabe entera y se descarta, no se parte. El `dlqerror` acaba en 1023 «a».",
+      "op": "state-dlq",
+      "input": {
+        "original": {
+          "contract": "clientes.cliente.v1",
+          "tenantId": "acme",
+          "key": "cli-1",
+          "id": "01924f8e-7c3a-7b2d-9e14-3f8a1c9d0e55",
+          "source": "/produccion/crm-api",
+          "time": "2026-08-20T10:25:39.412Z",
+          "correlationid": "01924f8e-7c3a-7b2d-9e14-3f8a1c9d0e55",
+          "producerversion": "2.1.0",
+          "classification": "confidential",
+          "data": {
+            "clienteId": "cli-1",
+            "nombre": "María Peña",
+            "email": "maria@example.com",
+            "aggregateVersion": 7
+          }
+        },
+        "revision": 41,
+        "dlq": {
+          "reason": "permanent",
+          "attempts": 1,
+          "consumer": "tienda-web__state_clientes_cliente_v1__acme",
+          "error": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaé",
+          "dlqtime": "2026-08-20T10:25:40.117Z"
+        }
+      },
+      "sha256": "8ecae2c892c3f59622a81666a0a23f6d38c344eb08302f7bf231dd0dd98e74c5"
+    },
+    {
+      "id": "ajuste-dlqerror-justo-1024",
+      "spec": "04-errors.md §3",
+      "why": "1022 «a» + «é» son EXACTAMENTE 1024 bytes: cabe entero, no se recorta nada.",
+      "op": "state-dlq",
+      "input": {
+        "original": {
+          "contract": "clientes.cliente.v1",
+          "tenantId": "acme",
+          "key": "cli-1",
+          "id": "01924f8e-7c3a-7b2d-9e14-3f8a1c9d0e55",
+          "source": "/produccion/crm-api",
+          "time": "2026-08-20T10:25:39.412Z",
+          "correlationid": "01924f8e-7c3a-7b2d-9e14-3f8a1c9d0e55",
+          "producerversion": "2.1.0",
+          "classification": "confidential",
+          "data": {
+            "clienteId": "cli-1",
+            "nombre": "María Peña",
+            "email": "maria@example.com",
+            "aggregateVersion": 7
+          }
+        },
+        "revision": 41,
+        "dlq": {
+          "reason": "permanent",
+          "attempts": 1,
+          "consumer": "tienda-web__state_clientes_cliente_v1__acme",
+          "error": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaé",
+          "dlqtime": "2026-08-20T10:25:40.117Z"
+        }
+      },
+      "sha256": "a9eb064855d2e1ce3edffacaabb5b682d1462184f0e3901e7393a0c0fe769bc5"
+    },
+    {
+      "id": "ajuste-dlqerror-euro-en-el-corte",
+      "spec": "04-errors.md §3",
+      "why": "1022 «a» + «€» (3 bytes) son 1025: el euro se descarta entero.",
+      "op": "state-dlq",
+      "input": {
+        "original": {
+          "contract": "clientes.cliente.v1",
+          "tenantId": "acme",
+          "key": "cli-1",
+          "id": "01924f8e-7c3a-7b2d-9e14-3f8a1c9d0e55",
+          "source": "/produccion/crm-api",
+          "time": "2026-08-20T10:25:39.412Z",
+          "correlationid": "01924f8e-7c3a-7b2d-9e14-3f8a1c9d0e55",
+          "producerversion": "2.1.0",
+          "classification": "confidential",
+          "data": {
+            "clienteId": "cli-1",
+            "nombre": "María Peña",
+            "email": "maria@example.com",
+            "aggregateVersion": 7
+          }
+        },
+        "revision": 41,
+        "dlq": {
+          "reason": "permanent",
+          "attempts": 1,
+          "consumer": "tienda-web__state_clientes_cliente_v1__acme",
+          "error": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa€",
+          "dlqtime": "2026-08-20T10:25:40.117Z"
+        }
+      },
+      "sha256": "18f99dc2e53759dda6d4a6c09d32e9714bb9c0d7982a30cda85a25440cce3578"
+    },
+    {
+      "id": "ajuste-dlqerror-emoji-en-el-corte",
+      "spec": "04-errors.md §3",
+      "why": "1021 «a» + 😀 (4 bytes) + «b»: el emoji no cabe entero (1025) y se descarta, y NO se parte en dos mitades de sustituto (que se serializarían como `\\ud83d`).",
+      "op": "state-dlq",
+      "input": {
+        "original": {
+          "contract": "clientes.cliente.v1",
+          "tenantId": "acme",
+          "key": "cli-1",
+          "id": "01924f8e-7c3a-7b2d-9e14-3f8a1c9d0e55",
+          "source": "/produccion/crm-api",
+          "time": "2026-08-20T10:25:39.412Z",
+          "correlationid": "01924f8e-7c3a-7b2d-9e14-3f8a1c9d0e55",
+          "producerversion": "2.1.0",
+          "classification": "confidential",
+          "data": {
+            "clienteId": "cli-1",
+            "nombre": "María Peña",
+            "email": "maria@example.com",
+            "aggregateVersion": 7
+          }
+        },
+        "revision": 41,
+        "dlq": {
+          "reason": "permanent",
+          "attempts": 1,
+          "consumer": "tienda-web__state_clientes_cliente_v1__acme",
+          "error": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa😀b",
+          "dlqtime": "2026-08-20T10:25:40.117Z"
+        }
+      },
+      "sha256": "c2e1d21c40dbf33bf6a15c3b9ca02f27e3d8f6085b1afade1bb974dfaab21449"
+    },
+    {
+      "id": "ajuste-dlqerror-300-emojis",
+      "spec": "04-errors.md §3",
+      "why": "300 × 😀 son 1200 bytes: caben 256 (1024 bytes justos).",
+      "op": "state-dlq",
+      "input": {
+        "original": {
+          "contract": "clientes.cliente.v1",
+          "tenantId": "acme",
+          "key": "cli-1",
+          "id": "01924f8e-7c3a-7b2d-9e14-3f8a1c9d0e55",
+          "source": "/produccion/crm-api",
+          "time": "2026-08-20T10:25:39.412Z",
+          "correlationid": "01924f8e-7c3a-7b2d-9e14-3f8a1c9d0e55",
+          "producerversion": "2.1.0",
+          "classification": "confidential",
+          "data": {
+            "clienteId": "cli-1",
+            "nombre": "María Peña",
+            "email": "maria@example.com",
+            "aggregateVersion": 7
+          }
+        },
+        "revision": 41,
+        "dlq": {
+          "reason": "permanent",
+          "attempts": 1,
+          "consumer": "tienda-web__state_clientes_cliente_v1__acme",
+          "error": "😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀",
+          "dlqtime": "2026-08-20T10:25:40.117Z"
+        }
+      },
+      "sha256": "5e3327469c81643486e4866287507535f62e1e99ad436a1869323bc07dbc8dbc"
+    },
+    {
+      "id": "ajuste-estado-subject-v9999",
+      "spec": "02-naming.md §1",
+      "why": "El tope es 9999: cabe.",
+      "op": "state-subject",
+      "input": {
+        "contract": "clientes.cliente.v9999",
+        "tenantId": "acme",
+        "key": "cli-1"
+      },
+      "expectSubject": "state.clientes.cliente.v9999.acme.cli-1"
+    },
+    {
+      "id": "ajuste-estado-subject-v10000",
+      "spec": "02-naming.md §1",
+      "why": "10000 son 5 dígitos: fuera del patrón `v[1-9][0-9]{0,3}`.",
+      "op": "state-subject",
+      "input": {
+        "contract": "clientes.cliente.v10000",
+        "tenantId": "acme",
+        "key": "cli-1"
+      },
+      "expect": "INVALID_STATE_CONTRACT"
+    },
+    {
+      "id": "ajuste-estado-subject-v4294967296",
+      "spec": "02-naming.md §1",
+      "why": "Node lo aceptaba y Rust lo rechazaba (el `u32` de Rust no era de la spec): ahora lo rechazan los dos, por el patrón.",
+      "op": "state-subject",
+      "input": {
+        "contract": "clientes.cliente.v4294967296",
+        "tenantId": "acme",
+        "key": "cli-1"
+      },
+      "expect": "INVALID_STATE_CONTRACT"
+    },
+    {
+      "id": "ajuste-estado-subject-v99999999999999999999",
+      "spec": "02-naming.md §1",
+      "why": "Node escribía `v100000000000000000000` (el número pasaba por `Number`) y Rust lo rechazaba: el mismo contrato, dos veredictos.",
+      "op": "state-subject",
+      "input": {
+        "contract": "clientes.cliente.v99999999999999999999",
+        "tenantId": "acme",
+        "key": "cli-1"
+      },
+      "expect": "INVALID_STATE_CONTRACT"
+    },
+    {
+      "id": "ajuste-estado-build-v10000",
+      "spec": "02-naming.md §1",
+      "why": "El mismo rechazo al construir la entrada, no solo al calcular el subject.",
+      "op": "state-build",
+      "input": {
+        "contract": "clientes.cliente.v10000",
+        "tenantId": "acme",
+        "key": "cli-1",
+        "id": "01924f8e-7c3a-7b2d-9e14-3f8a1c9d0e55",
+        "source": "/produccion/crm-api",
+        "time": "2026-08-20T10:25:39.412Z",
+        "correlationid": "01924f8e-7c3a-7b2d-9e14-3f8a1c9d0e55",
+        "producerversion": "2.1.0",
+        "classification": "confidential",
+        "data": {
+          "clienteId": "cli-1",
+          "nombre": "María Peña",
+          "email": "maria@example.com",
+          "aggregateVersion": 7
+        }
+      },
+      "expect": "INVALID_STATE_CONTRACT"
+    },
+    {
+      "id": "ajuste-estado-build-v9999",
+      "spec": "02-naming.md §1",
+      "why": "Con v9999 el `type` es `com.flux.state.clientes.cliente.v9999` en los dos.",
+      "op": "state-build",
+      "input": {
+        "contract": "clientes.cliente.v9999",
+        "tenantId": "acme",
+        "key": "cli-1",
+        "id": "01924f8e-7c3a-7b2d-9e14-3f8a1c9d0e55",
+        "source": "/produccion/crm-api",
+        "time": "2026-08-20T10:25:39.412Z",
+        "correlationid": "01924f8e-7c3a-7b2d-9e14-3f8a1c9d0e55",
+        "producerversion": "2.1.0",
+        "classification": "confidential",
+        "data": {
+          "clienteId": "cli-1",
+          "nombre": "María Peña",
+          "email": "maria@example.com",
+          "aggregateVersion": 7
+        }
+      },
+      "sha256": "76bc3b3deb8cebbd9f83c3fff9c3b506770e384d67d8257a184fd9e06521b632"
+    },
+    {
+      "id": "ajuste-rpc-operacion-v9999",
+      "spec": "02-naming.md §1",
+      "why": "El tope es 9999: cabe.",
+      "op": "rpc-operation",
+      "input": {
+        "operation": "clientes.cliente.v9999.obtener"
+      },
+      "expectSubject": "rpc.clientes.cliente.v9999.obtener"
+    },
+    {
+      "id": "ajuste-rpc-operacion-v10000",
+      "spec": "02-naming.md §1",
+      "why": "5 dígitos: INVALID_RPC_CALL.",
+      "op": "rpc-operation",
+      "input": {
+        "operation": "clientes.cliente.v10000.obtener"
+      },
+      "expect": "INVALID_RPC_CALL"
+    },
+    {
+      "id": "ajuste-rpc-operacion-v99999999999999999999",
+      "spec": "02-naming.md §1",
+      "why": "Rust la conservaba y Node escribía `v100000000000000000000`, contra el patrón sin tope.",
+      "op": "rpc-operation",
+      "input": {
+        "operation": "clientes.cliente.v99999999999999999999.obtener"
+      },
+      "expect": "INVALID_RPC_CALL"
+    },
+    {
+      "id": "ajuste-rpc-peticion-v9999",
+      "spec": "02-naming.md §1",
+      "why": "El `type` de la petición lleva v9999, idéntico en los dos.",
+      "op": "rpc-request",
+      "input": {
+        "operation": "clientes.cliente.v9999.obtener",
+        "tenantId": "acme",
+        "aggregateId": "cli-1",
+        "id": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+        "source": "/produccion/facturacion-api",
+        "time": "2026-08-20T10:41:07.318Z",
+        "correlationid": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+        "producerversion": "3.4.1",
+        "classification": "internal",
+        "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+        "data": {
+          "clienteId": "cli-1",
+          "totalCents": 9990,
+          "moneda": "EUR",
+          "campana": "Otoño"
+        }
+      },
+      "sha256": "2d482994f8fd095480fb66fadb246e56945858a7242641ed595256719fe530e7"
+    },
+    {
+      "id": "ajuste-rpc-peticion-v10000",
+      "spec": "02-naming.md §1",
+      "why": "Construir la petición también la rechaza.",
+      "op": "rpc-request",
+      "input": {
+        "operation": "clientes.cliente.v10000.obtener",
+        "tenantId": "acme",
+        "aggregateId": "cli-1",
+        "id": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+        "source": "/produccion/facturacion-api",
+        "time": "2026-08-20T10:41:07.318Z",
+        "correlationid": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+        "producerversion": "3.4.1",
+        "classification": "internal",
+        "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+        "data": {
+          "clienteId": "cli-1",
+          "totalCents": 9990,
+          "moneda": "EUR",
+          "campana": "Otoño"
+        }
+      },
+      "expect": "INVALID_RPC_CALL"
+    },
+    {
+      "id": "ajuste-rpc-message-1000-emojis",
+      "spec": "11-request-reply.md §3.3",
+      "why": "Mil emojis son 1000 caracteres: caben. Node contaba unidades UTF-16 (2000) y lo rechazaba; Rust ya contaba caracteres.",
+      "op": "rpc-error",
+      "input": {
+        "request": {
+          "operation": "clientes.cliente.v1.calcular-descuento",
+          "id": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+          "correlationid": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+          "tenantid": "acme",
+          "subject": "cli-1"
+        },
+        "id": "01924f91-5d11-7a62-8f0d-4e5f6a7b8c91",
+        "source": "/produccion/crm-api",
+        "time": "2026-08-20T10:41:07.331Z",
+        "correlationid": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+        "producerversion": "2.1.0",
+        "classification": "internal",
+        "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-b7ad6b7169203331-01",
+        "error": {
+          "class": "retryable",
+          "code": "HTTP_503",
+          "message": "😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀",
+          "retryAfterMs": 5000
+        }
+      },
+      "sha256": "405e759a1e326cd6a14212c9ee5b99b2d3dab6b7d0e23da637a98049c4a28ab5"
+    },
+    {
+      "id": "ajuste-rpc-message-1001-emojis",
+      "spec": "11-request-reply.md §3.3",
+      "why": "1001 caracteres: no caben.",
+      "op": "rpc-error",
+      "input": {
+        "request": {
+          "operation": "clientes.cliente.v1.calcular-descuento",
+          "id": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+          "correlationid": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+          "tenantid": "acme",
+          "subject": "cli-1"
+        },
+        "id": "01924f91-5d11-7a62-8f0d-4e5f6a7b8c91",
+        "source": "/produccion/crm-api",
+        "time": "2026-08-20T10:41:07.331Z",
+        "correlationid": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+        "producerversion": "2.1.0",
+        "classification": "internal",
+        "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-b7ad6b7169203331-01",
+        "error": {
+          "class": "retryable",
+          "code": "HTTP_503",
+          "message": "😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀",
+          "retryAfterMs": 5000
+        }
+      },
+      "expect": "INVALID_RPC_CALL"
+    },
+    {
+      "id": "ajuste-rpc-message-999-emojis-y-una-n",
+      "spec": "11-request-reply.md §3.3",
+      "why": "999 emojis + «ñ» son 1000 caracteres (4 + 2 bytes por carácter): caben.",
+      "op": "rpc-error",
+      "input": {
+        "request": {
+          "operation": "clientes.cliente.v1.calcular-descuento",
+          "id": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+          "correlationid": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+          "tenantid": "acme",
+          "subject": "cli-1"
+        },
+        "id": "01924f91-5d11-7a62-8f0d-4e5f6a7b8c91",
+        "source": "/produccion/crm-api",
+        "time": "2026-08-20T10:41:07.331Z",
+        "correlationid": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+        "producerversion": "2.1.0",
+        "classification": "internal",
+        "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-b7ad6b7169203331-01",
+        "error": {
+          "class": "retryable",
+          "code": "HTTP_503",
+          "message": "😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀😀ñ",
+          "retryAfterMs": 5000
+        }
+      },
+      "sha256": "5ff49a7f98671a85859c331948100e53f14c42d820575df5803c8a2dd442cfa5"
+    },
+    {
+      "id": "ajuste-rpc-message-1000-enes",
+      "spec": "11-request-reply.md §3.3",
+      "why": "1000 caracteres de 2 bytes: caben (ya pasaba).",
+      "op": "rpc-error",
+      "input": {
+        "request": {
+          "operation": "clientes.cliente.v1.calcular-descuento",
+          "id": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+          "correlationid": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+          "tenantid": "acme",
+          "subject": "cli-1"
+        },
+        "id": "01924f91-5d11-7a62-8f0d-4e5f6a7b8c91",
+        "source": "/produccion/crm-api",
+        "time": "2026-08-20T10:41:07.331Z",
+        "correlationid": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+        "producerversion": "2.1.0",
+        "classification": "internal",
+        "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-b7ad6b7169203331-01",
+        "error": {
+          "class": "retryable",
+          "code": "HTTP_503",
+          "message": "ññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññ",
+          "retryAfterMs": 5000
+        }
+      },
+      "sha256": "3b120c5bec0030cf19934cdb1de01b5406ea51d4665d395f8e1ce611258ac5ad"
+    },
+    {
+      "id": "ajuste-rpc-message-1001-enes",
+      "spec": "11-request-reply.md §3.3",
+      "why": "1001: no caben.",
+      "op": "rpc-error",
+      "input": {
+        "request": {
+          "operation": "clientes.cliente.v1.calcular-descuento",
+          "id": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+          "correlationid": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+          "tenantid": "acme",
+          "subject": "cli-1"
+        },
+        "id": "01924f91-5d11-7a62-8f0d-4e5f6a7b8c91",
+        "source": "/produccion/crm-api",
+        "time": "2026-08-20T10:41:07.331Z",
+        "correlationid": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+        "producerversion": "2.1.0",
+        "classification": "internal",
+        "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-b7ad6b7169203331-01",
+        "error": {
+          "class": "retryable",
+          "code": "HTTP_503",
+          "message": "ñññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññññ",
+          "retryAfterMs": 5000
+        }
+      },
+      "expect": "INVALID_RPC_CALL"
+    },
+    {
+      "id": "ajuste-rpc-error-malformado-class-poison",
+      "spec": "04-errors.md §7",
+      "why": "`poison` no viaja: `class` es `retryable` o `permanent`. Node lanzaba un `TypeError` sin código; ahora INVALID_RPC_CALL, el mismo que Rust.",
+      "op": "rpc-error",
+      "input": {
+        "request": {
+          "operation": "clientes.cliente.v1.calcular-descuento",
+          "id": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+          "correlationid": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+          "tenantid": "acme",
+          "subject": "cli-1"
+        },
+        "id": "01924f91-5d11-7a62-8f0d-4e5f6a7b8c91",
+        "source": "/produccion/crm-api",
+        "time": "2026-08-20T10:41:07.331Z",
+        "correlationid": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+        "producerversion": "2.1.0",
+        "classification": "internal",
+        "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-b7ad6b7169203331-01",
+        "error": {
+          "class": "poison",
+          "code": "HTTP_503",
+          "message": "el servicio de tarifas no responde",
+          "retryAfterMs": 5000
+        }
+      },
+      "expect": "INVALID_RPC_CALL"
+    },
+    {
+      "id": "ajuste-rpc-error-malformado-code-en-minusculas",
+      "spec": "04-errors.md §7",
+      "why": "`code` cumple `^[A-Z][A-Z0-9]*(_[A-Z0-9]+)*$`. Node lanzaba un `TypeError` sin código; ahora INVALID_RPC_CALL, el mismo que Rust.",
+      "op": "rpc-error",
+      "input": {
+        "request": {
+          "operation": "clientes.cliente.v1.calcular-descuento",
+          "id": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+          "correlationid": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+          "tenantid": "acme",
+          "subject": "cli-1"
+        },
+        "id": "01924f91-5d11-7a62-8f0d-4e5f6a7b8c91",
+        "source": "/produccion/crm-api",
+        "time": "2026-08-20T10:41:07.331Z",
+        "correlationid": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+        "producerversion": "2.1.0",
+        "classification": "internal",
+        "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-b7ad6b7169203331-01",
+        "error": {
+          "class": "retryable",
+          "code": "http_503",
+          "message": "el servicio de tarifas no responde",
+          "retryAfterMs": 5000
+        }
+      },
+      "expect": "INVALID_RPC_CALL"
+    },
+    {
+      "id": "ajuste-rpc-error-malformado-code-de-65",
+      "spec": "04-errors.md §7",
+      "why": "`code`: 64 como máximo. Node lanzaba un `TypeError` sin código; ahora INVALID_RPC_CALL, el mismo que Rust.",
+      "op": "rpc-error",
+      "input": {
+        "request": {
+          "operation": "clientes.cliente.v1.calcular-descuento",
+          "id": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+          "correlationid": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+          "tenantid": "acme",
+          "subject": "cli-1"
+        },
+        "id": "01924f91-5d11-7a62-8f0d-4e5f6a7b8c91",
+        "source": "/produccion/crm-api",
+        "time": "2026-08-20T10:41:07.331Z",
+        "correlationid": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+        "producerversion": "2.1.0",
+        "classification": "internal",
+        "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-b7ad6b7169203331-01",
+        "error": {
+          "class": "retryable",
+          "code": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+          "message": "el servicio de tarifas no responde",
+          "retryAfterMs": 5000
+        }
+      },
+      "expect": "INVALID_RPC_CALL"
+    },
+    {
+      "id": "ajuste-rpc-error-malformado-message-vacio",
+      "spec": "04-errors.md §7",
+      "why": "`message`: de 1 a 1000 caracteres. Node lanzaba un `TypeError` sin código; ahora INVALID_RPC_CALL, el mismo que Rust.",
+      "op": "rpc-error",
+      "input": {
+        "request": {
+          "operation": "clientes.cliente.v1.calcular-descuento",
+          "id": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+          "correlationid": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+          "tenantid": "acme",
+          "subject": "cli-1"
+        },
+        "id": "01924f91-5d11-7a62-8f0d-4e5f6a7b8c91",
+        "source": "/produccion/crm-api",
+        "time": "2026-08-20T10:41:07.331Z",
+        "correlationid": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+        "producerversion": "2.1.0",
+        "classification": "internal",
+        "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-b7ad6b7169203331-01",
+        "error": {
+          "class": "retryable",
+          "code": "HTTP_503",
+          "message": "",
+          "retryAfterMs": 5000
+        }
+      },
+      "expect": "INVALID_RPC_CALL"
+    },
+    {
+      "id": "ajuste-rpc-error-malformado-retryafter-con-permanent",
+      "spec": "04-errors.md §7",
+      "why": "`retryAfterMs` solo con `retryable`. Node lanzaba un `TypeError` sin código; ahora INVALID_RPC_CALL, el mismo que Rust.",
+      "op": "rpc-error",
+      "input": {
+        "request": {
+          "operation": "clientes.cliente.v1.calcular-descuento",
+          "id": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+          "correlationid": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+          "tenantid": "acme",
+          "subject": "cli-1"
+        },
+        "id": "01924f91-5d11-7a62-8f0d-4e5f6a7b8c91",
+        "source": "/produccion/crm-api",
+        "time": "2026-08-20T10:41:07.331Z",
+        "correlationid": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+        "producerversion": "2.1.0",
+        "classification": "internal",
+        "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-b7ad6b7169203331-01",
+        "error": {
+          "class": "permanent",
+          "code": "HTTP_503",
+          "message": "el servicio de tarifas no responde",
+          "retryAfterMs": 5000
+        }
+      },
+      "expect": "INVALID_RPC_CALL"
+    },
+    {
+      "id": "ajuste-rpc-error-malformado-retryafter-negativo",
+      "spec": "04-errors.md §7",
+      "why": "`retryAfterMs` es un entero ≥ 0. Node lanzaba un `TypeError` sin código; ahora INVALID_RPC_CALL, el mismo que Rust.",
+      "op": "rpc-error",
+      "input": {
+        "request": {
+          "operation": "clientes.cliente.v1.calcular-descuento",
+          "id": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+          "correlationid": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+          "tenantid": "acme",
+          "subject": "cli-1"
+        },
+        "id": "01924f91-5d11-7a62-8f0d-4e5f6a7b8c91",
+        "source": "/produccion/crm-api",
+        "time": "2026-08-20T10:41:07.331Z",
+        "correlationid": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+        "producerversion": "2.1.0",
+        "classification": "internal",
+        "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-b7ad6b7169203331-01",
+        "error": {
+          "class": "retryable",
+          "code": "HTTP_503",
+          "message": "el servicio de tarifas no responde",
+          "retryAfterMs": -1
+        }
+      },
+      "expect": "INVALID_RPC_CALL"
+    },
+    {
+      "id": "ajuste-rpc-error-malformado-retryafter-decimal",
+      "spec": "04-errors.md §7",
+      "why": "`retryAfterMs` es un entero. Node lanzaba un `TypeError` sin código; ahora INVALID_RPC_CALL, el mismo que Rust.",
+      "op": "rpc-error",
+      "input": {
+        "request": {
+          "operation": "clientes.cliente.v1.calcular-descuento",
+          "id": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+          "correlationid": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+          "tenantid": "acme",
+          "subject": "cli-1"
+        },
+        "id": "01924f91-5d11-7a62-8f0d-4e5f6a7b8c91",
+        "source": "/produccion/crm-api",
+        "time": "2026-08-20T10:41:07.331Z",
+        "correlationid": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+        "producerversion": "2.1.0",
+        "classification": "internal",
+        "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-b7ad6b7169203331-01",
+        "error": {
+          "class": "retryable",
+          "code": "HTTP_503",
+          "message": "el servicio de tarifas no responde",
+          "retryAfterMs": 1.5
+        }
+      },
+      "expect": "INVALID_RPC_CALL"
+    },
+    {
+      "id": "ajuste-rpc-error-malformado-retryafter-cadena",
+      "spec": "04-errors.md §7",
+      "why": "`retryAfterMs` es un entero. Node lanzaba un `TypeError` sin código; ahora INVALID_RPC_CALL, el mismo que Rust.",
+      "op": "rpc-error",
+      "input": {
+        "request": {
+          "operation": "clientes.cliente.v1.calcular-descuento",
+          "id": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+          "correlationid": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+          "tenantid": "acme",
+          "subject": "cli-1"
+        },
+        "id": "01924f91-5d11-7a62-8f0d-4e5f6a7b8c91",
+        "source": "/produccion/crm-api",
+        "time": "2026-08-20T10:41:07.331Z",
+        "correlationid": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+        "producerversion": "2.1.0",
+        "classification": "internal",
+        "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-b7ad6b7169203331-01",
+        "error": {
+          "class": "retryable",
+          "code": "HTTP_503",
+          "message": "el servicio de tarifas no responde",
+          "retryAfterMs": "5"
+        }
+      },
+      "expect": "INVALID_RPC_CALL"
+    },
+    {
+      "id": "ajuste-rpc-error-malformado-retryafter-null",
+      "spec": "04-errors.md §7",
+      "why": "`null` NO es «ausente»: es inválido (Rust lo confundía con la clave ausente al leer la entrada). Node lanzaba un `TypeError` sin código; ahora INVALID_RPC_CALL, el mismo que Rust.",
+      "op": "rpc-error",
+      "input": {
+        "request": {
+          "operation": "clientes.cliente.v1.calcular-descuento",
+          "id": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+          "correlationid": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+          "tenantid": "acme",
+          "subject": "cli-1"
+        },
+        "id": "01924f91-5d11-7a62-8f0d-4e5f6a7b8c91",
+        "source": "/produccion/crm-api",
+        "time": "2026-08-20T10:41:07.331Z",
+        "correlationid": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+        "producerversion": "2.1.0",
+        "classification": "internal",
+        "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-b7ad6b7169203331-01",
+        "error": {
+          "class": "retryable",
+          "code": "HTTP_503",
+          "message": "el servicio de tarifas no responde",
+          "retryAfterMs": null
+        }
+      },
+      "expect": "INVALID_RPC_CALL"
+    },
+    {
+      "id": "ajuste-estado-id-vacio",
+      "spec": "01-envelope.md §3.1, §5",
+      "why": "Node construía un evento que su propio parser rechazaría; Rust lo rechazaba sin código. Ahora los dos, con el código del parser.",
+      "op": "state-build",
+      "input": {
+        "contract": "clientes.cliente.v1",
+        "tenantId": "acme",
+        "key": "cli-1",
+        "id": "",
+        "source": "/produccion/crm-api",
+        "time": "2026-08-20T10:25:39.412Z",
+        "correlationid": "01924f8e-7c3a-7b2d-9e14-3f8a1c9d0e55",
+        "producerversion": "2.1.0",
+        "classification": "confidential",
+        "data": {
+          "clienteId": "cli-1",
+          "nombre": "María Peña",
+          "email": "maria@example.com",
+          "aggregateVersion": 7
+        }
+      },
+      "expect": "MISSING_REQUIRED_ATTRIBUTE"
+    },
+    {
+      "id": "ajuste-estado-source-vacio",
+      "spec": "01-envelope.md §3.1, §5",
+      "why": "Ídem para `source`.",
+      "op": "state-build",
+      "input": {
+        "contract": "clientes.cliente.v1",
+        "tenantId": "acme",
+        "key": "cli-1",
+        "id": "01924f8e-7c3a-7b2d-9e14-3f8a1c9d0e55",
+        "source": "",
+        "time": "2026-08-20T10:25:39.412Z",
+        "correlationid": "01924f8e-7c3a-7b2d-9e14-3f8a1c9d0e55",
+        "producerversion": "2.1.0",
+        "classification": "confidential",
+        "data": {
+          "clienteId": "cli-1",
+          "nombre": "María Peña",
+          "email": "maria@example.com",
+          "aggregateVersion": 7
+        }
+      },
+      "expect": "MISSING_REQUIRED_ATTRIBUTE"
+    },
+    {
+      "id": "ajuste-estado-correlationid-vacio",
+      "spec": "01-envelope.md §3.1, §5",
+      "why": "Una extensión obligatoria vacía es MISSING_REQUIRED_EXTENSION (vacío = ausente, §3.1).",
+      "op": "state-build",
+      "input": {
+        "contract": "clientes.cliente.v1",
+        "tenantId": "acme",
+        "key": "cli-1",
+        "id": "01924f8e-7c3a-7b2d-9e14-3f8a1c9d0e55",
+        "source": "/produccion/crm-api",
+        "time": "2026-08-20T10:25:39.412Z",
+        "correlationid": "",
+        "producerversion": "2.1.0",
+        "classification": "confidential",
+        "data": {
+          "clienteId": "cli-1",
+          "nombre": "María Peña",
+          "email": "maria@example.com",
+          "aggregateVersion": 7
+        }
+      },
+      "expect": "MISSING_REQUIRED_EXTENSION"
+    },
+    {
+      "id": "ajuste-estado-producerversion-vacio",
+      "spec": "01-envelope.md §3.1, §5",
+      "why": "Ídem.",
+      "op": "state-build",
+      "input": {
+        "contract": "clientes.cliente.v1",
+        "tenantId": "acme",
+        "key": "cli-1",
+        "id": "01924f8e-7c3a-7b2d-9e14-3f8a1c9d0e55",
+        "source": "/produccion/crm-api",
+        "time": "2026-08-20T10:25:39.412Z",
+        "correlationid": "01924f8e-7c3a-7b2d-9e14-3f8a1c9d0e55",
+        "producerversion": "",
+        "classification": "confidential",
+        "data": {
+          "clienteId": "cli-1",
+          "nombre": "María Peña",
+          "email": "maria@example.com",
+          "aggregateVersion": 7
+        }
+      },
+      "expect": "MISSING_REQUIRED_EXTENSION"
+    },
+    {
+      "id": "ajuste-estado-lapida-id-vacio",
+      "spec": "01-envelope.md §3.1, §5",
+      "why": "La lápida también.",
+      "op": "state-tombstone",
+      "input": {
+        "contract": "clientes.cliente.v1",
+        "tenantId": "acme",
+        "key": "cli-1",
+        "id": "",
+        "source": "/produccion/crm-api",
+        "time": "2026-08-20T10:31:02.057Z",
+        "correlationid": "01924f90-2b11-7a40-8c3d-6d5e4f3a2b10",
+        "producerversion": "2.1.0",
+        "aggregateVersion": 8
+      },
+      "expect": "MISSING_REQUIRED_ATTRIBUTE"
+    },
+    {
+      "id": "ajuste-estado-lapida-source-vacio",
+      "spec": "01-envelope.md §3.1, §5",
+      "why": "La lápida también.",
+      "op": "state-tombstone",
+      "input": {
+        "contract": "clientes.cliente.v1",
+        "tenantId": "acme",
+        "key": "cli-1",
+        "id": "01924f90-2b11-7a40-8c3d-6d5e4f3a2b10",
+        "source": "",
+        "time": "2026-08-20T10:31:02.057Z",
+        "correlationid": "01924f90-2b11-7a40-8c3d-6d5e4f3a2b10",
+        "producerversion": "2.1.0",
+        "aggregateVersion": 8
+      },
+      "expect": "MISSING_REQUIRED_ATTRIBUTE"
+    },
+    {
+      "id": "ajuste-rpc-peticion-id-vacio",
+      "spec": "01-envelope.md §3.1, §5",
+      "why": "En petición/respuesta el conjunto de códigos es cerrado: INVALID_RPC_CALL (Node construía el sobre con el atributo vacío).",
+      "op": "rpc-request",
+      "input": {
+        "operation": "clientes.cliente.v1.calcular-descuento",
+        "tenantId": "acme",
+        "aggregateId": "cli-1",
+        "id": "",
+        "source": "/produccion/facturacion-api",
+        "time": "2026-08-20T10:41:07.318Z",
+        "correlationid": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+        "producerversion": "3.4.1",
+        "classification": "internal",
+        "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+        "data": {
+          "clienteId": "cli-1",
+          "totalCents": 9990,
+          "moneda": "EUR",
+          "campana": "Otoño"
+        }
+      },
+      "expect": "INVALID_RPC_CALL"
+    },
+    {
+      "id": "ajuste-rpc-peticion-source-vacio",
+      "spec": "01-envelope.md §3.1, §5",
+      "why": "En petición/respuesta el conjunto de códigos es cerrado: INVALID_RPC_CALL (Node construía el sobre con el atributo vacío).",
+      "op": "rpc-request",
+      "input": {
+        "operation": "clientes.cliente.v1.calcular-descuento",
+        "tenantId": "acme",
+        "aggregateId": "cli-1",
+        "id": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+        "source": "",
+        "time": "2026-08-20T10:41:07.318Z",
+        "correlationid": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+        "producerversion": "3.4.1",
+        "classification": "internal",
+        "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+        "data": {
+          "clienteId": "cli-1",
+          "totalCents": 9990,
+          "moneda": "EUR",
+          "campana": "Otoño"
+        }
+      },
+      "expect": "INVALID_RPC_CALL"
+    },
+    {
+      "id": "ajuste-rpc-peticion-tenantid-vacio",
+      "spec": "01-envelope.md §3.1, §5",
+      "why": "En petición/respuesta el conjunto de códigos es cerrado: INVALID_RPC_CALL (Node construía el sobre con el atributo vacío).",
+      "op": "rpc-request",
+      "input": {
+        "operation": "clientes.cliente.v1.calcular-descuento",
+        "tenantId": "",
+        "aggregateId": "cli-1",
+        "id": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+        "source": "/produccion/facturacion-api",
+        "time": "2026-08-20T10:41:07.318Z",
+        "correlationid": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+        "producerversion": "3.4.1",
+        "classification": "internal",
+        "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+        "data": {
+          "clienteId": "cli-1",
+          "totalCents": 9990,
+          "moneda": "EUR",
+          "campana": "Otoño"
+        }
+      },
+      "expect": "INVALID_RPC_CALL"
+    },
+    {
+      "id": "ajuste-rpc-peticion-correlationid-vacio",
+      "spec": "01-envelope.md §3.1, §5",
+      "why": "En petición/respuesta el conjunto de códigos es cerrado: INVALID_RPC_CALL (Node construía el sobre con el atributo vacío).",
+      "op": "rpc-request",
+      "input": {
+        "operation": "clientes.cliente.v1.calcular-descuento",
+        "tenantId": "acme",
+        "aggregateId": "cli-1",
+        "id": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+        "source": "/produccion/facturacion-api",
+        "time": "2026-08-20T10:41:07.318Z",
+        "correlationid": "",
+        "producerversion": "3.4.1",
+        "classification": "internal",
+        "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+        "data": {
+          "clienteId": "cli-1",
+          "totalCents": 9990,
+          "moneda": "EUR",
+          "campana": "Otoño"
+        }
+      },
+      "expect": "INVALID_RPC_CALL"
+    },
+    {
+      "id": "ajuste-rpc-peticion-producerversion-vacio",
+      "spec": "01-envelope.md §3.1, §5",
+      "why": "En petición/respuesta el conjunto de códigos es cerrado: INVALID_RPC_CALL (Node construía el sobre con el atributo vacío).",
+      "op": "rpc-request",
+      "input": {
+        "operation": "clientes.cliente.v1.calcular-descuento",
+        "tenantId": "acme",
+        "aggregateId": "cli-1",
+        "id": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+        "source": "/produccion/facturacion-api",
+        "time": "2026-08-20T10:41:07.318Z",
+        "correlationid": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+        "producerversion": "",
+        "classification": "internal",
+        "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+        "data": {
+          "clienteId": "cli-1",
+          "totalCents": 9990,
+          "moneda": "EUR",
+          "campana": "Otoño"
+        }
+      },
+      "expect": "INVALID_RPC_CALL"
+    },
+    {
+      "id": "ajuste-rpc-respuesta-id-vacio",
+      "spec": "01-envelope.md §3.1, §5",
+      "why": "Ídem en la respuesta.",
+      "op": "rpc-reply",
+      "input": {
+        "request": {
+          "operation": "clientes.cliente.v1.calcular-descuento",
+          "id": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+          "correlationid": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+          "tenantid": "acme",
+          "subject": "cli-1"
+        },
+        "id": "",
+        "source": "/produccion/crm-api",
+        "time": "2026-08-20T10:41:07.329Z",
+        "correlationid": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+        "producerversion": "2.1.0",
+        "classification": "internal",
+        "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-b7ad6b7169203331-01",
+        "data": {
+          "descuentoCents": 500,
+          "moneda": "EUR",
+          "motivo": "Campaña de otoño"
+        }
+      },
+      "expect": "INVALID_RPC_CALL"
+    },
+    {
+      "id": "ajuste-rpc-respuesta-request-id-vacio",
+      "spec": "01-envelope.md §3.1, §5",
+      "why": "Lo que la respuesta hereda tampoco puede llegar vacío.",
+      "op": "rpc-reply",
+      "input": {
+        "request": {
+          "operation": "clientes.cliente.v1.calcular-descuento",
+          "id": "",
+          "correlationid": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+          "tenantid": "acme",
+          "subject": "cli-1"
+        },
+        "id": "01924f91-5d0f-7e03-9b6a-1c2d3e4f5a67",
+        "source": "/produccion/crm-api",
+        "time": "2026-08-20T10:41:07.329Z",
+        "correlationid": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+        "producerversion": "2.1.0",
+        "classification": "internal",
+        "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-b7ad6b7169203331-01",
+        "data": {
+          "descuentoCents": 500,
+          "moneda": "EUR",
+          "motivo": "Campaña de otoño"
+        }
+      },
+      "expect": "INVALID_RPC_CALL"
+    },
+    {
+      "id": "ajuste-rpc-respuesta-request-correlationid-vacio",
+      "spec": "01-envelope.md §3.1, §5",
+      "why": "Ídem.",
+      "op": "rpc-reply",
+      "input": {
+        "request": {
+          "operation": "clientes.cliente.v1.calcular-descuento",
+          "id": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+          "correlationid": "",
+          "tenantid": "acme",
+          "subject": "cli-1"
+        },
+        "id": "01924f91-5d0f-7e03-9b6a-1c2d3e4f5a67",
+        "source": "/produccion/crm-api",
+        "time": "2026-08-20T10:41:07.329Z",
+        "correlationid": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+        "producerversion": "2.1.0",
+        "classification": "internal",
+        "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-b7ad6b7169203331-01",
+        "data": {
+          "descuentoCents": 500,
+          "moneda": "EUR",
+          "motivo": "Campaña de otoño"
+        }
+      },
+      "expect": "INVALID_RPC_CALL"
+    },
+    {
+      "id": "ajuste-rpc-respuesta-request-tenantid-vacio",
+      "spec": "01-envelope.md §3.1, §5",
+      "why": "Ídem.",
+      "op": "rpc-reply",
+      "input": {
+        "request": {
+          "operation": "clientes.cliente.v1.calcular-descuento",
+          "id": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+          "correlationid": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+          "tenantid": "",
+          "subject": "cli-1"
+        },
+        "id": "01924f91-5d0f-7e03-9b6a-1c2d3e4f5a67",
+        "source": "/produccion/crm-api",
+        "time": "2026-08-20T10:41:07.329Z",
+        "correlationid": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+        "producerversion": "2.1.0",
+        "classification": "internal",
+        "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-b7ad6b7169203331-01",
+        "data": {
+          "descuentoCents": 500,
+          "moneda": "EUR",
+          "motivo": "Campaña de otoño"
+        }
+      },
+      "expect": "INVALID_RPC_CALL"
+    },
+    {
+      "id": "ajuste-rpc-error-id-vacio",
+      "spec": "01-envelope.md §3.1, §5",
+      "why": "Ídem en el error.",
+      "op": "rpc-error",
+      "input": {
+        "request": {
+          "operation": "clientes.cliente.v1.calcular-descuento",
+          "id": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+          "correlationid": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+          "tenantid": "acme",
+          "subject": "cli-1"
+        },
+        "id": "",
+        "source": "/produccion/crm-api",
+        "time": "2026-08-20T10:41:07.331Z",
+        "correlationid": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+        "producerversion": "2.1.0",
+        "classification": "internal",
+        "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-b7ad6b7169203331-01",
+        "error": {
+          "class": "retryable",
+          "code": "HTTP_503",
+          "message": "el servicio de tarifas no responde",
+          "retryAfterMs": 5000
+        }
+      },
+      "expect": "INVALID_RPC_CALL"
+    },
+    {
+      "id": "ajuste-rpc-error-source-vacio",
+      "spec": "01-envelope.md §3.1, §5",
+      "why": "Ídem en el error.",
+      "op": "rpc-error",
+      "input": {
+        "request": {
+          "operation": "clientes.cliente.v1.calcular-descuento",
+          "id": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+          "correlationid": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+          "tenantid": "acme",
+          "subject": "cli-1"
+        },
+        "id": "01924f91-5d11-7a62-8f0d-4e5f6a7b8c91",
+        "source": "",
+        "time": "2026-08-20T10:41:07.331Z",
+        "correlationid": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+        "producerversion": "2.1.0",
+        "classification": "internal",
+        "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-b7ad6b7169203331-01",
+        "error": {
+          "class": "retryable",
+          "code": "HTTP_503",
+          "message": "el servicio de tarifas no responde",
+          "retryAfterMs": 5000
+        }
+      },
+      "expect": "INVALID_RPC_CALL"
+    },
+    {
+      "id": "ajuste-estado-time-cuatro-decimales",
+      "spec": "01-envelope.md §2.2",
+      "why": "Cuatro decimales: Node los copiaba. Los bytes son LOS DE LA SPEC (10-state.md §2.6).",
+      "op": "state-build",
+      "input": {
+        "contract": "clientes.cliente.v1",
+        "tenantId": "acme",
+        "key": "cli-1",
+        "id": "01924f8e-7c3a-7b2d-9e14-3f8a1c9d0e55",
+        "source": "/produccion/crm-api",
+        "time": "2026-08-20T10:25:39.4120Z",
+        "correlationid": "01924f8e-7c3a-7b2d-9e14-3f8a1c9d0e55",
+        "producerversion": "2.1.0",
+        "classification": "confidential",
+        "data": {
+          "clienteId": "cli-1",
+          "nombre": "María Peña",
+          "email": "maria@example.com",
+          "aggregateVersion": 7
+        }
+      },
+      "sha256": "fa6b20beb64f90c06b0cfb2c82d809a8fd2672b365681d2cd9d1a99f29b13b40"
+    },
+    {
+      "id": "ajuste-estado-time-microsegundos",
+      "spec": "01-envelope.md §2.2",
+      "why": "Microsegundos: se TRUNCAN a milisegundos (no se redondean), como ya hacía Rust. Los bytes son LOS DE LA SPEC (10-state.md §2.6).",
+      "op": "state-build",
+      "input": {
+        "contract": "clientes.cliente.v1",
+        "tenantId": "acme",
+        "key": "cli-1",
+        "id": "01924f8e-7c3a-7b2d-9e14-3f8a1c9d0e55",
+        "source": "/produccion/crm-api",
+        "time": "2026-08-20T10:25:39.412345Z",
+        "correlationid": "01924f8e-7c3a-7b2d-9e14-3f8a1c9d0e55",
+        "producerversion": "2.1.0",
+        "classification": "confidential",
+        "data": {
+          "clienteId": "cli-1",
+          "nombre": "María Peña",
+          "email": "maria@example.com",
+          "aggregateVersion": 7
+        }
+      },
+      "sha256": "fa6b20beb64f90c06b0cfb2c82d809a8fd2672b365681d2cd9d1a99f29b13b40"
+    },
+    {
+      "id": "ajuste-estado-time-desfase-mas-02",
+      "spec": "01-envelope.md §2.2",
+      "why": "Un desfase `+02:00`: se pasa a UTC y se escribe `Z`. Los bytes son LOS DE LA SPEC (10-state.md §2.6).",
+      "op": "state-build",
+      "input": {
+        "contract": "clientes.cliente.v1",
+        "tenantId": "acme",
+        "key": "cli-1",
+        "id": "01924f8e-7c3a-7b2d-9e14-3f8a1c9d0e55",
+        "source": "/produccion/crm-api",
+        "time": "2026-08-20T12:25:39.412+02:00",
+        "correlationid": "01924f8e-7c3a-7b2d-9e14-3f8a1c9d0e55",
+        "producerversion": "2.1.0",
+        "classification": "confidential",
+        "data": {
+          "clienteId": "cli-1",
+          "nombre": "María Peña",
+          "email": "maria@example.com",
+          "aggregateVersion": 7
+        }
+      },
+      "sha256": "fa6b20beb64f90c06b0cfb2c82d809a8fd2672b365681d2cd9d1a99f29b13b40"
+    },
+    {
+      "id": "ajuste-estado-time-desfase-menos-0430",
+      "spec": "01-envelope.md §2.2",
+      "why": "Un desfase negativo con minutos. Los bytes son LOS DE LA SPEC (10-state.md §2.6).",
+      "op": "state-build",
+      "input": {
+        "contract": "clientes.cliente.v1",
+        "tenantId": "acme",
+        "key": "cli-1",
+        "id": "01924f8e-7c3a-7b2d-9e14-3f8a1c9d0e55",
+        "source": "/produccion/crm-api",
+        "time": "2026-08-20T05:55:39.412-04:30",
+        "correlationid": "01924f8e-7c3a-7b2d-9e14-3f8a1c9d0e55",
+        "producerversion": "2.1.0",
+        "classification": "confidential",
+        "data": {
+          "clienteId": "cli-1",
+          "nombre": "María Peña",
+          "email": "maria@example.com",
+          "aggregateVersion": 7
+        }
+      },
+      "sha256": "fa6b20beb64f90c06b0cfb2c82d809a8fd2672b365681d2cd9d1a99f29b13b40"
+    },
+    {
+      "id": "ajuste-estado-time-z-minuscula",
+      "spec": "01-envelope.md §2.2",
+      "why": "`z` minúscula: RFC 3339 la admite; sale `Z`. Los bytes son LOS DE LA SPEC (10-state.md §2.6).",
+      "op": "state-build",
+      "input": {
+        "contract": "clientes.cliente.v1",
+        "tenantId": "acme",
+        "key": "cli-1",
+        "id": "01924f8e-7c3a-7b2d-9e14-3f8a1c9d0e55",
+        "source": "/produccion/crm-api",
+        "time": "2026-08-20T10:25:39.412z",
+        "correlationid": "01924f8e-7c3a-7b2d-9e14-3f8a1c9d0e55",
+        "producerversion": "2.1.0",
+        "classification": "confidential",
+        "data": {
+          "clienteId": "cli-1",
+          "nombre": "María Peña",
+          "email": "maria@example.com",
+          "aggregateVersion": 7
+        }
+      },
+      "sha256": "fa6b20beb64f90c06b0cfb2c82d809a8fd2672b365681d2cd9d1a99f29b13b40"
+    },
+    {
+      "id": "ajuste-estado-time-sin-decimales",
+      "spec": "01-envelope.md §2.2",
+      "why": "Sin decimales: se normaliza a `.000Z` (Node copiaba `…39Z`).",
+      "op": "state-build",
+      "input": {
+        "contract": "clientes.cliente.v1",
+        "tenantId": "acme",
+        "key": "cli-1",
+        "id": "01924f8e-7c3a-7b2d-9e14-3f8a1c9d0e55",
+        "source": "/produccion/crm-api",
+        "time": "2026-08-20T10:25:39Z",
+        "correlationid": "01924f8e-7c3a-7b2d-9e14-3f8a1c9d0e55",
+        "producerversion": "2.1.0",
+        "classification": "confidential",
+        "data": {
+          "clienteId": "cli-1",
+          "nombre": "María Peña",
+          "email": "maria@example.com",
+          "aggregateVersion": 7
+        }
+      },
+      "sha256": "123403b2f988336e2e54d51fd3326c0098e0fa4b2aef614f1d9073a09710d675"
+    },
+    {
+      "id": "ajuste-estado-lapida-time-con-desfase",
+      "spec": "01-envelope.md §2.2",
+      "why": "La lápida también normaliza.",
+      "op": "state-tombstone",
+      "input": {
+        "contract": "clientes.cliente.v1",
+        "tenantId": "acme",
+        "key": "cli-1",
+        "id": "01924f90-2b11-7a40-8c3d-6d5e4f3a2b10",
+        "source": "/produccion/crm-api",
+        "time": "2026-08-20T12:31:02.057+02:00",
+        "correlationid": "01924f90-2b11-7a40-8c3d-6d5e4f3a2b10",
+        "producerversion": "2.1.0",
+        "aggregateVersion": 8
+      },
+      "sha256": "7a7868d2f643ccd584a354bce87c26d8d7f20826f23da26e99dbed78269bed3d"
+    },
+    {
+      "id": "ajuste-estado-time-invalido-ayer",
+      "spec": "01-envelope.md §2.2",
+      "why": "No es un instante: Node lo copiaba al sobre. Un `time` que no es un instante RFC 3339 es WRONG_ATTRIBUTE_TYPE (CloudEvents lo tipa Timestamp).",
+      "op": "state-build",
+      "input": {
+        "contract": "clientes.cliente.v1",
+        "tenantId": "acme",
+        "key": "cli-1",
+        "id": "01924f8e-7c3a-7b2d-9e14-3f8a1c9d0e55",
+        "source": "/produccion/crm-api",
+        "time": "ayer",
+        "correlationid": "01924f8e-7c3a-7b2d-9e14-3f8a1c9d0e55",
+        "producerversion": "2.1.0",
+        "classification": "confidential",
+        "data": {
+          "clienteId": "cli-1",
+          "nombre": "María Peña",
+          "email": "maria@example.com",
+          "aggregateVersion": 7
+        }
+      },
+      "expect": "WRONG_ATTRIBUTE_TYPE"
+    },
+    {
+      "id": "ajuste-estado-time-invalido-mes-13",
+      "spec": "01-envelope.md §2.2",
+      "why": "El mes 13 no existe. Un `time` que no es un instante RFC 3339 es WRONG_ATTRIBUTE_TYPE (CloudEvents lo tipa Timestamp).",
+      "op": "state-build",
+      "input": {
+        "contract": "clientes.cliente.v1",
+        "tenantId": "acme",
+        "key": "cli-1",
+        "id": "01924f8e-7c3a-7b2d-9e14-3f8a1c9d0e55",
+        "source": "/produccion/crm-api",
+        "time": "2026-13-20T10:25:39.412Z",
+        "correlationid": "01924f8e-7c3a-7b2d-9e14-3f8a1c9d0e55",
+        "producerversion": "2.1.0",
+        "classification": "confidential",
+        "data": {
+          "clienteId": "cli-1",
+          "nombre": "María Peña",
+          "email": "maria@example.com",
+          "aggregateVersion": 7
+        }
+      },
+      "expect": "WRONG_ATTRIBUTE_TYPE"
+    },
+    {
+      "id": "ajuste-estado-time-invalido-sin-zona",
+      "spec": "01-envelope.md §2.2",
+      "why": "Sin zona no es un instante: no se adivina la hora local. Un `time` que no es un instante RFC 3339 es WRONG_ATTRIBUTE_TYPE (CloudEvents lo tipa Timestamp).",
+      "op": "state-build",
+      "input": {
+        "contract": "clientes.cliente.v1",
+        "tenantId": "acme",
+        "key": "cli-1",
+        "id": "01924f8e-7c3a-7b2d-9e14-3f8a1c9d0e55",
+        "source": "/produccion/crm-api",
+        "time": "2026-08-20T10:25:39.412",
+        "correlationid": "01924f8e-7c3a-7b2d-9e14-3f8a1c9d0e55",
+        "producerversion": "2.1.0",
+        "classification": "confidential",
+        "data": {
+          "clienteId": "cli-1",
+          "nombre": "María Peña",
+          "email": "maria@example.com",
+          "aggregateVersion": 7
+        }
+      },
+      "expect": "WRONG_ATTRIBUTE_TYPE"
+    },
+    {
+      "id": "ajuste-estado-time-invalido-segundo-60",
+      "spec": "01-envelope.md §2.2",
+      "why": "Un segundo intercalar no existe en UTC de POSIX, y `Date` de JavaScript lo desplazaría al minuto siguiente: no se admite en ninguno. Un `time` que no es un instante RFC 3339 es WRONG_ATTRIBUTE_TYPE (CloudEvents lo tipa Timestamp).",
+      "op": "state-build",
+      "input": {
+        "contract": "clientes.cliente.v1",
+        "tenantId": "acme",
+        "key": "cli-1",
+        "id": "01924f8e-7c3a-7b2d-9e14-3f8a1c9d0e55",
+        "source": "/produccion/crm-api",
+        "time": "2026-06-30T23:59:60.000Z",
+        "correlationid": "01924f8e-7c3a-7b2d-9e14-3f8a1c9d0e55",
+        "producerversion": "2.1.0",
+        "classification": "confidential",
+        "data": {
+          "clienteId": "cli-1",
+          "nombre": "María Peña",
+          "email": "maria@example.com",
+          "aggregateVersion": 7
+        }
+      },
+      "expect": "WRONG_ATTRIBUTE_TYPE"
+    },
+    {
+      "id": "ajuste-estado-time-invalido-fuera-de-0000-9999",
+      "spec": "01-envelope.md §2.2",
+      "why": "En UTC es el año 10000: ya no es RFC 3339 (Rust lo escribía `+10000-01-01…`). Un `time` que no es un instante RFC 3339 es WRONG_ATTRIBUTE_TYPE (CloudEvents lo tipa Timestamp).",
+      "op": "state-build",
+      "input": {
+        "contract": "clientes.cliente.v1",
+        "tenantId": "acme",
+        "key": "cli-1",
+        "id": "01924f8e-7c3a-7b2d-9e14-3f8a1c9d0e55",
+        "source": "/produccion/crm-api",
+        "time": "9999-12-31T23:59:59.999-01:00",
+        "correlationid": "01924f8e-7c3a-7b2d-9e14-3f8a1c9d0e55",
+        "producerversion": "2.1.0",
+        "classification": "confidential",
+        "data": {
+          "clienteId": "cli-1",
+          "nombre": "María Peña",
+          "email": "maria@example.com",
+          "aggregateVersion": 7
+        }
+      },
+      "expect": "WRONG_ATTRIBUTE_TYPE"
+    },
+    {
+      "id": "ajuste-estado-time-invalido-30-de-febrero",
+      "spec": "01-envelope.md §2.2",
+      "why": "El 30 de febrero no existe. Un `time` que no es un instante RFC 3339 es WRONG_ATTRIBUTE_TYPE (CloudEvents lo tipa Timestamp).",
+      "op": "state-build",
+      "input": {
+        "contract": "clientes.cliente.v1",
+        "tenantId": "acme",
+        "key": "cli-1",
+        "id": "01924f8e-7c3a-7b2d-9e14-3f8a1c9d0e55",
+        "source": "/produccion/crm-api",
+        "time": "2026-02-30T10:25:39.412Z",
+        "correlationid": "01924f8e-7c3a-7b2d-9e14-3f8a1c9d0e55",
+        "producerversion": "2.1.0",
+        "classification": "confidential",
+        "data": {
+          "clienteId": "cli-1",
+          "nombre": "María Peña",
+          "email": "maria@example.com",
+          "aggregateVersion": 7
+        }
+      },
+      "expect": "WRONG_ATTRIBUTE_TYPE"
+    },
+    {
+      "id": "ajuste-rpc-peticion-time-cuatro-decimales",
+      "spec": "01-envelope.md §2.2",
+      "why": "Cuatro decimales: Node los copiaba. Los bytes son LOS DE LA SPEC (11-request-reply.md §3.5).",
+      "op": "rpc-request",
+      "input": {
+        "operation": "clientes.cliente.v1.calcular-descuento",
+        "tenantId": "acme",
+        "aggregateId": "cli-1",
+        "id": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+        "source": "/produccion/facturacion-api",
+        "time": "2026-08-20T10:41:07.3180Z",
+        "correlationid": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+        "producerversion": "3.4.1",
+        "classification": "internal",
+        "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+        "data": {
+          "clienteId": "cli-1",
+          "totalCents": 9990,
+          "moneda": "EUR",
+          "campana": "Otoño"
+        }
+      },
+      "sha256": "43ea71ade9fb6ff81ccb7c1f93047ffebd604d602492229e452b1c97dadf83f5"
+    },
+    {
+      "id": "ajuste-rpc-peticion-time-microsegundos",
+      "spec": "01-envelope.md §2.2",
+      "why": "Microsegundos: se TRUNCAN a milisegundos, no se redondean. Los bytes son LOS DE LA SPEC (11-request-reply.md §3.5).",
+      "op": "rpc-request",
+      "input": {
+        "operation": "clientes.cliente.v1.calcular-descuento",
+        "tenantId": "acme",
+        "aggregateId": "cli-1",
+        "id": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+        "source": "/produccion/facturacion-api",
+        "time": "2026-08-20T10:41:07.318927Z",
+        "correlationid": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+        "producerversion": "3.4.1",
+        "classification": "internal",
+        "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+        "data": {
+          "clienteId": "cli-1",
+          "totalCents": 9990,
+          "moneda": "EUR",
+          "campana": "Otoño"
+        }
+      },
+      "sha256": "43ea71ade9fb6ff81ccb7c1f93047ffebd604d602492229e452b1c97dadf83f5"
+    },
+    {
+      "id": "ajuste-rpc-peticion-time-desfase-mas-02",
+      "spec": "01-envelope.md §2.2",
+      "why": "Un desfase `+02:00`: se pasa a UTC y se escribe `Z`. Los bytes son LOS DE LA SPEC (11-request-reply.md §3.5).",
+      "op": "rpc-request",
+      "input": {
+        "operation": "clientes.cliente.v1.calcular-descuento",
+        "tenantId": "acme",
+        "aggregateId": "cli-1",
+        "id": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+        "source": "/produccion/facturacion-api",
+        "time": "2026-08-20T12:41:07.318+02:00",
+        "correlationid": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+        "producerversion": "3.4.1",
+        "classification": "internal",
+        "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+        "data": {
+          "clienteId": "cli-1",
+          "totalCents": 9990,
+          "moneda": "EUR",
+          "campana": "Otoño"
+        }
+      },
+      "sha256": "43ea71ade9fb6ff81ccb7c1f93047ffebd604d602492229e452b1c97dadf83f5"
+    },
+    {
+      "id": "ajuste-rpc-peticion-time-z-minuscula",
+      "spec": "01-envelope.md §2.2",
+      "why": "`z` minúscula. Los bytes son LOS DE LA SPEC (11-request-reply.md §3.5).",
+      "op": "rpc-request",
+      "input": {
+        "operation": "clientes.cliente.v1.calcular-descuento",
+        "tenantId": "acme",
+        "aggregateId": "cli-1",
+        "id": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+        "source": "/produccion/facturacion-api",
+        "time": "2026-08-20T10:41:07.318z",
+        "correlationid": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+        "producerversion": "3.4.1",
+        "classification": "internal",
+        "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+        "data": {
+          "clienteId": "cli-1",
+          "totalCents": 9990,
+          "moneda": "EUR",
+          "campana": "Otoño"
+        }
+      },
+      "sha256": "43ea71ade9fb6ff81ccb7c1f93047ffebd604d602492229e452b1c97dadf83f5"
+    },
+    {
+      "id": "ajuste-rpc-respuesta-time-con-desfase",
+      "spec": "01-envelope.md §2.2",
+      "why": "La respuesta también normaliza.",
+      "op": "rpc-reply",
+      "input": {
+        "request": {
+          "operation": "clientes.cliente.v1.calcular-descuento",
+          "id": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+          "correlationid": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+          "tenantid": "acme",
+          "subject": "cli-1"
+        },
+        "id": "01924f91-5d0f-7e03-9b6a-1c2d3e4f5a67",
+        "source": "/produccion/crm-api",
+        "time": "2026-08-20T12:41:07.329+02:00",
+        "correlationid": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+        "producerversion": "2.1.0",
+        "classification": "internal",
+        "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-b7ad6b7169203331-01",
+        "data": {
+          "descuentoCents": 500,
+          "moneda": "EUR",
+          "motivo": "Campaña de otoño"
+        }
+      },
+      "sha256": "b164fa71fa3e2943f3cb160f1a7cf3c520b09c2d93a0a1da81eef7f17da1f01c"
+    },
+    {
+      "id": "ajuste-rpc-error-time-con-desfase",
+      "spec": "01-envelope.md §2.2",
+      "why": "El error también normaliza.",
+      "op": "rpc-error",
+      "input": {
+        "request": {
+          "operation": "clientes.cliente.v1.calcular-descuento",
+          "id": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+          "correlationid": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+          "tenantid": "acme",
+          "subject": "cli-1"
+        },
+        "id": "01924f91-5d11-7a62-8f0d-4e5f6a7b8c91",
+        "source": "/produccion/crm-api",
+        "time": "2026-08-20T12:41:07.331+02:00",
+        "correlationid": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+        "producerversion": "2.1.0",
+        "classification": "internal",
+        "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-b7ad6b7169203331-01",
+        "error": {
+          "class": "retryable",
+          "code": "HTTP_503",
+          "message": "el servicio de tarifas no responde",
+          "retryAfterMs": 5000
+        }
+      },
+      "sha256": "fdff124948254dfa3263971aec86bf4d0184db77babe44da5e0714f28fc427f8"
+    },
+    {
+      "id": "ajuste-rpc-peticion-time-invalido",
+      "spec": "01-envelope.md §2.2",
+      "why": "`ayer` no es un instante: INVALID_RPC_CALL en petición/respuesta (Node lo copiaba).",
+      "op": "rpc-request",
+      "input": {
+        "operation": "clientes.cliente.v1.calcular-descuento",
+        "tenantId": "acme",
+        "aggregateId": "cli-1",
+        "id": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+        "source": "/produccion/facturacion-api",
+        "time": "ayer",
+        "correlationid": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+        "producerversion": "3.4.1",
+        "classification": "internal",
+        "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+        "data": {
+          "clienteId": "cli-1",
+          "totalCents": 9990,
+          "moneda": "EUR",
+          "campana": "Otoño"
+        }
+      },
+      "expect": "INVALID_RPC_CALL"
+    },
+    {
+      "id": "ajuste-rpc-respuesta-time-invalido",
+      "spec": "01-envelope.md §2.2",
+      "why": "Ídem en la respuesta.",
+      "op": "rpc-reply",
+      "input": {
+        "request": {
+          "operation": "clientes.cliente.v1.calcular-descuento",
+          "id": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+          "correlationid": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+          "tenantid": "acme",
+          "subject": "cli-1"
+        },
+        "id": "01924f91-5d0f-7e03-9b6a-1c2d3e4f5a67",
+        "source": "/produccion/crm-api",
+        "time": "2026-13-20T10:41:07.329Z",
+        "correlationid": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+        "producerversion": "2.1.0",
+        "classification": "internal",
+        "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-b7ad6b7169203331-01",
+        "data": {
+          "descuentoCents": 500,
+          "moneda": "EUR",
+          "motivo": "Campaña de otoño"
+        }
+      },
+      "expect": "INVALID_RPC_CALL"
+    },
+    {
+      "id": "ajuste-rpc-error-time-invalido",
+      "spec": "01-envelope.md §2.2",
+      "why": "Ídem en el error.",
+      "op": "rpc-error",
+      "input": {
+        "request": {
+          "operation": "clientes.cliente.v1.calcular-descuento",
+          "id": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+          "correlationid": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+          "tenantid": "acme",
+          "subject": "cli-1"
+        },
+        "id": "01924f91-5d11-7a62-8f0d-4e5f6a7b8c91",
+        "source": "/produccion/crm-api",
+        "time": "2026-08-20T10:41:07.331",
+        "correlationid": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+        "producerversion": "2.1.0",
+        "classification": "internal",
+        "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-b7ad6b7169203331-01",
+        "error": {
+          "class": "retryable",
+          "code": "HTTP_503",
+          "message": "el servicio de tarifas no responde",
+          "retryAfterMs": 5000
+        }
+      },
+      "expect": "INVALID_RPC_CALL"
+    },
+    {
+      "id": "ajuste-data-espacios-y-escape",
+      "spec": "01-envelope.md §4.1",
+      "why": "Con espacios entre elementos y `Oto\\u00f1o` escapado: Rust, que guardaba `data` tal cual, lo escribía así; Node (`JSON.parse` + `stringify`) lo compactaba y escribía `Otoño` literal. La forma canónica es la de Node, y los bytes son LOS DE LA SPEC.",
+      "op": "rpc-request",
+      "input": {
+        "operation": "clientes.cliente.v1.calcular-descuento",
+        "tenantId": "acme",
+        "aggregateId": "cli-1",
+        "id": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+        "source": "/produccion/facturacion-api",
+        "time": "2026-08-20T10:41:07.318Z",
+        "correlationid": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+        "producerversion": "3.4.1",
+        "classification": "internal",
+        "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
+      },
+      "dataTexto": "{ \"clienteId\" : \"cli-1\" , \"totalCents\" : 9990 , \"moneda\" : \"EUR\" , \"campana\" : \"Oto\\u00f1o\" }",
+      "sha256": "43ea71ade9fb6ff81ccb7c1f93047ffebd604d602492229e452b1c97dadf83f5"
+    },
+    {
+      "id": "ajuste-data-saltos-y-tabuladores",
+      "spec": "01-envelope.md §4.1",
+      "why": "Saltos de línea y tabuladores entre elementos tampoco entran.",
+      "op": "rpc-request",
+      "input": {
+        "operation": "clientes.cliente.v1.calcular-descuento",
+        "tenantId": "acme",
+        "aggregateId": "cli-1",
+        "id": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+        "source": "/produccion/facturacion-api",
+        "time": "2026-08-20T10:41:07.318Z",
+        "correlationid": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+        "producerversion": "3.4.1",
+        "classification": "internal",
+        "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
+      },
+      "dataTexto": "{\n\t\"clienteId\":\"cli-1\",\n\t\"totalCents\":9990,\n\t\"moneda\":\"EUR\",\n\t\"campana\":\"Otoño\"\n}",
+      "sha256": "43ea71ade9fb6ff81ccb7c1f93047ffebd604d602492229e452b1c97dadf83f5"
+    },
+    {
+      "id": "ajuste-data-clave-repetida",
+      "spec": "01-envelope.md §4.1",
+      "why": "Una clave repetida conserva la posición de la primera y el valor de la última (`JSON.parse`): Rust escribía las dos. Aquí `totalCents` vale 9990 y va donde iba la primera.",
+      "op": "rpc-request",
+      "input": {
+        "operation": "clientes.cliente.v1.calcular-descuento",
+        "tenantId": "acme",
+        "aggregateId": "cli-1",
+        "id": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+        "source": "/produccion/facturacion-api",
+        "time": "2026-08-20T10:41:07.318Z",
+        "correlationid": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+        "producerversion": "3.4.1",
+        "classification": "internal",
+        "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
+      },
+      "dataTexto": "{\"clienteId\":\"cli-1\",\"totalCents\":1,\"moneda\":\"EUR\",\"campana\":\"Otoño\",\"totalCents\":9990}",
+      "sha256": "43ea71ade9fb6ff81ccb7c1f93047ffebd604d602492229e452b1c97dadf83f5"
+    },
+    {
+      "id": "ajuste-data-barra-escapada",
+      "spec": "01-envelope.md §4.1",
+      "why": "`\\/` es una `/` literal: el escape no se conserva.",
+      "op": "rpc-request",
+      "input": {
+        "operation": "clientes.cliente.v1.calcular-descuento",
+        "tenantId": "acme",
+        "aggregateId": "cli-1",
+        "id": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+        "source": "/produccion/facturacion-api",
+        "time": "2026-08-20T10:41:07.318Z",
+        "correlationid": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+        "producerversion": "3.4.1",
+        "classification": "internal",
+        "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
+      },
+      "dataTexto": "{\"a\":\"a\\/b\"}",
+      "sha256": "677d96be55dae3659099b839e8f4282d9807a8be74d28063c27f5149fb8341b4"
+    },
+    {
+      "id": "ajuste-data-del-escapado",
+      "spec": "01-envelope.md §4.1",
+      "why": "`\\u007f` es DEL literal (0x7f): `JSON.stringify` solo escapa los controles de U+0000 a U+001F. Rust lo conservaba escapado.",
+      "op": "rpc-request",
+      "input": {
+        "operation": "clientes.cliente.v1.calcular-descuento",
+        "tenantId": "acme",
+        "aggregateId": "cli-1",
+        "id": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+        "source": "/produccion/facturacion-api",
+        "time": "2026-08-20T10:41:07.318Z",
+        "correlationid": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+        "producerversion": "3.4.1",
+        "classification": "internal",
+        "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
+      },
+      "dataTexto": "{\"a\":\"\\u007f\"}",
+      "sha256": "6048d48c72e6bf1ac2181c90bfe2914946d625171768e23fc40319fefa9a924c"
+    },
+    {
+      "id": "ajuste-data-par-sustituto-escapado",
+      "spec": "01-envelope.md §4.1",
+      "why": "Un par sustituto escapado (`\\ud83d\\ude00`) es el emoji, literal.",
+      "op": "rpc-request",
+      "input": {
+        "operation": "clientes.cliente.v1.calcular-descuento",
+        "tenantId": "acme",
+        "aggregateId": "cli-1",
+        "id": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+        "source": "/produccion/facturacion-api",
+        "time": "2026-08-20T10:41:07.318Z",
+        "correlationid": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+        "producerversion": "3.4.1",
+        "classification": "internal",
+        "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
+      },
+      "dataTexto": "{\"a\":\"\\ud83d\\ude00\"}",
+      "sha256": "292964118d0c7d1c00ea8a72912b0bdcb054e02015cf317ad3025931503a5a3d"
+    },
+    {
+      "id": "ajuste-data-controles-escapados",
+      "spec": "01-envelope.md §4.1",
+      "why": "Los controles U+0000–U+001F SÍ se escapan: `\\n` en su forma corta y `\\u0001` en minúscula de cuatro dígitos.",
+      "op": "rpc-request",
+      "input": {
+        "operation": "clientes.cliente.v1.calcular-descuento",
+        "tenantId": "acme",
+        "aggregateId": "cli-1",
+        "id": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+        "source": "/produccion/facturacion-api",
+        "time": "2026-08-20T10:41:07.318Z",
+        "correlationid": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+        "producerversion": "3.4.1",
+        "classification": "internal",
+        "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
+      },
+      "dataTexto": "{\"a\":\"\\u0001\\n\\t\\u001f\"}",
+      "sha256": "81a70e8e138b6f1033b51f74e0a371c408c01bb210b86efddd9b7845a8960a47"
+    },
+    {
+      "id": "ajuste-data-u2028-literal",
+      "spec": "01-envelope.md §4.1",
+      "why": "U+2028 va literal (`JSON.stringify` bien formado no lo escapa) y `<`, `>`, `&` también.",
+      "op": "rpc-request",
+      "input": {
+        "operation": "clientes.cliente.v1.calcular-descuento",
+        "tenantId": "acme",
+        "aggregateId": "cli-1",
+        "id": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+        "source": "/produccion/facturacion-api",
+        "time": "2026-08-20T10:41:07.318Z",
+        "correlationid": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+        "producerversion": "3.4.1",
+        "classification": "internal",
+        "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
+      },
+      "dataTexto": "{\"a\":\"x\\u2028y<&>\"}",
+      "sha256": "07cfcb1a9af21df3e81d96ed691a7deb29d4340285ce75f857094301f51162d8"
+    },
+    {
+      "id": "ajuste-data-anidado",
+      "spec": "01-envelope.md §4.1",
+      "why": "Objetos y arrays anidados, con `null` y booleanos, compactos y en su orden.",
+      "op": "rpc-request",
+      "input": {
+        "operation": "clientes.cliente.v1.calcular-descuento",
+        "tenantId": "acme",
+        "aggregateId": "cli-1",
+        "id": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+        "source": "/produccion/facturacion-api",
+        "time": "2026-08-20T10:41:07.318Z",
+        "correlationid": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+        "producerversion": "3.4.1",
+        "classification": "internal",
+        "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
+      },
+      "dataTexto": "{ \"z\" : [ 1 , { \"b\" : null , \"a\" : true } , [ ] , { } ] , \"a\" : false }",
+      "sha256": "3c260ea7447459eea0065e0704628a14af2b46789c9fae42bb0c0279de421e15"
+    },
+    {
+      "id": "ajuste-estado-data-espacios",
+      "spec": "01-envelope.md §4.1",
+      "why": "El estado pasa por la misma forma canónica: `data` con espacios y la `ñ` escapada da los bytes de la spec (10-state.md §2.6).",
+      "op": "state-build",
+      "input": {
+        "contract": "clientes.cliente.v1",
+        "tenantId": "acme",
+        "key": "cli-1",
+        "id": "01924f8e-7c3a-7b2d-9e14-3f8a1c9d0e55",
+        "source": "/produccion/crm-api",
+        "time": "2026-08-20T10:25:39.412Z",
+        "correlationid": "01924f8e-7c3a-7b2d-9e14-3f8a1c9d0e55",
+        "producerversion": "2.1.0",
+        "classification": "confidential"
+      },
+      "dataTexto": "{ \"clienteId\" : \"cli-1\" , \"nombre\" : \"María Pe\\u00f1a\" , \"email\" : \"maria@example.com\" , \"aggregateVersion\" : 7 }",
+      "sha256": "fa6b20beb64f90c06b0cfb2c82d809a8fd2672b365681d2cd9d1a99f29b13b40"
+    },
+    {
+      "id": "ajuste-rpc-peticion-orden-data-antes-que-clasificacion",
+      "spec": "11-request-reply.md §4.1 (paso 0), §3.2",
+      "why": "Una clasificación inválida Y un `data` que no es un objeto: gana INVALID_RPC_CALL (operación → timeout → `data` objeto → clasificación). El arnés de Rust convertía la clasificación ANTES de llamar al SDK y daba INVALID_DATACLASSIFICATION.",
+      "op": "rpc-request",
+      "input": {
+        "operation": "clientes.cliente.v1.calcular-descuento",
+        "tenantId": "acme",
+        "aggregateId": "cli-1",
+        "id": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+        "source": "/produccion/facturacion-api",
+        "time": "2026-08-20T10:41:07.318Z",
+        "correlationid": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+        "producerversion": "3.4.1",
+        "classification": "secreto",
+        "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+        "data": [
+          1
+        ]
+      },
+      "expect": "INVALID_RPC_CALL"
+    },
+    {
+      "id": "ajuste-rpc-peticion-clasificacion-invalida-sola",
+      "spec": "11-request-reply.md §4.1 (paso 0), §3.2",
+      "why": "Control: con un `data` bueno, la clasificación inválida SÍ es INVALID_DATACLASSIFICATION.",
+      "op": "rpc-request",
+      "input": {
+        "operation": "clientes.cliente.v1.calcular-descuento",
+        "tenantId": "acme",
+        "aggregateId": "cli-1",
+        "id": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+        "source": "/produccion/facturacion-api",
+        "time": "2026-08-20T10:41:07.318Z",
+        "correlationid": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+        "producerversion": "3.4.1",
+        "classification": "secreto",
+        "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+        "data": {
+          "clienteId": "cli-1",
+          "totalCents": 9990,
+          "moneda": "EUR",
+          "campana": "Otoño"
+        }
+      },
+      "expect": "INVALID_DATACLASSIFICATION"
+    },
+    {
+      "id": "ajuste-rpc-respuesta-orden-data-antes-que-clasificacion",
+      "spec": "11-request-reply.md §4.1 (paso 0), §3.2",
+      "why": "Lo mismo en la respuesta.",
+      "op": "rpc-reply",
+      "input": {
+        "request": {
+          "operation": "clientes.cliente.v1.calcular-descuento",
+          "id": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+          "correlationid": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+          "tenantid": "acme",
+          "subject": "cli-1"
+        },
+        "id": "01924f91-5d0f-7e03-9b6a-1c2d3e4f5a67",
+        "source": "/produccion/crm-api",
+        "time": "2026-08-20T10:41:07.329Z",
+        "correlationid": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+        "producerversion": "2.1.0",
+        "classification": "secreto",
+        "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-b7ad6b7169203331-01",
+        "data": "no es un objeto"
+      },
+      "expect": "INVALID_RPC_CALL"
+    },
+    {
+      "id": "ajuste-rpc-respuesta-clasificacion-invalida-sola",
+      "spec": "11-request-reply.md §4.1 (paso 0), §3.2",
+      "why": "Control en la respuesta.",
+      "op": "rpc-reply",
+      "input": {
+        "request": {
+          "operation": "clientes.cliente.v1.calcular-descuento",
+          "id": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+          "correlationid": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+          "tenantid": "acme",
+          "subject": "cli-1"
+        },
+        "id": "01924f91-5d0f-7e03-9b6a-1c2d3e4f5a67",
+        "source": "/produccion/crm-api",
+        "time": "2026-08-20T10:41:07.329Z",
+        "correlationid": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+        "producerversion": "2.1.0",
+        "classification": "secreto",
+        "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-b7ad6b7169203331-01",
+        "data": {
+          "descuentoCents": 500,
+          "moneda": "EUR",
+          "motivo": "Campaña de otoño"
+        }
+      },
+      "expect": "INVALID_DATACLASSIFICATION"
+    },
+    {
+      "id": "ajuste-rpc-peticion-operacion-antes-que-data",
+      "spec": "11-request-reply.md §4.1 (paso 0), §3.2",
+      "why": "Una operación mal formada gana a un `data` que no es un objeto.",
+      "op": "rpc-request",
+      "input": {
+        "operation": "Clientes.cliente.v1.obtener",
+        "tenantId": "acme",
+        "aggregateId": "cli-1",
+        "id": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+        "source": "/produccion/facturacion-api",
+        "time": "2026-08-20T10:41:07.318Z",
+        "correlationid": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+        "producerversion": "3.4.1",
+        "classification": "internal",
+        "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+        "data": [
+          1
+        ]
+      },
+      "expect": "INVALID_RPC_CALL"
+    },
+    {
+      "id": "ajuste-rpc-peticion-v99999999999999999999",
+      "spec": "02-naming.md §1",
+      "why": "Node escribía en el `type` `…request.v100000000000000000000` (el entero pasaba por `Number`) y Rust `…request.v99999999999999999999`: el MISMO contrato, dos bytes distintos. Con el tope de 4 dígitos los dos la rechazan.",
+      "op": "rpc-request",
+      "input": {
+        "operation": "clientes.cliente.v99999999999999999999.obtener",
+        "tenantId": "acme",
+        "aggregateId": "cli-1",
+        "id": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+        "source": "/produccion/facturacion-api",
+        "time": "2026-08-20T10:41:07.318Z",
+        "correlationid": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+        "producerversion": "3.4.1",
+        "classification": "internal",
+        "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+        "data": {
+          "clienteId": "cli-1",
+          "totalCents": 9990,
+          "moneda": "EUR",
+          "campana": "Otoño"
+        }
+      },
+      "expect": "INVALID_RPC_CALL"
+    },
+    {
+      "id": "ajuste-rpc-peticion-v4294967296",
+      "spec": "02-naming.md §1",
+      "why": "Lo mismo con el primer entero que no cabe en un `u32`.",
+      "op": "rpc-request",
+      "input": {
+        "operation": "clientes.cliente.v4294967296.obtener",
+        "tenantId": "acme",
+        "aggregateId": "cli-1",
+        "id": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+        "source": "/produccion/facturacion-api",
+        "time": "2026-08-20T10:41:07.318Z",
+        "correlationid": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+        "producerversion": "3.4.1",
+        "classification": "internal",
+        "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+        "data": {
+          "clienteId": "cli-1",
+          "totalCents": 9990,
+          "moneda": "EUR",
+          "campana": "Otoño"
+        }
+      },
+      "expect": "INVALID_RPC_CALL"
+    },
+    {
+      "id": "ajuste-rpc-respuesta-v10000",
+      "spec": "02-naming.md §1",
+      "why": "La respuesta también deriva su `type` de la operación.",
+      "op": "rpc-reply",
+      "input": {
+        "request": {
+          "operation": "clientes.cliente.v10000.calcular-descuento",
+          "id": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+          "correlationid": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+          "tenantid": "acme",
+          "subject": "cli-1"
+        },
+        "id": "01924f91-5d0f-7e03-9b6a-1c2d3e4f5a67",
+        "source": "/produccion/crm-api",
+        "time": "2026-08-20T10:41:07.329Z",
+        "correlationid": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+        "producerversion": "2.1.0",
+        "classification": "internal",
+        "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-b7ad6b7169203331-01",
+        "data": {
+          "descuentoCents": 500,
+          "moneda": "EUR",
+          "motivo": "Campaña de otoño"
+        }
+      },
+      "expect": "INVALID_RPC_CALL"
+    },
+    {
+      "id": "ajuste-rpc-error-operacion-malformada",
+      "spec": "11-request-reply.md §4.1 (paso 0), §3.2",
+      "why": "Node validaba la operación de la petición a la que contesta el error y Rust no (`rpc-error` no la parseaba): ahora los dos rechazan una operación mal formada.",
+      "op": "rpc-error",
+      "input": {
+        "request": {
+          "operation": "Clientes.cliente.v1.obtener",
+          "id": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+          "correlationid": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+          "tenantid": "acme",
+          "subject": "cli-1"
+        },
+        "id": "01924f91-5d11-7a62-8f0d-4e5f6a7b8c91",
+        "source": "/produccion/crm-api",
+        "time": "2026-08-20T10:41:07.331Z",
+        "correlationid": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+        "producerversion": "2.1.0",
+        "classification": "internal",
+        "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-b7ad6b7169203331-01",
+        "error": {
+          "class": "retryable",
+          "code": "HTTP_503",
+          "message": "el servicio de tarifas no responde",
+          "retryAfterMs": 5000
+        }
+      },
+      "expect": "INVALID_RPC_CALL"
+    },
+    {
+      "id": "ajuste-rpc-error-operacion-con-prefijo-rpc",
+      "spec": "11-request-reply.md §4.1 (paso 0), §3.2",
+      "why": "Con el prefijo `rpc.` puesto por quien llama: RESERVED_DOMAIN, también al construir un error.",
+      "op": "rpc-error",
+      "input": {
+        "request": {
+          "operation": "rpc.clientes.cliente.v1.obtener",
+          "id": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+          "correlationid": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+          "tenantid": "acme",
+          "subject": "cli-1"
+        },
+        "id": "01924f91-5d11-7a62-8f0d-4e5f6a7b8c91",
+        "source": "/produccion/crm-api",
+        "time": "2026-08-20T10:41:07.331Z",
+        "correlationid": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+        "producerversion": "2.1.0",
+        "classification": "internal",
+        "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-b7ad6b7169203331-01",
+        "error": {
+          "class": "retryable",
+          "code": "HTTP_503",
+          "message": "el servicio de tarifas no responde",
+          "retryAfterMs": 5000
+        }
+      },
+      "expect": "RESERVED_DOMAIN"
+    },
+    {
+      "id": "ajuste-rpc-error-operacion-v10000",
+      "spec": "02-naming.md §1",
+      "why": "La versión mayor también se valida al construir un error.",
+      "op": "rpc-error",
+      "input": {
+        "request": {
+          "operation": "clientes.cliente.v10000.obtener",
+          "id": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+          "correlationid": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+          "tenantid": "acme",
+          "subject": "cli-1"
+        },
+        "id": "01924f91-5d11-7a62-8f0d-4e5f6a7b8c91",
+        "source": "/produccion/crm-api",
+        "time": "2026-08-20T10:41:07.331Z",
+        "correlationid": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+        "producerversion": "2.1.0",
+        "classification": "internal",
+        "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-b7ad6b7169203331-01",
+        "error": {
+          "class": "retryable",
+          "code": "HTTP_503",
+          "message": "el servicio de tarifas no responde",
+          "retryAfterMs": 5000
+        }
+      },
+      "expect": "INVALID_RPC_CALL"
+    },
+    {
+      "id": "ajuste-rpc-respuesta-sin-tracestate",
+      "spec": "11-request-reply.md §3.2",
+      "why": "§3.2 no prevé `tracestate` en la respuesta, y Node no lo escribe: Rust lo escribía si se lo daban. La respuesta lleva solo `traceparent`: con un `tracestate` de entrada los bytes siguen siendo los de la spec.",
+      "op": "rpc-reply",
+      "input": {
+        "request": {
+          "operation": "clientes.cliente.v1.calcular-descuento",
+          "id": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+          "correlationid": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+          "tenantid": "acme",
+          "subject": "cli-1"
+        },
+        "id": "01924f91-5d0f-7e03-9b6a-1c2d3e4f5a67",
+        "source": "/produccion/crm-api",
+        "time": "2026-08-20T10:41:07.329Z",
+        "correlationid": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+        "producerversion": "2.1.0",
+        "classification": "internal",
+        "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-b7ad6b7169203331-01",
+        "data": {
+          "descuentoCents": 500,
+          "moneda": "EUR",
+          "motivo": "Campaña de otoño"
+        },
+        "tracestate": "vendor=valor"
+      },
+      "sha256": "b164fa71fa3e2943f3cb160f1a7cf3c520b09c2d93a0a1da81eef7f17da1f01c"
+    },
+    {
+      "id": "ajuste-rpc-error-sin-tracestate",
+      "spec": "11-request-reply.md §3.2",
+      "why": "Ídem en el error: los bytes de la spec.",
+      "op": "rpc-error",
+      "input": {
+        "request": {
+          "operation": "clientes.cliente.v1.calcular-descuento",
+          "id": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+          "correlationid": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+          "tenantid": "acme",
+          "subject": "cli-1"
+        },
+        "id": "01924f91-5d11-7a62-8f0d-4e5f6a7b8c91",
+        "source": "/produccion/crm-api",
+        "time": "2026-08-20T10:41:07.331Z",
+        "correlationid": "01924f91-5d0b-7c1a-8e22-9a4b3c2d1e10",
+        "producerversion": "2.1.0",
+        "classification": "internal",
+        "traceparent": "00-4bf92f3577b34da6a3ce929d0e0e4736-b7ad6b7169203331-01",
+        "error": {
+          "class": "retryable",
+          "code": "HTTP_503",
+          "message": "el servicio de tarifas no responde",
+          "retryAfterMs": 5000
+        },
+        "tracestate": "vendor=valor"
+      },
+      "sha256": "fdff124948254dfa3263971aec86bf4d0184db77babe44da5e0714f28fc427f8"
+    }
+  ],
   "rpcVectors": [
     {
       "id": "rpc-request-spec-3-5",

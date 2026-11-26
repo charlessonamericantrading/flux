@@ -38,11 +38,15 @@ import type { ConnectOptions } from "./client.js";
 import { ConsumerConfigMismatchError, TenantIsolationError } from "./client-errors.js";
 import { contextFromEvent, currentContext, runWithContext, activeTraceparent } from "./context.js";
 import {
+  InvalidEnvelopeInputError,
+  exigirAtributos,
   parseEvent,
   serialize,
+  tiempoCanonico,
   type DataClassification,
   type FluxEvent,
 } from "./envelope.js";
+import { truncateUtf8Bytes } from "./text.js";
 import { ErrorClass, PoisonError, isClassifiedError, type Classification } from "./errors.js";
 import type { MetricsSink } from "./metrics.js";
 import {
@@ -90,7 +94,7 @@ export const STATE_TENANT_PATTERN = /^[a-z0-9]+(-[a-z0-9]+)*$/;
 export const STATE_TENANT_MAX_LENGTH = 64;
 /** `<dominio>.<agregado>.v<major>`: el subject sin `state.`, sin tenant y sin clave. */
 export const STATE_CONTRACT_PATTERN =
-  /^[a-z0-9]+(-[a-z0-9]+)*\.[a-z0-9]+(-[a-z0-9]+)*\.v[1-9][0-9]*$/;
+  /^[a-z0-9]+(-[a-z0-9]+)*\.[a-z0-9]+(-[a-z0-9]+)*\.v[1-9][0-9]{0,3}$/;
 /** 2^53 − 1: el mayor entero que Node, y todo lo que use `double`, representa sin perder precisión. */
 export const AGGREGATE_VERSION_MAX = Number.MAX_SAFE_INTEGER;
 /** Intentos de un `put`/`delete` ante un conflicto de secuencia (10-state.md §3.2, paso 4). */
@@ -141,7 +145,7 @@ export function parseStateContract(contract: unknown): ParsedStateContract {
     const n = contract.split(".").length;
     throw new InvalidStateContractError(
       contract,
-      n !== 3 ? `debe tener exactamente 3 tokens, tiene ${n}` : "formato esperado <dominio>.<agregado>.v<major>",
+      n !== 3 ? `debe tener exactamente 3 tokens, tiene ${n}` : "formato esperado <dominio>.<agregado>.v<major> (la versión mayor, de 1 a 4 dígitos: v1…v9999)",
     );
   }
   const [domain, aggregate, v] = contract.split(".");
@@ -182,6 +186,27 @@ export function assertStateClassification(c: unknown): DataClassification {
   if (c === undefined) return STATE_DEFAULT_CLASSIFICATION;
   if (!STATE_CLASSIFICATIONS.includes(c as DataClassification)) throw new InvalidDataClassificationError(c);
   return c as DataClassification;
+}
+
+/**
+ * Lo que comprueba todo constructor de estado además de la forma del contrato, la clave y el tenant: que los atributos que el SDK
+ * rellena no lleguen vacíos y que `time` sea un instante (se normaliza a la forma canónica). El mismo código que daría el
+ * parser ante el mismo defecto: el conjunto de estado (04-errors.md §6) es cerrado y ninguno de sus siete encaja.
+ */
+function entradaDelSobre(
+  input: { id: string; source: string; correlationid: string; producerversion: string; time: string },
+): string {
+  const rechaza = (m: string, c: "MISSING_REQUIRED_ATTRIBUTE" | "MISSING_REQUIRED_EXTENSION") => new InvalidEnvelopeInputError(m, c);
+  exigirAtributos(
+    [
+      ["id", input.id],
+      ["source", input.source],
+      ["correlationid", input.correlationid, true],
+      ["producerversion", input.producerversion, true],
+    ],
+    rechaza,
+  );
+  return tiempoCanonico(input.time, (m) => new InvalidEnvelopeInputError(m, "WRONG_ATTRIBUTE_TYPE"));
 }
 
 // ═════════════════════════════════════════════════════════════════════════════════════════
@@ -310,12 +335,13 @@ export function buildStateEvent<T extends object>(input: StateEventInput<T>): Fl
   assertStateTenant(input.tenantId);
   aggregateVersionOf(input.data);
   const classification = assertStateClassification(input.classification);
+  const time = entradaDelSobre(input);
   return {
     specversion: "1.0",
     id: input.id,
     source: input.source,
     type: stateType(c.contract),
-    time: input.time,
+    time,
     datacontenttype: "application/json",
     dataschema: input.dataschema ?? stateDataschema(c.contract),
     subject: input.key,
@@ -358,12 +384,13 @@ export function buildStateTombstone(input: StateTombstoneInput): FluxEvent<{ agg
   assertStateKey(input.key);
   assertStateTenant(input.tenantId);
   const aggregateVersion = aggregateVersionOf({ aggregateVersion: input.aggregateVersion });
+  const time = entradaDelSobre(input);
   return {
     specversion: "1.0",
     id: input.id,
     source: input.source,
     type: stateTombstoneType(c.contract),
-    time: input.time,
+    time,
     datacontenttype: "application/json",
     dataschema: TOMBSTONE_DATASCHEMA,
     subject: input.key,
@@ -390,13 +417,6 @@ export interface StateDlqInfo {
   error: string;
   /** Lo da quien llama: si lo pusiera esta función, los bytes no serían comparables. */
   dlqtime: string;
-}
-
-/** Corta a `max` UTF-16 sin partir un par sustituto: una mitad se serializaría como `\ud83d`. */
-function truncar(s: string, max: number): string {
-  if (s.length <= max) return s;
-  const corte = /[\ud800-\udbff]/.test(s[max - 1] ?? "") ? max - 1 : max;
-  return s.slice(0, corte);
 }
 
 /**
@@ -426,8 +446,9 @@ export function toStateDlqEvent(event: FluxEvent, info: StateDlqInfo): FluxEvent
     dlqreason: info.reason,
     dlqattempts: info.attempts,
     dlqconsumer: info.consumer,
-    dlqerror: truncar(info.error, 1024),
-    dlqtime: info.dlqtime,
+    // 1024 BYTES UTF-8 sin partir un carácter (04-errors.md §3).
+    dlqerror: truncateUtf8Bytes(info.error, 1024),
+    dlqtime: tiempoCanonico(info.dlqtime, (m) => new InvalidEnvelopeInputError(m, "WRONG_ATTRIBUTE_TYPE")),
     data: { key: info.key, revision: info.revision },
   };
 }
@@ -468,12 +489,13 @@ export function buildUnreadableStateDlqEvent(input: {
   dlq: Omit<StateDlqInfo, "key" | "revision">;
 }): FluxEvent<{ key: string; revision: number }> {
   const c = parseStateContract(input.contract);
+  const time = entradaDelSobre({ ...input, correlationid: input.id });
   const synth: FluxEvent = {
     specversion: "1.0",
     id: input.id,
     source: input.source,
     type: stateType(c.contract),
-    time: input.time,
+    time,
     datacontenttype: "application/json",
     dataschema: input.dataschema ?? stateDataschema(c.contract),
     subject: input.key,

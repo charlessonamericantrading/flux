@@ -518,6 +518,52 @@ describeBroker("SDK Node: petición/respuesta bajo ACL exacta", () => {
     });
   });
 
+  describe("la excepción única de la comprobación 4 (§4.3): el error de una petición ilegible, con un responder en bruto contra el broker", () => {
+    /** Un responder en bruto: contesta a lo que llegue con `fn(petición)`. */
+    async function rogueCrudo(fn: (peticion: FluxEvent & Record<string, any>) => Record<string, unknown>) {
+      const nc = await conectarCrudo(broker, "rogue");
+      const sub = nc.subscribe(SUBJECT, { callback: (_e, m) => void m.respond(enc.encode(JSON.stringify(fn(JSON.parse(dec.decode(m.data)))))) });
+      await nc.flush();
+      return async () => { sub.unsubscribe(); await nc.close(); };
+    }
+    // Lo que contesta un SDK a una petición que no pudo leer (§5.2): `correlationid` = su propio `id`, `tenantid: system`, `causationid` = el `id` de la petición.
+    const ilegible = (p: Record<string, any>, extra: Record<string, unknown> = {}) => ({
+      specversion: "1.0", id: "01924f91-5d13-7b85-a3e1-6a7b8c9d0e22", source: "/test/rogue", type: "com.flux.rpc.error.v1",
+      time: new Date().toISOString(), datacontenttype: "application/json", dataschema: "https://schemas.internal/system/rpc/error/1.0.0.json",
+      correlationid: "01924f91-5d13-7b85-a3e1-6a7b8c9d0e22", tenantid: "system", producerversion: "1", dataclassification: "internal",
+      causationid: p.id, data: { class: "permanent", code: "MALFORMED_JSON", message: "la petición no es un CloudEvent válido de flux" }, ...extra,
+    });
+
+    test("el error de una petición ilegible llega como PermanentError con el código del sobre (MALFORMED_JSON), NO como RPC_INVALID_REPLY", async () => {
+      const para = await rogueCrudo((p) => ilegible(p));
+      const llama = await abrir("facturacion-api");
+      await assert.rejects(llama.request(OP, PETICION, { timeoutMs: 3000 }), (e: RpcPermanentError) => {
+        assert.ok(e instanceof RpcPermanentError, `${e.name}: ${e.message}`);
+        assert.equal(e.code, "MALFORMED_JSON");
+        assert.equal(e.fluxClass, ErrorClass.PERMANENT);
+        return true;
+      });
+      await para();
+    });
+
+    test("CONTROL: la excepción es estrecha: sin `causationid` de la petición, con otro `correlationid` o con un tenant ajeno sigue siendo RPC_INVALID_REPLY", async () => {
+      const llama = await abrir("facturacion-api");
+      const casos: Array<[string, (p: Record<string, any>) => Record<string, unknown>]> = [
+        ["causationid de otra petición", (p) => ilegible(p, { causationid: "01924f91-0000-7000-8000-000000000000" })],
+        ["correlationid que no es el propio", (p) => ilegible(p, { correlationid: "otro-flujo" })],
+        ["tenant ajeno (ni `system` ni el de la petición)", (p) => ilegible(p, { tenantid: "globex" })],
+      ];
+      for (const [nombre, fn] of casos) {
+        const para = await rogueCrudo(fn);
+        await assert.rejects(llama.request(OP, PETICION, { timeoutMs: 3000 }), (e: RpcInvalidReplyError) => {
+          assert.ok(e instanceof RpcInvalidReplyError, `${nombre}: ${e.name}: ${e.message}`);
+          return true;
+        }, nombre);
+        await para();
+      }
+    });
+  });
+
   test("A-67, A-88: un STREAM que captura `rpc.>` contesta con su acuse → RPC_INVALID_REPLY que apunta a `flux doctor`", async () => {
     await jsm.streams.add({ name: "TRAMPA", subjects: ["rpc.clientes.>"], storage: StorageType.Memory });
     try {

@@ -14,12 +14,19 @@
     "subject": {
       "format": "<dominio>.<agregado>.v<major>.<evento>",
       "tokens": 4,
-      "pattern": "^[a-z0-9]+(-[a-z0-9]+)*\\.[a-z0-9]+(-[a-z0-9]+)*\\.v[1-9][0-9]*\\.[a-z0-9]+(-[a-z0-9]+)*$",
+      "pattern": "^[a-z0-9]+(-[a-z0-9]+)*\\.[a-z0-9]+(-[a-z0-9]+)*\\.v[1-9][0-9]{0,3}\\.[a-z0-9]+(-[a-z0-9]+)*$",
       "rules": {
         "dominio": "sustantivo plural, kebab-case",
         "agregado": "sustantivo singular, kebab-case",
-        "major": "literal 'v' + entero >= 1",
+        "major": "literal 'v' + entero de 1 a 4 digitos, >= 1 y sin ceros a la izquierda (v1...v9999)",
         "evento": "verbo en pasado, kebab-case"
+      },
+      "majorVersion": {
+        "minDigits": 1,
+        "maxDigits": 4,
+        "max": 9999,
+        "leadingZeros": false,
+        "$comment": "La version mayor son de 1 a 4 digitos: v1...v9999 (02-naming.md §1). Sin tope, Node escribia `v100000000000000000000` en el type (el numero pasaba por `Number`) y Rust rechazaba lo que no cupiese en un `u32`: el mismo subject, dos veredictos. Cada patron de este fichero que lleva la version (subject, type, estado, operacion, ACL) lleva el tope `[1-9][0-9]{0,3}`; check-protocol-json.mjs lo comprueba en todos. Los ejemplos `valid`/`invalid` de abajo NO incluyen v10000; cada SDK lo prueba en su propio test (`v9999` se acepta, `v99999` y `v10000` se rechazan). Los siete SDKs llevan el tope en su patron de subject (Python, Go, Java, .NET y PHP solo ahi: el resto de lo decidido al medir Node contra Rust esta pendiente en esos cinco, Fase 6)."
       },
       "valid": [
         "pedidos.pedido.v1.creado",
@@ -33,7 +40,7 @@
     },
     "type": {
       "format": "com.flux.<dominio>.<agregado>.<evento>.v<major>",
-      "pattern": "^com\\.flux\\.[a-z0-9-]+\\.[a-z0-9-]+\\.[a-z0-9-]+\\.v[1-9][0-9]*$",
+      "pattern": "^com\\.flux\\.[a-z0-9-]+\\.[a-z0-9-]+\\.[a-z0-9-]+\\.v[1-9][0-9]{0,3}$",
       "derivedFromSubject": true,
       "$comment": "Transformacion mecanica y biyectiva con el subject. El SDK la calcula; nunca se pide al desarrollador."
     },
@@ -135,6 +142,16 @@
         "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}\\.\\d{3}Z$",
         "precision": "exactly-3-decimals",
         "generatedBy": "sdk",
+        "builderInput": {
+          "accepts": "rfc3339-date-time",
+          "normalizesTo": "exactly-3-decimals-and-Z-in-UTC",
+          "fractionBeyondMillis": "truncated",
+          "rejectsLeapSecond": true,
+          "yearRangeUtc": [0, 9999],
+          "invalidCode": "WRONG_ATTRIBUTE_TYPE",
+          "invalidCodeInRpc": "INVALID_RPC_CALL",
+          "spec": "specification/01-envelope.md §2.2"
+        },
         "$comment": "Instante en que OCURRIO el hecho, no el de publicacion. EXACTAMENTE 3 decimales y sufijo Z: los formateadores ISO por defecto divergen (Go RFC3339Nano recorta ceros -> .41Z; Python isoformat da microsegundos y +00:00). Un SDK DEBE formatear explicitamente."
       },
       "datacontenttype": {
@@ -211,7 +228,10 @@
       },
       "dlqerror": {
         "type": "string",
-        "dlqOnly": true
+        "dlqOnly": true,
+        "maxBytes": 1024,
+        "truncation": "utf8-bytes-never-split-a-character",
+        "$comment": "1024 BYTES UTF-8 como maximo, cortado sin partir un caracter (04-errors.md §3). Node contaba 1024 unidades UTF-16 (2693 bytes con 1500 «é»), Rust 1024 bytes, Python puntos de codigo y Go runas: el mismo evento muerto no tenia los mismos bytes en la DLQ. No se anade `…`. Vectores `ajuste-dlqerror-*`."
       },
       "dlqtime": {
         "type": "string",
@@ -276,6 +296,23 @@
         "minimum": 1,
         "description": "Contador monotonico. Habilita handlers insensibles al orden via 'WHERE aggregate_version < $n'."
       }
+    },
+    "canonicalForm": {
+      "spec": "specification/01-envelope.md §4.1",
+      "reference": "ecmascript-json-stringify-with-literal-utf8",
+      "insignificantWhitespace": false,
+      "keyOrder": "as-given-repeated-key-keeps-first-position-and-last-value",
+      "escapedCharacters": ["\"", "\\", "U+0000-U+001F"],
+      "numbers": "untouched",
+      "notPortable": [
+        "integer-outside-2^53-1",
+        "float-or-exponent-notation",
+        "array-index-like-key",
+        "lone-utf16-surrogate",
+        "nesting-over-128",
+        "number-outside-double-range"
+      ],
+      "$comment": "La forma canonica de `data` es la de JSON.stringify de Node con UTF-8 literal; los constructores reescriben `data` a ella (Rust ya no lo guarda como texto crudo). Los numeros NO se tocan (01-envelope.md §2.5), y los que un lenguaje escribe de otra manera —enteros fuera de ±(2^53−1), flotantes, exponentes, -0— no tienen forma comun: el dinero va en enteros. Vectores `ajuste-data-*`."
     },
     "encoding": "utf-8-literal",
     "$commentEncoding": "UTF-8 con no-ASCII LITERAL, sin escapes de la forma backslash-u-XXXX. El encoder por defecto de System.Text.Json escapa todo lo no-ASCII, asi que un payload en espanol producido por .NET no coincide byte a byte con Node/Go. Requiere JavaScriptEncoder.UnsafeRelaxedJsonEscaping."
@@ -795,12 +832,12 @@
         "accountInfo": "^\\$JS\\.API\\.INFO$",
         "ownDomain": "^[a-z0-9]+(-[a-z0-9]+)*\\.>$",
         "streamInfo": "^\\$JS\\.API\\.STREAM\\.INFO\\.(EVT|DLQ)_[A-Z0-9_]+$",
-        "eventConsumerCreate": "^\\$JS\\.API\\.CONSUMER\\.CREATE\\.EVT_[A-Z0-9_]+\\.[a-z0-9]+(-[a-z0-9]+)*__[a-z0-9_]+\\.[a-z0-9]+(-[a-z0-9]+)*\\.[a-z0-9]+(-[a-z0-9]+)*\\.v[1-9][0-9]*\\.[a-z0-9]+(-[a-z0-9]+)*$",
+        "eventConsumerCreate": "^\\$JS\\.API\\.CONSUMER\\.CREATE\\.EVT_[A-Z0-9_]+\\.[a-z0-9]+(-[a-z0-9]+)*__[a-z0-9_]+\\.[a-z0-9]+(-[a-z0-9]+)*\\.[a-z0-9]+(-[a-z0-9]+)*\\.v[1-9][0-9]{0,3}\\.[a-z0-9]+(-[a-z0-9]+)*$",
         "dlqReaderCreate": "^\\$JS\\.API\\.CONSUMER\\.CREATE\\.DLQ_[A-Z0-9_]+\\.[a-z0-9]+(-[a-z0-9]+)*__dlq_[a-z0-9_]+\\.dlq\\.[a-z0-9]+(-[a-z0-9]+)*\\.>$",
         "consumerInfo": "^\\$JS\\.API\\.CONSUMER\\.INFO\\.(EVT|DLQ)_[A-Z0-9_]+\\.[a-z0-9]+(-[a-z0-9]+)*__[a-z0-9_]+$",
         "consumerNext": "^\\$JS\\.API\\.CONSUMER\\.MSG\\.NEXT\\.(EVT|DLQ)_[A-Z0-9_]+\\.[a-z0-9]+(-[a-z0-9]+)*__[a-z0-9_]+$",
         "ack": "^\\$JS\\.ACK\\.(EVT|DLQ)_[A-Z0-9_]+\\.[a-z0-9]+(-[a-z0-9]+)*__[a-z0-9_]+\\.>$",
-        "dlqPublish": "^dlq\\.[a-z0-9]+(-[a-z0-9]+)*\\.[a-z0-9]+(-[a-z0-9]+)*\\.v[1-9][0-9]*\\.[a-z0-9]+(-[a-z0-9]+)*$"
+        "dlqPublish": "^dlq\\.[a-z0-9]+(-[a-z0-9]+)*\\.[a-z0-9]+(-[a-z0-9]+)*\\.v[1-9][0-9]{0,3}\\.[a-z0-9]+(-[a-z0-9]+)*$"
       },
       "dlqReaderDurable": {
         "format": "<servicio>__dlq_<dominio>",
@@ -1425,7 +1462,7 @@
     "subject": {
       "format": "state.<dominio>.<agregado>.v<major>.<tenant>.<clave>",
       "tokens": 6,
-      "pattern": "^state\\.[a-z0-9]+(-[a-z0-9]+)*\\.[a-z0-9]+(-[a-z0-9]+)*\\.v[1-9][0-9]*\\.[a-z0-9]+(-[a-z0-9]+)*\\.[A-Za-z0-9][A-Za-z0-9_-]{0,127}$",
+      "pattern": "^state\\.[a-z0-9]+(-[a-z0-9]+)*\\.[a-z0-9]+(-[a-z0-9]+)*\\.v[1-9][0-9]{0,3}\\.[a-z0-9]+(-[a-z0-9]+)*\\.[A-Za-z0-9][A-Za-z0-9_-]{0,127}$",
       "valid": [
         "state.clientes.cliente.v1.acme.cli-1",
         "state.logistica.linea-envio.v2.acme-corp.Env_00-9"
@@ -1442,7 +1479,7 @@
     },
     "contract": {
       "format": "<dominio>.<agregado>.v<major>",
-      "pattern": "^[a-z0-9]+(-[a-z0-9]+)*\\.[a-z0-9]+(-[a-z0-9]+)*\\.v[1-9][0-9]*$",
+      "pattern": "^[a-z0-9]+(-[a-z0-9]+)*\\.[a-z0-9]+(-[a-z0-9]+)*\\.v[1-9][0-9]{0,3}$",
       "valid": [
         "clientes.cliente.v1",
         "logistica.linea-envio.v2"
@@ -1525,12 +1562,12 @@
     "type": {
       "value": {
         "format": "com.flux.state.<dominio>.<agregado>.v<major>",
-        "pattern": "^com\\.flux\\.state\\.[a-z0-9]+(-[a-z0-9]+)*\\.[a-z0-9]+(-[a-z0-9]+)*\\.v[1-9][0-9]*$",
+        "pattern": "^com\\.flux\\.state\\.[a-z0-9]+(-[a-z0-9]+)*\\.[a-z0-9]+(-[a-z0-9]+)*\\.v[1-9][0-9]{0,3}$",
         "example": "com.flux.state.clientes.cliente.v1"
       },
       "tombstone": {
         "format": "com.flux.state.<dominio>.<agregado>.deleted.v<major>",
-        "pattern": "^com\\.flux\\.state\\.[a-z0-9]+(-[a-z0-9]+)*\\.[a-z0-9]+(-[a-z0-9]+)*\\.deleted\\.v[1-9][0-9]*$",
+        "pattern": "^com\\.flux\\.state\\.[a-z0-9]+(-[a-z0-9]+)*\\.[a-z0-9]+(-[a-z0-9]+)*\\.deleted\\.v[1-9][0-9]{0,3}$",
         "example": "com.flux.state.clientes.cliente.deleted.v1",
         "$comment": "`deleted` en ingles viene del plan (§2.3) mientras el esquema se llama `eliminado`: mezcla de idiomas heredada, marcada como decision del dueno en el informe de la fase."
       },
@@ -1653,7 +1690,7 @@
       "connectionTenantAlwaysFilters": true,
       "durable": {
         "format": "<servicio>__state_<dominio>_<agregado>_v<major>[__<tenant>]",
-        "pattern": "^[a-z0-9]+(-[a-z0-9]+)*__state_[a-z0-9]+(_[a-z0-9]+)+_v[1-9][0-9]*(__[a-z0-9]+(_[a-z0-9]+)*)?$",
+        "pattern": "^[a-z0-9]+(-[a-z0-9]+)*__state_[a-z0-9]+(_[a-z0-9]+)+_v[1-9][0-9]{0,3}(__[a-z0-9]+(_[a-z0-9]+)*)?$",
         "tenantSuffix": "__<tenant con - sustituido por _>",
         "example": "tienda-web__state_clientes_cliente_v1__acme",
         "valid": [
@@ -1730,7 +1767,7 @@
       "subject": {
         "format": "dlq.state.<dominio>.<agregado>.v<major>",
         "tokens": 5,
-        "pattern": "^dlq\\.state\\.[a-z0-9]+(-[a-z0-9]+)*\\.[a-z0-9]+(-[a-z0-9]+)*\\.v[1-9][0-9]*$",
+        "pattern": "^dlq\\.state\\.[a-z0-9]+(-[a-z0-9]+)*\\.[a-z0-9]+(-[a-z0-9]+)*\\.v[1-9][0-9]{0,3}$",
         "example": "dlq.state.clientes.cliente.v1",
         "valid": [
           "dlq.state.clientes.cliente.v1"
@@ -1806,12 +1843,12 @@
       "$comment": "Lo que un servicio necesita para el estado, MEDIDO contra un broker con una ACL escrita a mano (A-38 a A-40, A-48) y lo que gen-acl.mjs debe producir (clave `watches`). Extiende security.acl: NO la sustituye ni relaja su lista cerrada, y security.acl.neverGrantedExceptions exceptua de lo denegable estas dos formas por subject de ESTADO de DIRECT.GET (ownerDirectGet y observerDirectGet, y SOLO esas: la forma de cuerpo, y cualquier comodin por encima del tenant, siguen denegados). Lo que gen-acl.mjs genera de verdad esta en security.manifest y se ejecuta contra un broker en conformance/security.mjs (S15 a S20) y scripts/verify-acl.mjs. Un permiso que no encaje en ninguno de estos patrones ni en security.acl.permissionPatterns es un error del generador.",
       "ownerPublish": "^state\\.[a-z0-9]+(-[a-z0-9]+)*\\.>$",
       "ownerDirectGet": "^\\$JS\\.API\\.DIRECT\\.GET\\.STATE_[A-Z0-9_]+\\.state\\.[a-z0-9]+(-[a-z0-9]+)*\\.>$",
-      "observerDirectGet": "^\\$JS\\.API\\.DIRECT\\.GET\\.STATE_[A-Z0-9_]+\\.state\\.[a-z0-9]+(-[a-z0-9]+)*\\.[a-z0-9]+(-[a-z0-9]+)*\\.v[1-9][0-9]*\\.([a-z0-9]+(-[a-z0-9]+)*|\\*)\\.\\*$",
-      "consumerInfo": "^\\$JS\\.API\\.CONSUMER\\.INFO\\.STATE_[A-Z0-9_]+\\.[a-z0-9]+(-[a-z0-9]+)*__state_[a-z0-9]+(_[a-z0-9]+)+_v[1-9][0-9]*(__[a-z0-9]+(_[a-z0-9]+)*)?$",
-      "consumerNext": "^\\$JS\\.API\\.CONSUMER\\.MSG\\.NEXT\\.STATE_[A-Z0-9_]+\\.[a-z0-9]+(-[a-z0-9]+)*__state_[a-z0-9]+(_[a-z0-9]+)+_v[1-9][0-9]*(__[a-z0-9]+(_[a-z0-9]+)*)?$",
-      "ack": "^\\$JS\\.ACK\\.STATE_[A-Z0-9_]+\\.[a-z0-9]+(-[a-z0-9]+)*__state_[a-z0-9]+(_[a-z0-9]+)+_v[1-9][0-9]*(__[a-z0-9]+(_[a-z0-9]+)*)?\\.>$",
-      "consumerCreate": "^\\$JS\\.API\\.CONSUMER\\.CREATE\\.STATE_[A-Z0-9_]+\\.[a-z0-9]+(-[a-z0-9]+)*__state_[a-z0-9]+(_[a-z0-9]+)+_v[1-9][0-9]*(__[a-z0-9]+(_[a-z0-9]+)*)?\\.state\\.[a-z0-9]+(-[a-z0-9]+)*\\.[a-z0-9]+(-[a-z0-9]+)*\\.v[1-9][0-9]*\\.([a-z0-9]+(-[a-z0-9]+)*|\\*)\\.\\*$",
-      "dlqPublish": "^dlq\\.state\\.[a-z0-9]+(-[a-z0-9]+)*\\.[a-z0-9]+(-[a-z0-9]+)*\\.v[1-9][0-9]*$",
+      "observerDirectGet": "^\\$JS\\.API\\.DIRECT\\.GET\\.STATE_[A-Z0-9_]+\\.state\\.[a-z0-9]+(-[a-z0-9]+)*\\.[a-z0-9]+(-[a-z0-9]+)*\\.v[1-9][0-9]{0,3}\\.([a-z0-9]+(-[a-z0-9]+)*|\\*)\\.\\*$",
+      "consumerInfo": "^\\$JS\\.API\\.CONSUMER\\.INFO\\.STATE_[A-Z0-9_]+\\.[a-z0-9]+(-[a-z0-9]+)*__state_[a-z0-9]+(_[a-z0-9]+)+_v[1-9][0-9]{0,3}(__[a-z0-9]+(_[a-z0-9]+)*)?$",
+      "consumerNext": "^\\$JS\\.API\\.CONSUMER\\.MSG\\.NEXT\\.STATE_[A-Z0-9_]+\\.[a-z0-9]+(-[a-z0-9]+)*__state_[a-z0-9]+(_[a-z0-9]+)+_v[1-9][0-9]{0,3}(__[a-z0-9]+(_[a-z0-9]+)*)?$",
+      "ack": "^\\$JS\\.ACK\\.STATE_[A-Z0-9_]+\\.[a-z0-9]+(-[a-z0-9]+)*__state_[a-z0-9]+(_[a-z0-9]+)+_v[1-9][0-9]{0,3}(__[a-z0-9]+(_[a-z0-9]+)*)?\\.>$",
+      "consumerCreate": "^\\$JS\\.API\\.CONSUMER\\.CREATE\\.STATE_[A-Z0-9_]+\\.[a-z0-9]+(-[a-z0-9]+)*__state_[a-z0-9]+(_[a-z0-9]+)+_v[1-9][0-9]{0,3}(__[a-z0-9]+(_[a-z0-9]+)*)?\\.state\\.[a-z0-9]+(-[a-z0-9]+)*\\.[a-z0-9]+(-[a-z0-9]+)*\\.v[1-9][0-9]{0,3}\\.([a-z0-9]+(-[a-z0-9]+)*|\\*)\\.\\*$",
+      "dlqPublish": "^dlq\\.state\\.[a-z0-9]+(-[a-z0-9]+)*\\.[a-z0-9]+(-[a-z0-9]+)*\\.v[1-9][0-9]{0,3}$",
       "dlqReaderCreate": "^\\$JS\\.API\\.CONSUMER\\.CREATE\\.DLQ_[A-Z0-9_]+\\.[a-z0-9]+(-[a-z0-9]+)*__dlq_state_[a-z0-9]+(_[a-z0-9]+)*\\.dlq\\.state\\.[a-z0-9]+(-[a-z0-9]+)*\\.>$",
       "devOnlyPatterns": [
         "consumerCreate",
@@ -1850,7 +1887,7 @@
           "conflict",
           "invalid_schema"
         ],
-        "contractLabelPattern": "^[a-z0-9]+(-[a-z0-9]+)*\\.[a-z0-9]+(-[a-z0-9]+)*\\.v[1-9][0-9]*$",
+        "contractLabelPattern": "^[a-z0-9]+(-[a-z0-9]+)*\\.[a-z0-9]+(-[a-z0-9]+)*\\.v[1-9][0-9]{0,3}$",
         "countsOperations": [
           "put",
           "delete"
@@ -1909,7 +1946,7 @@
     "subject": {
       "format": "rpc.<dominio>.<agregado>.v<major>.<operacion>",
       "tokens": 5,
-      "pattern": "^rpc\\.[a-z0-9]+(-[a-z0-9]+)*\\.[a-z0-9]+(-[a-z0-9]+)*\\.v[1-9][0-9]*\\.[a-z0-9]+(-[a-z0-9]+)*$",
+      "pattern": "^rpc\\.[a-z0-9]+(-[a-z0-9]+)*\\.[a-z0-9]+(-[a-z0-9]+)*\\.v[1-9][0-9]{0,3}\\.[a-z0-9]+(-[a-z0-9]+)*$",
       "valid": [
         "rpc.clientes.cliente.v1.obtener",
         "rpc.clientes.cliente.v1.calcular-descuento",
@@ -1933,7 +1970,7 @@
     "operation": {
       "format": "<dominio>.<agregado>.v<major>.<operacion>",
       "tokens": 4,
-      "pattern": "^[a-z0-9]+(-[a-z0-9]+)*\\.[a-z0-9]+(-[a-z0-9]+)*\\.v[1-9][0-9]*\\.[a-z0-9]+(-[a-z0-9]+)*$",
+      "pattern": "^[a-z0-9]+(-[a-z0-9]+)*\\.[a-z0-9]+(-[a-z0-9]+)*\\.v[1-9][0-9]{0,3}\\.[a-z0-9]+(-[a-z0-9]+)*$",
       "equalsEventSubjectPattern": true,
       "valid": [
         "clientes.cliente.v1.obtener",
@@ -1997,12 +2034,12 @@
     "type": {
       "request": {
         "format": "com.flux.rpc.<dominio>.<agregado>.<operacion>.request.v<major>",
-        "pattern": "^com\\.flux\\.rpc\\.[a-z0-9]+(-[a-z0-9]+)*\\.[a-z0-9]+(-[a-z0-9]+)*\\.[a-z0-9]+(-[a-z0-9]+)*\\.request\\.v[1-9][0-9]*$",
+        "pattern": "^com\\.flux\\.rpc\\.[a-z0-9]+(-[a-z0-9]+)*\\.[a-z0-9]+(-[a-z0-9]+)*\\.[a-z0-9]+(-[a-z0-9]+)*\\.request\\.v[1-9][0-9]{0,3}$",
         "example": "com.flux.rpc.clientes.cliente.calcular-descuento.request.v1"
       },
       "reply": {
         "format": "com.flux.rpc.<dominio>.<agregado>.<operacion>.reply.v<major>",
-        "pattern": "^com\\.flux\\.rpc\\.[a-z0-9]+(-[a-z0-9]+)*\\.[a-z0-9]+(-[a-z0-9]+)*\\.[a-z0-9]+(-[a-z0-9]+)*\\.reply\\.v[1-9][0-9]*$",
+        "pattern": "^com\\.flux\\.rpc\\.[a-z0-9]+(-[a-z0-9]+)*\\.[a-z0-9]+(-[a-z0-9]+)*\\.[a-z0-9]+(-[a-z0-9]+)*\\.reply\\.v[1-9][0-9]{0,3}$",
         "example": "com.flux.rpc.clientes.cliente.calcular-descuento.reply.v1"
       },
       "error": {
@@ -2058,7 +2095,13 @@
       "errorFallbackWhenRequestUnreadable": {
         "correlationid": "own-id",
         "tenantid": "system",
-        "causationid": "request.id-only-if-a-valid-string"
+        "causationid": "request.id-only-if-a-valid-string",
+        "validIdMaxCodePoints": 128,
+        "validIdAllowsControlCharacters": false,
+        "callerExemptedFromCheck4": {
+          "only": "error-with-tenantid-system-and-correlationid-equal-to-own-id",
+          "checksStillApplied": ["causationid-is-request-id", "error-data-fits-error-schema"]
+        }
       },
       "newRootAttributes": [],
       "attributeOrder": "declaration-order-with-data-last",
@@ -2083,6 +2126,13 @@
       "codePattern": "errors.codePattern",
       "dataclassification": "internal",
       "messageNeverContainsDataValues": true,
+      "messageLength": {
+        "unit": "unicode-code-points",
+        "min": 1,
+        "max": 1000,
+        "emptyOrWhitespaceReplacedBy": "el servicio rechazó la petición",
+        "truncatedTo": "999-code-points-plus-ellipsis"
+      },
       "retryAfterMsOnlyWhen": "retryable",
       "dataschema": "https://schemas.internal/system/rpc/error/1.0.0.json",
       "schemaPath": "schemas/system/rpc/error/1.0.0.json",
@@ -2219,7 +2269,7 @@
     },
     "acl": {
       "$comment": "Lo que la peticion/respuesta necesita, MEDIDO contra un broker (A-66, A-68, A-71, A-73) y que gen-acl.mjs PRODUCE (specification/06-security.md §3.9; ejecutado contra un nats-server real por scripts/verify-acl.mjs y por los casos S21 a S28 de conformance/security.mjs). Extiende security.acl: NO la sustituye. El llamante publica SOLO en el subject EXACTO de cada operacion concedida y se suscribe a su inbox privado; el dueno se suscribe a `rpc.<dominio>.>` y NO necesita ningun permiso de publicacion sobre inboxes: lo da allow_responses. Sin el inbox privado de la fase 1, cualquiera leeria las respuestas ajenas (A-71).",
-      "callerPublish": "^rpc\\.[a-z0-9]+(-[a-z0-9]+)*\\.[a-z0-9]+(-[a-z0-9]+)*\\.v[1-9][0-9]*\\.[a-z0-9]+(-[a-z0-9]+)*$",
+      "callerPublish": "^rpc\\.[a-z0-9]+(-[a-z0-9]+)*\\.[a-z0-9]+(-[a-z0-9]+)*\\.v[1-9][0-9]{0,3}\\.[a-z0-9]+(-[a-z0-9]+)*$",
       "callerSubscribe": "security.acl.inbox.permissionPattern",
       "callerNeverPublish": [
         "rpc.>",
@@ -2384,7 +2434,7 @@
           "server": "lo que tarda el handler, desde que se recibe la peticion hasta que sale la respuesta"
         }
       },
-      "operationLabelPattern": "^[a-z0-9]+(-[a-z0-9]+)*\\.[a-z0-9]+(-[a-z0-9]+)*\\.v[1-9][0-9]*\\.[a-z0-9]+(-[a-z0-9]+)*$",
+      "operationLabelPattern": "^[a-z0-9]+(-[a-z0-9]+)*\\.[a-z0-9]+(-[a-z0-9]+)*\\.v[1-9][0-9]{0,3}\\.[a-z0-9]+(-[a-z0-9]+)*$",
       "forbiddenLabels": [
         "tenantid",
         "tenant",

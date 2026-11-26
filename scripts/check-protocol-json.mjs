@@ -813,6 +813,41 @@ const CODIGOS_RPC = {
 
 /** ¿Hay algún subject concreto que casen a la vez dos patrones de NATS? `*` casa un token; `>`, uno o más al final.
  *  Es el algoritmo de `flux doctor` (11-request-reply.md §8): el runner de conformance lo mide contra un broker. */
+/**
+ * Las decisiones de los AJUSTES (conformance/harness/vectors.json → `ajustesVectors`): lo que la spec fijó tras medir las
+ * divergencias de Node y Rust fuera de los vectores. Cada afirmación de protocol.json se comprueba aquí contra lo que dicen la
+ * prosa y los vectores, y cada una tiene su mutación abajo.
+ */
+function fallosDeAjustes(doc) {
+  const f = [];
+  const eq = (a, b) => JSON.stringify(a) === JSON.stringify(b);
+  const ce = doc.cloudevents ?? {};
+  // 04-errors.md §3: `dlqerror` mide 1024 BYTES UTF-8, sin partir un carácter.
+  const dq = ce.optionalExtensions?.dlqerror ?? ce.optionalExtensions?.dlqerror;
+  if (dq?.maxBytes !== 1024 || dq?.truncation !== "utf8-bytes-never-split-a-character") f.push("cloudevents.optionalExtensions.dlqerror: 1024 BYTES UTF-8 como máximo, sin partir un carácter (no unidades UTF-16 ni puntos de código)");
+  // 01-envelope.md §2.2: el `time` que da quien llama se normaliza o se rechaza.
+  const bi = ce.requiredAttributes?.time?.builderInput ?? {};
+  if (bi.accepts !== "rfc3339-date-time" || bi.normalizesTo !== "exactly-3-decimals-and-Z-in-UTC" || bi.fractionBeyondMillis !== "truncated") f.push("cloudevents.requiredAttributes.time.builderInput: un constructor admite un date-time de RFC 3339, lo normaliza a 3 decimales y Z en UTC y TRUNCA los decimales de más");
+  if (bi.rejectsLeapSecond !== true || !eq(bi.yearRangeUtc, [0, 9999])) f.push("cloudevents.requiredAttributes.time.builderInput: no admite un segundo 60 ni un año en UTC fuera de 0000–9999");
+  if (bi.invalidCode !== "WRONG_ATTRIBUTE_TYPE" || bi.invalidCodeInRpc !== "INVALID_RPC_CALL") f.push("cloudevents.requiredAttributes.time.builderInput: un time inválido es WRONG_ATTRIBUTE_TYPE (INVALID_RPC_CALL en petición/respuesta)");
+  // 01-envelope.md §4.1: la forma canónica de `data`.
+  const cf = doc.data?.canonicalForm ?? {};
+  if (cf.reference !== "ecmascript-json-stringify-with-literal-utf8" || cf.insignificantWhitespace !== false || cf.numbers !== "untouched") f.push("data.canonicalForm: la de JSON.stringify con UTF-8 literal, sin espacios y con los números SIN tocar (01-envelope.md §2.5)");
+  if (cf.keyOrder !== "as-given-repeated-key-keeps-first-position-and-last-value") f.push("data.canonicalForm.keyOrder: las claves en el orden en que se dan; una repetida conserva la posición de la primera y el valor de la última");
+  const NO_PORTABLES = ["integer-outside-2^53-1", "float-or-exponent-notation", "array-index-like-key", "lone-utf16-surrogate", "nesting-over-128", "number-outside-double-range"];
+  if (!eq(cf.notPortable, NO_PORTABLES)) f.push(`data.canonicalForm.notPortable debe listar lo que no tiene forma común entre lenguajes: ${JSON.stringify(NO_PORTABLES)}`);
+  // 11-request-reply.md §3.3: `message` de un error, en puntos de código.
+  const ml = doc.rpc?.error?.messageLength ?? {};
+  if (ml.unit !== "unicode-code-points" || ml.min !== 1 || ml.max !== 1000) f.push("rpc.error.messageLength: de 1 a 1000 caracteres UNICODE (puntos de código, como maxLength de JSON Schema), no unidades UTF-16");
+  // 11-request-reply.md §5.2: el `id` que cita el error de una petición ilegible.
+  const un = doc.rpc?.envelope?.errorFallbackWhenRequestUnreadable ?? {};
+  if (un.validIdMaxCodePoints !== 128 || un.validIdAllowsControlCharacters !== false) f.push("rpc.envelope.errorFallbackWhenRequestUnreadable: el `id` que cita el error es una cadena de 128 caracteres como máximo y sin caracteres de control");
+  // 11-request-reply.md §4.3.4: la excepción es ESTRECHA.
+  const ex = un.callerExemptedFromCheck4 ?? {};
+  if (ex.only !== "error-with-tenantid-system-and-correlationid-equal-to-own-id" || !eq(ex.checksStillApplied, ["causationid-is-request-id", "error-data-fits-error-schema"])) f.push("rpc.envelope.errorFallbackWhenRequestUnreadable.callerExemptedFromCheck4: solo un error con tenantid system y correlationid igual a su propio id; las comprobaciones 3 y 5 siguen");
+  return f;
+}
+
 function solapa(a, b) {
   const x = a.split("."), y = b.split(".");
   for (let i = 0; ; i++) {
@@ -1144,6 +1179,52 @@ for (const [path, deben, noDeben] of CASES) {
   }
 }
 
+// ── La versión mayor son de 1 a 4 dígitos (02-naming.md §1): `v1`…`v9999` ──────────────────────────────────────────────
+// Sin tope, Node escribía `v100000000000000000000` (pasaba por `Number`) y Rust rechazaba lo que no cabía en un `u32`: el mismo
+// subject, dos veredictos. El tope vive en CADA patrón donde aparece la versión (el subject, el `type`, el estado, la operación, la
+// ACL…), así que se comprueba en todos —no solo en el de los eventos— con una muestra por cada uno que se construye con la versión
+// que se pide, y el patrón que la acepte sin tope tiene que fallar aquí.
+{
+  const mayor = p.naming?.subject?.majorVersion;
+  if (mayor?.minDigits !== 1 || mayor?.maxDigits !== 4 || mayor?.max !== 9999) {
+    fallos.push("naming.subject.majorVersion debe ser { minDigits: 1, maxDigits: 4, max: 9999 }: la versión mayor es `v1`…`v9999` (02-naming.md §1)");
+  }
+  const MUESTRAS = {
+    "naming.subject.pattern": (v) => `pedidos.pedido.${v}.creado`,
+    "naming.type.pattern": (v) => `com.flux.pedidos.pedido.creado.${v}`,
+    "naming.durableConsumer.pattern": () => null, // no lleva la versión como token propio
+    "state.subject.pattern": (v) => `state.clientes.cliente.${v}.acme.cli-1`,
+    "state.contract.pattern": (v) => `clientes.cliente.${v}`,
+    "state.dlq.subject.pattern": (v) => `dlq.state.clientes.cliente.${v}`,
+    "state.type.value.pattern": (v) => `com.flux.state.clientes.cliente.${v}`,
+    "state.type.tombstone.pattern": (v) => `com.flux.state.clientes.cliente.deleted.${v}`,
+    "rpc.subject.pattern": (v) => `rpc.clientes.cliente.${v}.obtener`,
+    "rpc.operation.pattern": (v) => `clientes.cliente.${v}.obtener`,
+    "rpc.type.request.pattern": (v) => `com.flux.rpc.clientes.cliente.obtener.request.${v}`,
+    "rpc.type.reply.pattern": (v) => `com.flux.rpc.clientes.cliente.obtener.reply.${v}`,
+    "rpc.acl.callerPublish": (v) => `rpc.clientes.cliente.${v}.obtener`,
+  };
+  for (const [ruta, muestra] of Object.entries(MUESTRAS)) {
+    if (muestra("v1") === null) continue;
+    const src = get(ruta);
+    if (typeof src !== "string") { fallos.push(`${ruta}: no existe o no es una cadena (versión mayor)`); continue; }
+    const re = new RegExp(src);
+    for (const v of ["v1", "v9", "v10", "v9999"]) {
+      if (!re.test(muestra(v))) fallos.push(`${ruta}: DEBERÍA aceptar la versión mayor ${v} (${JSON.stringify(muestra(v))}): son de 1 a 4 dígitos`);
+    }
+    for (const v of ["v10000", "v99999", "v4294967296", "v99999999999999999999", "v0", "v01", "v"]) {
+      if (re.test(muestra(v))) fallos.push(`${ruta}: DEBERÍA rechazar la versión mayor ${v} (${JSON.stringify(muestra(v))}): el tope es 9999 y no hay ceros a la izquierda`);
+    }
+    // Autocomprobación: el mismo patrón SIN tope tiene que fallar esta comprobación (si no, no detectaría nada).
+    if (src.includes("[1-9][0-9]{0,3}")) {
+      const sinTope = new RegExp(src.replace("[1-9][0-9]{0,3}", "[1-9][0-9]*"));
+      if (!sinTope.test(muestra("v10000"))) fallos.push(`autocomprobación: ${ruta} sin tope de versión mayor NO aceptaría v10000: la comprobación de arriba no detectaría la mutación`);
+    } else {
+      fallos.push(`${ruta}: no lleva el tope de la versión mayor (\`[1-9][0-9]{0,3}\`)`);
+    }
+  }
+}
+
 // Coherencias numéricas que la prosa afirma y que se pueden comprobar.
 const c = p.consumer;
 if (c.ackWaitSeconds * 1000 !== c.backoffMs[0]) {
@@ -1425,7 +1506,7 @@ let mutacionesAcl = 0;
     "una excepción que no existe": (d) => { d.security.acl.neverGrantedExceptions.push("state.acl.noExiste"); },
     "la excepción del dueño admite DIRECT.GET.>": (d) => { d.state.acl.ownerDirectGet = "^\\$JS\\.API\\.DIRECT\\.GET\\.>$"; },
     "la excepción del dueño admite la forma de cuerpo": (d) => { d.state.acl.ownerDirectGet = "^\\$JS\\.API\\.DIRECT\\.GET\\.STATE_[A-Z0-9_]+(\\..*)?$"; },
-    "la excepción del observador sin el tenant fijado": (d) => { d.state.acl.observerDirectGet = "^\\$JS\\.API\\.DIRECT\\.GET\\.STATE_[A-Z0-9_]+\\.state\\.[a-z0-9]+(-[a-z0-9]+)*\\.[a-z0-9]+(-[a-z0-9]+)*\\.v[1-9][0-9]*\\.>$"; },
+    "la excepción del observador sin el tenant fijado": (d) => { d.state.acl.observerDirectGet = "^\\$JS\\.API\\.DIRECT\\.GET\\.STATE_[A-Z0-9_]+\\.state\\.[a-z0-9]+(-[a-z0-9]+)*\\.[a-z0-9]+(-[a-z0-9]+)*\\.v[1-9][0-9]{0,3}\\.>$"; },
     "neverGrantedPattern ya no caza DIRECT.GET": (d) => { d.security.acl.neverGrantedPattern = d.security.acl.neverGrantedPattern.replace("|\\$JS\\.API\\.DIRECT\\.GET(\\..*)?", ""); },
     "streamInfo admite STATE_": (d) => { d.security.acl.permissionPatterns.streamInfo = "^\\$JS\\.API\\.STREAM\\.INFO\\.(EVT|DLQ|STATE)_[A-Z0-9_]+$"; },
     "ownerPublish admite state.>": (d) => { d.state.acl.ownerPublish = "^state\\.([a-z0-9]+(-[a-z0-9]+)*\\.)?>$"; },
@@ -1504,10 +1585,10 @@ let mutacionesRpc = 0;
     "un stream de rpc": (d) => { d.rpc.transport.stream = "RPC_CLIENTES"; },
     "una DLQ de rpc": (d) => { d.rpc.transport.dlq = "dlq.rpc"; },
     "el subject de rpc con 4 tokens": (d) => { d.rpc.subject.format = "rpc.<dominio>.<agregado>.<operacion>"; d.rpc.subject.tokens = 4; },
-    "el subject de rpc admite comodines": (d) => { d.rpc.subject.pattern = "^rpc\\.[a-z0-9*>-]+\\.[a-z0-9-]+\\.v[1-9][0-9]*\\.[a-z0-9-]+$"; },
+    "el subject de rpc admite comodines": (d) => { d.rpc.subject.pattern = "^rpc\\.[a-z0-9*>-]+\\.[a-z0-9-]+\\.v[1-9][0-9]{0,3}\\.[a-z0-9-]+$"; },
     "el subject de rpc admite mayúsculas": (d) => { d.rpc.subject.pattern = d.rpc.subject.pattern.replaceAll("a-z", "A-Za-z"); },
     "la operación distinta de un subject de evento": (d) => { d.rpc.operation.pattern = "^[a-z]+\\.[a-z]+\\.v[1-9]\\.[a-z]+$"; },
-    "la operación admite el prefijo rpc.": (d) => { d.rpc.operation.pattern = "^(rpc\\.)?[a-z0-9]+(-[a-z0-9]+)*\\.[a-z0-9]+(-[a-z0-9]+)*\\.v[1-9][0-9]*\\.[a-z0-9]+(-[a-z0-9]+)*$"; },
+    "la operación admite el prefijo rpc.": (d) => { d.rpc.operation.pattern = "^(rpc\\.)?[a-z0-9]+(-[a-z0-9]+)*\\.[a-z0-9]+(-[a-z0-9]+)*\\.v[1-9][0-9]{0,3}\\.[a-z0-9]+(-[a-z0-9]+)*$"; },
     "el nombre de operación admite guiones bajos": (d) => { d.rpc.operationName.pattern = "^[a-z0-9]+([-_][a-z0-9]+)*$"; },
     "suscripción al comodín rpc.<dominio>.>": (d) => { d.rpc.queueGroup.subscription = "domain-wildcard"; d.rpc.queueGroup.wildcardSubscriptionForbidden = false; },
     "el grupo de cola no es el servicio": (d) => { d.rpc.queueGroup.name = "random"; },
@@ -1663,10 +1744,45 @@ let mutacionesAclRpc = 0;
   mutacionesAclRpc = Object.keys(delDocumento).length + Object.keys(delGenerador).length;
 }
 
+// ── Los ajustes: el documento real y sus mutaciones ────────────────────────────────────────────────────────────────────────
+let mutacionesAjustes = 0;
+{
+  for (const f of fallosDeAjustes(p)) fallos.push(f);
+  const delDocumento = {
+    "dlqerror por unidades UTF-16": (d) => { d.cloudevents.optionalExtensions.dlqerror.truncation = "utf16-units"; },
+    "dlqerror sin tope en bytes": (d) => { d.cloudevents.optionalExtensions.dlqerror.maxBytes = 1000; },
+    "el time de un constructor se copia": (d) => { d.cloudevents.requiredAttributes.time.builderInput.accepts = "anything"; },
+    "los decimales de más se redondean": (d) => { d.cloudevents.requiredAttributes.time.builderInput.fractionBeyondMillis = "rounded"; },
+    "se admite un segundo 60": (d) => { d.cloudevents.requiredAttributes.time.builderInput.rejectsLeapSecond = false; },
+    "el año en UTC sin acotar": (d) => { d.cloudevents.requiredAttributes.time.builderInput.yearRangeUtc = [-1, 10000]; },
+    "un time inválido sin código": (d) => { d.cloudevents.requiredAttributes.time.builderInput.invalidCode = "ERROR"; },
+    "data con espacios": (d) => { d.data.canonicalForm.insignificantWhitespace = true; },
+    "los números de data se reescriben": (d) => { d.data.canonicalForm.numbers = "rewritten"; },
+    "una clave repetida conserva las dos": (d) => { d.data.canonicalForm.keyOrder = "as-given-repeated-key-kept"; },
+    "se quita un número no portable": (d) => { d.data.canonicalForm.notPortable.pop(); },
+    "message en unidades UTF-16": (d) => { d.rpc.error.messageLength.unit = "utf16-code-units"; },
+    "message de 1001": (d) => { d.rpc.error.messageLength.max = 1001; },
+    "el id citado sin tope": (d) => { d.rpc.envelope.errorFallbackWhenRequestUnreadable.validIdMaxCodePoints = 256; },
+    "el id citado con controles": (d) => { d.rpc.envelope.errorFallbackWhenRequestUnreadable.validIdAllowsControlCharacters = true; },
+    "la excepción de la comprobación 4 ancha": (d) => { d.rpc.envelope.errorFallbackWhenRequestUnreadable.callerExemptedFromCheck4.only = "any-error-with-tenantid-system"; },
+    "la excepción sin la comprobación 3": (d) => { d.rpc.envelope.errorFallbackWhenRequestUnreadable.callerExemptedFromCheck4.checksStillApplied = ["error-data-fits-error-schema"]; },
+  };
+  const base = fallosDeAjustes(p);
+  if (base.length) fallos.push(`autocomprobación: fallosDeAjustes ya falla sobre el protocol.json real (${base.length}); no se puede autocomprobar`);
+  else {
+    for (const [nombre, estropea] of Object.entries(delDocumento)) {
+      const copia = structuredClone(p);
+      estropea(copia);
+      if (!fallosDeAjustes(copia).length) fallos.push(`autocomprobación: la mutación «${nombre}» NO la detecta fallosDeAjustes`);
+    }
+    mutacionesAjustes = Object.keys(delDocumento).length;
+  }
+}
+
 if (fallos.length) {
   console.error(`\n✗ ${fallos.length} problema(s) en protocol.json\n`);
   for (const f of fallos) console.error(`  ✗ ${f}`);
   process.exit(1);
 }
 
-console.log(`✓ protocol.json coherente (${CASES.length} patrones + invariantes numéricas, de códigos, de capacidades y de estado · autocomprobación de estado: ${mutacionesEstado} mutaciones del documento y ${mutacionesAcl} de la ACL y su generador · de rpc: ${mutacionesRpc} mutaciones del documento y ${mutacionesAclRpc} de su ACL y su generador, todas detectadas)`);
+console.log(`✓ protocol.json coherente (${CASES.length} patrones + invariantes numéricas, de códigos, de capacidades y de estado · autocomprobación de estado: ${mutacionesEstado} mutaciones del documento y ${mutacionesAcl} de la ACL y su generador · de rpc: ${mutacionesRpc} mutaciones del documento y ${mutacionesAclRpc} de su ACL y su generador · de los ajustes: ${mutacionesAjustes} mutaciones, todas detectadas)`);

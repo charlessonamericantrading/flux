@@ -2006,6 +2006,97 @@ async fn algoritmo_una_respuesta_que_no_es_de_esta_peticion_es_rpc_invalid_reply
     }
 }
 
+/// EXCEPCIÓN ÚNICA de la comprobación 4 (§4.3): el error de una petición que quien responde no pudo leer lleva
+/// `correlationid` propio y `tenantid: system`. Contra un broker real y un responder en bruto: quien llama ve el
+/// código del sobre (`MALFORMED_JSON`) como `PermanentError`, NO `RPC_INVALID_REPLY`; y la excepción es estrecha.
+#[tokio::test]
+async fn algoritmo_el_error_de_una_peticion_ilegible_llega_con_el_codigo_del_sobre() {
+    let bin = broker_bin!();
+    let broker = Broker::con_acl(&bin);
+    let llama = bus(&broker.url(), "llama").await;
+    // Lo que contesta un SDK a una petición que no pudo leer (§5.2).
+    let ilegible = |peticion: &flux::Event| {
+        let mut e = respuesta_buena(peticion);
+        e.event_type = "com.flux.rpc.error.v1".into();
+        e.dataschema = "https://schemas.internal/system/rpc/error/1.0.0.json".into();
+        e.dataclassification = flux::DataClassification::Internal;
+        e.correlationid = e.id.clone();
+        e.tenantid = "system".into();
+        e.aggregate_id = None;
+        e.partitionkey = None;
+        e.data = serde_json::from_str(
+            r#"{"class":"permanent","code":"MALFORMED_JSON","message":"la petición no es un CloudEvent válido de flux"}"#,
+        )
+        .unwrap();
+        e
+    };
+    // La forma exacta: pasa, con el código del sobre y como PermanentError.
+    let tarea = responder_en_bruto(&broker.url(), OBTENER, move |p| bytes_de(&ilegible(p))).await;
+    let e = llama
+        .request_with(
+            OBTENER,
+            &json!({ "clienteId": "cli-1" }),
+            RequestOptions::default().with_timeout_ms(3_000),
+        )
+        .await
+        .unwrap_err();
+    tarea.abort();
+    assert_eq!(
+        (e.class(), e.code()),
+        (Some(ErrorClass::Permanent), Some("MALFORMED_JSON")),
+        "{e}"
+    );
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    // CONTROL: la excepción es estrecha. Sin el `causationid` de la petición, con otro `correlationid` o con un
+    // tenant ajeno, sigue siendo RPC_INVALID_REPLY.
+    type Rompe = Box<dyn Fn(&mut flux::Event) + Send + Sync>;
+    let estrechas: Vec<(&str, Rompe)> = vec![
+        (
+            "causationid de otra petición",
+            Box::new(|e| e.causationid = Some("otra".into())),
+        ),
+        ("sin causationid", Box::new(|e| e.causationid = None)),
+        (
+            "correlationid que no es el propio",
+            Box::new(|e| e.correlationid = "otro-flujo".into()),
+        ),
+        (
+            "tenant ajeno (ni `system` ni el de la petición)",
+            Box::new(|e| e.tenantid = "globex".into()),
+        ),
+    ];
+    for (nombre, rompe) in estrechas {
+        let rompe = Arc::new(rompe);
+        let tarea = responder_en_bruto(&broker.url(), OBTENER, move |p| {
+            let mut e = respuesta_buena(p);
+            e.event_type = "com.flux.rpc.error.v1".into();
+            e.dataschema = "https://schemas.internal/system/rpc/error/1.0.0.json".into();
+            e.dataclassification = flux::DataClassification::Internal;
+            e.correlationid = e.id.clone();
+            e.tenantid = "system".into();
+            e.data = serde_json::from_str(
+                r#"{"class":"permanent","code":"MALFORMED_JSON","message":"m"}"#,
+            )
+            .unwrap();
+            rompe(&mut e);
+            bytes_de(&e)
+        })
+        .await;
+        let e = llama
+            .request_with(
+                OBTENER,
+                &json!({ "clienteId": "cli-1" }),
+                RequestOptions::default().with_timeout_ms(3_000),
+            )
+            .await
+            .unwrap_err();
+        tarea.abort();
+        assert_eq!(code(&e), "RPC_INVALID_REPLY", "{nombre}: {e}");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
 /// Un error con `retryAfterMs` en 5000.0 (lo escribe un serializador ajeno) sigue siendo un entero.
 #[tokio::test]
 async fn algoritmo_un_error_ajeno_bien_formado_se_traduce_a_su_clase() {

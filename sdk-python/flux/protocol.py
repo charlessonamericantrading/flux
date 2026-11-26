@@ -107,7 +107,7 @@ def seconds(ms: float) -> float:
 
 #: `<dominio>.<agregado>.v<major>.<evento>` — 02-naming.md §1
 SUBJECT_PATTERN: Final = re.compile(
-    r"^[a-z0-9]+(-[a-z0-9]+)*\.[a-z0-9]+(-[a-z0-9]+)*\.v[1-9][0-9]*\.[a-z0-9]+(-[a-z0-9]+)*$"
+    r"^[a-z0-9]+(-[a-z0-9]+)*\.[a-z0-9]+(-[a-z0-9]+)*\.v[1-9][0-9]{0,3}\.[a-z0-9]+(-[a-z0-9]+)*$"
 )
 
 
