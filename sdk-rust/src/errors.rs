@@ -14,6 +14,8 @@ use std::time::Duration;
 
 use thiserror::Error;
 
+use crate::protocol::RESERVED_DOMAINS;
+
 /// Error de aplicación devuelto por un handler.
 ///
 /// Es el `Box<dyn Error>` idiomático y no un tipo propio a propósito: el handler debe
@@ -267,6 +269,32 @@ pub const INVALID_CREDENTIALS_CODE: &str = "INVALID_CREDENTIALS";
 /// socket — 04-errors.md §5.3.
 pub const INVALID_TLS_OPTIONS_CODE: &str = "INVALID_TLS_OPTIONS";
 
+// ─── Los seis códigos de la capacidad `state` — 04-errors.md §6 ──────────────
+
+/// Código estable: el tenant de un estado no sirve, o no se pudo resolver ninguno —
+/// 04-errors.md §6. **PERMANENT.**
+pub const INVALID_TENANT_FOR_STATE_CODE: &str = "INVALID_TENANT_FOR_STATE";
+
+/// Código estable: la clave de un estado no cumple `^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$` —
+/// 04-errors.md §6. **PERMANENT.**
+pub const INVALID_STATE_KEY_CODE: &str = "INVALID_STATE_KEY";
+
+/// Código estable: `data` no lleva un `aggregateVersion` entero ≥ 1 y ≤ 2^53 − 1 —
+/// 04-errors.md §6. **PERMANENT**, y también al consumir.
+pub const MISSING_AGGREGATE_VERSION_CODE: &str = "MISSING_AGGREGATE_VERSION";
+
+/// Código estable: el sobre de una entrada de estado no coincide con el subject de NATS en el
+/// que llegó — 04-errors.md §6. **POISON**: el mensaje es legible pero miente sobre su identidad.
+pub const STATE_SUBJECT_MISMATCH_CODE: &str = "STATE_SUBJECT_MISMATCH";
+
+/// Código estable: el chequeo de secuencia de `put`/`delete` agotó sus 3 intentos —
+/// 04-errors.md §6. **RETRYABLE**: el conflicto es del entorno, no de la llamada.
+pub const STATE_CONFLICT_CODE: &str = "STATE_CONFLICT";
+
+/// Código estable: un subject o un contrato usa un dominio reservado (`dlq`, `state`, `rpc`,
+/// `system`) — 04-errors.md §6. **PERMANENT.**
+pub const RESERVED_DOMAIN_CODE: &str = "RESERVED_DOMAIN";
+
 /// Por qué el broker rechazó la conexión inicial: el `reason` de
 /// [`FluxError::ConnectionRejected`]. Los mismos dos valores que `reason` en el SDK de Node.
 ///
@@ -459,6 +487,10 @@ pub enum FluxError {
         /// Su nombre (`EVT_PEDIDOS`, `facturacion-api__pedidos_pedido_v1_creado`).
         name: String,
         /// La denegación literal del broker (`Publish to "$JS.API.STREAM.CREATE.…"`).
+        ///
+        /// **Vacía** cuando el SDK no intentó crear el recurso —el estado replicado nunca crea
+        /// su stream—: el mensaje dice entonces que no contesta nadie, en vez de «el broker
+        /// denegó …».
         denied: String,
     },
 
@@ -531,6 +563,103 @@ pub enum FluxError {
     #[error("opciones TLS inválidas en connect(): {0}")]
     InvalidTlsOptions(String),
 
+    // ─── Estado replicado — 10-state.md, 04-errors.md §6 ─────────────────────────
+    //
+    // Los seis son variantes propias y no un `Permanent(Failure)` con `with_code(…)` por la misma
+    // razón que `NotProvisioned`: el código es el que agrupa el panel
+    // (`flux_events_dlq_total{code}`) y **la aplicación no puede sustituirlo**.
+    /// El tenant de un estado no sirve, o no se pudo resolver ninguno — 10-state.md §2.4.
+    ///
+    /// A diferencia de un evento, un estado **no** cae en `system` por defecto: aquí el tenant
+    /// es una dirección (va en el subject), y un tenant equivocado no es una etiqueta mal puesta
+    /// sino un dato guardado en otro sitio. Se resuelve de la opción de la llamada, del evento en
+    /// curso y del `tenant_id` de `connect()`; si no sale ninguno, es este error. Falla **antes**
+    /// de tocar la red.
+    ///
+    /// **PERMANENT.** El texto nunca incluye valores de `data`: acaba en logs.
+    #[error("{}", format_invalid_tenant(.tenant.as_deref(), .reason))]
+    InvalidTenantForState {
+        /// El tenant rechazado, o `None` si no se pudo resolver ninguno.
+        tenant: Option<String>,
+        /// Por qué no sirve.
+        reason: String,
+    },
+
+    /// La clave de un estado no cabe en un token de NATS — 10-state.md §2.3.
+    ///
+    /// El broker **no** valida la clave (A-41): acepta `*`, `>`, `a.b` —que son *dos* tokens, y la
+    /// entrada quedaría fuera del filtro de todos los observadores, sin error— y 2000 caracteres.
+    /// Por eso la valida el SDK, **antes** de tocar la red, y sin ninguna codificación automática:
+    /// dos escapes distintos serían dos claves distintas para el mismo agregado.
+    ///
+    /// **PERMANENT.**
+    #[error("{}", format_invalid_key(.key, .reason))]
+    InvalidStateKey {
+        /// La clave rechazada. Una clave es un identificador opaco, no PII, y puede citarse.
+        key: String,
+        /// Por qué se rechazó.
+        reason: String,
+    },
+
+    /// `data` no lleva un `aggregateVersion` válido — 10-state.md §3.4.
+    ///
+    /// El nombre cubre todo lo que no sea un entero ≥ 1 y ≤ 2^53 − 1, no solo la ausencia: `null`,
+    /// una cadena, un decimal (también `7.0`), `0`, un negativo o uno mayor. Se comprueba
+    /// **siempre**, con o sin validación L3: es una regla del protocolo, no del esquema.
+    ///
+    /// **PERMANENT**, y también al **consumir**: una entrada sin versión válida no se puede
+    /// aplicar de forma condicional. El texto **no** incluye el valor recibido.
+    #[error("{}", format_missing_version(.reason))]
+    MissingAggregateVersion {
+        /// Qué le pasa al campo, sin citar su valor.
+        reason: String,
+    },
+
+    /// El sobre de una entrada de estado no coincide con el subject de NATS en el que llegó —
+    /// 10-state.md §5.4.
+    ///
+    /// El mensaje es legible pero **miente sobre su identidad** (su tenant, su clave o su
+    /// `type`), y quien consume no puede saber cuál de los dos dice la verdad: un productor roto
+    /// u hostil. **POISON** (`term()` + DLQ de estado + alerta), y la entrada **no** se aplica.
+    #[error("{}", format_subject_mismatch(.attribute, .envelope, .subject))]
+    StateSubjectMismatch {
+        /// El atributo del sobre que discrepa: `tenantid`, `subject` o `type`.
+        attribute: String,
+        /// Lo que dice el sobre.
+        envelope: String,
+        /// Lo que dice el subject de NATS (el que decidió el broker).
+        subject: String,
+    },
+
+    /// El chequeo de secuencia agotó sus intentos — 10-state.md §3.2.
+    ///
+    /// Alguien escribió la misma clave entre la lectura y la publicación, las tres veces. Es un
+    /// error y **no** un tercer resultado de `put`: un conflicto no es ni `ok` ni `stale`, es que
+    /// no se sabe. **RETRYABLE**: repetir la llamada relee y suele resolverlo, o acaba en `stale`.
+    #[error("{}", format_state_conflict(.key, *.attempts))]
+    StateConflict {
+        /// La clave en disputa.
+        key: String,
+        /// Cuántas veces se intentó.
+        attempts: u32,
+    },
+
+    /// Un subject o un contrato usa un dominio reservado — 10-state.md §2.7.
+    ///
+    /// `dlq`, `state`, `rpc` y `system` son espacios de nombres del protocolo. Lo rechazan
+    /// `publish`, `subscribe`, `put`, `get`, `delete` y `watch`, **antes** de tocar la red.
+    /// En particular `publish()` no puede escribir en `state.`: el evento llegaría al stream de
+    /// estado **sin** el chequeo de secuencia y sobrescribiría sin condición (A-45).
+    ///
+    /// **PERMANENT.**
+    #[error("{}", format_reserved_domain(.domain, .subject))]
+    ReservedDomain {
+        /// El dominio reservado.
+        domain: String,
+        /// El subject o contrato que lo usaba.
+        subject: String,
+    },
+
     /// Fallo de transporte: conexión, publicación, creación de stream o de consumidor.
     ///
     /// Una conexión inicial rechazada por la credencial o por el TLS **no** es esto: es
@@ -543,6 +672,73 @@ pub enum FluxError {
         #[source]
         source: HandlerError,
     },
+}
+
+fn format_invalid_tenant(tenant: Option<&str>, reason: &str) -> String {
+    match tenant {
+        Some(t) => format!(
+            "el tenant {t:?} no sirve para un estado: {reason}. Debe cumplir \
+             ^[a-z0-9]+(-[a-z0-9]+)*$ con 64 caracteres como máximo (el tenant de un evento es \
+             cualquier cadena; el de un estado, no: va en el subject de NATS — 10-state.md §2.4). \
+             Pásalo en la opción `tenant_id` de la llamada o en `ConnectOptions::with_tenant_id`"
+        ),
+        None => format!(
+            "no se pudo resolver el tenant del estado: {reason}. En un estado NO hay tenant por \
+             defecto, ni `system` implícito: el tenant es una dirección y un tenant equivocado es \
+             un dato guardado en otro sitio (10-state.md §2.4). Pásalo en la opción `tenant_id` de \
+             la llamada o en `ConnectOptions::with_tenant_id`; quien quiera `system`, que lo diga"
+        ),
+    }
+}
+
+fn format_invalid_key(key: &str, reason: &str) -> String {
+    format!(
+        "clave de estado inválida {key:?}: {reason}. Debe cumplir \
+         ^[A-Za-z0-9][A-Za-z0-9_-]{{0,127}}$ —un único token de NATS: sin puntos, sin comodines, \
+         sin espacios, de 1 a 128 caracteres, sin `_` inicial— y NO se codifica sola: el broker no \
+         valida la clave y una clave con un punto son dos tokens, con lo que la entrada quedaría \
+         fuera del filtro de todos los observadores sin ningún error (10-state.md §2.3). Una clave \
+         es un identificador opaco (`cli-1`), nunca un email"
+    )
+}
+
+fn format_missing_version(reason: &str) -> String {
+    format!(
+        "`aggregateVersion` inválido en `data`: {reason}. Es obligatorio y debe ser un entero ≥ 1 \
+         y ≤ 2^53 − 1 (9007199254740991): lo pone el dueño del agregado —su contador monotónico, el \
+         mismo de sus eventos—, no el SDK. `7.5` y `7.0` no valen, ni una cadena (`\"7\"`) \
+         (10-state.md §3.4)"
+    )
+}
+
+fn format_subject_mismatch(attribute: &str, envelope: &str, subject: &str) -> String {
+    format!(
+        "la entrada de estado miente sobre su identidad: el atributo `{attribute}` del sobre vale \
+         {envelope:?} y el subject de NATS dice {subject:?}. La identidad de una entrada está en el \
+         subject (el tenant y la clave), y el sobre la repite; si discrepan uno de los dos miente y \
+         no se sabe cuál, así que NO se aplica: un productor roto u hostil (10-state.md §5.4)"
+    )
+}
+
+fn format_state_conflict(key: &str, attempts: u32) -> String {
+    format!(
+        "el chequeo de secuencia de la clave {key:?} agotó sus {attempts} intentos: otro escritor \
+         modificó la misma clave entre la lectura y la publicación las {attempts} veces. Es \
+         RETRYABLE: repetir la llamada relee la clave y suele resolverlo, o acaba en `stale` si el \
+         otro escribió una versión mayor. Si ocurre a menudo, hay más de un escritor compitiendo por \
+         la misma clave (10-state.md §3.2)"
+    )
+}
+
+fn format_reserved_domain(domain: &str, subject: &str) -> String {
+    format!(
+        "el dominio `{domain}` de {subject:?} está reservado: {} son espacios de nombres del \
+         protocolo y no pueden ser un dominio (un `EVT_{}` colisionaría con ellos en el broker, y \
+         un `publish()` a `state.…` llegaría al stream de estado sin el chequeo de secuencia — \
+         10-state.md §2.7). Elige otro nombre para el dominio",
+        RESERVED_DOMAINS.join(", "),
+        domain.to_uppercase()
+    )
 }
 
 fn format_mismatch(durable: &str, diffs: &[ConfigDifference]) -> String {
@@ -566,6 +762,19 @@ fn format_mismatch(durable: &str, diffs: &[ConfigDifference]) -> String {
 }
 
 fn format_not_provisioned(kind: ResourceKind, name: &str, denied: &str) -> String {
+    // Sin denegación: el recurso falta y el SDK **no intentó** crearlo. Es el caso del estado
+    // replicado, que ni consulta ni crea su stream (10-state.md §2.1): su señal es que nadie
+    // contesta (`no responders`) o que `CONSUMER.INFO` dice «stream not found» (A-32, A-48).
+    if denied.is_empty() {
+        return format!(
+            "el {kind} `{name}` no existe, o existe sin `allow_direct`: en los dos casos no \
+             contesta nadie (`no responders`) y se ven exactamente igual (A-32). El SDK de estado \
+             no crea ni consulta el stream de estado (10-state.md §2.1): aprovisiónalo con \
+             `flux provision` y audita su configuración (`max_msgs_per_subject: 1`, \
+             `allow_direct: true`, `max_age: 0`, `discard: old`) con `flux doctor`. No es un \
+             timeout."
+        );
+    }
     format!(
         "el {kind} `{name}` no existe y este servicio no tiene permiso para crearlo \
          (el broker denegó {denied}). En producción los streams y los consumidores se \
@@ -686,7 +895,6 @@ impl FluxError {
     #[must_use]
     pub fn class(&self) -> Option<ErrorClass> {
         match self {
-            Self::Retryable(_) => Some(ErrorClass::Retryable),
             // Las dos de esquema SÍ declaran clase, y comparten la de PERMANENT: el evento
             // es sintácticamente correcto —se parseó, no es POISON— pero incumple su
             // contrato, y reintentarlo seis veces dará seis veces lo mismo
@@ -706,8 +914,21 @@ impl FluxError {
             | Self::PermissionDenied { .. }
             | Self::ConnectionRejected { .. }
             | Self::InvalidCredentials(_)
-            | Self::InvalidTlsOptions(_) => Some(ErrorClass::Permanent),
-            Self::Poison(_) => Some(ErrorClass::Poison),
+            | Self::InvalidTlsOptions(_)
+            // Los cuatro de estado que se lanzan al LLAMAR: la llamada está mal y repetirla da
+            // el mismo error — 04-errors.md §6. Un `put` dentro de un handler que los provoque va
+            // a la DLQ en la primera entrega.
+            | Self::InvalidTenantForState { .. }
+            | Self::InvalidStateKey { .. }
+            | Self::MissingAggregateVersion { .. }
+            | Self::ReservedDomain { .. } => Some(ErrorClass::Permanent),
+            // POISON y no PERMANENT: el mensaje es legible pero miente sobre su identidad, y un
+            // productor que lo hace está roto o es hostil. Es lo que 04-errors.md §1.3 pide
+            // despertar a alguien por.
+            Self::Poison(_) | Self::StateSubjectMismatch { .. } => Some(ErrorClass::Poison),
+            // El conflicto es del entorno —otra instancia escribe la misma clave—, no de la
+            // llamada: un reintento relee y suele resolverlo.
+            Self::Retryable(_) | Self::StateConflict { .. } => Some(ErrorClass::Retryable),
             _ => None,
         }
     }
@@ -728,6 +949,13 @@ impl FluxError {
             Self::ConnectionRejected { .. } => return Some(CONNECTION_REJECTED_CODE),
             Self::InvalidCredentials(_) => return Some(INVALID_CREDENTIALS_CODE),
             Self::InvalidTlsOptions(_) => return Some(INVALID_TLS_OPTIONS_CODE),
+            // Los seis de estado: el código es el que agrupa el panel, no la aplicación.
+            Self::InvalidTenantForState { .. } => return Some(INVALID_TENANT_FOR_STATE_CODE),
+            Self::InvalidStateKey { .. } => return Some(INVALID_STATE_KEY_CODE),
+            Self::MissingAggregateVersion { .. } => return Some(MISSING_AGGREGATE_VERSION_CODE),
+            Self::StateSubjectMismatch { .. } => return Some(STATE_SUBJECT_MISMATCH_CODE),
+            Self::StateConflict { .. } => return Some(STATE_CONFLICT_CODE),
+            Self::ReservedDomain { .. } => return Some(RESERVED_DOMAIN_CODE),
             _ => {}
         }
         let f = self.failure()?;
