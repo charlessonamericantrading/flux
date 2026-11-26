@@ -2500,10 +2500,8 @@ impl State {
 
                 // La que lleva `pending == 0` cierra la foto, pero solo DESPUÉS de procesarla:
                 // `onSynced` promete que el handler ya terminó con todo lo que había al abrir.
-                let closes_the_snapshot = msg
-                    .info()
-                    .ok()
-                    .is_some_and(|i| synced_after_delivery(i.pending));
+                let closes_the_snapshot =
+                    msg.info().is_ok_and(|i| synced_after_delivery(i.pending));
 
                 // Un pánico FUERA del handler rompería el bucle y el consumidor dejaría de
                 // consumir en silencio — el mismo bug que `subscribe` evita.
@@ -4143,32 +4141,39 @@ mod tests {
     }
 
     impl StateIo for FakeStream {
-        async fn read(&self, subject: &str) -> Result<Current, FluxError> {
+        // Sin `async`: este fake no espera nada, y el `clippy` del CI (más nuevo que el local)
+        // rechaza un `async fn` sin `.await` en un impl del trait (`unused_async_trait_impl`).
+        fn read(&self, subject: &str) -> impl Future<Output = Result<Current, FluxError>> {
             let mut i = lock(&self.inner);
             i.reads += 1;
-            Ok(i.messages
+            std::future::ready(Ok(i
+                .messages
                 .get(subject)
-                .map_or(Current::Absent, |(seq, bytes)| current_of(*seq, bytes)))
+                .map_or(Current::Absent, |(seq, bytes)| current_of(*seq, bytes))))
         }
 
-        async fn publish(
+        fn publish(
             &self,
             subject: &str,
             id: &str,
             expected: u64,
             bytes: &[u8],
-        ) -> Result<Published, FluxError> {
-            let mut i = lock(&self.inner);
-            i.publishes.push((id.to_string(), expected, bytes.to_vec()));
-            let actual = i.messages.get(subject).map_or(0, |(seq, _)| *seq);
-            if expected != actual {
-                return Ok(Published::SequenceConflict);
-            }
-            i.seq += 1;
-            let seq = i.seq;
-            i.messages
-                .insert(subject.to_string(), (seq, bytes.to_vec()));
-            Ok(Published::Acked { seq })
+        ) -> impl Future<Output = Result<Published, FluxError>> {
+            // La lógica queda en un cierre para conservar el `return` temprano de antes.
+            let resultado = (|| {
+                let mut i = lock(&self.inner);
+                i.publishes.push((id.to_string(), expected, bytes.to_vec()));
+                let actual = i.messages.get(subject).map_or(0, |(seq, _)| *seq);
+                if expected != actual {
+                    return Ok(Published::SequenceConflict);
+                }
+                i.seq += 1;
+                let seq = i.seq;
+                i.messages
+                    .insert(subject.to_string(), (seq, bytes.to_vec()));
+                Ok(Published::Acked { seq })
+            })();
+            std::future::ready(resultado)
         }
     }
 
@@ -4386,19 +4391,19 @@ mod tests {
             calls: AtomicUsize,
         }
         impl StateIo for Scripted {
-            async fn read(&self, _: &str) -> Result<Current, FluxError> {
-                Ok(Current::Absent)
+            fn read(&self, _: &str) -> impl Future<Output = Result<Current, FluxError>> {
+                std::future::ready(Ok(Current::Absent))
             }
-            async fn publish(
+            fn publish(
                 &self,
                 _: &str,
                 _: &str,
                 _: u64,
                 _: &[u8],
-            ) -> Result<Published, FluxError> {
+            ) -> impl Future<Output = Result<Published, FluxError>> {
                 self.calls.fetch_add(1, Ordering::SeqCst);
                 let body = lock(&self.replies).remove(0);
-                parse_ack(body.as_bytes())
+                std::future::ready(parse_ack(body.as_bytes()))
             }
         }
         const UN_NODO: &str =
