@@ -260,6 +260,49 @@ jobs:
           FLUX_TEST_PORTS: '4650-4699'
         run: node conformance/security/mutantes.mjs --sdk
 
+  # banco de medida (`bench/`): SOLO la prueba de humo. Comprueba que el runner corre de punta a punta contra un nats-server real con la
+  # configuración segura (ACL generada, nkeys, flux provision, TLS en un punto) y que RESULTS.md se regenera con su ESTRUCTURA. No mira
+  # ningún valor: una cifra que sube o baja con el ruido de un runner compartido no es un fallo del banco, y los números que se publican
+  # son los de una corrida completa en una máquina en calma (bench/README.md). La autoprueba SÍ es una prueba de lógica: estropea el banco
+  # a propósito y exige que sus comprobaciones lo detecten.
+  bench-humo:
+    name: Banco de medida — prueba de humo (modo rápido) y autoprueba
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+          cache: false
+      - name: Compilar nats-server 2.14.5
+        run: |
+          GOBIN="$PWD/bin" go install github.com/nats-io/nats-server/v2@v2.14.5
+          echo "NATS_SERVER=$PWD/bin/nats-server" >> "$GITHUB_ENV"
+      - run: npm install --no-audit --no-fund
+        working-directory: conformance
+      - run: npm install --no-audit --no-fund
+        working-directory: cli
+      - run: npm install --no-audit --no-fund
+        working-directory: sdk-node
+      - run: npm run build
+        working-directory: sdk-node
+      # El RESULTS.md que está en el repositorio, el publicado, tiene la estructura esperada: nadie lo editó a mano hasta romperla.
+      - name: El RESULTS.md versionado tiene la estructura esperada
+        run: node bench/comprobar-resultados.mjs bench/RESULTS.md
+      - name: Prueba de humo — node bench/run.mjs --rapido
+        env:
+          FLUX_TEST_PORTS: '4700-4799'
+        run: node bench/run.mjs --rapido --salida bench/RESULTS.md
+      - name: RESULTS.md se regenera con la estructura esperada
+        run: node bench/comprobar-resultados.mjs bench/RESULTS.md
+      - name: La autoprueba — el banco estropeado a propósito DEBE ser detectado
+        env:
+          FLUX_TEST_PORTS: '4700-4799'
+        run: node bench/autoprueba.mjs
+
   protocol-json-valid:
     name: protocol.json coherente
     runs-on: ubuntu-latest

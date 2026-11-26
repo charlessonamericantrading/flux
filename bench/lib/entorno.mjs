@@ -10,7 +10,7 @@
 
 import { execFile, execFileSync, spawn } from "node:child_process";
 import { existsSync, readFileSync } from "node:fs";
-import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdtemp, rm, writeFile } from "node:fs/promises";
 import net from "node:net";
 import os from "node:os";
 import path from "node:path";
@@ -288,4 +288,3 @@ export async function crearBroker({ manifiesto, tls = false, nombre = "bench", p
 /** Una cadena `service` válida (`^[a-z0-9]+(-[a-z0-9]+)*$`) y ordenada para el servicio nº `i`. */
 export const nombreServicio = (prefijo, i) => `${prefijo}-${String(i).padStart(4, "0")}`;
 
-export { readFile, mkdir };

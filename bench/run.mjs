@@ -81,6 +81,9 @@ const SALIDA = path.resolve(opt("--salida") ?? (RAPIDO ? path.join(BENCH, "resul
 if (flag("--solo-informe")) {
   const { readFile } = await import("node:fs/promises");
   const datos = JSON.parse(await readFile(path.resolve(opt("--datos") ?? path.join(BENCH, "datos", "completo.json")), "utf8"));
+  // Las comprobaciones se RECALCULAN con el código actual a partir de los contadores guardados de cada repetición: si se corrige
+  // una comprobación mal escrita, el informe lo refleja sin volver a medir. (No toca ningún número medido.)
+  for (const p of datos.puntos) for (const r of p.reps) if (!r.error) r.comprobaciones = comprobar(p.escenario, r);
   await mkdir(path.dirname(SALIDA), { recursive: true });
   await writeFile(SALIDA, generarInforme(datos));
   console.log(`✓ ${path.relative(process.cwd(), SALIDA)} regenerado desde los datos (sin medir)`);

@@ -28,12 +28,13 @@ const A = { ...base, n: 5, cambiosPorMin: 60, periodoS: 1, ventanaS: 6 };
 const B = { ...base, n: 5, hechosPorMin: 120, ventanaS: 5 };
 const C = { ...base, concurrencia: 4, ventanaS: 2 };
 
-/** Cada caso: qué se estropea, qué debe fallar (regex sobre el nombre de la comprobación; `null` = nada: es un control). */
+/** Cada caso: qué se estropea, qué debe fallar (regex sobre el nombre de la comprobación, y opcionalmente sobre su detalle; `null` = nada: es un control). */
 const CASOS = [
   { nombre: "control A: sondeo con ETag sin sabotaje", esc: "A", correr: () => corridaA({ ...A, metodo: "etag" }), falla: null },
   { nombre: "A: sondeadores sin keep-alive (una conexión por sondeo)", esc: "A", correr: () => corridaA({ ...A, metodo: "etag", sabotaje: "sin-keepalive" }), falla: /keep-alive real|una conexión viva/ },
-  { nombre: "A: el servidor ignora If-None-Match (el sondeo «con ETag» es ingenuo)", esc: "A", correr: () => corridaA({ ...A, metodo: "etag", sabotaje: "ignora-etag" }), falla: /304/ },
-  { nombre: "A: un cliente saturado (hilo de JS al 96 %)", esc: "A", correr: () => corridaA({ ...A, metodo: "etag", sabotaje: "saturar" }), falla: /fiabilidad/ },
+  { nombre: "A: el servidor ignora If-None-Match (el sondeo «con ETag» es ingenuo)", esc: "A", // pocos cambios (6 /min) para que haya muchos más sondeos que cambios: es donde un servidor que ignora If-None-Match se delata
+    correr: () => corridaA({ ...A, cambiosPorMin: 6, metodo: "etag", sabotaje: "ignora-etag" }), falla: /304/ },
+  { nombre: "A: un cliente saturado (hilo de JS al 96 %)", esc: "A", correr: () => corridaA({ ...A, metodo: "etag", sabotaje: "saturar" }), falla: /fiabilidad/, detalle: /saturado/ },
   { nombre: "control B: webhooks sin sabotaje", esc: "B", correr: () => corridaB({ ...B, metodo: "webhook" }), falla: null },
   { nombre: "B: un receptor que falla una de cada tres (reintentos)", esc: "B", correr: () => corridaB({ ...B, metodo: "webhook", sabotaje: "falla-una-de-tres" }), falla: /sin reintentos ni fallos|perdidos/ },
   { nombre: "B: un consumidor flux que se traga los eventos", esc: "B", correr: (b) => corridaB({ ...B, metodo: "flux", broker: b, sabotaje: "descarta" }), falla: /ninguno perdido/, broker: "B" },
@@ -65,7 +66,8 @@ try {
         mal++;
       } else console.log(`✓ ${c.nombre}: todas las comprobaciones pasan`);
     } else {
-      const detectadas = falladas.filter((x) => c.falla.test(x.nombre));
+      // `detalle`: además del nombre, lo que dice la comprobación (la de fiabilidad sale también por carga ajena: aquí debe ser por SATURACIÓN).
+      const detectadas = falladas.filter((x) => c.falla.test(x.nombre) && (!c.detalle || c.detalle.test(x.detalle)));
       if (detectadas.length) console.log(`✓ ${c.nombre}: DETECTADO → ${detectadas.map((x) => `«${x.nombre}» (${x.detalle})`).join("; ")}`);
       else {
         console.log(`✗ ${c.nombre}: NO se detectó (fallaron: ${falladas.map((x) => x.nombre).join("; ") || "ninguna"})`);

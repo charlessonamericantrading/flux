@@ -127,7 +127,7 @@ function tablaA(datos, titulo, filtro, variable, etiquetaVar) {
     `#### ${titulo}`,
     "",
     tabla(
-      [etiquetaVar, "Método", "Peticiones o mensajes emitidos /min", "CPU total (% de un núcleo)", "· clientes", "· servidor", "· nats-server", "KiB en la red /min", "Enterarse p50", "p99", "máx", "n", "Estado"],
+      [etiquetaVar, "Método", "Peticiones o mensajes emitidos /min", "CPU total (% de un núcleo)", "· clientes", "· servidor", "· nats-server", "KiB en la red /min", "Enterarse p50 †", "p99 †", "máx †", "n", "Estado"],
       filas,
       2,
     ),
@@ -167,7 +167,7 @@ function tablaB(datos, titulo, filtro, variable, etiquetaVar) {
     `#### ${titulo}`,
     "",
     tabla(
-      [etiquetaVar, "Método", "Peticiones o mensajes emitidos /hecho", "CPU total (ms /hecho)", "· productor", "· receptores (suma)", "· nats-server", "KiB en la red /hecho", "Entrega p50", "p99", "máx", "Estado"],
+      [etiquetaVar, "Método", "Peticiones o mensajes emitidos /hecho", "CPU total (ms /hecho)", "· productor", "· receptores (suma)", "· nats-server", "KiB en la red /hecho", "Entrega p50 †", "p99 †", "máx †", "Estado"],
       filas,
       2,
     ),
@@ -208,7 +208,7 @@ function tablaC(datos, titulo, filtro) {
     `#### ${titulo}`,
     "",
     tabla(
-      ["Concurrencia", "Método", "Llamadas /s", "p50", "p99", "máx", "CPU total (µs /llamada)", "· cliente", "· servidor", "· nats-server", "Bytes /llamada", "Conexiones TCP nuevas /llamada", "Estado"],
+      ["Concurrencia", "Método", "Llamadas /s †", "p50 †", "p99 †", "máx †", "CPU total (µs /llamada)", "· cliente", "· servidor", "· nats-server", "Bytes /llamada", "Conexiones TCP nuevas /llamada", "Estado"],
       filas,
       2,
     ),
@@ -224,7 +224,8 @@ function repsDe(datos, escenario, params) {
 }
 const med = (rs, f) => mediana(rs.map(f).filter(Number.isFinite));
 const veces = (a, b) => (Number.isFinite(a) && Number.isFinite(b) && b > 0 ? a / b : NaN);
-const x = (v) => (Number.isFinite(v) ? (v >= 10 ? `${num(v, 0)}×` : v >= 1 ? `${num(v, 1)}×` : `${num(v, 2)}×`) : "—");
+/** Un cociente: `1/800×` si es muy pequeño (0.00× no dice nada). */
+const x = (v) => (Number.isFinite(v) ? (v >= 10 ? `${num(v, 0)}×` : v >= 1 ? `${num(v, 1)}×` : v >= 0.1 ? `${num(v, 2)}×` : v > 0 ? `1/${num(1 / v, 0)}×` : "0×") : "—");
 
 function cruces(datos) {
   const { c, t } = datos.meta.centroA;
@@ -399,7 +400,7 @@ export function generarInforme(datos) {
   push("## Cómo leer las tablas", "");
   push(
     "- Cada celda es **mediana [mín–máx]** de las repeticiones del punto. Las latencias son la mediana, entre repeticiones, del percentil de cada una (`n` = muestras sumadas).",
-    "- **Robustas a la carga de la máquina:** peticiones o mensajes emitidos, bytes en la red, segundos de CPU de cada proceso. **Sensibles:** latencias y llamadas por segundo.",
+    "- **Robustas a la carga de la máquina:** peticiones o mensajes emitidos, bytes en la red, segundos de CPU de cada proceso. **Sensibles** (marcadas con †): latencias y llamadas por segundo; con la máquina cargada son orientativas.",
     "- CPU: `/proc/<pid>` de cada proceso desde fuera (clientes = suma de todos los procesos de consumidores; servidor = el CRM o el productor; `nats-server`). «% de un núcleo» es CPU / tiempo de ventana: 100 % = un núcleo entero.",
     "- Bytes: de APLICACIÓN en los sockets (HTTP: `bytesRead + bytesWritten` del lado servidor; NATS: `in_bytes + out_bytes` de `/varz`). Sin cabeceras TCP/IP y, con TLS, ya descifrados (ni `/varz` ni el `TLSSocket` de Node cuentan los registros TLS: el coste en bytes de TLS no está en estas tablas).",
     "- Peticiones o mensajes emitidos: HTTP = peticiones recibidas por el servidor; flux = `in_msgs` de `nats-server` (todo lo que los clientes le mandan: publicaciones, peticiones de mensajes, acuses…).",
@@ -409,7 +410,17 @@ export function generarInforme(datos) {
 
   push("## Lectura", "");
   push("### Cruces calculados con los datos", "", lecturaAutomatica(datos), "");
-  if (lectura) push("### Lectura escrita a mano", "", lectura, "");
+  if (lectura) {
+    // La lectura la escribe una persona sobre UNA ejecución (`<!-- ejecucion: <inicio ISO> -->` en su primera línea). Si el informe se
+    // regenera con otra, las cifras de esa prosa pueden no corresponder: se avisa en vez de callarlo.
+    const escritaSobre = /<!--\s*ejecucion:\s*(\S+)\s*-->/.exec(lectura)?.[1];
+    const cuerpo = lectura.replace(/<!--\s*ejecucion:[^>]*-->\s*/, "");
+    push("### Lectura escrita a mano", "");
+    if (escritaSobre !== datos.meta.inicio) {
+      push(`> **Aviso:** esta lectura se escribió sobre la ejecución del ${escritaSobre ?? "(sin indicar)"} y estas cifras son de la del ${datos.meta.inicio}. Los números que cita pueden no corresponder a las tablas de arriba: **revísala** antes de citarla, y actualiza la marca \`<!-- ejecucion: … -->\` de \`bench/lectura.md\`.`, "");
+    }
+    push(cuerpo, "");
+  }
 
   push("## Escenario A — enterarse de un cambio", "");
   push(
@@ -442,9 +453,13 @@ export function generarInforme(datos) {
 
   push("## Hallazgos del banco", "");
   push(
-    "Cosas que el banco descubrió y que no son una cifra. Están también, con su medida, en el Apéndice A de `docs/plan-v1.1/PLAN.md`.",
+    "Cosas que el banco descubrió y que no son una cifra de la malla. Cada una está, con su medida, en el Apéndice A de `docs/plan-v1.1/PLAN.md`, y las que se reproducen con un script lo traen en `bench/diagnostico/`. **No se ha tocado ningún `sdk-*/src`.**",
     "",
-    "- **A-170 — `activeTraceparent()` hace un `import()` de `@opentelemetry/api` en CADA publicación, petición y respuesta.** Sin el paquete instalado, cada llamada recorre la resolución de módulos de Node y lanza una excepción que se descarta: ~85 µs de CPU por llamada (microbenchmark de `bench/`), en las dos puntas de una petición. Con `@opentelemetry/api` presente la llamada cuesta ~3 µs. Es la diferencia entre `flux` y «flux con OpenTelemetry presente» en C.",
+    "- **A-170 — `activeTraceparent()` hace un `import()` de `@opentelemetry/api` en CADA publicación, petición y respuesta** (`sdk-node/src/context.ts`). Sin el paquete instalado, cada llamada recorre la resolución de módulos de Node y lanza una excepción que se descarta: ~85 µs de CPU por llamada, en las dos puntas de una petición; con el paquete resuelto, ~3 µs. Es la diferencia entre «flux» y «flux (con OpenTelemetry presente)» en C.",
+    "- **A-171 — `gen()` de `scripts/lib/nats-harness.mjs` se rompe con ~1 000 servicios:** `spawnSync` corta la salida de `gen-acl.mjs` en 1 MiB (~1.06 KB por servicio) y devuelve `status: null`; `dev-secure.mjs` fallaría con «gen-acl.mjs falló» sin motivo. El banco usa su propio `execFile` con `maxBuffer` alto.",
+    "- **A-172 — Casi 2/3 de la CPU de `nats-server` en B (y en A) es escribir el estado de cada consumidor durable a disco** (`consumerFileStore.flushLoop → writeState → writeAtomically`: fichero temporal + renombrado, por consumidor), no mover mensajes. Perfil con `pprof` (`prof_port`).",
+    "- **A-173 — Con los durables en memoria (`mem_storage: true`) la CPU de `nats-server` baja a 0.23× (B) y 0.29× (A), y la total a 0.36× y 0.51×:** `node bench/diagnostico/consumidores-en-memoria.mjs [a|b]`. No es una recomendación (el estado del consumidor se pierde al reiniciar el servidor): es lo que cuesta no hacerlo, para que el dueño del protocolo decida.",
+    "- **A-174 — Un `Authentication Timeout` del broker sale como «credenciales rechazadas» (`ConnectionRejectedError`, PERMANENT):** `permanentConnectError` (`sdk-node/src/security.ts`) trata todo `AuthorizationError` igual. Pasó una vez con la máquina a 19 de carga (N = 1000) y se reproduce sin carga: `node bench/diagnostico/auth-timeout.mjs`. Un servicio que arranca con el broker saturado no reintenta: se cae.",
     "",
   );
 
