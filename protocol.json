@@ -953,7 +953,8 @@
       "node": {
         "capabilities": [
           "signing",
-          "security"
+          "security",
+          "state"
         ],
         "evidence": {
           "security": [
@@ -961,6 +962,10 @@
             "sdk-node/test/integration/auth.test.ts",
             "sdk-node/test/integration/tls.test.ts",
             "sdk-node/test/security.test.ts"
+          ],
+          "state": [
+            "sdk-node/test/state.test.ts",
+            "sdk-node/test/integration/state.test.ts"
           ]
         }
       },
@@ -987,11 +992,16 @@
       "rust": {
         "capabilities": [
           "signing",
-          "security"
+          "security",
+          "state"
         ],
         "evidence": {
           "security": [
             "sdk-rust/tests/security.rs"
+          ],
+          "state": [
+            "sdk-rust/tests/state.rs",
+            "sdk-rust/src/state.rs"
           ]
         }
       },
