@@ -33,12 +33,14 @@ import { v7 as uuidv7 } from "uuid";
 
 import {
   buildEvent,
+  EnvelopeError,
   parseEvent,
   serialize,
   toDlqEvent,
   type DataClassification,
   type FluxEvent,
 } from "./envelope.js";
+import { externalEventId } from "./external-id.js";
 import { ErrorClass, PoisonError, type Classification } from "./errors.js";
 import { ConsumerConfigMismatchError, TenantIsolationError } from "./client-errors.js";
 import { StateClient } from "./state.js";
@@ -206,6 +208,14 @@ export interface PublishOptions {
   /** Instante en que ocurrió el hecho, si no es "ahora". */
   time?: Date | string;
   partitionKey?: string;
+  /**
+   * La clave del hecho en un sistema EXTERNO (el id del evento de una pasarela de pagos, de un tercero): con ella el `id`
+   * del evento es DETERMINISTA —un UUIDv7 con los milisegundos de `time` y los 74 bits restantes de
+   * `SHA-256(<source> "|" <externalKey>)`— y el mismo hecho reenviado da siempre el mismo `id`, de modo que los
+   * consumidores lo deduplican (01-envelope.md §2.6.1). **Exige `time`**: el instante del hecho externo, que es lo que hace
+   * estable el `id` (con «ahora», cada reenvío tendría el suyo). Sin `externalKey`, el `id` es un UUIDv7 nuevo.
+   */
+  externalKey?: string;
 }
 
 export interface SubscribeOptions {
@@ -469,7 +479,21 @@ export class FluxBus {
     const { domain } = parseSubject(subject);
     await this.#ensureStream(domain);
 
-    const id = uuidv7();
+    // Un hecho importado de un sistema externo tiene un `id` DETERMINISTA (01-envelope.md §2.6.1): el mismo hecho
+    // reenviado por el proveedor da el mismo `id` y los consumidores lo deduplican.
+    let id: string;
+    if (options.externalKey !== undefined) {
+      if (options.time === undefined) {
+        throw new EnvelopeError(
+          "`externalKey` exige `time`: el instante del hecho EXTERNO, que es lo que hace estable el `id`. Con «ahora» cada reenvío " +
+            "del proveedor tendría su propio `id` y nadie podría deduplicarlo (01-envelope.md §2.6.1). Si el proveedor no da " +
+            "un instante, no hay `id` determinista: omite `externalKey` y deduplica por una clave de negocio de `data`",
+        );
+      }
+      id = externalEventId({ source: this.#source, externalKey: options.externalKey, time: options.time });
+    } else {
+      id = uuidv7();
+    }
     const inherited = currentContext();
 
     const event = buildEvent<T>({
