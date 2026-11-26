@@ -124,17 +124,38 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      # `cryptography` es un extra OPCIONAL del SDK (la firma es una extensión
-      # opcional de v1), pero en CI se instala a propósito: si no, los tests de firma
-      # se saltan y el CI daría verde sin haberlos ejecutado NUNCA.
-      - run: pip install pytest cryptography
-      - run: python -m pytest sdk-python/tests -q
-      # Y sin el extra: el resto de la suite DEBE seguir pasando, saltando solo la
-      # firma. Una dependencia opcional que rompe la recolección entera no es opcional.
+      # Se instala desde el extra `dev` de pyproject.toml y no con una lista a mano: la
+      # lista a mano fue justo lo que falló. Con `pip install pytest cryptography` el CI
+      # ejecutaba 167 de los 205 tests y daba verde: los otros 38 —los módulos
+      # `test_validation`, `test_client_l3` y `test_consumer_pending`, más uno de
+      # `test_tenant`— se saltaban porque `jsonschema` y `nats-py` no estaban. `dev` agrupa
+      # todo lo que la suite necesita (`cryptography`, `jsonschema`, `pytest`) y `nats-py`
+      # llega como dependencia base.
+      - run: pip install -e "sdk-python[dev]"
+      # `importorskip` convierte una dependencia ausente en un SALTO, no en un fallo, y
+      # pytest no tiene un `--fail-on-skipped` como PHPUnit. Aquí están todas las
+      # dependencias, así que un salto significa que falta una y la cobertura sería
+      # ficticia: se hace fallar a mano. `-rs` lista los saltos con su motivo.
+      - name: Suite completa, sin un solo test saltado
+        run: |
+          set -o pipefail
+          python -m pytest sdk-python/tests -q -rs | tee pytest.out
+          if grep -q '^SKIPPED' pytest.out; then
+            echo "✗ Hay tests saltados: falta una dependencia en el paso de instalación"
+            exit 1
+          fi
+      # Y sin los extras: el resto de la suite DEBE seguir pasando, saltando solo lo que
+      # los necesita. Una dependencia opcional que rompe la recolección entera no es
+      # opcional. Aquí SÍ se esperan saltos (la firma; luego también la validación), así
+      # que basta con exigir que la suite salga en verde.
       - name: La suite pasa también SIN el extra de firma
         run: |
           pip uninstall -y cryptography
-          python -m pytest sdk-python/tests -q
+          python -m pytest sdk-python/tests -q -rs
+      - name: La suite pasa también SIN el extra de validación
+        run: |
+          pip uninstall -y jsonschema
+          python -m pytest sdk-python/tests -q -rs
 
   sdk-go:
     name: SDK Go — vet, test y gofmt

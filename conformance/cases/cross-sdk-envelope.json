@@ -2,8 +2,8 @@
   "case": "cross-sdk-envelope",
   "title": "Todos los SDKs serializan el mismo evento de forma byte a byte idéntica",
   "spec": "specification/01-envelope.md §2.2, §2.3, §3.3",
-  "verifiedAgainst": "sdk-node, sdk-python, sdk-go",
-  "verifiedOn": "2026-08-20",
+  "verifiedAgainst": "Los siete SDKs (node, python, go, rust, php, java, dotnet) en el job `cross-sdk` de CI (.github/workflows/spec.yml; ejecución 45799231281). En local, node, python, go, rust, php y java con `node conformance/cross-sdk.mjs`; dotnet solo en CI.",
+  "verifiedOn": "2026-11-26",
 
   "rationale": "Un protocolo polyglot cuyo envelope no es reproducible entre lenguajes no es un protocolo: es una convención informal. Sin serialización idéntica se rompen el replay verbatim desde la DLQ, la firma criptográfica del evento (fase 4), la deduplicación por hash de contenido y los fixtures compartidos de esta misma suite. Este caso nació de tres divergencias reales que los ports a Python y Go destaparon.",
 

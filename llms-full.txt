@@ -571,7 +571,7 @@ El resultado sería que **dos servicios del mismo ecosistema emiten `time` disti
 para el mismo instante**. Eso rompe:
 
 - El **replay verbatim** desde la DLQ, que deja de ser byte a byte idéntico.
-- Cualquier **firma criptográfica** sobre el evento serializado (fase 4).
+- Cualquier **firma criptográfica** sobre el evento serializado ([07-signing.md](07-signing.md)).
 - La **deduplicación por hash de contenido**.
 - Los **fixtures compartidos** entre SDKs en la suite de conformidad.
 
@@ -785,7 +785,7 @@ Un objeto JSON con las mismas claves en otro orden es equivalente como dato y
 **distinto como bytes**, y flux depende de la secuencia de bytes en cuatro sitios:
 
 - El **replay verbatim** desde la DLQ deja de producir el mismo mensaje.
-- Una **firma criptográfica** sobre el evento serializado (fase 4) no verifica.
+- Una **firma criptográfica** sobre el evento serializado ([07-signing.md](07-signing.md)) no verifica.
 - La **deduplicación por hash de contenido** ve dos eventos donde hay uno.
 - Los **fixtures compartidos** entre SDKs dejan de comparar.
 
@@ -1787,9 +1787,9 @@ rediseñarse. La alternativa —cripto-borrado con clave por sujeto— queda fue
 | Tema | Estado | Nota |
 |---|---|---|
 | Firma de eventos | ✅ **Implementada** | Ed25519, extensión opcional — ver [07-signing.md](07-signing.md). Traslada la autenticidad del canal al evento. |
-| Cifrado a nivel de campo | Fase 4 | Hoy: no metas ahí lo que no puedas guardar en claro. |
+| Cifrado a nivel de campo | Fuera de v1 | Propuesto como Fase 7 opcional en [`docs/plan-v1.1/PLAN.md`](../docs/plan-v1.1/PLAN.md). Hoy: no metas ahí lo que no puedas guardar en claro. |
 | Aislamiento real de tenant | ✅ **Documentado** | Tres modelos con su coste real — ver [09-multitenancy.md](09-multitenancy.md). El default de v1 (filtrado en consumidor) NO resiste a un servicio legítimo comprometido; el Modelo B sí. |
-| Auditoría inmutable de acceso | Fase 4 | Hoy: logs del servidor NATS. |
+| Auditoría inmutable de acceso | Fuera de v1 | Hoy: logs y advisories del servidor NATS. |
 
 Esta tabla existe para que nadie confunda "no está en el documento" con "está
 resuelto".
