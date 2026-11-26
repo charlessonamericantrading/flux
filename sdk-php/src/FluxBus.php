@@ -156,6 +156,9 @@ final class FluxBus
      *
      * @param array<string,mixed> $data Objeto JSON, claves en camelCase, importes como
      *        entero en la unidad mínima, sin PII y sin `null` para "ausente".
+     * @param string|null $externalKey La clave del hecho en el sistema externo (`evt_1Nx…`), para un hecho
+     *        **importado**: el `id` pasa a derivarse de `source`, esta clave y `time`, y el mismo hecho reenviado
+     *        da siempre el mismo (01-envelope.md §2.6.1). Exige `$time`: el instante del hecho externo.
      *
      * @throws InvalidSubjectException|EnvelopeException
      */
@@ -167,11 +170,26 @@ final class FluxBus
         ?string $classification = null,
         \DateTimeInterface|string|null $time = null,
         ?string $partitionKey = null,
+        ?string $externalKey = null,
     ): FluxEvent {
         $parsed = Protocol::parseSubject($subject); // falla temprano y con un mensaje útil
         $this->ensureEventStream($parsed->domain);
 
-        $id = Protocol::uuid7();
+        // Un hecho importado de un sistema externo tiene un `id` DETERMINISTA (01-envelope.md §2.6.1): el
+        // mismo hecho reenviado por el proveedor da el mismo `id` y los consumidores lo deduplican.
+        if ($externalKey !== null) {
+            if ($time === null) {
+                throw new EnvelopeException(
+                    '`externalKey` exige `time`: el instante del hecho EXTERNO, que es lo que hace estable el `id`. Con «ahora» cada '
+                    . 'reenvío del proveedor tendría su propio `id` y nadie podría deduplicarlo (01-envelope.md §2.6.1). Si el '
+                    . 'proveedor no da un instante, no hay `id` determinista: omite `externalKey` y deduplica por una clave de '
+                    . 'negocio de `data`'
+                );
+            }
+            $id = ExternalId::derive($this->source, $externalKey, $time);
+        } else {
+            $id = Protocol::uuid7();
+        }
         $inherited = EventContext::current();
 
         $event = Envelope::build(
@@ -928,7 +946,8 @@ final class FluxBus
             'dlqreason' => ErrorClass::Poison->value,
             'dlqattempts' => 1,
             'dlqconsumer' => $consumer,
-            'dlqerror' => substr(($error->errorCode ?? 'POISON') . ': ' . $error->getMessage(), 0, 1024),
+            // 1024 BYTES UTF-8 sin partir un carácter (04-errors.md §3): un `substr` cortaría un emoji por la mitad.
+            'dlqerror' => Text::truncateUtf8Bytes(($error->errorCode ?? 'POISON') . ': ' . $error->getMessage(), 1024),
             'dlqtime' => $now,
             'data' => [
                 'originalSubject' => $subject,
@@ -941,7 +960,7 @@ final class FluxBus
         try {
             $this->transport->publish(
                 Protocol::dlqSubject($subject),
-                json_encode($envelope, Envelope::JSON_FLAGS),
+                Json::encode($envelope),
                 [Protocol::MSG_ID_HEADER => "poison-{$id}"],
             );
 

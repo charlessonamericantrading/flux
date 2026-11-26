@@ -12,6 +12,6 @@ namespace Flux;
  * antes de tocar el cable y no tiene nada que ver con la DLQ. Un POISON es un mensaje
  * ajeno ilegible, ya en el stream.
  */
-final class EnvelopeException extends \InvalidArgumentException
+class EnvelopeException extends \InvalidArgumentException
 {
 }

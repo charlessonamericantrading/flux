@@ -127,7 +127,7 @@ final class Classifier
             return new Classification(
                 errorClass: $e->fluxClass(),
                 code: $e->errorCode ?? self::shortName($e),
-                retryAfterMs: $e instanceof RetryableError ? $e->retryAfterMs : null,
+                retryAfterMs: $e instanceof RetryableError || $e instanceof CodedError ? $e->retryAfterMs : null,
             );
         }
 
