@@ -839,12 +839,14 @@
       }
     },
     "manifest": {
-      "$comment": "El manifiesto de ownership (examples/services.json) que alimenta gen-acl.mjs y flux provision. Normativo en specification/06-security.md §3.8; los permisos de estado concretos, en state.acl. `watches` es la lista de contratos de estado que observa un servicio.",
+      "$comment": "El manifiesto de ownership (examples/services.json) que alimenta gen-acl.mjs y flux provision. Normativo en specification/06-security.md §3.8; los permisos de estado concretos, en state.acl. `watches` es la lista de contratos de estado que observa un servicio. `calls` y `serves` (petición/respuesta) son listas de OPERACIONES y se describen en rpc.acl.manifest.",
       "serviceKeys": [
         "name",
         "owns",
         "consumes",
-        "watches"
+        "watches",
+        "calls",
+        "serves"
       ],
       "unknownServiceKeysRejected": true,
       "watches": {
@@ -2206,7 +2208,7 @@
       "$comment": "Un stream que captura una operacion contesta a cada peticion con su acuse `{\"stream\":…,\"seq\":n}` (A-18, A-67): quien llama lo recibe como si fuera la respuesta (casi siempre: es una carrera con la respuesta real), el que responde ejecuta igualmente, y ademas el stream PERSISTE cada peticion, datos personales incluidos. `flux doctor` DEBE comprobarlo con ops credentials; `flux provision` no crea ninguno (EVT_<DOM> es `<dom>.>` y `rpc` es un dominio reservado, 02-naming.md §1.3). El algoritmo de solape se midio contra un broker con 16 patrones (A-69)."
     },
     "acl": {
-      "$comment": "Lo que la peticion/respuesta necesita, MEDIDO contra un broker (A-66, A-68, A-71, A-73) y que gen-acl.mjs debe llegar a producir. Extiende security.acl: NO la sustituye. El llamante publica SOLO en el subject EXACTO de cada operacion concedida y se suscribe a su inbox privado; el dueno se suscribe a `rpc.<dominio>.>` y NO necesita ningun permiso de publicacion sobre inboxes: lo da allow_responses. Sin el inbox privado de la fase 1, cualquiera leeria las respuestas ajenas (A-71).",
+      "$comment": "Lo que la peticion/respuesta necesita, MEDIDO contra un broker (A-66, A-68, A-71, A-73) y que gen-acl.mjs PRODUCE (specification/06-security.md §3.9; ejecutado contra un nats-server real por scripts/verify-acl.mjs y por los casos S21 a S28 de conformance/security.mjs). Extiende security.acl: NO la sustituye. El llamante publica SOLO en el subject EXACTO de cada operacion concedida y se suscribe a su inbox privado; el dueno se suscribe a `rpc.<dominio>.>` y NO necesita ningun permiso de publicacion sobre inboxes: lo da allow_responses. Sin el inbox privado de la fase 1, cualquiera leeria las respuestas ajenas (A-71).",
       "callerPublish": "^rpc\\.[a-z0-9]+(-[a-z0-9]+)*\\.[a-z0-9]+(-[a-z0-9]+)*\\.v[1-9][0-9]*\\.[a-z0-9]+(-[a-z0-9]+)*$",
       "callerSubscribe": "security.acl.inbox.permissionPattern",
       "callerNeverPublish": [
@@ -2232,7 +2234,46 @@
         "$comment": "Medido (A-68): `allow_responses: true` admite UNA respuesta por peticion (la segunda es una violacion) y NO caduca; `{ max: n }` admite n; `{ expires }` deniega la que llega tarde. Responder a un subject que no es el `reply` de la peticion, tambien. Sin allow_responses el dueno no puede responder y quien llama ve un timeout. Como el timeout maximo es 25 s, una respuesta valida nunca llega despues: `{ max: 1, expires: 30s }` acota lo que puede hacer un dueno comprometido con los inboxes que ha visto, sin romper ninguna respuesta legitima. DEBERIA; lo decide el generador."
       },
       "ownerWithoutSubscribePermission": "callers-see-no-responders",
-      "$commentOwner": "Un dueno al que la ACL deniega la suscripcion parece un servicio CAIDO para quien llama: `no responders` (A-73). respond() DEBE fallar con PERMISSION_DENIED nombrando el subject (06-security.md §3.7), no arrancar mudo."
+      "$commentOwner": "Un dueno al que la ACL deniega la suscripcion parece un servicio CAIDO para quien llama: `no responders` (A-73). respond() DEBE fallar con PERMISSION_DENIED nombrando el subject (06-security.md §3.7), no arrancar mudo.",
+      "manifest": {
+        "$comment": "Las claves del manifiesto de ownership (examples/services.json) para peticion/respuesta. `calls` (quien llama) y `serves` (el dueno) son listas de OPERACIONES —el nombre de la operacion, sin el prefijo `rpc.`, que pone el SDK—, y de ellas salen los permisos de callerPublish/callerSubscribe y de ownerSubscribe/ownerAllowResponses de este bloque. scripts/check-protocol-json.mjs EJECUTA el generador sobre servicios de prueba y comprueba que emite exactamente eso, y que lo ancho (`rpc.>`, `rpc.<dominio>.>`, un permiso de publicacion sobre inboxes para el dueno, un allow_responses sin acotar) se detecta. Los errores del manifiesto dicen que esta mal y como se arregla (04-errors.md §5.2).",
+        "keys": [
+          "calls",
+          "serves"
+        ],
+        "entry": "<dominio>.<agregado>.v<major>.<operacion>",
+        "entryPattern": "rpc.operation.pattern",
+        "entryWithRpcPrefix": "RESERVED_DOMAIN",
+        "reservedDomainsRejected": true,
+        "wildcardsRejected": true,
+        "duplicatesRejected": true,
+        "nonListRejected": true,
+        "operationMustExistInBundleRpcIndex": true,
+        "calls": {
+          "grants": [
+            "callerPublish"
+          ],
+          "domainMustHaveOwner": true,
+          "ownDomainRejected": true,
+          "operationMustBeServed": true,
+          "$comment": "Un servicio que solo llama NO recibe ninguna suscripcion de dominio ni allow_responses: su unica suscripcion es el inbox privado. Una operacion que nadie atiende se rechaza en el manifiesto: quien llama solo veria `no responders` (RPC_UNAVAILABLE)."
+        },
+        "serves": {
+          "grants": [
+            "ownerSubscribe",
+            "ownerAllowResponses"
+          ],
+          "onlyOwnDomain": true,
+          "subscribePerDomain": true,
+          "noPublishOnInboxes": true,
+          "$comment": "Solo el dueno de un dominio atiende sus operaciones: con dos servicios sobre la misma operacion los dos la ejecutan y quien llama ve UNA respuesta (A-60). El permiso es `rpc.<dominio>.>` (uno por dominio servido), pero el SDK se suscribe al subject EXACTO de cada operacion (A-64). Un dueno que no declara `serves` no recibe ninguna suscripcion ni allow_responses."
+        },
+        "generatedAllowResponses": {
+          "max": 1,
+          "expires": "30s"
+        },
+        "tenantsModelBSamePermissions": true
+      }
     },
     "schemaPath": {
       "request": "schemas/rpc/<dominio>/<agregado>/<operacion>/request/<major>.<minor>.<patch>.json",
